@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""生成 ComfyUI-Hana 的占位图资产（纯标准库，无第三方依赖）。
+"""生成 ComfyUI-Hana 的占位图资产（纯标准库，无第三方依赖）。· v2 简洁扁平版
 
 产物：
-  app/assets/icon.png    256x256   App 身份图标
-  app/ui/assets/cover.png 640x400 卡片封面
+  app/assets/icon.png     256x256  App 身份图标
+  app/ui/assets/cover.png 640x400  卡片封面
 
-绘制内容：深色底 + 三个“工作流节点”圆角方块 + 连线（呼应 ComfyUI 的节点画布）。
-以 2x 超采样后盒式降采样做抗锯齿。可重复执行，幂等覆盖。
+设计：纯色 + 几何（节点方块 + 直线连线，呼应 ComfyUI 节点画布）；
+小圆角、无点缀、无渐变。以 4x 超采样后盒式降采样做抗锯齿。可重复执行，幂等覆盖。
 """
 import struct
 import sys
@@ -15,33 +15,28 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # D:\HanakoWorks\ComfyUI
 
-BG_TOP = (24, 27, 36)       # 深夜蓝黑
-BG_BOTTOM = (33, 38, 52)
-NODE_STROKE = (124, 156, 198)   # 冷蓝
-NODE_FILL = (44, 52, 72)
-ACCENT = (232, 168, 124)    # 暖橙（ComfyUI 风格点缀）
-WIRE = (110, 130, 160)
+BG = (30, 34, 43)             # 底色（深石板蓝）
+NODE_FILL = (43, 52, 70)      # 普通节点填充
+NODE_STROKE = (124, 156, 198)  # 节点描边 / 冷蓝
+ACCENT = (232, 168, 124)      # 强调节点（暖橙）
+WIRE = (109, 132, 168)        # 连线
+SS = 4                        # 超采样倍率
 
 
 def blend(dst, src, a):
     return tuple(int(round(d + (s - d) * a)) for d, s in zip(dst, src))
 
 
-def in_rounded_rect(x, y, rx0, ry0, rx1, ry1, r):
-    if x < rx0 or x > rx1 or y < ry0 or y > ry1:
+def in_rounded_rect(x, y, x0, y0, x1, y1, r):
+    if x < x0 or x > x1 or y < y0 or y > y1:
         return False
-    cx = min(max(x, rx0 + r), rx1 - r)
-    cy = min(max(y, ry0 + r), ry1 - r)
+    cx = min(max(x, x0 + r), x1 - r)
+    cy = min(max(y, y0 + r), y1 - r)
     dx, dy = x - cx, y - cy
     return dx * dx + dy * dy <= r * r + 1e-6
 
 
-def in_disc(x, y, cx, cy, r):
-    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
-
-
 def seg_hit(x, y, x0, y0, x1, y1, half):
-    # 点到线段的距离 < half
     vx, vy = x1 - x0, y1 - y0
     wx, wy = x - x0, y - y0
     L2 = vx * vx + vy * vy
@@ -50,42 +45,38 @@ def seg_hit(x, y, x0, y0, x1, y1, half):
     return (x - px) ** 2 + (y - py) ** 2 <= half * half
 
 
-def render(w, h, nodes, wires, ss=2):
-    """nodes: [(x0,y0,x1,y1,radius)] 相对坐标乘 w/h；wires 连接 nodes 中心。"""
-    W, H = w * ss, h * ss
+def center(n):
+    x0, y0, x1, y1, _r, _style = n
+    return ((x0 + x1) / 2, (y0 + y1) / 2)
+
+
+def render(w, h, nodes, wires):
+    """nodes: [(x0,y0,x1,y1,r,style)]，坐标为最终像素；wires: 节点下标对。"""
+    W, H = w * SS, h * SS
+    # 先算超采样坐标
+    def sn(n):
+        x0, y0, x1, y1, r, style = n
+        return (x0 * SS, y0 * SS, x1 * SS, y1 * SS, r * SS, style)
+    snodes = [sn(n) for n in nodes]
+    swires = [(center(nodes[a]), center(nodes[b])) for a, b in wires]
     px = []
     for yy in range(H):
         row = []
-        ty = yy / (H - 1) if H > 1 else 0
-        bg = blend(BG_TOP, BG_BOTTOM, ty)
         for xx in range(W):
-            nx, ny = xx / W, yy / H
-            c = bg
+            c = BG
             # 连线（先画，节点覆盖其上）
-            for (a, b) in wires:
-                ax, ay = nodes[a][0], nodes[a][1]
-                bx, by = nodes[b][0], nodes[b][1]
-                ax = (ax + nodes[a][2]) / 2 * W
-                ay = (ay + nodes[a][3]) / 2 * H
-                bx = (bx + nodes[b][2]) / 2 * W
-                by = (by + nodes[b][3]) / 2 * H
-                if seg_hit(xx, yy, ax, ay, bx, by, 1.6 * ss):
-                    c = blend(c, WIRE, 0.9)
-            for (x0, y0, x1, y1, r) in nodes:
-                RX0, RY0, RX1, RY1 = x0 * W, y0 * H, x1 * W, y1 * H
-                R = r * min(W, H)
-                if in_rounded_rect(xx, yy, RX0, RY0, RX1, RY1, R):
-                    edge = (
-                        in_rounded_rect(xx, yy, RX0, RY0, RX1, RY1, R)
-                        and not in_rounded_rect(xx, yy, RX0 + 1.5 * ss, RY0 + 1.5 * ss,
-                                                RX1 - 1.5 * ss, RY1 - 1.5 * ss, max(R - 1.5 * ss, 0))
-                    )
-                    c = blend(c, NODE_STROKE if edge else NODE_FILL, 1.0)
-            # 点缀圆点（节点“端口”）
-            for (x0, y0, x1, y1, r) in nodes:
-                for (fx, fy) in ((x0, (y0 + y1) / 2), (x1, (y0 + y1) / 2)):
-                    if in_disc(xx, yy, fx * W, fy * H, 2.6 * ss):
-                        c = blend(c, ACCENT, 1.0)
+            for ((ax, ay), (bx, by)) in swires:
+                if seg_hit(xx, yy, ax * SS, ay * SS, bx * SS, by * SS, 1.4 * SS):
+                    c = blend(c, WIRE, 1.0)
+            # 节点
+            for (x0, y0, x1, y1, r, style) in snodes:
+                if in_rounded_rect(xx, yy, x0, y0, x1, y1, r):
+                    if style == "accent":
+                        c = ACCENT
+                    else:
+                        edge = not in_rounded_rect(xx, yy, x0 + 1.0 * SS, y0 + 1.0 * SS,
+                                                   x1 - 1.0 * SS, y1 - 1.0 * SS, max(r - 1.0 * SS, 0))
+                        c = NODE_STROKE if edge else NODE_FILL
             row.append(c)
         px.append(row)
     # 盒式降采样
@@ -94,9 +85,9 @@ def render(w, h, nodes, wires, ss=2):
         row = []
         for xx in range(w):
             rs = gs = bs = n = 0
-            for dy in range(ss):
-                for dx in range(ss):
-                    r, g, b = px[yy * ss + dy][xx * ss + dx]
+            for dy in range(SS):
+                for dx in range(SS):
+                    r, g, b = px[yy * SS + dy][xx * SS + dx]
                     rs += r; gs += g; bs += b; n += 1
             row.append((rs // n, gs // n, bs // n))
         out.append(row)
@@ -122,22 +113,25 @@ def write_png(path, w, h, pixels):
 
 def main():
     app = ROOT / "app"
+
+    # 图标 256×256：三个节点（右上强调），两条连线
     icon_nodes = [
-        (0.10, 0.22, 0.42, 0.46, 0.14),
-        (0.58, 0.14, 0.90, 0.38, 0.14),
-        (0.34, 0.58, 0.66, 0.82, 0.14),
+        (46, 70, 112, 136, 10, "plain"),    # 左
+        (150, 44, 216, 110, 10, "accent"),  # 右上
+        (98, 150, 164, 216, 10, "plain"),   # 下中
     ]
-    icon_wires = [(0, 1), (0, 2), (1, 2)]
+    icon_wires = [(0, 1), (0, 2)]
     write_png(app / "assets" / "icon.png", 256, 256, render(256, 256, icon_nodes, icon_wires))
 
+    # 封面 640×400：五节点两列流（中上强调），五条连线
     cover_nodes = [
-        (0.06, 0.20, 0.24, 0.52, 0.10),
-        (0.36, 0.10, 0.54, 0.42, 0.10),
-        (0.66, 0.24, 0.84, 0.56, 0.10),
-        (0.20, 0.62, 0.44, 0.94, 0.10),
-        (0.58, 0.60, 0.82, 0.92, 0.10),
+        (54, 156, 136, 238, 12, "plain"),   # A 左
+        (214, 84, 296, 166, 12, "accent"),  # B 中上
+        (214, 250, 296, 332, 12, "plain"),  # C 中下
+        (392, 84, 474, 166, 12, "plain"),   # D 右上
+        (392, 250, 474, 332, 12, "plain"),  # E 右下
     ]
-    cover_wires = [(0, 1), (1, 2), (0, 3), (3, 4), (2, 4), (1, 3)]
+    cover_wires = [(0, 1), (0, 2), (1, 2), (1, 3), (2, 4)]
     write_png(app / "ui" / "assets" / "cover.png", 640, 400, render(640, 400, cover_nodes, cover_wires))
 
     print("written:", app / "assets" / "icon.png")
