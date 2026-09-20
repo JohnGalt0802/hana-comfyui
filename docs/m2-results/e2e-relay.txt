@@ -1,0 +1,12 @@
+PASS  前置：8188 队列为空  | running=0 pending=0
+PASS  中继就绪
+PASS  事件订阅已连接（提交前）
+PASS  提交成功（prompt_id）  | prompt_id=a8f5a22c-a4f3-4a71-a5ac-fd05f6bdd5da
+PASS  任务在 180s 内抵达终态  | state=completed
+FAIL  事件缓存捕获执行事件  | events=
+PASS  history 产出产物记录  | {"node":"2","kind":"images","filename":"comfyui_hana_m2_00002_.png","subfolder":"","type":"output"}
+PASS  产物文件真实落盘（size>0）  | D:\ComfyUI\ComfyUI\output\comfyui_hana_m2_00002_.png (317 B)
+产物路径：D:\ComfyUI\ComfyUI\output\comfyui_hana_m2_00002_.png
+PASS  完成后：8188 队列已清空  | running=0 pending=0
+
+8/9 passed

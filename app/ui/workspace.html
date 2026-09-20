@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ComfyUI 工作区</title>
+<style>
+/* 主题：自包含两套色板（浅 / 深），跟随 hana.theme；不依赖宿主 CSS 变量 */
+:root {
+  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
+  --bg-page: #f7f3eb; --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --ok: #2e7d32; --bad: #c62828; --warn-bg: rgba(198,40,40,.1); --warn-border: rgba(198,40,40,.35);
+}
+body.t-dark {
+  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
+  --bg-page: #1b1e24; --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --ok: #6fbf73; --bad: #e57373; --warn-bg: rgba(229,115,115,.12); --warn-border: rgba(229,115,115,.4);
+}
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; }
+body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; overflow: hidden; }
+#ws-root { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+/* 顶栏：只在需要注意时出现（告警条 / 工具条） */
+#ws-bar { display: none; align-items: center; gap: 10px; padding: 4px 10px; font-size: 12px; flex-wrap: wrap; }
+#ws-bar.show { display: flex; }
+#ws-bar.warn { background: var(--warn-bg); border-bottom: 1px solid var(--warn-border); color: var(--bad); }
+#ws-bar.info { background: var(--bg-card); border-bottom: 1px solid var(--border); color: var(--text-muted); }
+#ws-bar .spacer { flex: 1; }
+#ws-bar button {
+  font-size: 11.5px; padding: 2px 10px; border-radius: 6px; cursor: pointer;
+  border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent);
+}
+#ws-bar button:hover { background: var(--accent); color: #fff; }
+
+#ws-body { position: relative; flex: 1; min-height: 0; }
+#ws-frame-wrap { position: absolute; inset: 0; display: none; }
+#ws-frame-wrap.show { display: block; }
+#ws-frame { width: 100%; height: 100%; border: 0; display: block; background: var(--bg-page); }
+#ws-loading {
+  position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+  gap: 10px; color: var(--text-muted); background: var(--bg-page); z-index: 2;
+}
+#ws-loading.show { display: flex; }
+.spinner {
+  width: 16px; height: 16px; border-radius: 50%; display: inline-block;
+  border: 2px solid var(--border); border-top-color: var(--accent); animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 三态视图：booting / error */
+.view { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px; overflow: auto; }
+.view.show { display: flex; }
+.panel {
+  width: min(560px, 100%); background: var(--bg-card); border: 0.5px solid var(--border);
+  border-radius: 14px; padding: 20px 22px;
+}
+.panel h1 { margin: 0 0 4px; font-size: 17px; font-weight: 700; }
+.panel .sub { color: var(--text-muted); font-size: 12px; margin-bottom: 14px; }
+.panel .note { margin: 10px 0 14px; line-height: 1.7; }
+.panel .meta { color: var(--text-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.panel .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.panel button {
+  font-size: 12px; padding: 6px 14px; border-radius: 8px; cursor: pointer;
+  border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent);
+}
+.panel button:hover { background: var(--accent); color: #fff; }
+.panel button.primary { border-color: var(--accent); }
+.panel select {
+  font-size: 12px; padding: 4px 8px; border-radius: 8px; color: var(--text);
+  border: 0.5px solid var(--border); background: var(--bg-page);
+}
+.panel details { margin-top: 14px; font-size: 11.5px; color: var(--text-muted); }
+.panel details summary { cursor: pointer; color: var(--text-muted); }
+.panel pre {
+  white-space: pre-wrap; word-break: break-all; background: rgba(127,127,127,.08);
+  border-radius: 8px; padding: 8px 10px; margin: 8px 0 0; max-height: 220px; overflow: auto;
+}
+.chip { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); }
+.chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
+.chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
+</style>
+</head>
+<body>
+<div id="ws-root">
+  <div id="ws-bar"><span id="ws-bar-text"></span><span class="spacer"></span><button id="ws-bar-action" style="display:none"></button></div>
+  <div id="ws-body">
+    <div id="ws-loading"><span class="spinner"></span><span>正在加载 ComfyUI 前端……</span></div>
+    <div id="ws-frame-wrap"><iframe id="ws-frame" title="ComfyUI"></iframe></div>
+
+    <div class="view show" id="view-booting">
+      <div class="panel">
+        <h1>ComfyUI 工作区</h1>
+        <div class="sub">正在连接本机 ComfyUI（127.0.0.1:8188）· 中继由本 App 受管拉起</div>
+        <div class="row"><span class="spinner"></span><span id="boot-note">正在读取状态……</span></div>
+        <div class="note meta" id="boot-meta"></div>
+        <div class="row">
+          <button class="primary" id="btn-retry">重试启动</button>
+          <button id="btn-reload-boot">刷新状态</button>
+          <span class="meta">连接方式</span>
+          <select id="sel-mode">
+            <option value="auto">自动（首选 hana.api.url）</option>
+            <option value="sdk">hana.api.url</option>
+            <option value="raw">直接相对路径</option>
+          </select>
+        </div>
+        <details id="boot-raw-wrap" style="display:none"><summary>原始状态</summary><pre id="boot-raw"></pre></details>
+      </div>
+    </div>
+
+    <div class="view" id="view-error">
+      <div class="panel">
+        <h1>ComfyUI 工作区 · 中继未就绪</h1>
+        <div class="sub">本页会在中继恢复后自动进入工作区；也可手动重试。</div>
+        <div class="note" id="err-note">—</div>
+        <div class="note meta" id="err-meta"></div>
+        <div class="row">
+          <button class="primary" id="btn-retry2">重试启动</button>
+          <button id="btn-reload2">刷新页面</button>
+          <span class="meta">连接方式</span>
+          <select id="sel-mode2">
+            <option value="auto">自动（首选 hana.api.url）</option>
+            <option value="sdk">hana.api.url</option>
+            <option value="raw">直接相对路径</option>
+          </select>
+        </div>
+        <details id="err-raw-wrap" style="display:none"><summary>原始错误</summary><pre id="err-raw"></pre></details>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="module" src="./workspace.js"></script>
+</body>
+</html>

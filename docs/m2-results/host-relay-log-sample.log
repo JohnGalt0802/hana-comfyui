@@ -1,0 +1,29 @@
+[comfy-relay] [03:19:27.132] [info] 日志落盘：C:\Users\John Galt\.hanako\app-data\comfyui-hana\logs\relay.log
+[comfy-relay] [03:19:27.154] [info] 中继监听 127.0.0.1:49470 → http://127.0.0.1:8188（mode=managed）
+[comfy-relay] [03:19:27.165] [info] 后端 127.0.0.1:8188 可达（ComfyUI 0.37.0）
+[comfy-relay] [03:19:27.167] [info] 已订阅后端 /ws（进度事件缓存就绪）
+[comfy-relay] [03:20:10.926] [info] 日志落盘：C:\Users\John Galt\.hanako\app-data\comfyui-hana\logs\relay.log
+[comfy-relay] [03:20:10.945] [info] 中继监听 127.0.0.1:45838 → http://127.0.0.1:8188（mode=managed）
+[comfy-relay] [03:20:10.956] [info] 后端 127.0.0.1:8188 可达（ComfyUI 0.37.0）
+[comfy-relay] [03:20:10.958] [info] 已订阅后端 /ws（进度事件缓存就绪）
+[comfy-relay] [03:20:18.508] [info] POST /prompt → 200 5ms
+[comfy-relay] [03:20:19.746] [info] GET /userdata?dir=workflows&recurse=true&full_info=true → 200 2ms
+[comfy-relay] [03:20:19.755] [info] GET /userdata?dir=workflows&recurse=true&full_info=true → 200 2ms
+[comfy-relay] [03:20:19.761] [info] GET /userdata?dir=workflows&recurse=true&full_info=true → 200 1ms
+[comfy-relay] [03:20:19.900] [info] GET /object_info → 200 133ms
+[comfy-relay] [03:20:19.930] [info] POST /prompt → 200 3ms
+[comfy-relay] [03:20:21.184] [info] upload icon.png（3012 B → HTTP 200）
+[comfy-relay] [03:20:21.189] [info] GET /queue → 200 1ms
+[comfy-relay] [03:20:38.681] [info] 日志落盘：C:\Users\John Galt\.hanako\app-data\comfyui-hana\logs\relay.log
+[comfy-relay] [03:20:38.702] [info] 中继监听 127.0.0.1:48801 → http://127.0.0.1:8188（mode=managed）
+[comfy-relay] [03:20:38.713] [info] 后端 127.0.0.1:8188 可达（ComfyUI 0.37.0）
+[comfy-relay] [03:20:38.715] [info] 已订阅后端 /ws（进度事件缓存就绪）
+[comfy-relay] [03:20:42.791] [info] POST /prompt → 200 5ms
+[comfy-relay] [03:20:45.292] [info] GET /userdata?dir=workflows&recurse=true&full_info=true → 200 2ms
+[comfy-relay] [03:20:45.297] [info] GET /userdata?dir=workflows&recurse=true&full_info=true → 200 1ms
+[comfy-relay] [03:20:45.303] [info] GET /userdata?dir=workflows&recurse=true&full_info=true → 200 1ms
+[comfy-relay] [03:20:45.420] [info] GET /object_info → 200 112ms
+[comfy-relay] [03:20:45.465] [info] POST /prompt → 200 1ms
+[comfy-relay] [03:20:46.703] [info] upload icon.png（3012 B → HTTP 200）
+[comfy-relay] [03:20:46.708] [info] GET /queue → 200 1ms
+[comfy-relay] [03:21:28.529] [info] GET /view?filename=comfyui_hana_m2_host_00002_.png&subfolder=&type=output → 200 8ms

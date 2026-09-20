@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ComfyUI 状态</title>
+<style>
+:root {
+  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
+  --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --ok: #2e7d32; --bad: #c62828;
+}
+body.t-dark {
+  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
+  --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --ok: #6fbf73; --bad: #e57373;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 10px 12px; background: transparent; color: var(--text); font: 12px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+h1 { font-size: 13px; font-weight: 700; margin: 0 0 8px; }
+.sect { margin-bottom: 10px; }
+.row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; border-bottom: 0.5px dashed var(--border); }
+.row:last-child { border-bottom: 0; }
+.k { color: var(--text-muted); flex: 0 0 auto; }
+.v { text-align: right; word-break: break-all; font-variant-numeric: tabular-nums; }
+.chip { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); white-space: nowrap; }
+.chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
+.chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
+.chip.warn { background: rgba(180,120,30,.18); color: #9c6b1e; }
+button { font-size: 11.5px; padding: 4px 12px; border-radius: 7px; cursor: pointer; border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent); width: 100%; }
+button:hover { background: var(--accent); color: #fff; }
+.note { color: var(--text-muted); font-size: 11px; margin-top: 8px; line-height: 1.6; }
+.err { color: var(--bad); font-size: 11px; word-break: break-all; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <h1>ComfyUI 状态</h1>
+  <div class="sect">
+    <div class="row"><span class="k">中继</span><span class="v" id="p-phase">读取中…</span></div>
+    <div class="row"><span class="k">服务端口</span><span class="v" id="p-port">—</span></div>
+    <div class="row"><span class="k">后端</span><span class="v" id="p-backend">—</span></div>
+    <div class="row"><span class="k">ComfyUI</span><span class="v" id="p-ver">—</span></div>
+    <div class="row"><span class="k">队列</span><span class="v" id="p-queue">—</span></div>
+  </div>
+  <button id="p-retry">重试启动</button>
+  <div class="note" id="p-note"></div>
+  <div class="err" id="p-err"></div>
+  <script type="module" src="./assets/panel-status.js"></script>
+</body>
+</html>

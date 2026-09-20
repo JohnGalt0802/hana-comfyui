@@ -1,0 +1,11 @@
+# 本地构建物与临时产物（不进版本库）
+_build/
+
+# 测试运行日志/输出（可重跑再生成；规范化证据在 docs/m0-results、docs/m2-results）
+tools/**/logs/
+tools/**/*.log
+
+# 系统杂物
+.DS_Store
+Thumbs.db
+desktop.ini

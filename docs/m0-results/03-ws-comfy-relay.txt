@@ -1,0 +1,5 @@
+connecting ws://127.0.0.1:39241/ws
+  · open
+  · message type=status len=120
+  · status payload ≈ {"type": "status", "data": {"status": {"exec_info": {"queue_remaining": 0}}, "sid": "82f78de0d1304f59b17938d6d3f83b90"}}
+RELAY PASS：经中继 /ws 收到 status 消息并关闭

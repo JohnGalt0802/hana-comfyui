@@ -1,0 +1,44 @@
+会话路径：C:\Users\John Galt\.hanako\agents\hanako\sessions\2026-09-20T18-01-30-297Z_01a0bffa-f5b9-7929-a1bc-10f49fccc6c1.jsonl
+PASS  前置：8188 队列为空
+PASS  status（按钮通道）  | HTTP 200；- 中继：ready · runtimeId=8686f71a-eeea-48be-8391-9e5728af8750 · 服务端口 48801
+  status 文本：
+    ComfyUI-Hana 状态（v0.2.0）
+    - 中继：ready · runtimeId=8686f71a-eeea-48be-8391-9e5728af8750 · 服务端口 48801
+    - 后端 http://127.0.0.1:8188：可达 · ComfyUI 0.37.0（前端 1.53.6）
+    - 队列：运行中 0 · 排队 0
+    - 事件订阅：已连接（缓存 0 条）
+    - 中继请求：累计 0（WS 0）· 错误 0
+    - 说明：中继已就绪：ComfyUI 前端可经代理路径加载（相对寻址），HTTP/WS 全通。
+PASS  submit（API 格式）  | promptId=e6a8382f-3058-4a5b-8dbb-12aa36f79635
+  submit 文本：
+    已提交 ComfyUI 工作流：M2 宿主测试-A
+    - prompt_id: e6a8382f-3058-4a5b-8dbb-12aa36f79635
+    - 来源：inline（API 格式）
+    - 宿主任务：未创建（无 callToken（按钮通道调用）：仅内存跟踪，不投递结果）
+    - 跟踪方式：后台自动跟踪（结果不主动投递，用 comfyui action=result 取产物）
+    Card "ComfyUI 生成 · M2 宿主测试-A" rendered. cardInstanceId: a_c0beff2d38a9c3704d8d (for ui_inspect), cardEntityId: app-card:a_c0beff2d38a9c3704d8d (for read_card_activity).
+PASS  submit 返回任务卡引用  | /task.html?pid=e6a8382f-3058-4a5b-8dbb-12aa36f79635
+PASS  任务卡路由：任务完成  | states=pending→completed
+PASS  任务卡路由：产物含 viewPath 与 filePath  | {"filename":"comfyui_hana_m2_host_00002_.png","subfolder":"","type":"output","filePath":"D:\\ComfyUI\\ComfyUI\\output\\comfyui_hana_m2_host_00002_.png","sizeBytes":317,"viewPath":"view?filename=comfyui_hana_m2_host_00002_.png&subfolder=&type=output"}
+PASS  result 取产物（含本地路径）  | D:\ComfyUI\ComfyUI\output\comfyui_hana_m2_host_00002_.png
+  result 文本：
+    ComfyUI 产物（prompt e6a8382f-3058-4a5b-8dbb-12aa36f79635，1 个）
+    - D:\ComfyUI\ComfyUI\output\comfyui_hana_m2_host_00002_.png（0 KB）
+PASS  query（promptId）  | - 状态：completed
+PASS  query（列表）
+  query 列表文本：
+    ComfyUI 任务清单
+    - 队列：运行中 0 · 排队 0
+    - 本 App 跟踪（1，最近 10）：
+      · e6a8382f… completed · M2 宿主测试-A
+PASS  workflows 列表  | ComfyUI 已保存工作流（userdata/workflows，0 个）
+PASS  workflows 取不存在 → 明确报错  | comfyui(workflows) 失败：userdata 工作流里找不到「不存在的模板.json」。可用：（空——请先在 ComfyUI 里保存一个工作流，或用「导出 API 格式」的文件路径）
+PASS  submit {template} 不存在 → 明确报错  | comfyui(submit) 失败：userdata 工作流里找不到「不存在.json」。可用：（空——请先在 ComfyUI 里保存一个工作流，或用「导出 API 格式」的文件路径）
+PASS  submit（UI 格式→API 转换）  | promptId=0490fbb0-b5b7-4605-9520-6a5212b14f0e
+PASS  UI 格式任务完成  | completed
+PASS  upload（图片上传）  | name=icon.png
+  upload 文本：已上传图片到 ComfyUI input：icon.png / 在 inputs 里引用：{"<LoadImage 节点 id>.image": "icon.png"}
+PASS  cancel 不存在 → 明确语义  | 00000000-0000-0000-0000-000000000000 不在 ComfyUI 队列中（可能已完成或已不存在）。如需清空整个队列请显式传 all:true。
+PASS  完成后：8188 队列已清空
+
+17/17 passed

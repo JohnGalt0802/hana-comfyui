@@ -1,0 +1,9 @@
+fake backend listening on 39231
+relay ready
+PASS  WS 101 状态行透传  | HTTP/1.1 101 Switching Protocols
+PASS  101 响应头透传（Upgrade/Sec-WebSocket-Accept）
+PASS  握手同段'早到负载'字节原样  | got=00fffe818a000102c3287f80 want=00fffe818a000102c3287f80
+PASS  客户端→后端→客户端二进制往返原样  | got=8180deadbeef00ff1020f09f9880 want=8180deadbeef00ff1020f09f9880
+PASS  中继日志记录了 WS 建立
+
+5/5 passed

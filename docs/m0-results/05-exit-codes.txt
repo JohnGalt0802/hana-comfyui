@@ -1,0 +1,29 @@
+relay A listening=True (pid=14568)
+B exitCode=7  (期望 7)
+  B.err> [comfy-relay] [03:19:00.811] [error] 监听失败（EADDRINUSE）：127.0.0.1:39140
+C exitCode=2  (期望 2，等待约 8s 后端探测超时)
+  C.err> [comfy-relay] [03:19:09.044] [error] requireBackend：后端 127.0.0.1:39199 在 8000ms 内不可达（fetch failed）
+D exitCode=3  (期望 3)
+  D.err> [comfy-relay] [03:19:09.165] [error] --port 非法：99999
+  D.err> 用法：
+  D.err>   node comfy-relay.mjs <runtime-config.json>          受管模式（由 Hana ctx.runtime.start 拉起）
+  D.err>   node comfy-relay.mjs --standalone --port <端口> --backend <host:端口>
+  D.err>                                                       本地测试模式
+  D.err> 选项：
+  D.err>   --ready-marker <文本>   受管模式下由配置提供；standalone 默认 COMFY_RELAY_READY:<port>
+  D.err>   --require-backend       启动时后端不可达则退出码 2（默认关闭：attach 模式下后端可后起）
+  D.err>   --log-file <路径>       追加写日志文件（启动时 >5MiB 滚动为 <路径>.1）
+  D.err>   --control-key <密钥>    /_relay/* 管理端点密钥（≥16 字符）；受管模式由配置提供
+  D.err>   --comfy-base <路径>     ComfyUI 安装根（供 fs 路径提示；默认 D:\ComfyUI\ComfyUI）
+  D.err>   --client-id <id>        后端 /ws 订阅与提交共用的 clientId（默认 comfyui-relay）
+  D.err>   --help                  显示本帮助
+relay E listening=True (pid=33016)  配置文件已自删=True  (期望 True)
+E stdout 首行> COMFY_RELAY_READY:localtest123
+F exitCode=3  (期望 3)
+
+==== 汇总 ====
+PASS  端口占用→7  expected=7 got=7
+PASS  后端不可达→2  expected=2 got=2
+PASS  参数非法→3  expected=3 got=3
+PASS  受管配置自删+marker  expected=True/COMFY_RELAY_READY:localtest123 got=True/COMFY_RELAY_READY:localtest123
+PASS  配置非法→3  expected=3 got=3

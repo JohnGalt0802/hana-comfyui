@@ -1,0 +1,104 @@
+EXIT: 0
+---- stdout ----
+{
+  "uiDir": "D:\\HanakoWorks\\ComfyUI\\app\\ui",
+  "count": 4,
+  "results": [
+    {
+      "page": "panel.html",
+      "loadError": null,
+      "visibleText": "ComfyUI 状态\n中继\n读取中…\n服务端口\n—\n后端\n—\nComfyUI\n—\n队列\n—\n重试启动\n状态读取失败：@hana/app-sdk/ui requires an App iframe route under /api/apps/:appId/ui/.",
+      "hasRenderable": true,
+      "messages": [
+        {
+          "level": 2,
+          "message": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security\n  Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of\n  this app to unnecessary security risks.\n\nFor more information and help, consult\nhttps://electronjs.org/docs/tutorial/security.\nThis warning will not show up\nonce the app is packaged."
+        }
+      ]
+    },
+    {
+      "page": "settings.html",
+      "loadError": null,
+      "visibleText": "ComfyUI-Hana · 设置\nv0 骨架：连接参数目前为固定值（只读）；后续里程碑开放可编辑项。\n连接（只读）\nComfyUI 后端\n127.0.0.1:8188\n后端状态\n读取失败\n中继\n—\nApp 版本\n—\n为什么需要这些能力\napp/runtime.local-machine + app/runtime.network：以本机权限拉起\"中继\"受管进程，并允许它连接 127.0.0.1:8188（本机 ComfyUI）。\napp/runtime.execute：启动/监督该受管进程并注册其回环服务代理（HTTP/WS）。\napp/tools.expose-to-model：向模型提供 comfyui 工具（v0 仅 status）。\n\n本 App 不修改 ComfyUI 安装；所有转发都是到 127.0.0.1:8188 的只读/直通访问。\n\n说明\n\nv0 为 attach 模式",
+      "hasRenderable": true,
+      "messages": [
+        {
+          "level": 2,
+          "message": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security\n  Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of\n  this app to unnecessary security risks.\n\nFor more information and help, consult\nhttps://electronjs.org/docs/tutorial/security.\nThis warning will not show up\nonce the app is packaged."
+        }
+      ]
+    },
+    {
+      "page": "task.html",
+      "loadError": null,
+      "visibleText": "ComfyUI 任务卡\nM2 里程碑将在这里呈现单次生成任务（进度 / 产物 / 取消）。当前为占位卡，仅显示连接状态。\n中继\n读取失败\n后端未知\n打开工作区\n刷新状态",
+      "hasRenderable": true,
+      "messages": [
+        {
+          "level": 2,
+          "message": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security\n  Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of\n  this app to unnecessary security risks.\n\nFor more information and help, consult\nhttps://electronjs.org/docs/tutorial/security.\nThis warning will not show up\nonce the app is packaged."
+        }
+      ]
+    },
+    {
+      "page": "workspace.html",
+      "loadError": null,
+      "visibleText": "ComfyUI 工作区 · 中继未就绪\n本页会在中继恢复后自动进入工作区；也可手动重试。\n读取 App 状态失败（路由不可达）：@hana/app-sdk/ui requires an App iframe route under /api/apps/:appId/ui/.\n重试启动\n刷新页面\n连接方式\n自动（首选 hana.api.url）\nhana.api.url\n直接相对路径\n原始错误",
+      "hasRenderable": true,
+      "messages": [
+        {
+          "level": 2,
+          "message": "[comfyui-hana] hana.ready 失败： Error: @hana/app-sdk/ui requires an App iframe route under /api/apps/:appId/ui/."
+        },
+        {
+          "level": 2,
+          "message": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security\n  Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of\n  this app to unnecessary security risks.\n\nFor more information and help, consult\nhttps://electronjs.org/docs/tutorial/security.\nThis warning will not show up\nonce the app is packaged."
+        }
+      ]
+    }
+  ]
+}
+---- stderr ----
+(empty)
+---- steps ----
+2026-09-20T18:44:29.023Z start argv=["D:\\HanakoWorks\\ComfyUI\\_build\\electron-v33\\electron.exe","D:\\HanakoWorks\\ComfyUI\\tools\\m0-checks\\ui-precheck.mjs","--app-dir","D:\\HanakoWorks\\ComfyUI\\app"]
+2026-09-20T18:44:29.025Z pages=["panel.html","settings.html","task.html","workspace.html"]
+2026-09-20T18:44:29.054Z whenReady
+2026-09-20T18:44:31.728Z RESULT panel.html loadError=null textLen=131 renderable=true msgs=1
+2026-09-20T18:44:31.728Z   msg[2] %cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security
+  Policy set or a policy with "unsafe-eval" enabled. This exposes users of
+  this app to unnecessary security risks.
+
+For more information and help, consult
+https://electronjs.org/docs/tutorial/security.
+This warning will not show up
+once the app is packaged.
+2026-09-20T18:44:34.254Z RESULT settings.html loadError=null textLen=400 renderable=true msgs=1
+2026-09-20T18:44:34.254Z   msg[2] %cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security
+  Policy set or a policy with "unsafe-eval" enabled. This exposes users of
+  this app to unnecessary security risks.
+
+For more information and help, consult
+https://electronjs.org/docs/tutorial/security.
+This warning will not show up
+once the app is packaged.
+2026-09-20T18:44:36.773Z RESULT task.html loadError=null textLen=84 renderable=true msgs=1
+2026-09-20T18:44:36.773Z   msg[2] %cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security
+  Policy set or a policy with "unsafe-eval" enabled. This exposes users of
+  this app to unnecessary security risks.
+
+For more information and help, consult
+https://electronjs.org/docs/tutorial/security.
+This warning will not show up
+once the app is packaged.
+2026-09-20T18:44:39.295Z RESULT workspace.html loadError=null textLen=197 renderable=true msgs=2
+2026-09-20T18:44:39.295Z   msg[2] [comfyui-hana] hana.ready 失败： Error: @hana/app-sdk/ui requires an App iframe route under /api/apps/:appId/ui/.
+2026-09-20T18:44:39.296Z   msg[2] %cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security
+  Policy set or a policy with "unsafe-eval" enabled. This exposes users of
+  this app to unnecessary security risks.
+
+For more information and help, consult
+https://electronjs.org/docs/tutorial/security.
+This warning will not show up
+once the app is packaged.
+2026-09-20T18:44:39.297Z done

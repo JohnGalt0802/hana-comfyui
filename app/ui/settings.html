@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ComfyUI-Hana 设置</title>
+<style>
+:root {
+  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
+  --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --ok: #2e7d32; --bad: #c62828;
+}
+body.t-dark {
+  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
+  --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --ok: #6fbf73; --bad: #e57373;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 18px 20px; background: transparent; color: var(--text); font: 13px/1.6 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+h1 { font-size: 16px; font-weight: 700; margin: 0 0 4px; }
+.sub { color: var(--text-muted); font-size: 12px; margin-bottom: 16px; }
+.sec { background: var(--bg-card); border: 0.5px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; max-width: 640px; }
+.sec h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+.row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 0.5px dashed var(--border); }
+.row:last-child { border-bottom: 0; }
+.k { color: var(--text-muted); }
+.v { text-align: right; word-break: break-all; font-variant-numeric: tabular-nums; }
+.chip { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); }
+.chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
+.chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
+p.note { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; }
+ul.note { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; padding-left: 18px; }
+code { background: rgba(127,127,127,.12); border-radius: 4px; padding: 0 4px; font-size: 11.5px; }
+</style>
+</head>
+<body>
+  <h1>ComfyUI-Hana · 设置</h1>
+  <div class="sub">v0 骨架：连接参数目前为固定值（只读）；后续里程碑开放可编辑项。</div>
+
+  <div class="sec">
+    <h2>连接（只读）</h2>
+    <div class="row"><span class="k">ComfyUI 后端</span><span class="v" id="s-backend">127.0.0.1:8188</span></div>
+    <div class="row"><span class="k">后端状态</span><span class="v" id="s-reachable">读取中…</span></div>
+    <div class="row"><span class="k">中继</span><span class="v" id="s-relay">—</span></div>
+    <div class="row"><span class="k">App 版本</span><span class="v" id="s-version">—</span></div>
+  </div>
+
+  <div class="sec">
+    <h2>为什么需要这些能力</h2>
+    <ul class="note">
+      <li><code>app/runtime.local-machine</code> + <code>app/runtime.network</code>：以本机权限拉起"中继"受管进程，并允许它连接 127.0.0.1:8188（本机 ComfyUI）。</li>
+      <li><code>app/runtime.execute</code>：启动/监督该受管进程并注册其回环服务代理（HTTP/WS）。</li>
+      <li><code>app/tools.expose-to-model</code>：向模型提供 <code>comfyui</code> 工具（v0 仅 status）。</li>
+    </ul>
+    <p class="note">本 App 不修改 ComfyUI 安装；所有转发都是到 127.0.0.1:8188 的只读/直通访问。</p>
+  </div>
+
+  <div class="sec">
+    <h2>说明</h2>
+    <p class="note">v0 为 attach 模式：连接已在运行的外部 ComfyUI 实例；不会自行启动或停止 ComfyUI。中继端口为每次启动随机分配（38000-52000），不对外开放。</p>
+  </div>
+
+  <script type="module" src="./assets/settings.js"></script>
+</body>
+</html>

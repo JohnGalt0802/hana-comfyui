@@ -1,0 +1,46 @@
+# ComfyUI-Hana（v2 App，开发仓）· v0.2
+
+把本机 ComfyUI（`D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
+**开发仓**：`D:\HanakoWorks\ComfyUI\app\`；**宿主副本**：`C:\Users\John Galt\.hanako\apps\comfyui-hana\`（由 `..\tools\sync-to-host.ps1` 同步）。
+
+## 状态（M0–M2 完成，M2.5/M2.6 收尾）
+
+- 工具 `comfyui` 全动作：status / submit / query / result / cancel / workflows / upload
+- 任务桥：submit → `ctx.tasks.create({callToken, delivery:"next-step"})` → 2s 轮询结算（complete/fail/cancel）
+  - 能力已扩容（2026-09-21 批准并生效）：`app/tasks.manage` + `app/session.start-turn`（ledger=always）
+  - **子代理会话边界**：宿主可靠投递只写桌面会话；从子代理会话发起的任务不会自动回执（工具文案会如实标注；`query` 的「投递」行可查 `published/delivered`）
+- 任务卡：`ui/task.html`（轮询 `GET /comfyui-hana/task?id=`；缩略图经 `_surface` 凭据路径）
+- 中继 v0.2：订阅 8188 `/ws` 进度事件缓存（`/_relay/prompts`）、历史摘要（`/_relay/history`）、
+  `/_relay/fs/{stat,read}` + `/_relay/upload`（controlKey 保护）、日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`）
+- 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
+  cancel 定向中断 10/10（M3）；静态校验 ok
+
+## 关键口径
+
+- **clientId 配对**：ComfyUI 只把执行事件发给提交方 `client_id` 的 WS 连接；中继订阅与提交共用
+  同一个「每次启动随机」的 clientId（`comfyui-hana-relay-<hex>`）——不要复用固定 id（旧连接关闭时 Host 侧按 sid 清理，会误删新连接）。
+- **产物定位**：`D:\ComfyUI\ComfyUI\output\...`（`/_relay/fs/stat` 校验存在）；预览 URL 走代理 `view?`。
+- submit 不支持「UI 格式 → API」的完整转换：子图/环绕/静音/旁路节点会明确报错，改用「导出（API 格式）」。
+- 投递诊断：`ctx.tasks.getDelivery`（`query` 已暴露）；宿主被卡记录在 `%HANA_HOME%\.ephemeral\deferred-tasks.json`。
+
+## 本地开发
+
+```powershell
+# 静态校验（先 staging 到目录名=id）
+pwsh -NoProfile -File D:\HanakoWorks\ComfyUI\tools\validate-app.ps1
+
+# 测试（按需）
+node D:\HanakoWorks\ComfyUI\tools\m2-checks\test-relay-v02.mjs     # 中继新端点
+node D:\HanakoWorks\ComfyUI\tools\m2-checks\test-e2e-relay.mjs     # 中继级 E2E（前置：8188 队列为空）
+node D:\HanakoWorks\ComfyUI\tools\m2-checks\host-stage.mjs         # 宿主段工具全动作
+node D:\HanakoWorks\ComfyUI\tools\m3-checks\test-cancel.mjs        # cancel 定向取消
+
+# 同步到宿主副本（-DryRun 预览）
+pwsh -NoProfile -File D:\HanakoWorks\ComfyUI\tools\sync-to-host.ps1 -DryRun
+```
+
+## 纪律
+
+- 不在用户队列非空时提交测试任务；测试工作流一律极小（纯 CPU）。
+- 宿主安装/重启由主脑统一安排；App 级 reload 可自行执行（本仓流程）。
+- 项目全景与待办见 `..\README.md` 与 `..\docs\待办与验收清单.md`。

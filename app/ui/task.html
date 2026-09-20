@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ComfyUI 任务</title>
+<style>
+:root {
+  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
+  --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --ok: #2e7d32; --bad: #c62828; --warn: #b07a1e;
+}
+body.t-dark {
+  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
+  --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --ok: #6fbf73; --bad: #e57373; --warn: #d9a94e;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 10px 12px; background: transparent; color: var(--text); font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+.tk-hdr { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.tk-title { font-size: 14px; font-weight: 700; }
+.chip { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); white-space: nowrap; }
+.chip.run { background: rgba(83,125,150,.2); color: var(--accent); }
+.chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
+.chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
+.chip.warn { background: rgba(176,122,30,.18); color: var(--warn); }
+.tk-meta { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tk-bar { height: 6px; background: rgba(127,127,127,.12); border-radius: 999px; overflow: hidden; margin: 8px 0 6px; }
+.tk-bar > div { height: 100%; border-radius: 999px; background: var(--accent); transition: width .3s; }
+.tk-bar.indet > div { width: 40% !important; animation: tk-slide 1.4s ease-in-out infinite; }
+@keyframes tk-slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.tk-row { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--text-muted); padding: 1px 0; }
+.tk-row .v { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
+.tk-out { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; margin-top: 8px; }
+.tk-thumb { position: relative; border: 0.5px solid var(--border); border-radius: 8px; overflow: hidden; background: rgba(127,127,127,.06); min-height: 72px; display: flex; align-items: center; justify-content: center; }
+.tk-thumb img { width: 100%; height: 96px; object-fit: cover; display: block; }
+.tk-thumb .name { position: absolute; left: 0; right: 0; bottom: 0; font-size: 9.5px; padding: 2px 5px; color: #eee; background: linear-gradient(transparent, rgba(0,0,0,.65)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tk-thumb .ph { font-size: 10px; color: var(--text-muted); padding: 8px; text-align: center; word-break: break-all; }
+.tk-err { margin-top: 8px; font-size: 11.5px; color: var(--bad); white-space: pre-wrap; word-break: break-all; }
+.tk-note { color: var(--text-muted); font-size: 11.5px; margin-top: 8px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <div id="tk-root">
+    <div class="tk-hdr"><span class="tk-title">ComfyUI 任务</span><span class="chip" id="tk-state">读取中…</span></div>
+    <div class="tk-note">正在读取任务状态…</div>
+  </div>
+  <script type="module" src="./assets/task.js"></script>
+</body>
+</html>

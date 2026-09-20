@@ -1,0 +1,25 @@
+relay pid=26096 listening=True
+status.ok=True  backend.reachable=True  comfy=0.37.0  frontend=1.53.6  queue=0/0  uptimeSec=0
+via-relay GET /api/queue => 200 len=42
+via-relay GET /system_stats => 200 len=1115
+via-relay GET / => 200 len=20059 type=text/html
+via-relay GET /api/object_info/LoadImage => 200 len=1992
+direct  GET /api/queue => 200 len=42
+queue body identical: True
+system_stats 静态字段一致: comfy=True frontend=True vramTotal=True（ram_free/vram_free 为动态值，不比对）
+index body identical: True
+curl(no-origin) direct=200 relay=200  (期望 200/200)
+curl(cross-site headers) direct=403 relay=200  (直连预期 403：中间件拦跨站；中继预期 200：服务端语义转发，浏览器跨站头不转发)
+requests.total=6  byMethod={"GET":6}
+---- relay stdout ----
+COMFY_RELAY_READY:39123
+[comfy-relay] [03:18:56.773] [info] 中继监听 127.0.0.1:39123 → http://127.0.0.1:8188（mode=standalone）
+[comfy-relay] [03:18:56.786] [info] 后端 127.0.0.1:8188 可达（ComfyUI 0.37.0）
+[comfy-relay] [03:18:56.789] [info] 已订阅后端 /ws（进度事件缓存就绪）
+[comfy-relay] [03:18:57.026] [info] GET /api/queue → 200 5ms
+[comfy-relay] [03:18:57.034] [info] GET /system_stats → 200 3ms
+[comfy-relay] [03:18:57.038] [info] GET / → 200 2ms
+[comfy-relay] [03:18:57.094] [info] GET /api/object_info/LoadImage → 200 3ms
+[comfy-relay] [03:18:57.153] [info] GET /api/queue → 200 1ms
+[comfy-relay] [03:18:57.188] [info] GET /api/queue → 200 1ms
+---- relay stderr ----

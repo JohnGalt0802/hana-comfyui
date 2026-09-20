@@ -1,0 +1,1 @@
+{"phase":"ready","runtimeId":"e2bf561f-d453-4d63-9c2e-34a6a9d8d52c","proxyPrefix":"/api/apps/comfyui-hana/routes/_runtime/e2bf561f-d453-4d63-9c2e-34a6a9d8d52c/","service":{"state":"ready","port":46515},"error":null,"note":"中继已就绪：ComfyUI 前端可经代理路径加载（相对寻址），HTTP/WS 全通。","updatedAt":"2026-09-20T18:58:10.549Z"}

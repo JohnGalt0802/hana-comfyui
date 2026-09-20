@@ -1,0 +1,5 @@
+connecting ws://127.0.0.1:8188/ws (direct)
+  · open
+  · message type=status len=120
+  · status payload ≈ {"type": "status", "data": {"status": {"exec_info": {"queue_remaining": 0}}, "sid": "eb52fbcafc384eba868255f2eeb47353"}}
+DIRECT PASS：8188 /ws 可收到 status

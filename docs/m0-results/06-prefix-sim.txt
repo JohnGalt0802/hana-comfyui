@@ -1,0 +1,30 @@
+relay:39251  sim:39252  ready
+PASS  剥前缀链路 GET /api/queue 200  | status=200
+PASS  剥前缀链路 body 与直连一致
+PASS  剥前缀链路 GET /system_stats 200  | status=200 len=1115
+PASS  剥前缀链路 GET / 返回 ComfyUI 前端 HTML  | status=200 len=20059
+PASS  前端 index.html 使用相对寻址（./assets/… 模块入口）
+PASS  静态资源经剥前缀链路可取（/assets/index-CKO20XHW.js）  | status=200 len=3234
+PASS  未剥离的 /_surface/ 凭证段被中继防御性清理后仍 200  | status=200
+PASS  凭证查询参数被清理且其余查询串保留（200）  | status=200
+PASS  WS 经剥前缀全链路收到 status 消息  | status
+
+---- relay log ----
+COMFY_RELAY_READY:39251
+[comfy-relay] [03:19:10.083] [info] 中继监听 127.0.0.1:39251 → http://127.0.0.1:8188（mode=standalone）
+[comfy-relay] [03:19:10.097] [info] 后端 127.0.0.1:8188 可达（ComfyUI 0.37.0）
+[comfy-relay] [03:19:10.098] [info] 已订阅后端 /ws（进度事件缓存就绪）
+[comfy-relay] [03:19:10.271] [info] GET /api/queue → 200 3ms
+[comfy-relay] [03:19:10.277] [info] GET /system_stats → 200 2ms
+[comfy-relay] [03:19:10.281] [info] GET / → 200 2ms
+[comfy-relay] [03:19:10.286] [info] GET /assets/index-CKO20XHW.js → 200 2ms
+[comfy-relay] [03:19:10.288] [warn] 收到未剥离的 /_surface/ 凭证段，已防御性清理（第 1 次）：/_surface/<redacted>/api/queue
+[comfy-relay] [03:19:10.289] [info] GET /api/queue → 200 1ms
+[comfy-relay] [03:19:10.291] [warn] 收到凭证查询参数，已防御性清理（第 1 次）：/api/queue?appSurfaceSession=<redacted>&x=1
+[comfy-relay] [03:19:10.292] [info] GET /api/queue?x=1 → 200 1ms
+[comfy-relay] [03:19:10.297] [info] WS /ws 已建立（active 1）→ 127.0.0.1:8188
+[comfy-relay] [03:19:10.304] [info] WS /ws 关闭（8ms，active 0）
+---- sim log ----
+host-sim listening 127.0.0.1:39252 → relay:39251（剥前缀 /api/apps/comfyui-hana/routes/_runtime/）
+
+9/9 passed

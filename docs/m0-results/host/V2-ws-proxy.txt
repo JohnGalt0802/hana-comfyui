@@ -1,0 +1,7 @@
+boot-state: phase=ready service={"state":"ready","port":41236} proxyPrefix=/api/apps/comfyui-hana/routes/_runtime/a7c71d20-89de-471f-9abc-624651efbdee/
+[host-proxy] 连接 ws://127.0.0.1:14500/api/apps/comfyui-hana/routes/_runtime/a7c71d20-89de-471f-9abc-624651efbdee/ws
+[host-proxy] 握手响应: HTTP/1.1 101 Switching Protocols
+[host-proxy] 文本消息(120B): {"type": "status", "data": {"status": {"exec_info": {"queue_remaining": 0}}, "sid": "65fde7a26f6144768a077399899524e8"}}
+[host-proxy] 文本消息(120B): {"type": "status", "data": {"status": {"exec_info": {"queue_remaining": 0}}, "sid": "65fde7a26f6144768a077399899524e8"}}
+[host-proxy] 收到 close 帧
+PASS [host-proxy]：收到 status 消息（status in 12ms）

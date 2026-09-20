@@ -1,0 +1,12 @@
+{
+  "ticket": "<ticket-redacted（已过期，入仓前脱敏）>",
+  "ticketId": "ait_563d267a-d327-4f08-8405-20324c202b4c",
+  "appId": "comfyui-hana",
+  "surfacePath": "/api/apps/comfyui-hana/ui/",
+  "expiresAt": "2026-09-20T18:58:46.226Z",
+  "surfaceSession": {
+    "token": "<surface-session-token-redacted（已过期，入仓前脱敏）>",
+    "expiresAt": "2026-09-21T06:53:46.227Z"
+  },
+  "uiBasePath": "/api/apps/comfyui-hana/ui/_surface/<redacted>/"
+}
