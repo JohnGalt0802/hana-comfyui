@@ -39,7 +39,7 @@ function hostThemeIsDark() {
 
 function syncTheme() {
   document.body.classList.toggle("t-dark", hostThemeIsDark());
-  ensureComfyPaletteSync();
+  ensureComfySync();
 }
 
 // ── ComfyUI 前端色板跟随（内层 iframe 同源直控）───────────────────────────
@@ -54,6 +54,7 @@ const PALETTE_SYNC_MAX_TICKS = 48; // 约 24s
 let paletteSyncTimer = null;
 let paletteSyncTicks = 0;
 let paletteSyncBlocked = false;
+let paletteJustSwitched = false;
 
 function paletteIsLight(settings, id) {
   if (!id) return null;
@@ -89,6 +90,7 @@ function syncComfyPalette() {
   if (currentLight !== null && currentLight === (target === "light")) return "done"; // 明暗已一致
   try {
     settings.setSettingValue("Comfy.ColorPalette", target);
+    paletteJustSwitched = true; // 基座换肤异步落定；下一拍再应用主题色，避免被 loadColorPalette 冲掉
     console.log(`[comfyui-hana] ComfyUI 色板跟随宿主主题：${current || "(未知)"} → ${target}`);
     return "done";
   } catch (e) {
@@ -97,19 +99,184 @@ function syncComfyPalette() {
   }
 }
 
-function ensureComfyPaletteSync() {
-  if (paletteSyncBlocked || paletteSyncTimer) return; // 轮询在跑时会自动消费最新主题值
+// ── 宿主主题色映射（ComfyUI 使用宿主主题配色）────────────────────────────
+// 数据源：宿主主题 CSS（hana-css → /api/apps/theme.css?theme=…，变量为 :root 作用域）。
+// 壳页 fetch + 解析出变量表，写入内层 iframe：
+//   ① CSS 变量覆盖（!important 压过 ComfyUI 的内联样式）→ 全局/面板/输入框/Vue 节点
+//   ② LiteGraph 与 canvas 走 JS 赋值（画布绘制不吃 CSS）→ 节点配色与连线
+// 与基座（dark/light 色板）配合：基座提供未映射部分（插槽色/背景图等），本层改造主题色。
+const HANA_CSS_MAP = [
+  ["--bg-color", "--bg"],
+  ["--fg-color", "--text"],
+  ["--comfy-menu-bg", "--sidebar-bg"],
+  ["--comfy-menu-secondary-bg", "--bg-card"],
+  ["--comfy-menu-hover-bg", "--accent-light"],
+  ["--comfy-input-bg", "--bg-card"],
+  ["--input-text", "--text"],
+  ["--descrip-text", "--text-muted"],
+  ["--drag-text", "--text-muted"],
+  ["--error-text", "--danger"],
+  ["--border-color", "--border"],
+  ["--tr-even-bg-color", "--bg"],
+  ["--tr-odd-bg-color", "--bg-card"],
+  ["--content-bg", "--bg-card"],
+  ["--content-fg", "--text"],
+  ["--content-hover-bg", "--accent-light"],
+  ["--content-hover-fg", "--text"],
+  // Vue 节点渲染（1.x 组件化节点的样式变量）
+  ["--component-node-border", "--border"],
+  ["--component-node-background", "--bg-card"],
+  ["--component-node-widget-background", "--bg"],
+  ["--component-node-foreground", "--text-light"],
+  ["--node-component-header", "--text"],
+  ["--node-component-header-surface", "--sidebar-bg"],
+  ["--node-component-header-icon", "--text-muted"],
+];
+const HANA_JS_MAP = [
+  ["NODE_TITLE_COLOR", "--text"],
+  ["NODE_SELECTED_TITLE_COLOR", "--accent"],
+  ["NODE_TEXT_COLOR", "--text-light"],
+  ["NODE_TEXT_HIGHLIGHT_COLOR", "--text"],
+  ["NODE_DEFAULT_COLOR", "--sidebar-bg"],
+  ["NODE_DEFAULT_BGCOLOR", "--bg-card"],
+  ["NODE_DEFAULT_BOXCOLOR", "--border"],
+  ["NODE_BOX_OUTLINE_COLOR", "--border"],
+  ["WIDGET_BGCOLOR", "--bg"],
+  ["WIDGET_OUTLINE_COLOR", "--border"],
+  ["WIDGET_TEXT_COLOR", "--text"],
+  ["WIDGET_SECONDARY_TEXT_COLOR", "--text-muted"],
+  ["WIDGET_DISABLED_TEXT_COLOR", "--text-muted"],
+  ["LINK_COLOR", "--accent"],
+  ["EVENT_LINK_COLOR", "--coral"],
+  ["CONNECTING_LINK_COLOR", "--accent-hover"],
+  ["CLEAR_BACKGROUND_COLOR", "--bg"],
+];
+const HANA_VAR_FALLBACK = { "--coral": "--accent-hover", "--sidebar-bg": "--bg-card" };
+let hanaThemeVars = null;
+let hanaThemeVarsUrl = null;
+let hanaThemeVarsInflight = null;
+
+function hostThemeCssUrl() {
+  try { return hana.theme?.getSnapshot?.()?.cssUrl || null; } catch { return null; }
+}
+
+function parseThemeCssVars(cssText) {
+  const vars = {};
+  const re = /(--[a-zA-Z0-9_-]+)\s*:\s*([^;}]+)[;}]/g;
+  let m;
+  while ((m = re.exec(cssText))) {
+    const name = m[1];
+    const value = m[2].trim();
+    if (!value || value.startsWith("url(")) continue; // 跳过背景图等非色值
+    vars[name] = value;
+  }
+  return vars;
+}
+
+function fetchHostThemeVars() {
+  const url = hostThemeCssUrl();
+  if (!url) return;
+  if (hanaThemeVars && hanaThemeVarsUrl === url) return;
+  if (hanaThemeVarsInflight && hanaThemeVarsInflight.url === url) return; // 已在取
+  const promise = fetch(url, { credentials: "same-origin", cache: "no-store" })
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error("theme css HTTP " + r.status))))
+    .then((text) => {
+      hanaThemeVars = parseThemeCssVars(text);
+      hanaThemeVarsUrl = url;
+      return hanaThemeVars;
+    })
+    .catch((e) => { console.warn("[comfyui-hana] 宿主主题变量获取失败：", e); return null; })
+    .then((vars) => {
+      if (hanaThemeVarsInflight && hanaThemeVarsInflight.promise === promise) hanaThemeVarsInflight = null;
+      return vars;
+    });
+  hanaThemeVarsInflight = { url, promise };
+}
+
+function hanaVar(name) {
+  if (!hanaThemeVars) return null;
+  let v = hanaThemeVars[name];
+  if (!v) { const fb = HANA_VAR_FALLBACK[name]; if (fb) v = hanaThemeVars[fb]; }
+  return v || null;
+}
+
+function buildHanaOverrideCss() {
+  const lines = [":root {"];
+  for (const [comfyVar, hostVar] of HANA_CSS_MAP) {
+    const v = hanaVar(hostVar);
+    if (v) lines.push(`  ${comfyVar}: ${v} !important;`);
+  }
+  lines.push("}");
+  return lines.join("\n");
+}
+
+function applyHanaThemeVars() {
+  if (paletteSyncBlocked) return true;
+  let win = null, doc = null;
+  try {
+    win = els.frame && els.frame.contentWindow;
+    doc = win && win.document;
+  } catch { return true; }
+  if (!doc || !doc.documentElement) return false; // 内层未就绪
+  if (!hanaThemeVars) return false;               // 变量未就绪
+
+  // ① CSS 覆盖（!important 压过 ComfyUI 内联变量）
+  const css = buildHanaOverrideCss();
+  let el = doc.getElementById("hana-comfy-theme");
+  if (!el) {
+    el = doc.createElement("style");
+    el.id = "hana-comfy-theme";
+    (doc.head || doc.documentElement).appendChild(el);
+  }
+  if (el.textContent !== css) el.textContent = css;
+
+  // ② LiteGraph / canvas（画布绘制，CSS 管不到）
+  try {
+    const LG = win.LiteGraph;
+    if (LG) for (const [key, hostVar] of HANA_JS_MAP) {
+      const v = hanaVar(hostVar);
+      if (v) LG[key] = v;
+    }
+    const cv = win.app && win.app.canvas;
+    if (cv) {
+      const t = hanaVar("--text"), a = hanaVar("--accent");
+      if (t) cv.node_title_color = t;
+      if (a) cv.default_link_color = a;
+      if (typeof cv.setDirty === "function") cv.setDirty(true, true);
+    }
+  } catch (e) {
+    console.warn("[comfyui-hana] ComfyUI 主题色写入失败：", e);
+  }
+  return true;
+}
+
+// 组合同步：基座（dark/light）→ 主题色覆盖；轮询直到两者就绪。
+function comfySyncTick() {
+  fetchHostThemeVars(); // 发起/复用宿主主题变量获取（幂等）
+  const base = syncComfyPalette();
+  if (base !== "done") return base;
+  if (paletteJustSwitched) {
+    paletteJustSwitched = false; // 基座刚换：本拍只等 loadColorPalette 落定，下一拍再应用主题色
+    return "pending";
+  }
+  const url = hostThemeCssUrl();
+  if (url && (!hanaThemeVars || hanaThemeVarsUrl !== url)) return "pending"; // 等新主题变量
+  return applyHanaThemeVars() ? "done" : "pending";
+}
+
+function ensureComfySync() {
+  if (paletteSyncBlocked || paletteSyncTimer) return; // 轮询在跑时会自动消费最新主题
   paletteSyncTicks = 0;
-  if (syncComfyPalette() !== "pending") return;
+  if (comfySyncTick() !== "pending") return;
   paletteSyncTimer = setInterval(() => {
     paletteSyncTicks += 1;
-    if (syncComfyPalette() !== "pending" || paletteSyncTicks >= PALETTE_SYNC_MAX_TICKS) {
-      stopComfyPaletteSync();
+    if (comfySyncTick() !== "pending" || paletteSyncTicks >= PALETTE_SYNC_MAX_TICKS) {
+      stopComfySync();
     }
   }, PALETTE_SYNC_TICK_MS);
 }
 
-function stopComfyPaletteSync() {
+function stopComfySync() {
   if (paletteSyncTimer) { clearInterval(paletteSyncTimer); paletteSyncTimer = null; }
 }
 
@@ -304,7 +471,7 @@ $("btn-reload2").addEventListener("click", () => { try { location.reload(); } ca
 els.frame.addEventListener("load", () => {
   frameLoaded = true;
   els.loading.classList.remove("show");
-  ensureComfyPaletteSync(); // 内层文档（重）载入 → 对齐 ComfyUI 色板
+  ensureComfySync(); // 内层文档（重）载入 → 重新对齐基座色板与主题色
 });
 
 // ── 启动 ──────────────────────────────────────────────────────────────────
