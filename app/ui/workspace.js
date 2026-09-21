@@ -26,7 +26,7 @@ let frameRuntimeId = null; // 已装载 iframe 对应的 runtimeId；变化即�
 let frameLoaded = false;
 
 // ── 主题 ──────────────────────────────────────────────────────────────────
-function syncTheme() {
+function hostThemeIsDark() {
   let snap = null;
   try { snap = hana.theme?.getSnapshot?.() || null; } catch { snap = null; }
   const label = String(snap?.theme || "");
@@ -34,7 +34,83 @@ function syncTheme() {
   if (!snap?.appearance && (!label || label === "inherit")) {
     dark = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
   }
-  document.body.classList.toggle("t-dark", dark);
+  return dark;
+}
+
+function syncTheme() {
+  document.body.classList.toggle("t-dark", hostThemeIsDark());
+  ensureComfyPaletteSync();
+}
+
+// ── ComfyUI 前端色板跟随（内层 iframe 同源直控）───────────────────────────
+// 壳页与内层 iframe 同在宿主域 → 直接访问 contentWindow 里的 legacy app
+// （GraphCanvas 就绪后挂 window.app）→ 用 app.ui.settings 读写 Comfy.ColorPalette。
+// 策略：仅当「明暗对立」时切换（宿主 dark ↔ 色板 light 系），用户自选的
+// 同明暗色板（nord / 自定义深色等）不打扰；触发时机：壳页加载 / iframe 每次
+// load / 宿主主题变化。写入经 ComfyUI 自身设置链路（含服务端持久化）。
+const CORE_DARK_PALETTES = new Set(["dark", "solarized", "arc", "nord", "github"]);
+const PALETTE_SYNC_TICK_MS = 500;
+const PALETTE_SYNC_MAX_TICKS = 48; // 约 24s
+let paletteSyncTimer = null;
+let paletteSyncTicks = 0;
+let paletteSyncBlocked = false;
+
+function paletteIsLight(settings, id) {
+  if (!id) return null;
+  if (id === "light") return true;
+  if (CORE_DARK_PALETTES.has(id)) return false;
+  try { // 自定义色板：读它的 light_theme 声明；读不到按未知处理
+    const customs = settings.getSettingValue("Comfy.CustomColorPalettes") || {};
+    const p = customs[id];
+    if (p && typeof p.light_theme === "boolean") return p.light_theme;
+  } catch { /* 忽略 */ }
+  return null;
+}
+
+function syncComfyPalette() {
+  if (paletteSyncBlocked) return "blocked";
+  let settings = null;
+  try {
+    const win = els.frame && els.frame.contentWindow;
+    settings = win && win.app && win.app.ui && win.app.ui.settings;
+  } catch (e) {
+    paletteSyncBlocked = true; // 跨源被拒：重复尝试无意义
+    console.warn("[comfyui-hana] 内层 iframe 不可访问（跨源限制），ComfyUI 主题跟随停用。", e);
+    return "blocked";
+  }
+  if (!settings || typeof settings.setSettingValue !== "function" || typeof settings.getSettingValue !== "function") {
+    return "pending"; // 内层前端尚未就绪
+  }
+  const target = hostThemeIsDark() ? "dark" : "light";
+  let current = null;
+  try { current = settings.getSettingValue("Comfy.ColorPalette"); } catch { current = null; }
+  if (current === target) return "done";
+  const currentLight = paletteIsLight(settings, current);
+  if (currentLight !== null && currentLight === (target === "light")) return "done"; // 明暗已一致
+  try {
+    settings.setSettingValue("Comfy.ColorPalette", target);
+    console.log(`[comfyui-hana] ComfyUI 色板跟随宿主主题：${current || "(未知)"} → ${target}`);
+    return "done";
+  } catch (e) {
+    console.warn("[comfyui-hana] ComfyUI 色板切换失败：", e);
+    return "pending"; // 可能是时序问题，留给轮询重试
+  }
+}
+
+function ensureComfyPaletteSync() {
+  if (paletteSyncBlocked || paletteSyncTimer) return; // 轮询在跑时会自动消费最新主题值
+  paletteSyncTicks = 0;
+  if (syncComfyPalette() !== "pending") return;
+  paletteSyncTimer = setInterval(() => {
+    paletteSyncTicks += 1;
+    if (syncComfyPalette() !== "pending" || paletteSyncTicks >= PALETTE_SYNC_MAX_TICKS) {
+      stopComfyPaletteSync();
+    }
+  }, PALETTE_SYNC_TICK_MS);
+}
+
+function stopComfyPaletteSync() {
+  if (paletteSyncTimer) { clearInterval(paletteSyncTimer); paletteSyncTimer = null; }
 }
 
 // ── 视图切换 ──────────────────────────────────────────────────────────────
@@ -225,7 +301,11 @@ $("btn-retry").addEventListener("click", () => { void postRetryStart().catch(() 
 $("btn-retry2").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.errNote.textContent = "已请求启动，等待中继就绪……"; });
 $("btn-reload-boot").addEventListener("click", () => { void tick(); });
 $("btn-reload2").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
-els.frame.addEventListener("load", () => { frameLoaded = true; els.loading.classList.remove("show"); });
+els.frame.addEventListener("load", () => {
+  frameLoaded = true;
+  els.loading.classList.remove("show");
+  ensureComfyPaletteSync(); // 内层文档（重）载入 → 对齐 ComfyUI 色板
+});
 
 // ── 启动 ──────────────────────────────────────────────────────────────────
 async function main() {
