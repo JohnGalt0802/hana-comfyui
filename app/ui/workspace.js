@@ -152,6 +152,8 @@ const HANA_JS_MAP = [
   ["CLEAR_BACKGROUND_COLOR", "--bg"],
 ];
 const HANA_VAR_FALLBACK = { "--coral": "--accent-hover", "--sidebar-bg": "--bg-card" };
+const CANVAS_SHADE_DARK = 0.15;  // 画布底色：深色主题相对 --bg 加深比例（朝黑）
+const CANVAS_SHADE_LIGHT = 0.4;  // 浅色主题相对 --bg 提亮比例（朝白）
 let hanaThemeVars = null;
 let hanaThemeVarsUrl = null;
 let hanaThemeVarsInflight = null;
@@ -200,6 +202,27 @@ function hanaVar(name) {
   return v || null;
 }
 
+function cssColorToRgb(value) {
+  if (typeof value !== "string") return null;
+  const v = value.trim();
+  let m = /^#([0-9a-f]{6})$/i.exec(v);
+  if (m) {
+    const n = parseInt(m[1], 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  m = /^#([0-9a-f]{3})$/i.exec(v);
+  if (m) return [0, 1, 2].map((i) => parseInt(m[1][i] + m[1][i], 16));
+  m = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i.exec(v);
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+  return null;
+}
+
+function shadeRgb(rgb, towardBlack, ratio) {
+  const target = towardBlack ? 0 : 255;
+  const c = rgb.map((val) => Math.round(val + (target - val) * ratio));
+  return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+}
+
 function buildHanaOverrideCss() {
   const lines = [":root {"];
   for (const [comfyVar, hostVar] of HANA_CSS_MAP) {
@@ -242,6 +265,12 @@ function applyHanaThemeVars() {
       const t = hanaVar("--text"), a = hanaVar("--accent");
       if (t) cv.node_title_color = t;
       if (a) cv.default_link_color = a;
+      // 画布底色：在 --bg 之上再沉一层/提一层，与面板拉开层次（不直接用主题色）
+      const bgRgb = cssColorToRgb(hanaVar("--bg") || "");
+      if (bgRgb && cv.clear_background_color !== "transparent") {
+        const darkCanvas = hostThemeIsDark();
+        cv.clear_background_color = shadeRgb(bgRgb, darkCanvas, darkCanvas ? CANVAS_SHADE_DARK : CANVAS_SHADE_LIGHT);
+      }
       if (typeof cv.setDirty === "function") cv.setDirty(true, true);
     }
   } catch (e) {
