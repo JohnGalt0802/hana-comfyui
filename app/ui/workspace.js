@@ -8,7 +8,7 @@ import { hana } from "./assets/sdk.js";
 
 const $ = (id) => document.getElementById(id);
 const els = {
-  bar: $("ws-bar"), barText: $("ws-bar-text"), barAction: $("ws-bar-action"),
+  bar: $("ws-bar"), barText: $("ws-bar-text"), barAction: $("ws-bar-action"), barAction2: $("ws-bar-action2"),
   loading: $("ws-loading"), frameWrap: $("ws-frame-wrap"), frame: $("ws-frame"),
   boot: $("view-booting"), bootNote: $("boot-note"), bootMeta: $("boot-meta"),
   bootRawWrap: $("boot-raw-wrap"), bootRaw: $("boot-raw"),
@@ -318,18 +318,38 @@ function showView(name) {
   if (name === "ready" && !frameLoaded) els.loading.classList.add("show");
 }
 
-function setBar(kind, text, actionLabel, actionFn) {
+function setBar(kind, text, actions = []) {
   if (!kind) { els.bar.classList.remove("show"); return; }
   els.bar.className = `show ${kind}`;
   els.barText.textContent = text;
-  if (actionLabel && actionFn) {
-    els.barAction.style.display = "inline-block";
-    els.barAction.textContent = actionLabel;
-    els.barAction.onclick = actionFn;
-  } else {
-    els.barAction.style.display = "none";
-    els.barAction.onclick = null;
+  [els.barAction, els.barAction2].forEach((btn, i) => {
+    const a = actions[i];
+    if (a && a.label && a.fn) {
+      btn.style.display = "inline-block";
+      btn.textContent = a.label;
+      btn.onclick = a.fn;
+    } else {
+      btn.style.display = "none";
+      btn.onclick = null;
+    }
+  });
+}
+
+// 复制引导语：优先 clipboard API，旧环境回落 execCommand；按钮上给 2s 反馈
+async function copyGuide(text) {
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; }
+  catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      ok = document.execCommand("copy");
+      ta.remove();
+    } catch { ok = false; }
   }
+  els.barAction.textContent = ok ? "已复制 ✓" : "复制失败";
+  setTimeout(() => { els.barAction.textContent = "复制引导语"; }, 2000);
 }
 
 // ── 数据读取 ──────────────────────────────────────────────────────────────
@@ -474,7 +494,20 @@ async function statusTick() {
     const backend = st.relay && st.relay.backend ? st.relay.backend : null;
     const reachable = !!(backend && backend.reachable);
     if (!reachable) {
-      setBar("warn", `ComfyUI 后端（127.0.0.1:8188）不可达：${(backend && backend.lastError) || "连接失败"}`, "重试", () => { void statusTick(); void postRetryStart().catch(() => {}); });
+      const env = st.relay && st.relay.env ? st.relay.env : null;
+      const hit = env && Array.isArray(env.installs) && env.installs.length ? env.installs[0] : null;
+      const retry = { label: "重试", fn: () => { void statusTick(); void postRetryStart().catch(() => {}); } };
+      if (hit) {
+        setBar("warn", `ComfyUI 服务未运行（已检测到安装：${hit.path}）。启动后可自动恢复，也可让 Hana 助手协助。`, [
+          { label: "复制引导语", fn: () => copyGuide(`帮我启动 ComfyUI（安装位置：${hit.path}）`) },
+          retry,
+        ]);
+      } else {
+        setBar("warn", "未检测到 ComfyUI 环境（常见位置无安装、服务不可达）。尚未安装？可让 Hana 助手引导安装。", [
+          { label: "复制引导语", fn: () => copyGuide("帮我安装 ComfyUI") },
+          retry,
+        ]);
+      }
     } else {
       setBar(null);
     }

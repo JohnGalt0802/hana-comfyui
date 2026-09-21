@@ -21,7 +21,7 @@ import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const APP_ID = "comfyui-hana";
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.3.0";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
@@ -876,7 +876,14 @@ export default defineApp(async (sdk) => {
   function noteForReady() {
     const backendOk = !!(state.snapshot && state.snapshot.relay && state.snapshot.relay.backend && state.snapshot.relay.backend.reachable);
     if (!state.snapshot) return "中继已就绪，正在读取状态快照……";
-    if (!backendOk) return `中继已就绪，但 ComfyUI 后端（${BACKEND.host}:${BACKEND.port}）当前不可达——请确认 ComfyUI 正在运行，中继会持续探测。`;
+    if (!backendOk) {
+      const env = state.snapshot.relay && state.snapshot.relay.env ? state.snapshot.relay.env : null;
+      const hit = env && Array.isArray(env.installs) ? env.installs[0] : null;
+      if (hit) {
+        return `中继已就绪，但 ComfyUI 服务（${BACKEND.host}:${BACKEND.port}）不可达——检测到本机安装（${hit.path}），可能尚未启动。启动后中继会自动恢复；也可对 Hana 说「帮我启动 ComfyUI」。`;
+      }
+      return `中继已就绪，但 ComfyUI 服务（${BACKEND.host}:${BACKEND.port}）不可达——未在本机常见位置检测到 ComfyUI 安装。如果尚未安装，对 Hana 说「帮我安装 ComfyUI」（安装引导见 App 技能）；如果装在别处，请让助手按实际路径与端口接入。`;
+    }
     return "中继已就绪：ComfyUI 前端可经代理路径加载（相对寻址），HTTP/WS 全通。";
   }
 
@@ -954,6 +961,14 @@ export default defineApp(async (sdk) => {
       if (relay.events) lines.push(`- 事件订阅：${relay.events.connected ? "已连接" : "未连接"}（缓存 ${relay.events.promptsTracked} 条）`);
       if (relay.requests) lines.push(`- 中继请求：累计 ${relay.requests.total}（WS ${relay.requests.ws}）· 错误 ${relay.requests.errors}`);
       if (!b.reachable && b.lastError) lines.push(`- 后端错误：${b.lastError}`);
+      if (!b.reachable) {
+        const env = relay.env || null;
+        if (env && env.found) {
+          lines.push(`- 本机安装探测：检测到 ${env.installs.map((i) => `${i.path}（${i.kind}${i.version ? ` ${i.version}` : ""}${i.hasVenv ? "，含环境" : ""}）`).join("；")}`);
+        } else if (env) {
+          lines.push("- 本机安装探测：常见位置未发现 ComfyUI（如已安装在别处，请告知实际位置；如尚未安装，可让助手引导安装）");
+        }
+      }
     } else {
       lines.push(`- 后端：状态快照未就绪${snap && snap.error ? `（${snap.error}）` : ""}`);
     }

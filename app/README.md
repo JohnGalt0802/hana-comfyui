@@ -1,4 +1,4 @@
-# ComfyUI-Hana（v2 App，开发仓）· v0.2
+# ComfyUI-Hana（v2 App，开发仓）· v0.3
 
 把本机 ComfyUI（`D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：`D:\HanakoWorks\ComfyUI\app\`；**宿主副本**：`C:\Users\John Galt\.hanako\apps\comfyui-hana\`（由 `..\tools\sync-to-host.ps1` 同步）。
@@ -10,8 +10,10 @@
   - 能力已扩容（2026-09-21 批准并生效）：`app/tasks.manage` + `app/session.start-turn`（ledger=always）
   - **子代理会话边界**：宿主可靠投递只写桌面会话；从子代理会话发起的任务不会自动回执（工具文案会如实标注；`query` 的「投递」行可查 `published/delivered`）
 - 任务卡：`ui/task.html`（轮询 `GET /comfyui-hana/task?id=`；缩略图经 `_surface` 凭据路径）
-- 中继 v0.2：订阅 8188 `/ws` 进度事件缓存（`/_relay/prompts`）、历史摘要（`/_relay/history`）、
+- 中继 v0.3：订阅 8188 `/ws` 进度事件缓存（`/_relay/prompts`）、历史摘要（`/_relay/history`）、
   `/_relay/fs/{stat,read}` + `/_relay/upload`（controlKey 保护）、日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`）
+- 环境自举（v0.3 新增）：后端不可达时中继附「本机安装探测」（`/_relay/status` 的 `env` 字段；或 `node runtime/comfy-relay.mjs --probe-env` 直看）；
+  壳页按「装了没跑 / 未检测到」分流引导（复制引导语→交给 Hana）；安装手册 `skills/comfyui-hana/INSTALL.md`
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok
 
@@ -30,6 +32,7 @@
 pwsh -NoProfile -File D:\HanakoWorks\ComfyUI\tools\validate-app.ps1
 
 # 测试（按需）
+node D:\HanakoWorks\ComfyUI\app\runtime\comfy-relay.mjs --probe-env  # 安装探测（应输出本机 ComfyUI 安装 JSON）
 node D:\HanakoWorks\ComfyUI\tools\m2-checks\test-relay-v02.mjs     # 中继新端点
 node D:\HanakoWorks\ComfyUI\tools\m2-checks\test-e2e-relay.mjs     # 中继级 E2E（前置：8188 队列为空）
 node D:\HanakoWorks\ComfyUI\tools\m2-checks\host-stage.mjs         # 宿主段工具全动作

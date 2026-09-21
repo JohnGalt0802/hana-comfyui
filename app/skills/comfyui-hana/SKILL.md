@@ -1,15 +1,34 @@
 ---
 name: comfyui-hana
-description: ComfyUI-Hana（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）。
+description: ComfyUI-Hana（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传；环境自举——未安装/未启动时引导 agent 完成安装或启动。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、帮我安装 ComfyUI、帮我启动 ComfyUI、未检测到 ComfyUI 环境。
 ---
 
-# ComfyUI-Hana（v0.2）
+# ComfyUI-Hana（v0.3）
 
-把本机 ComfyUI（`D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。
+把本机 ComfyUI（默认 `D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。环境不存在时可引导安装/启动（见「环境不存在时」章节）。
 
 ## 架构一句话
 
 受管 runtime 拉起「中继」（`runtime/comfy-relay.mjs`）→ 宿主代理路径提供 HTTP/WS 通道 → 整页工作区嵌入官方前端；`comfyui` 工具经中继操作 8188；每次提交在宿主建一条正式任务（next-step 回执）并有任务卡。
+
+## 环境不存在时（未安装 / 未启动）
+
+工作区提示「未检测到 ComfyUI 环境」或用户说“帮我装/启动 ComfyUI”时：
+
+**三步侦察（不要跳）：**
+1. 服务：`Invoke-RestMethod http://127.0.0.1:8188/system_stats`——失败 = 服务没跑。
+2. 安装探测（只读）——运行本技能包所在 App 的 `runtime/comfy-relay.mjs`（相对本文件：`../../runtime/comfy-relay.mjs`）：
+   `node "<本 App 目录>/runtime/comfy-relay.mjs" --probe-env`
+   输出 JSON：`found` / `installs[]`（path、kind=source|portable|desktop、version、hasVenv）。
+3. 分流处理：
+   - **检测到安装 + 服务没跑 → 先启动**：工作目录 = 安装根，
+     `venv\Scripts\python.exe main.py --listen 127.0.0.1 --port 8188`（隐藏窗口；portable 用 `python_embeded\python.exe`），
+     轮询 8188 到就绪。无 venv 说明环境没装好，按 INSTALL.md 补建。
+   - **未检测到 → 安装**：照同目录 `INSTALL.md` 全流程执行（Windows 主线，含镜像与逐步骤验证；每阶段完工向用户报一次进展）。
+   - **装在非常规位置**：以用户提供的实际路径为准（同样走“启动”流程）。
+4. 完成后 `GET /system_stats` 返回 200 → 告诉用户“回工作区刷新即可”（中继每 5s 探测，会自动恢复）。
+
+安装步骤、镜像配置与排错表全在同目录 `INSTALL.md`，动手前先读它。
 
 ## 当前能力（v0.2）
 
@@ -94,7 +113,7 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
 | 症状 | 先查 | 说明 |
 |---|---|---|
 | `中继未就绪` | 等 1-3s；或 `POST /comfyui-hana/relay/start` | 中继自动拉起，失败会自动退避重试 |
-| `后端不可达` | ComfyUI 是否在跑（8188） | attach 模式：中继常驻并持续探测，恢复即可用 |
+| `后端不可达` | 先走上文「环境不存在时」三步侦察 | attach 模式：中继常驻并持续探测，恢复即可用；未装/未启动时按引导流程处理 |
 | submit 报 `node_errors` | `action=workflows` 核对节点/输入名 | ComfyUI 的节点校验错误原文在报错里 |
 | submit 报"UI→API 转换遇到不支持的构造" | 是否子图/静音节点 | 导出 API 格式再提交 |
 | 任务卡缩略图不显示 | 卡的凭据段 | 预览走 `_surface` 凭据路径；老卡或非卡环境可能 403 |

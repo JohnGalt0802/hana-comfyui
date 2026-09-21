@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// runtime/comfy-relay.mjs — ComfyUI-Hana 受管中继（Node 单文件，无第三方依赖）· v0.2
+// runtime/comfy-relay.mjs — ComfyUI-Hana 受管中继（Node 单文件，无第三方依赖）· v0.3
 // ─────────────────────────────────────────────────────────────────────────────
 // 干什么：把宿主受管服务代理（/api/apps/comfyui-hana/routes/_runtime/<runtimeId>/…）
 //         转发来的请求，HTTP/WS 全量反代到本机 ComfyUI（默认 127.0.0.1:8188）。
 // 业务面（/_relay/*，只读为主；管理端点需 x-comfy-relay-key）：
-//   GET  /_relay/status            聚合状态（后端可达性、队列、请求计数、事件订阅、日志文件）
+//   GET  /_relay/status            聚合状态（后端可达性、队列、请求计数、事件订阅、日志文件；
+//                                  后端不可达时附 env：本机 ComfyUI 安装探测）
 //   GET  /_relay/prompts           进度事件缓存（订阅后端 /ws 得来）：active + recent
 //   GET  /_relay/prompts/<id>      单个 prompt 的事件记录
 //   GET  /_relay/history?id=&max=  历史摘要（裁剪版：status/error/outputs，避免全量历史体积）
@@ -20,6 +21,7 @@
 //   standalone（本地测试）：node comfy-relay.mjs --standalone --port 39123 --backend 127.0.0.1:8188
 //     可选：--ready-marker <文本>、--require-backend、--log-file <路径>、
 //           --control-key <密钥>（≥16 字符）、--comfy-base <ComfyUI 根>、--help
+//  诊断：node comfy-relay.mjs --probe-env（打印本机安装探测 JSON 后退出）
 //
 // 退出码：0 OK / 1 INTERNAL / 2 BACKEND_UNREACHABLE（requireBackend 时）/ 3 USAGE / 7 PORT
 // 日志：请求与信息走 stdout（宿主受管 runtime 捕获）；warn/error 走 stderr；
@@ -34,7 +36,8 @@ import http from "node:http";
 import net from "node:net";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
-import { basename, dirname, extname } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, extname, join } from "node:path";
 
 // ── 退出码 ──────────────────────────────────────────────────────────────────
 const EXIT = Object.freeze({ OK: 0, INTERNAL: 1, BACKEND: 2, USAGE: 3, PORT: 7 });
@@ -137,6 +140,7 @@ const USAGE = `用法：
   --control-key <密钥>    /_relay/* 管理端点密钥（≥16 字符）；受管模式由配置提供
   --comfy-base <路径>     ComfyUI 安装根（供 fs 路径提示；默认 D:\\ComfyUI\\ComfyUI）
   --client-id <id>        后端 /ws 订阅与提交共用的 clientId（默认 comfyui-relay）
+  --probe-env             打印本机 ComfyUI 安装探测结果（JSON）后退出（诊断用）
   --help                  显示本帮助`;
 
 function usageExit(text) {
@@ -399,6 +403,92 @@ function extractSystem(data) {
         }))
       : null,
   };
+}
+
+// ── 本机安装探测（环境引导用）───────────────────────────────────────────────
+// 目标：区分「装了但没跑」与「可能没装」，供 App / 壳页给出对应引导文案。
+// 策略：有限候选路径 + 指纹判定，绝不做全盘扫描；结果按 TTL 缓存（同步、廉价）。
+const ENV_PROBE_TTL_MS = 15_000;
+const envProbe = { at: 0, result: null };
+
+function candidateRoots() {
+  const home = homedir();
+  const roots = [];
+  const push = (p) => { if (p && !roots.includes(p)) roots.push(p); };
+  if (process.env.COMFYUI_PATH) push(process.env.COMFYUI_PATH.trim());
+  if (process.platform === "win32") {
+    for (const d of ["C", "D", "E", "F", "G"]) {
+      push(`${d}:\\ComfyUI`);
+      push(`${d}:\\ComfyUI\\ComfyUI`);
+      push(`${d}:\\ComfyUI_windows_portable`);
+    }
+    push(join(home, "ComfyUI"));
+    push(join(home, "Desktop", "ComfyUI"));
+    push(join(home, "Documents", "ComfyUI"));
+    if (process.env.LOCALAPPDATA) push(join(process.env.LOCALAPPDATA, "Programs", "@comfyorgcomfyui-electron"));
+  } else if (process.platform === "darwin") {
+    push(join(home, "ComfyUI"));
+    push(join(home, "Documents", "ComfyUI"));
+    push("/Applications/ComfyUI.app");
+  } else {
+    push(join(home, "ComfyUI"));
+    push("/opt/ComfyUI");
+  }
+  return roots;
+}
+
+function detectInstall(root) {
+  try {
+    if (!existsSync(root)) return null;
+    // ComfyUI Desktop（Electron 版）：安装目录名特异，存在即视为线索
+    if (root.includes("@comfyorgcomfyui-electron")) {
+      return { path: root, kind: "desktop", version: null, hasVenv: false, mainPy: null };
+    }
+    // 源码安装：main.py + folder_paths.py 同目录
+    if (existsSync(join(root, "main.py")) && existsSync(join(root, "folder_paths.py"))) {
+      let version = null;
+      try {
+        const vf = join(root, "comfyui_version.py");
+        if (existsSync(vf)) {
+          const m = /__version__\s*=\s*["']([^"']+)["']/.exec(readFileSync(vf, "utf8").slice(0, 4000));
+          if (m) version = m[1];
+        }
+      } catch { /* 版本读不到不致命 */ }
+      const parent = dirname(root);
+      const hasVenv = ["venv", ".venv"].some((d) =>
+        existsSync(join(root, d, "Scripts", "python.exe")) || existsSync(join(root, d, "bin", "python")) ||
+        existsSync(join(parent, d, "Scripts", "python.exe")) || existsSync(join(parent, d, "bin", "python")));
+      return { path: root, kind: "source", version, hasVenv, mainPy: join(root, "main.py") };
+    }
+    // 便携包：python_embeded + ComfyUI/main.py（双指纹，缺一不判——避免把「外层包着源码仓」的目录误判）
+    if (existsSync(join(root, "ComfyUI", "main.py")) && existsSync(join(root, "python_embeded", "python.exe"))) {
+      return {
+        path: root, kind: "portable", version: null,
+        hasVenv: true,
+        mainPy: join(root, "ComfyUI", "main.py"),
+      };
+    }
+    return null;
+  } catch { return null; }
+}
+
+function probeEnv(force = false) {
+  if (!force && envProbe.result && Date.now() - envProbe.at < ENV_PROBE_TTL_MS) return envProbe.result;
+  const roots = candidateRoots();
+  const installs = [];
+  for (const root of roots) {
+    const hit = detectInstall(root);
+    if (hit && !installs.some((i) => i.path === hit.path)) installs.push(hit);
+  }
+  envProbe.result = {
+    platform: process.platform,
+    found: installs.length > 0,
+    installs: installs.slice(0, 5),
+    candidatesChecked: roots.length,
+    probeAt: new Date().toISOString(),
+  };
+  envProbe.at = Date.now();
+  return envProbe.result;
 }
 
 async function probeQueue() {
@@ -720,6 +810,8 @@ function statusPayload() {
       errors: stats.errors,
       active: stats.active,
     },
+    // 后端不可达时才附安装探测（供 App/壳页分流「装了没跑」vs「可能没装」）
+    env: backend.reachable ? null : probeEnv(),
   };
 }
 
@@ -1174,6 +1266,17 @@ function startProbeTimer() {
 }
 
 async function main() {
+  // 诊断开关：打印本机安装探测结果（JSON）后退出，不启动服务器（供 agent / 人工排查）
+  if (process.argv.includes("--probe-env")) {
+    try {
+      process.stdout.write(JSON.stringify(probeEnv(true), null, 2) + "\n");
+      process.exit(EXIT.OK);
+    } catch (e) {
+      logErr(`--probe-env 失败：${(e && e.message) || e}`);
+      process.exit(EXIT.INTERNAL);
+    }
+    return;
+  }
   try {
     config = loadConfig(process.argv.slice(2));
   } catch (e) {
