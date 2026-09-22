@@ -142,7 +142,7 @@ const USAGE = `用法：
   --require-backend       启动时后端不可达则退出码 2（默认关闭：attach 模式下后端可后起）
   --log-file <路径>       追加写日志文件（启动时 >5MiB 滚动为 <路径>.1）
   --control-key <密钥>    /_relay/* 管理端点密钥（≥16 字符）；受管模式由配置提供
-  --comfy-base <路径>     ComfyUI 安装根（供 fs 路径提示；默认 D:\\ComfyUI\\ComfyUI）
+  --comfy-base <路径>     ComfyUI 安装根（可选；不传则由本机安装探测自动识别）
   --client-id <id>        后端 /ws 订阅与提交共用的 clientId（默认 comfyui-relay）
   --probe-env             打印本机 ComfyUI 安装探测结果（JSON）后退出（诊断用）
   --help                  显示本帮助`;
@@ -923,8 +923,9 @@ function statusPayload() {
       errors: stats.errors,
       active: stats.active,
     },
-    // 后端不可达时才附安装探测（供 App/壳页分流「装了没跑」vs「可能没装」）
-    env: backend.reachable ? null : probeEnv(),
+    // 安装探测：总是附带（TTL 15s 缓存，成本可忽略）。壳页用它分流「装了没跑 / 未检测到」；
+    // App 用它取安装根做产物定位（不硬编码本机路径）。
+    env: probeEnv(),
   };
 }
 

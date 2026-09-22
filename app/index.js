@@ -26,7 +26,7 @@ const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
 // 注意：每次中继启动生成唯一后缀——ComfyUI 旧连接的 finally 会按 sid pop，复用同名会在快速重启时误删新连接。
-const COMFY_BASE = "D:\\ComfyUI\\ComfyUI"; // ComfyUI 安装根（output/temp 产物定位用）
+// ComfyUI 安装根不硬编码：由中继的本机安装探测动态提供（见 comfyBase()），任何机器都能用。
 const READY_MAX_MS = 240_000;
 const READY_POLL_MS = 300;
 const STATUS_POLL_MS = 1_500;
@@ -130,7 +130,6 @@ export default defineApp(async (sdk) => {
       logFile: join(dataDir, "logs", "relay.log"),
       controlKey,
       clientId,
-      comfyBase: COMFY_BASE,
       note: `comfyui-hana relay v${APP_VERSION} (attempt ${attempt}) @ ${new Date().toISOString()}`,
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -339,6 +338,14 @@ export default defineApp(async (sdk) => {
     return state.phase === "ready" && !!state.runtimeId;
   }
 
+  // ComfyUI 安装根：由中继本机安装探测动态提供（env.installs[0].path），不硬编码路径；
+  // 探测不到（装在不常见位置）时返回 null，产物定位退化为「仅相对名 + 预览 URL」。
+  function comfyBase() {
+    const env = state.snapshot && state.snapshot.relay ? state.snapshot.relay.env : null;
+    const hit = env && Array.isArray(env.installs) ? env.installs[0] : null;
+    return hit && typeof hit.path === "string" && hit.path ? hit.path : null;
+  }
+
   async function relayFetch(path, init = {}) {
     if (!relayReady()) {
       throw new Error(`中继未就绪（phase=${state.phase}）：${noteFor(state.phase)}`);
@@ -469,8 +476,10 @@ export default defineApp(async (sdk) => {
     for (const o of job.outputs.slice(0, 30)) {
       o.viewPath = viewPathOf(o);
       if (o.type === "output" || o.type === "temp") {
+        const root = comfyBase();
+        if (!root) continue; // 未识别安装根：跳过绝对路径补充
         const base = o.type === "temp" ? "temp" : "output";
-        const p = `${COMFY_BASE}\\${base}\\${o.subfolder ? o.subfolder + "\\" : ""}${o.filename}`;
+        const p = `${root}\\${base}\\${o.subfolder ? o.subfolder + "\\" : ""}${o.filename}`;
         try {
           const { ok, data } = await relayJson("/_relay/fs/stat", { method: "POST", body: JSON.stringify({ path: p }) });
           if (ok && data?.stat?.exists) {
@@ -940,7 +949,7 @@ export default defineApp(async (sdk) => {
       snapshotAt: snap ? new Date(snap.at).toISOString() : null,
       backendUrl: `http://${BACKEND.host}:${BACKEND.port}`,
       jobs: jobsSummary(),
-      comfyBase: COMFY_BASE,
+      comfyBase: comfyBase(),
     };
   }
 

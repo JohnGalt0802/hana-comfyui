@@ -1,7 +1,7 @@
 # ComfyUI-Hana（v2 App，开发仓）· v0.4
 
-把本机 ComfyUI（`D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
-**开发仓**：`D:\HanakoWorks\ComfyUI\app\`；**宿主副本**：`C:\Users\John Galt\.hanako\apps\comfyui-hana\`（由 `..\tools\sync-to-host.ps1` 同步）。
+把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
+**开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
 
 ## 状态（M0–M2 完成，M2.5/M2.6 收尾）
 
@@ -24,25 +24,25 @@
 
 - **clientId 配对**：ComfyUI 只把执行事件发给提交方 `client_id` 的 WS 连接；中继订阅与提交共用
   同一个「每次启动随机」的 clientId（`comfyui-hana-relay-<hex>`）——不要复用固定 id（旧连接关闭时 Host 侧按 sid 清理，会误删新连接）。
-- **产物定位**：`D:\ComfyUI\ComfyUI\output\...`（`/_relay/fs/stat` 校验存在）；预览 URL 走代理 `view?`。
+- **产物定位**：ComfyUI 安装根的 `output/...`（安装根由中继环境探测自动识别，不硬编码；`/_relay/fs/stat` 校验存在）；预览 URL 走代理 `view?`。
 - submit 不支持「UI 格式 → API」的完整转换：子图/环绕/静音/旁路节点会明确报错，改用「导出（API 格式）」。
 - 投递诊断：`ctx.tasks.getDelivery`（`query` 已暴露）；宿主被卡记录在 `%HANA_HOME%\.ephemeral\deferred-tasks.json`。
 
 ## 本地开发
 
 ```powershell
-# 静态校验（先 staging 到目录名=id）
-pwsh -NoProfile -File D:\HanakoWorks\ComfyUI\tools\validate-app.ps1
+# 静态校验（先 staging 到目录名=id；脚本在项目根 tools/ 下）
+pwsh -NoProfile -File ..\tools\validate-app.ps1
 
-# 测试（按需）
-node D:\HanakoWorks\ComfyUI\app\runtime\comfy-relay.mjs --probe-env  # 安装探测（应输出本机 ComfyUI 安装 JSON）
-node D:\HanakoWorks\ComfyUI\tools\m2-checks\test-relay-v02.mjs     # 中继新端点
-node D:\HanakoWorks\ComfyUI\tools\m2-checks\test-e2e-relay.mjs     # 中继级 E2E（前置：8188 队列为空）
-node D:\HanakoWorks\ComfyUI\tools\m2-checks\host-stage.mjs         # 宿主段工具全动作
-node D:\HanakoWorks\ComfyUI\tools\m3-checks\test-cancel.mjs        # cancel 定向取消
+# 测试（按需；脚本在项目根 tools/ 下）
+node .\runtime\comfy-relay.mjs --probe-env          # 安装探测（应输出本机 ComfyUI 安装 JSON）
+node ..\tools\m2-checks\test-relay-v02.mjs          # 中继新端点
+node ..\tools\m2-checks\test-e2e-relay.mjs          # 中继级 E2E（前置：8188 队列为空）
+node ..\tools\m2-checks\host-stage.mjs              # 宿主段工具全动作
+node ..\tools\m3-checks\test-cancel.mjs             # cancel 定向取消
 
 # 同步到宿主副本（-DryRun 预览）
-pwsh -NoProfile -File D:\HanakoWorks\ComfyUI\tools\sync-to-host.ps1 -DryRun
+pwsh -NoProfile -File ..\tools\sync-to-host.ps1 -DryRun
 ```
 
 ## 纪律

@@ -5,7 +5,7 @@ description: ComfyUI-Hana（v2 App）——把本机 ComfyUI（127.0.0.1:8188）
 
 # ComfyUI-Hana（v0.3）
 
-把本机 ComfyUI（默认 `D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。环境不存在时可引导安装/启动（见「环境不存在时」章节）。
+把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。环境不存在时可引导安装/启动（见「环境不存在时」章节）。
 
 ## 架构一句话
 
@@ -126,5 +126,5 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
 
 - 中继日志：**落盘** `app-data/comfyui-hana/logs/relay.log`（>5MiB 滚动到 `relay.log.1`）+ 宿主受管 runtime stdout。
 - 私有运行时配置：`app-data/comfyui-hana/integration/relay-*.json`（0600，中继读取后自删；含 controlKey，管理端点 `/_relay/fs/*`、`/_relay/upload` 需该密钥）。
-- 产物定位：`D:\ComfyUI\ComfyUI\output\<subfolder>\<filename>`（经 `/_relay/fs/stat` 验证存在）。
+- 产物定位：ComfyUI 安装根的 `output\<subfolder>\<filename>`（安装根由本机环境探测自动识别，不硬编码；经 `/_relay/fs/stat` 验证存在）。
 - 端口随机（38000-52000）、仅绑定 127.0.0.1。
