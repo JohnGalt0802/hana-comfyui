@@ -51,6 +51,8 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 /* 三态视图：booting / error */
 .view { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px; overflow: auto; }
 .view.show { display: flex; }
+/* 服务未运行：盖住 iframe（不透明），避免把中继的 ECONNREFUSED JSON 直接抩给用户 */
+#view-offline { background: var(--bg-page); z-index: 3; }
 .panel {
   width: min(560px, 100%); background: var(--bg-card); border: 0.5px solid var(--border);
   border-radius: 14px; padding: 20px 22px;
@@ -125,6 +127,20 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
           </select>
         </div>
         <details id="boot-raw-wrap" style="display:none"><summary>原始状态</summary><pre id="boot-raw"></pre></details>
+      </div>
+    </div>
+
+    <div class="view" id="view-offline">
+      <div class="panel">
+        <h1>ComfyUI 服务未运行</h1>
+        <div class="sub">中继已就绪，但 127.0.0.1:8188 上没有 ComfyUI 在跑。服务由计划任务拉起，独立于 Hana 存活。</div>
+        <div class="note" id="off-note">点「启动服务」开始；首次启动约 30～90 秒（依赖导入）。</div>
+        <div class="row">
+          <button class="primary" id="btn-svc-start">启动服务</button>
+          <button class="primary" id="btn-svc-guide" style="display:none">安装引导</button>
+          <button id="btn-svc-reload">刷新工作区</button>
+        </div>
+        <div class="note meta" id="off-meta"></div>
       </div>
     </div>
 

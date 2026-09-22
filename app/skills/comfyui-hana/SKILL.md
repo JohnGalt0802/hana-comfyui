@@ -19,11 +19,13 @@ App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 - 工具：`comfyui(action="service", op="status"|"start"|"stop")`，start 可用 `path` 指定安装根。
 
 机制（2026-09-23 实测，不是推断）：服务由 **Windows 计划任务**（`HanaComfyUI-Backend`）以当前用户身份拉起，
-启动器脚本落在 `app-data/comfyui-hana/logs/backend-launcher.cmd`，服务日志写 `logs/backend.log`。
+启动器脚本落在 `app-data/comfyui-hana/logs/backend-launcher.cmd`（真正干活）+ `backend-launcher.vbs`（用 wscript 的
+`Run(..., 0, False)` 隐藏窗口，否则任务会弹出一个可见 cmd 窗口），服务日志写 `logs/backend.log`。
 这么绕是因为中继进程跑在宿主沙箱的 job 里，直接 spawn 的子进程会随中继退出被回收（detached 也逃不出去）；
 走计划任务则脱离沙箱，**ComfyUI 独立于 Hana 存活**（Hana 重启/退出都不影响它，实测沙箱退出后 8188 继续服务）。
 撤下由中继执行 `taskkill /T /F`（受限令牌下实测可终止）；计划任务只当启动器，不常驻。
-首次启动约 30～90 秒（依赖导入），届时 `status`/面板会自行变绿。
+首次启动约 30～90 秒（依赖导入），面板与工作区会自行变绿；工作区在服务未跑时显示覆盖层（启动按钮 + 已等待秒数），
+不会把中继的 `ECONNREFUSED` JSON 直接抩到界面上。
 
 注意区分：面板的**「重启中继」**只重启本 App 的中继（受管 runtime，随 Hana 生命周期），跟 ComfyUI 服务是两件事。
 中继挂了但服务还在跑时，只需重启中继；ComfyUI 没跑时才点「启动服务」。

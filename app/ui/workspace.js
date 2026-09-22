@@ -14,6 +14,7 @@ const els = {
   bootRawWrap: $("boot-raw-wrap"), bootRaw: $("boot-raw"),
   err: $("view-error"), errNote: $("err-note"), errMeta: $("err-meta"),
   errRawWrap: $("err-raw-wrap"), errRaw: $("err-raw"),
+  offline: $("view-offline"), offNote: $("off-note"), offMeta: $("off-meta"),
 };
 
 const MODE_KEY = "comfyui-hana.workspace.urlMode";
@@ -313,6 +314,7 @@ function stopComfySync() {
 function showView(name) {
   els.boot.classList.toggle("show", name === "booting");
   els.err.classList.toggle("show", name === "error");
+  els.offline.classList.toggle("show", name === "offline");
   els.frameWrap.classList.toggle("show", name === "ready");
   if (name !== "ready") { els.loading.classList.remove("show"); }
   if (name === "ready" && !frameLoaded) els.loading.classList.add("show");
@@ -350,15 +352,10 @@ async function copyText(text) {
   }
 }
 
-// ── 安装引导弹窗（未检测到 ComfyUI 时）─────────────────────────────────────
-// 流程：step1 选方式（助手装 / 自己装）→ step2 选位置 + 动作（直接发起 / 复制指令）→ step3 完成
-const GUIDE_SEEN_KEY = "comfyui-hana.install-guide.seen";
+// ── 安装引导弹窗（未检测到 ComfyUI 时；现由工作区 offline 覆盖层的「安装引导」按钮触发）──
 let guideOpen = false;
 let guideSelected = null;
 let guideCustomPath = null;
-
-function guideSeen() { try { return localStorage.getItem(GUIDE_SEEN_KEY) === "1"; } catch { return false; } }
-function markGuideSeen() { try { localStorage.setItem(GUIDE_SEEN_KEY, "1"); } catch { /* 忽略 */ } }
 
 function escHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -521,6 +518,7 @@ async function postBackendStart() {
   return r.json().catch(() => ({}));
 }
 async function startBackend() {
+  svcRequestedAt = Date.now();
   setBar("info", "已请求启动 ComfyUI 服务，等待就绪（首次约 30～90 秒）…", []);
   try {
     const j = await postBackendStart();
@@ -533,6 +531,27 @@ async function startBackend() {
     return;
   }
   setTimeout(() => { void statusTick(); }, 1500);
+}
+
+// 服务不可达时的覆盖层（盖住 iframe，不让用户直接看到中继的 ECONNREFUSED JSON）
+let svcRequestedAt = 0;
+function showOffline(st) {
+  const relay = (st && st.relay) || null;
+  const env = relay ? relay.env : null;
+  const proc = relay && relay.backend ? relay.backend.proc || null : null;
+  const hit = env && Array.isArray(env.installs) && env.installs.length ? env.installs[0] : null;
+  $("btn-svc-start").style.display = hit ? "" : "none";
+  $("btn-svc-guide").style.display = hit ? "none" : "";
+  const bits = [];
+  bits.push(hit ? `安装根 ${hit.path}` : "未检测到可启动的安装");
+  if (proc && proc.startedAt) bits.push(`上次由本 App 拉起：${String(proc.startedAt).replace("T", " ").slice(0, 19)}`);
+  if (svcRequestedAt) bits.push(`已等待 ${Math.round((Date.now() - svcRequestedAt) / 1000)} 秒`);
+  if (proc && proc.lastError) bits.push(`上次错误：${proc.lastError}`);
+  els.offMeta.textContent = bits.join(" · ");
+  if (!els.offline.classList.contains("show")) {
+    els.offNote.textContent = "点「启动服务」开始；首次启动约 30～90 秒（依赖导入）。";
+    showView("offline");
+  }
 }
 
 // ── iframe 目标构造（两种形式；auto = sdk → 凭据路径 → raw 逐级回落）──────
@@ -661,26 +680,15 @@ async function statusTick() {
     const backend = st.relay && st.relay.backend ? st.relay.backend : null;
     const reachable = !!(backend && backend.reachable);
     if (!reachable) {
-      const env = st.relay && st.relay.env ? st.relay.env : null;
-      const hit = env && Array.isArray(env.installs) && env.installs.length ? env.installs[0] : null;
-      const retryRelay = { label: "重启中继", fn: () => { void statusTick(); void postRetryStart().catch(() => {}); } };
-      if (hit) {
-        setBar("warn", `ComfyUI 服务未运行（已检测到安装：${hit.path}）。`, [
-          { label: "启动服务", fn: () => { void startBackend(); } },
-          retryRelay,
-        ]);
-      } else {
-        setBar("warn", "未检测到 ComfyUI 环境。", [
-          { label: "安装引导", fn: () => { guideShow(1); } },
-          retryRelay,
-        ]);
-        // 首次检测到「未安装」自动弹引导（每浏览器一次；关掉后可从顶栏重开）
-        if (env && env.found === false && !guideSeen() && !guideOpen) {
-          markGuideSeen();
-          guideShow(1);
-        }
-      }
+      // 覆盖层承担提示（比顶栏更清楚），避免 iframe 直接渲染中继的 ECONNREFUSED JSON
+      setBar(null);
+      showOffline(st);
     } else {
+      if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; }
+      if (els.offline.classList.contains("show")) {
+        showView("ready");
+        ensureComfySync(); // 服务刚回来，重新对齐主题
+      }
       setBar(null);
     }
   } catch { /* 状态读取失败不打扰界面 */ }
@@ -711,6 +719,9 @@ bindModeSelect($("sel-mode2"));
 $("btn-retry").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.bootNote.textContent = "已请求启动，等待中继就绪……"; });
 $("btn-retry2").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.errNote.textContent = "已请求启动，等待中继就绪……"; });
 $("btn-reload-boot").addEventListener("click", () => { void tick(); });
+$("btn-svc-start").addEventListener("click", () => { void startBackend(); });
+$("btn-svc-guide").addEventListener("click", () => { guideShow(1); });
+$("btn-svc-reload").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
 $("btn-reload2").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
 els.frame.addEventListener("load", () => {
   frameLoaded = true;
