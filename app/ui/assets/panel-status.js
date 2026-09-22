@@ -60,7 +60,9 @@ function render(st) {
   if (proc) {
     if (proc.install) svcBits.push(`安装根 ${proc.install}`);
     if (reachable && Array.isArray(proc.pids) && proc.pids.length) svcBits.push(`监听进程 ${proc.pids.join(", ")}`);
-    if (proc.startedAt) svcBits.push(`本 App 拉起于 ${String(proc.startedAt).replace("T", " ").slice(0, 19)}`);
+    const stamp = (iso) => String(iso).replace("T", " ").slice(0, 19);
+    if (proc.startedAt) svcBits.push(reachable ? `本 App 拉起于 ${stamp(proc.startedAt)}` : `上次由本 App 拉起：${stamp(proc.startedAt)}`);
+    if (!reachable && proc.lastStop && proc.lastStop.at) svcBits.push(`上次停止：${stamp(proc.lastStop.at)}`);
   }
   $("p-note").textContent = [boot.note || "", svcBits.join(" · ")].filter(Boolean).join("\n");
   const errText = (boot.error && boot.error.userText) || st.relayError || (backend && !backend.reachable ? backend.lastError : "");
