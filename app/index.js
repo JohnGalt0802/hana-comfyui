@@ -21,7 +21,7 @@ import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const APP_ID = "comfyui-hana";
-const APP_VERSION = "0.3.0";
+const APP_VERSION = "0.4.0";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
@@ -1507,6 +1507,34 @@ export default defineApp(async (sdk) => {
 
       app.get("/comfyui-hana/health", (c) => c.json({ ok: true, app: { id: APP_ID, version: APP_VERSION }, ts: new Date().toISOString() }));
 
+      // 主机指标（GPU / CPU / 内存）：中继侧采集（nvidia-smi + os 模块），面板图表数据源
+      app.get("/comfyui-hana/metrics", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/metrics", { timeoutMs: 8_000 });
+          return c.json(ok && data && typeof data === "object" ? data : { ok: false, error: `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      // 释放显存：让 ComfyUI 后端卸载全部模型（POST /free），中继原样反代
+      app.post("/comfyui-hana/release", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/free", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ unload_models: true, free_memory: true }),
+            timeoutMs: 15_000,
+          });
+          void refreshSnapshot(); // 让状态/图表尽快反映卸载后的显存变化
+          return c.json({ ok, status, backend: data }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
       app.get("/comfyui-hana/task", async (c) => {
         try {
           const id = String(c.req.query("id") || "").trim();
@@ -1535,7 +1563,7 @@ export default defineApp(async (sdk) => {
         return c.json({ ok: true, accepted: true, phase: state.phase }, 202);
       });
     });
-    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|task|relay/start）");
+    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|task|relay/start）");
   } catch (e) {
     error(`ctx.routes.register 失败（壳页诊断面不可用，工具面仍可用）：${msgOf(e)}`);
   }

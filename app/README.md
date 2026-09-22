@@ -1,4 +1,4 @@
-# ComfyUI-Hana（v2 App，开发仓）· v0.3
+# ComfyUI-Hana（v2 App，开发仓）· v0.4
 
 把本机 ComfyUI（`D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：`D:\HanakoWorks\ComfyUI\app\`；**宿主副本**：`C:\Users\John Galt\.hanako\apps\comfyui-hana\`（由 `..\tools\sync-to-host.ps1` 同步）。
@@ -14,6 +14,9 @@
   `/_relay/fs/{stat,read}` + `/_relay/upload`（controlKey 保护）、日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`）
 - 环境自举（v0.3 新增）：后端不可达时中继附「本机安装探测」（`/_relay/status` 的 `env` 字段；或 `node runtime/comfy-relay.mjs --probe-env` 直看）；
   壳页按「装了没跑 / 未检测到」分流引导（复制引导语→交给 Hana）；安装手册 `skills/comfyui-hana/INSTALL.md`
+- 状态面板（v0.4 新增）：整页工作区左侧栏（functionPanel）带 GPU/CPU/内存实时图表（任务管理器风格曲线）
+  与「释放显存」按钮（`POST /comfyui-hana/release` → 中继反代后端 `/free`）；指标经中继 `/_relay/metrics`
+  （nvidia-smi 4s 缓存 + os 模块 CPU/内存采样；零新增能力）
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok
 

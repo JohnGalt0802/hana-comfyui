@@ -31,6 +31,21 @@ button { font-size: 11.5px; padding: 4px 12px; border-radius: 7px; cursor: point
 button:hover { background: var(--accent); color: #fff; }
 .note { color: var(--text-muted); font-size: 11px; margin-top: 8px; line-height: 1.6; }
 .err { color: var(--bad); font-size: 11px; word-break: break-all; margin-top: 6px; }
+/* ── 主机指标区（GPU/CPU/内存；任务管理器风格曲线）── */
+.mon-sec { font-size: 12px; font-weight: 600; margin: 12px 0 8px; display: flex; align-items: center; gap: 8px; }
+.sec-spacer { flex: 1; }
+.gpu-release {
+  font-size: 11px; font-weight: 500; padding: 3px 12px; border-radius: 999px; cursor: pointer;
+  border: 0.5px solid var(--border); background: var(--bg-card); color: var(--bad);
+  transition: background .15s, color .15s, border-color .15s;
+}
+.gpu-release:hover { background: var(--bad); border-color: var(--bad); color: #fff; }
+.gpu-release.loading { opacity: .55; cursor: default; }
+.chart-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.chart-meta { width: 92px; flex-shrink: 0; }
+.chart-label { font-size: 10.5px; color: var(--text-muted); margin-bottom: 1px; }
+.chart-val { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.chart { flex: 1; height: 38px; min-width: 80px; display: block; }
 </style>
 </head>
 <body>
@@ -42,7 +57,16 @@ button:hover { background: var(--accent); color: #fff; }
     <div class="row"><span class="k">ComfyUI</span><span class="v" id="p-ver">—</span></div>
     <div class="row"><span class="k">队列</span><span class="v" id="p-queue">—</span></div>
   </div>
-  <button id="p-retry">重试启动</button>
+  <div class="mon-sec"><span id="m-gpu-name">GPU</span><span class="sec-spacer"></span><button class="gpu-release" id="m-release" title="让 ComfyUI 卸载全部模型、释放显存（后端 /free）">释放显存</button></div>
+  <div class="chart-row"><div class="chart-meta"><div class="chart-label">GPU 利用率</div><div class="chart-val" id="v-util">—</div></div><canvas class="chart" id="c-util"></canvas></div>
+  <div class="chart-row"><div class="chart-meta"><div class="chart-label">显存</div><div class="chart-val" id="v-vram">—</div></div><canvas class="chart" id="c-vram"></canvas></div>
+  <div class="chart-row"><div class="chart-meta"><div class="chart-label">温度</div><div class="chart-val" id="v-temp">—</div></div><canvas class="chart" id="c-temp"></canvas></div>
+  <div class="chart-row"><div class="chart-meta"><div class="chart-label">功耗</div><div class="chart-val" id="v-pwr">—</div></div><canvas class="chart" id="c-pwr"></canvas></div>
+  <div class="chart-row"><div class="chart-meta"><div class="chart-label">CPU</div><div class="chart-val" id="v-cpu">—</div></div><canvas class="chart" id="c-cpu"></canvas></div>
+  <div class="chart-row"><div class="chart-meta"><div class="chart-label">内存</div><div class="chart-val" id="v-ram">—</div></div><canvas class="chart" id="c-ram"></canvas></div>
+  <div class="note" id="m-note"></div>
+
+  <button id="p-retry" style="margin-top:10px">重试启动</button>
   <div class="note" id="p-note"></div>
   <div class="err" id="p-err"></div>
   <script type="module" src="./assets/panel-status.js"></script>

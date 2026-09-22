@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// runtime/comfy-relay.mjs — ComfyUI-Hana 受管中继（Node 单文件，无第三方依赖）· v0.3
+// runtime/comfy-relay.mjs — ComfyUI-Hana 受管中继（Node 单文件，无第三方依赖）· v0.4
 // ─────────────────────────────────────────────────────────────────────────────
 // 干什么：把宿主受管服务代理（/api/apps/comfyui-hana/routes/_runtime/<runtimeId>/…）
 //         转发来的请求，HTTP/WS 全量反代到本机 ComfyUI（默认 127.0.0.1:8188）。
@@ -9,6 +9,7 @@
 //   GET  /_relay/prompts           进度事件缓存（订阅后端 /ws 得来）：active + recent
 //   GET  /_relay/prompts/<id>      单个 prompt 的事件记录
 //   GET  /_relay/history?id=&max=  历史摘要（裁剪版：status/error/outputs，避免全量历史体积）
+//   GET  /_relay/metrics           主机指标（GPU / CPU / 内存；GPU 走 nvidia-smi 定时缓存）
 //   POST /_relay/fs/stat           文件 stat（本机路径；{path}）
 //   POST /_relay/fs/read           读取文本/二进制（{path, encoding, maxBytes}，上限 8 MiB）
 //   POST /_relay/upload            读取本机图片并 multipart 上传到后端 /upload/image
@@ -36,7 +37,8 @@ import http from "node:http";
 import net from "node:net";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { execFile } from "node:child_process";
+import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 
 // ── 退出码 ──────────────────────────────────────────────────────────────────
@@ -52,6 +54,8 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const PROMPT_MAX_RECORDS = 300;    // 事件缓存上限（条）
 const PROMPT_KEEP_TERMINAL_MS = 30 * 60 * 1000;
 const FS_READ_MAX_BYTES = 8 * 1024 * 1024;
+const GPU_CACHE_MS = 4_000;        // nvidia-smi 采集缓存（子进程开销大，别按请求频率跑）
+const CPU_SAMPLE_MS = 1_500;       // CPU 采样节拍（按间隔算 delta，与客户端无关）
 const UPLOAD_MAX_BYTES = 64 * 1024 * 1024;
 const JSON_BODY_MAX_BYTES = 256 * 1024;
 const TRACKED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
@@ -489,6 +493,115 @@ function probeEnv(force = false) {
   };
   envProbe.at = Date.now();
   return envProbe.result;
+}
+
+// ── 主机指标采集（GPU / CPU / 内存）──────────────────────────────────────────
+// 供 App 状态面板的实时图表与「释放显存」按钮；只读，不碰后端。
+// GPU 走 nvidia-smi：受管 runtime 的 local-machine profile 允许子进程。
+// 踩坑（llama-monitor 2026-09-19 实测）：宿主裁剪过子进程环境，缺 ProgramFiles
+// 会让 nvidia-smi 的 NVML 初始化失败（exit 255，"Failed to initialize NVML"）；
+// 统一补 CHILD_ENV，缺 PATH 时固化的 "C:\Windows\System32" 也在内。
+const CHILD_ENV = {
+  ...process.env,
+  ProgramFiles: process.env.ProgramFiles || "C:\\Program Files",
+  "ProgramFiles(x86)": process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+  ProgramData: process.env.ProgramData || "C:\\ProgramData",
+  SystemRoot: process.env.SystemRoot || "C:\\Windows",
+  windir: process.env.windir || "C:\\Windows",
+  SystemDrive: process.env.SystemDrive || "C:",
+  PATH: process.env.PATH || "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem",
+};
+const SMI_PATH = existsSync("C:\\Windows\\System32\\nvidia-smi.exe") ? "C:\\Windows\\System32\\nvidia-smi.exe" : "nvidia-smi";
+const SMI_ARGS = [
+  "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu,power.draw,power.limit",
+  "--format=csv,noheader,nounits",
+];
+
+let gpuCache = { at: 0, value: null, error: null };
+let gpuInflight = false;
+function refreshGpu() {
+  if (gpuInflight) return;
+  gpuInflight = true;
+  execFile(SMI_PATH, SMI_ARGS, { windowsHide: true, timeout: 6_000, env: CHILD_ENV }, (err, stdout) => {
+    gpuInflight = false;
+    if (err) {
+      gpuCache = { at: Date.now(), value: null, error: String((err && err.message) || err).slice(0, 200) };
+      return;
+    }
+    try {
+      const p = String(stdout).trim().split(",").map((s) => s.trim());
+      const num = (i) => { const v = parseFloat(p[i]); return Number.isNaN(v) ? null : v; };
+      gpuCache = {
+        at: Date.now(),
+        value: {
+          name: p[0] || null,
+          memoryTotalMiB: num(1), memoryUsedMiB: num(2), memoryFreeMiB: num(3),
+          utilPct: num(4), tempC: num(5), powerW: num(6), powerLimitW: num(7),
+        },
+        error: null,
+      };
+    } catch (e) {
+      gpuCache = { at: Date.now(), value: null, error: String((e && e.message) || e).slice(0, 200) };
+    }
+  });
+}
+
+let cpuPrev = null;
+let cpuSnapshot = { usagePct: null, cores: 0, model: null };
+function sampleCpu() {
+  const cs = osCpus();
+  const now = Date.now();
+  const cur = cs.map((c) => {
+    const t = c.times;
+    return { idle: t.idle, total: t.user + t.nice + t.sys + t.idle + t.irq };
+  });
+  let usagePct = null;
+  if (cpuPrev && now > cpuPrev.t) {
+    let dIdle = 0, dTotal = 0;
+    for (let i = 0; i < Math.min(cur.length, cpuPrev.times.length); i++) {
+      dIdle += cur[i].idle - cpuPrev.times[i].idle;
+      dTotal += cur[i].total - cpuPrev.times[i].total;
+    }
+    if (dTotal > 0) usagePct = Math.max(0, Math.min(100, (1 - dIdle / dTotal) * 100));
+  }
+  cpuPrev = { t: now, times: cur };
+  cpuSnapshot = {
+    usagePct: usagePct === null ? null : Math.round(usagePct * 10) / 10,
+    cores: cur.length,
+    model: (cs[0] && cs[0].model) ? String(cs[0].model).replace(/\s+/g, " ").trim() : null,
+  };
+}
+
+function metricsPayload() {
+  if (Date.now() - gpuCache.at > GPU_CACHE_MS) refreshGpu(); // 异步刷新，本次回缓存值
+  const memTotal = totalmem();
+  const memFree = freemem();
+  return {
+    ok: true,
+    at: new Date().toISOString(),
+    gpu: gpuCache.value,
+    gpuError: gpuCache.value ? null : gpuCache.error,
+    gpuAt: gpuCache.at ? new Date(gpuCache.at).toISOString() : null,
+    cpu: cpuSnapshot,
+    mem: {
+      totalMiB: Math.round(memTotal / 1048576),
+      freeMiB: Math.round(memFree / 1048576),
+      usedMiB: Math.round((memTotal - memFree) / 1048576),
+      usedPct: memTotal > 0 ? Math.round(((memTotal - memFree) / memTotal) * 1000) / 10 : null,
+    },
+    platform: osPlatform(),
+    release: osRelease(),
+  };
+}
+
+function startMetricsSampler() {
+  sampleCpu(); // 建立首帧基线（下一次采样才有 usagePct）
+  refreshGpu();
+  const t = setInterval(() => {
+    sampleCpu();
+    if (Date.now() - gpuCache.at > GPU_CACHE_MS) refreshGpu();
+  }, CPU_SAMPLE_MS);
+  t.unref?.();
 }
 
 async function probeQueue() {
@@ -1177,6 +1290,14 @@ const server = http.createServer((req, res) => {
     jsonOut(res, 200, { ok: true, pid: process.pid, uptimeSec: Math.round(process.uptime()) }, req.method);
     return;
   }
+  if (pathOnly === "/_relay/metrics") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    jsonOut(res, 200, metricsPayload(), req.method);
+    return;
+  }
   if (pathOnly === "/_relay/prompts") {
     if (req.method !== "GET" && req.method !== "HEAD") {
       jsonOut(res, 405, { error: "method not allowed" }, req.method);
@@ -1312,6 +1433,7 @@ async function main() {
   process.stdout.write(`${marker}\n`); // 就绪标记：独占一行，精确匹配
   log(`中继监听 127.0.0.1:${servingPort} → http://${backend.host}:${backend.port}（mode=${config.mode}${config.requireBackend ? " requireBackend" : ""}）`);
   startProbeTimer();
+  startMetricsSampler();
   startBackendEvents();
 }
 
