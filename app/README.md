@@ -5,7 +5,7 @@
 
 ## 状态（M0–M2 完成，M2.5/M2.6 收尾）
 
-- 工具 `comfyui` 全动作：status / submit / query / result / cancel / workflows / upload
+- 工具 `comfyui` 全动作：status / submit / query / result / cancel / workflows / upload / service
 - 任务桥：submit → `ctx.tasks.create({callToken, delivery:"next-step"})` → 2s 轮询结算（complete/fail/cancel）
   - 能力已扩容（2026-09-21 批准并生效）：`app/tasks.manage` + `app/session.start-turn`（ledger=always）
   - **子代理会话边界**：宿主可靠投递只写桌面会话；从子代理会话发起的任务不会自动回执（工具文案会如实标注；`query` 的「投递」行可查 `published/delivered`）
@@ -21,6 +21,11 @@
   两个动作：直接发起安装（`session:create` + `session:send` 在默认工作区建会话投递提示词）/ 复制安装指令；
   路由 `install-targets|install-target|install-prompt|install-launch`；中继新增 `/_relay/drives`、`/_relay/custom-roots`；
   能力新增 `app/resources.read`（目录选择器用）
+- 服务起停（v0.6 新增，M9）：左侧面板「启动服务 / 停止服务」+ 工具 `comfyui(action="service", op=status|start|stop)`；
+  启动经 Windows 计划任务（`HanaComfyUI-Backend`）以当前用户身份拉起——中继自身跑在宿主沙箱 job 里，直接 spawn 的子进程
+  会随中继退出被回收（detached 也逃不出），走计划任务才**独立于 Hana 存活**；撤下走 `taskkill /T /F`（受限令牌实测可终止）；
+  中继新增 `/_relay/backend/{start,stop,proc}`，App 新增路由 `backend/start|stop|backend`；服务日志 `app-data/comfyui-hana/logs/backend.log`；
+  同时把面板原「重试启动」正名为「重启中继」（它只重启受管 runtime，与 ComfyUI 服务本体是两件事）
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok
 

@@ -9,7 +9,8 @@
 //   3. 任务桥：submit → ctx.tasks.create({callToken, delivery:"next-step"}) → 轮询结算
 //      （complete/fail/cancel）—— 需要能力词 app/tasks.manage + app/session.start-turn，
 //      未授权时自动降级为「仅内存跟踪」（工具返回值里说明原因）
-//   4. 路由：/comfyui-hana/boot-state | status | health | relay/start | task?id=
+//   4. 路由：/comfyui-hana/boot-state | status | health | relay/start | backend/start | backend/stop | backend | task?id=
+//      （relay/start 只重启「中继」；backend/* 管 8188 上的 ComfyUI 本体，由计划任务拉起，独立于 Hana 存活）
 //   5. 每 1.5s 轮询中继 /_relay/status（ctx.runtime.fetch 优先）；每 2s 结算任务
 //
 // 生命周期口径：本 App 负责"拉起 + 监督 + 状态出口 + 任务跟踪"；最终回收由宿主受管 runtime
@@ -21,7 +22,10 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import { join } from "node:path";
 
 const APP_ID = "comfyui-hana";
-const APP_VERSION = "0.5.0";
+// v0.6.0（M9）：ComfyUI 服务进程起停（中继 /_relay/backend/{start,stop,proc} + App 路由 + 工具 action=service
+//   + 左侧面板「启动服务/停止服务」）。启动走计划任务（脱离宿主沙箱 job，服务独立存活），撤下走 taskkill。
+//   面板原来那个「重试启动」正名为「重启中继」——它只重启受管 runtime，不碰 ComfyUI 服务本体。
+const APP_VERSION = "0.6.0";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
@@ -1412,6 +1416,71 @@ export default defineApp(async (sdk) => {
     };
   }
 
+  // ── 服务进程（启动 / 停止）───────────────────────────────────────────────
+  // 中继侧落到「计划任务拉起 + taskkill 撤下」，原因见 runtime/comfy-relay.mjs 服务管理区。
+  function serviceSnapshot() {
+    const snap = state.snapshot;
+    const b = snap && snap.relay && snap.relay.backend ? snap.relay.backend : null;
+    return { reachable: !!(b && b.reachable), proc: (b && b.proc) || null, url: b ? b.url : `http://${BACKEND.host}:${BACKEND.port}` };
+  }
+
+  async function actionService(args) {
+    const op = String(args.op || "status").trim().toLowerCase();
+    const cur = serviceSnapshot();
+    if (op === "status") {
+      const p = cur.proc;
+      const lines = [
+        `ComfyUI 服务：${cur.reachable ? "运行中" : "未运行"}（${cur.url}）`,
+        p && p.pids && p.pids.length ? `监听进程：${p.pids.join(", ")}` : "",
+        p && p.startedAt ? `由本 App 拉起于：${p.startedAt}` : "",
+        p && p.install ? `安装根：${p.install}` : "",
+        p && p.logFile ? `服务日志：${p.logFile}` : "",
+        p && p.lastError ? `上次错误：${p.lastError}` : "",
+      ].filter(Boolean);
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { comfyui: { action: "service", op, reachable: cur.reachable, proc: p } } };
+    }
+    if (!relayReady()) throw new Error(`中继未就绪（phase=${state.phase}）：${noteFor(state.phase)}`);
+    if (op === "start") {
+      const { ok, data } = await relayJson("/_relay/backend/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(typeof args.path === "string" && args.path.trim() ? { path: args.path.trim() } : {}),
+        timeoutMs: 25_000,
+      });
+      void refreshSnapshot();
+      const d = data && typeof data === "object" ? data : {};
+      if (!ok || d.ok === false) throw new Error(d.error || `中继返回 HTTP ${ok ? 200 : "?"}；${JSON.stringify(d).slice(0, 300)}`);
+      const text = d.already
+        ? "ComfyUI 服务已在运行（无需重复启动）。"
+        : [
+            "已请求启动 ComfyUI 服务（由计划任务以当前用户身份拉起，独立于 Hana 存活）。",
+            d.python ? `解释器：${d.python}` : "",
+            d.mainPy ? `入口：${d.mainPy}` : "",
+            d.logFile ? `日志：${d.logFile}` : "",
+            "首次启动约 30～90 秒（含依赖导入）；用 comfyui(action=\"status\") 或工作区左侧面板看就绪。",
+          ].filter(Boolean).join("\n");
+      return { content: [{ type: "text", text }], details: { comfyui: { action: "service", op, ...d } } };
+    }
+    if (op === "stop") {
+      const { ok, data } = await relayJson("/_relay/backend/stop", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+        timeoutMs: 25_000,
+      });
+      void refreshSnapshot();
+      const d = data && typeof data === "object" ? data : {};
+      if (!ok) throw new Error(d.error || "停止请求未成功（中继未就绪或中继返回错误）");
+      const text = d.already
+        ? "ComfyUI 服务本来就没在运行。"
+        : d.alive
+          ? `停止请求已发出，但 ${cur.url} 仍可达（pids=${JSON.stringify(d.pids || [])}）；可能进程正在退出，稍后重查。`
+          : `已停止 ComfyUI 服务（终止进程 ${JSON.stringify(d.stopped || [])}）。`;
+      return { content: [{ type: "text", text }], details: { comfyui: { action: "service", op, ...d } } };
+    }
+    throw new Error(`op 必须是 status / start / stop（收到 "${op}"）`);
+  }
+
   // ── 工具注册 ──────────────────────────────────────────────────────────────
   function actionBranches() {
     return [
@@ -1472,6 +1541,14 @@ export default defineApp(async (sdk) => {
         },
       },
       {
+        command: "service",
+        required: [],
+        fields: {
+          op: { type: "string", enum: ["status", "start", "stop"], description: "status=查服务进程状态（默认）；start=拉起本机 ComfyUI 服务（未运行时）；stop=撤下服务（终止 8188 上的进程）" },
+          path: { type: "string", description: "start 可选：指定 ComfyUI 安装根（默认用本机安装探测结果）" },
+        },
+      },
+      {
         command: "upload",
         required: ["path"],
         fields: {
@@ -1490,7 +1567,7 @@ export default defineApp(async (sdk) => {
       description:
         "ComfyUI-Hana：操作本机 ComfyUI（127.0.0.1:8188）的工具（一个 App 一个同名工具，action 选动作）。" +
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
-        "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）。" +
+        "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",
@@ -1547,9 +1624,10 @@ export default defineApp(async (sdk) => {
             case "result": return await actionResult(args, context);
             case "cancel": return await actionCancel(args);
             case "workflows": return await actionWorkflows(args);
+            case "service": return await actionService(args);
             case "upload": return await actionUpload(args);
             default:
-              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload（收到 "${action}"）`);
+              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service（收到 "${action}"）`);
           }
         } catch (e) {
           const text = `comfyui(${action || "?"}) 失败：${msgOf(e)}`;
@@ -1687,8 +1765,59 @@ export default defineApp(async (sdk) => {
           .catch((e) => warn(`relay/start 失败：${msgOf(e)}`));
         return c.json({ ok: true, accepted: true, phase: state.phase }, 202);
       });
+
+      // ── ComfyUI 服务进程（启动 / 停止）──────────────────────────────────
+      // 与上面的 relay/start 是两件事：relay/start 只重启本 App 的「中继」（受管 runtime，
+      // 随 Hana 生命周期）；这里的 start/stop 管的是 8188 上的 ComfyUI 本体，由计划任务拉起，
+      // 独立于 Hana 存活。具体机制见 runtime/comfy-relay.mjs 的「服务进程管理」区。
+      app.post("/comfyui-hana/backend/start", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const path = typeof body.path === "string" && body.path.trim() ? body.path.trim() : null;
+          const { ok, status, data } = await relayJson("/_relay/backend/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(path ? { path } : {}),
+            timeoutMs: 25_000,
+          });
+          if (ok) void refreshSnapshot();
+          const out = data && typeof data === "object" ? data : { ok, status };
+          return c.json(out, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.post("/comfyui-hana/backend/stop", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/backend/stop", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+            timeoutMs: 25_000,
+          });
+          void refreshSnapshot();
+          const out = data && typeof data === "object" ? data : { ok, status };
+          return c.json(out, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.get("/comfyui-hana/backend", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/backend/proc", { timeoutMs: 8_000 });
+          const out = data && typeof data === "object" ? data : { ok, status };
+          return c.json(out, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
     });
-    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-targets|install-target|install-prompt|install-launch|task|relay/start）");
+    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|task|relay/start|backend/start|backend/stop|backend）");
   } catch (e) {
     error(`ctx.routes.register 失败（壳页诊断面不可用，工具面仍可用）：${msgOf(e)}`);
   }

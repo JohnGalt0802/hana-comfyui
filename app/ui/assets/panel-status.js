@@ -40,9 +40,32 @@ function render(st) {
     : "—";
   const q = relay && relay.queue ? relay.queue : null;
   $("p-queue").textContent = q ? `${q.running} 运行 / ${q.pending} 排队` : "—";
-  $("p-note").textContent = boot.note || "";
+
+  // 服务起停按钮：不可达 → 「启动服务」；可达 → 「停止服务」
+  const reachable = !!(backend && backend.reachable);
+  const proc = backend && backend.proc ? backend.proc : null;
+  const startBtn = $("p-start"), stopBtn = $("p-stop");
+  if (!svcBusy) {
+    startBtn.style.display = reachable ? "none" : "";
+    stopBtn.style.display = reachable ? "" : "none";
+    startBtn.disabled = false;
+    stopBtn.disabled = false;
+    const hasInstall = !!(proc && (proc.install || proc.python || proc.mainPy));
+    startBtn.title = hasInstall
+      ? `启动 ComfyUI：${proc.python || proc.mainPy || ""}`
+      : "按本机安装探测结果拉起 ComfyUI（由计划任务以当前用户身份起，独立于 Hana 存活）";
+  }
+
+  const svcBits = [];
+  if (proc) {
+    if (proc.install) svcBits.push(`安装根 ${proc.install}`);
+    if (reachable && Array.isArray(proc.pids) && proc.pids.length) svcBits.push(`监听进程 ${proc.pids.join(", ")}`);
+    if (proc.startedAt) svcBits.push(`本 App 拉起于 ${String(proc.startedAt).replace("T", " ").slice(0, 19)}`);
+  }
+  $("p-note").textContent = [boot.note || "", svcBits.join(" · ")].filter(Boolean).join("\n");
   const errText = (boot.error && boot.error.userText) || st.relayError || (backend && !backend.reachable ? backend.lastError : "");
-  $("p-err").textContent = errText ? `${(boot.error && boot.error.code) || "err"}：${errText}` : "";
+  const procErr = proc && proc.lastError ? `服务：${proc.lastError}` : "";
+  $("p-err").textContent = [errText ? `${(boot.error && boot.error.code) || "err"}：${errText}` : "", procErr].filter(Boolean).join("\n");
 }
 
 async function poll() {
@@ -149,6 +172,60 @@ async function metricsTick() {
   }
 }
 
+// ── 服务起停（启动/停止 8188 上的 ComfyUI 本体）─────────────────────────
+let svcBusy = false;
+
+function setSvcBusy(on, label) {
+  svcBusy = on;
+  const btn = label && label.indexOf("停") === 0 ? $("p-stop") : $("p-start");
+  if (on) { btn.disabled = true; btn.textContent = label || "处理中…"; }
+  else { btn.textContent = btn.id === "p-stop" ? "停止服务" : "启动服务"; void poll(); }
+}
+
+async function startService() {
+  if (svcBusy) return;
+  setSvcBusy(true, "启动中…");
+  let msg = "";
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/backend/start", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    });
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && j.ok !== false) {
+      msg = j.already ? "服务已在运行" : "已请求启动，等待就绪（首次约 30～90 秒）…";
+    } else {
+      msg = "启动失败：" + ((j && j.error) || `HTTP ${r.status}`);
+    }
+  } catch (e) {
+    msg = "启动失败：" + String((e && e.message) || e);
+  } finally {
+    $("p-note").textContent = msg;
+    setSvcBusy(false, "启动服务");
+  }
+}
+
+async function stopService() {
+  if (svcBusy) return;
+  if (!window.confirm("停止 ComfyUI 服务会终止 8188 上的进程，正在跑的任务会中断。继续？")) return;
+  setSvcBusy(true, "停止中…");
+  let msg = "";
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/backend/stop", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    });
+    const j = await r.json().catch(() => null);
+    if (!r.ok) msg = "停止失败：" + ((j && j.error) || `HTTP ${r.status}`);
+    else if (j && j.already) msg = "服务本来就没在运行";
+    else if (j && j.alive) msg = "已发出停止请求，服务仍在响应（可能正在退出，稍后重查）";
+    else msg = `已停止服务（进程 ${JSON.stringify((j && j.stopped) || [])}）`;
+  } catch (e) {
+    msg = "停止失败：" + String((e && e.message) || e);
+  } finally {
+    $("p-note").textContent = msg;
+    setSvcBusy(false, "停止服务");
+  }
+}
+
 // ── 释放显存（POST /comfyui-hana/release → 中继反代后端 /free）──────────────
 let releasing = false;
 async function releaseVram() {
@@ -188,14 +265,16 @@ async function releaseVram() {
 
 // ── 交互 ──────────────────────────────────────────────────────────────────
 $("p-retry").addEventListener("click", async () => {
+  $("p-note").textContent = "已请求重启中继，等待就绪……";
   try {
     await hana.api.fetch("/comfyui-hana/relay/start", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-    $("p-note").textContent = "已请求启动，等待中继就绪……";
   } catch (e) {
-    $("p-note").textContent = "启动请求失败：" + String((e && e.message) || e);
+    $("p-note").textContent = "重启请求失败：" + String((e && e.message) || e);
   }
   setTimeout(() => { void poll(); }, 800);
 });
+$("p-start").addEventListener("click", () => { void startService(); });
+$("p-stop").addEventListener("click", () => { void stopService(); });
 $("m-release").addEventListener("click", () => { void releaseVram(); });
 window.addEventListener("resize", () => { redrawAll(); });
 

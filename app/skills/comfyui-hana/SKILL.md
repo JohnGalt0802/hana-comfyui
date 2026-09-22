@@ -1,6 +1,6 @@
 ---
 name: comfyui-hana
-description: ComfyUI-Hana（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传；环境自举——未安装/未启动时引导 agent 完成安装或启动。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、帮我安装 ComfyUI、帮我启动 ComfyUI、未检测到 ComfyUI 环境。
+description: ComfyUI-Hana（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；工作区左侧面板可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、帮我安装 ComfyUI、未检测到 ComfyUI 环境。
 ---
 
 # ComfyUI-Hana（v0.5）
@@ -11,11 +11,29 @@ description: ComfyUI-Hana（v2 App）——把本机 ComfyUI（127.0.0.1:8188）
 
 受管 runtime 拉起「中继」（`runtime/comfy-relay.mjs`）→ 宿主代理路径提供 HTTP/WS 通道 → 整页工作区嵌入官方前端；`comfyui` 工具经中继操作 8188；每次提交在宿主建一条正式任务（next-step 回执）并有任务卡。
 
+## 启动 / 停止 ComfyUI 服务（首选，别先去开终端）
+
+App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
+
+- 工作区**左侧面板**：「启动服务」/「停止服务」按钮（按当前可达性二选一显示）。
+- 工具：`comfyui(action="service", op="status"|"start"|"stop")`，start 可用 `path` 指定安装根。
+
+机制（2026-09-23 实测，不是推断）：服务由 **Windows 计划任务**（`HanaComfyUI-Backend`）以当前用户身份拉起，
+启动器脚本落在 `app-data/comfyui-hana/logs/backend-launcher.cmd`，服务日志写 `logs/backend.log`。
+这么绕是因为中继进程跑在宿主沙箱的 job 里，直接 spawn 的子进程会随中继退出被回收（detached 也逃不出去）；
+走计划任务则脱离沙箱，**ComfyUI 独立于 Hana 存活**（Hana 重启/退出都不影响它，实测沙箱退出后 8188 继续服务）。
+撤下由中继执行 `taskkill /T /F`（受限令牌下实测可终止）；计划任务只当启动器，不常驻。
+首次启动约 30～90 秒（依赖导入），届时 `status`/面板会自行变绿。
+
+注意区分：面板的**「重启中继」**只重启本 App 的中继（受管 runtime，随 Hana 生命周期），跟 ComfyUI 服务是两件事。
+中继挂了但服务还在跑时，只需重启中继；ComfyUI 没跑时才点「启动服务」。
+
 ## 环境不存在时（未安装 / 未启动）
 
 工作区提示「未检测到 ComfyUI 环境」或用户说“帮我装/启动 ComfyUI”时：
 
-**三步侦察（不要跳）：**
+**首选**：已装但没跑 → 直接 `comfyui(action="service", op="start")`（或让用户点面板按钮），不要手工开终端。
+下面三步侦察用于**启动失败或未安装**时排查：
 1. 服务：`Invoke-RestMethod http://127.0.0.1:8188/system_stats`——失败 = 服务没跑。
 2. 安装探测（只读）——运行本技能包所在 App 的 `runtime/comfy-relay.mjs`（相对本文件：`../../runtime/comfy-relay.mjs`）：
    `node "<本 App 目录>/runtime/comfy-relay.mjs" --probe-env`
@@ -36,10 +54,10 @@ description: ComfyUI-Hana（v2 App）——把本机 ComfyUI（127.0.0.1:8188）
 
 | 面 | 内容 |
 |----|------|
-| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload**（单工具 action 分派） |
+| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service**（单工具 action 分派；service 管 8188 服务进程起停） |
 | 任务桥 | submit → 宿主任务（`delivery:"next-step"`）→ 2s 轮询结算（完成回执含产物路径；失败/中断给原因） |
 | 任务卡 | 每次 submit 返回 `details.card`（进度/队列位/耗时/产物缩略），数据经 `GET /comfyui-hana/task?id=` |
-| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` |
+| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` |
 | 中继增强 | 订阅 8188 `/ws` 做进度事件缓存；`/_relay/history` 裁剪历史；日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`） |
 | 卡片 | 「ComfyUI 工作区」整页卡（含状态面板）、「ComfyUI 任务卡」 |
 
@@ -58,6 +76,7 @@ comfyui(action="...", ...)
 | `cancel` | — | `promptId`/`taskId` 定向取消（排队中→删除；执行中→定向中断）；`all:true` 才全清 | 模式说明 |
 | `workflows` | — | 无参列 userdata/workflows；`name` 读取节点结构摘要（id/type/title） | 结构清单 |
 | `upload` | `path` | 上传本机图片到 input（图生图） | 存储名（供 inputs 引用） |
+| `service` | — | ComfyUI 服务进程起停：`op=status`（默认）查状态/监听 PID/安装根/日志路径；`op=start` 拉起服务（可带 `path` 指定安装根）；`op=stop` 撤下服务（taskkill 8188 上的进程） | `details.comfyui.{reachable,proc,install,python,mainPy,logFile}` |
 
 ### submit 的工作流三形态
 
@@ -121,12 +140,16 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
 | 任务卡缩略图不显示 | 卡的凭据段 | 预览走 `_surface` 凭据路径；老卡或非卡环境可能 403 |
 | `result` 说"尚未完成" | 历史未落 | 等几秒重试，或先 `query` 看状态 |
 | 提交后没有自动回执 | `query` 的“投递”行 | 桌面会话：`published` = 等下一个输入点送达；子代理会话：永不自动送达，改用 query/result 主动取 |
+| 点了「启动服务」没反应 | `comfyui(action="service", op="status")` 的 `lastError` + `logs/backend.log` | 常见：无 venv python / 计划任务创建失败（启动器路径含空格必须带引号，已在代码里处理）/ 端口 8188 被别的进程占 |
+| 服务起不来但日志为空 | 计划任务 `HanaComfyUI-Backend` 的 Last Result | 非 0 就是任务层失败（如 0x800704C1=启动器路径解析失败）；任务只作启动器，手动 `schtasks /run /tn HanaComfyUI-Backend` 等价 |
 | `cancel all:true` 慎重 | 会清空整个队列 | 默认只取消指定 prompt |
 | 工作区打不开 | `boot-state` 的 note | 见 M0 记录 §8 的宿主段排错 |
 
 ## 数据与日志
 
 - 中继日志：**落盘** `app-data/comfyui-hana/logs/relay.log`（>5MiB 滚动到 `relay.log.1`）+ 宿主受管 runtime stdout。
+- 服务本体日志：`app-data/comfyui-hana/logs/backend.log`（启动器重定向；由计划任务拉起的 ComfyUI 的 stdout/stderr）。
+- 服务起停状态：`app-data/comfyui-hana/logs/backend-state.json`（上次由谁拉起、安装根、启动时间，跨中继重启保留）。
 - 私有运行时配置：`app-data/comfyui-hana/integration/relay-*.json`（0600，中继读取后自删；含 controlKey，管理端点 `/_relay/fs/*`、`/_relay/upload` 需该密钥）。
 - 产物定位：ComfyUI 安装根的 `output\<subfolder>\<filename>`（安装根由本机环境探测自动识别，不硬编码；经 `/_relay/fs/stat` 验证存在）。
 - 端口随机（38000-52000）、仅绑定 127.0.0.1。

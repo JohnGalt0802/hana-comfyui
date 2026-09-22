@@ -4,12 +4,12 @@
 
 ## 当前状态
 
-**M0–M2 完成（含 M2.5 能力扩容、M2.6 回执诊断与修复），app 可用**；剩余两项人工验收（见 `docs/待办与验收清单.md`）：
+**M0–M2 完成（含 M2.5 能力扩容、M2.6 回执诊断与修复），M3–M9 相继完成，app 可用**；剩余人工验收见 `docs/待办与验收清单.md`：
 
 - 界面：整页工作区（`ui/workspace.html`）嵌入 ComfyUI 官方前端——**零改造**，前端按相对寻址经宿主代理路径加载（HTTP/WS 全通，宿主段已实测）
-- 能力：`comfyui` 单工具 7 动作——`status / submit / query / result / cancel / workflows / upload`
+- 能力：`comfyui` 单工具 8 动作——`status / submit / query / result / cancel / workflows / upload / service`
 - 任务：每次提交 = 宿主正式任务（`ctx.tasks`）+ 内联任务卡（`details.card`）+ **next-step 回执**（桌面会话；子代理会话受宿主限制不会自动回执，工具文案会如实标注）
-- 服务形态：**attach 模式**——连接外部运行中的 ComfyUI，不托管其生命周期（managed 模式列 M4）
+- 服务形态：**attach 模式**——连接外部运行中的 ComfyUI；M9 起左侧面板可**一键启动 / 停止**服务（计划任务拉起，独立于 Hana 存活；不托管其自启/自愈）
 
 ## 目录结构
 
@@ -22,6 +22,10 @@ D:\HanakoWorks\ComfyUI\
 │   ├── M0-验证记录.md        # 本地段 + 宿主段 V1–V7
 │   ├── M2-验证记录.md        # M2 开发/扩容/回执诊断（§9–§10）
 │   ├── M3-收尾记录.md        # 日志滚动 / cancel 实测 / 仓库初始化
+│   ├── M6-环境引导记录.md     # 环境探测与引导（v0.3）
+│   ├── M7-状态面板记录.md     # GPU/CPU/内存图表 + 释放显存（v0.4）
+│   ├── M8-安装引导记录.md     # 选位置安装弹窗（v0.5）
+│   ├── M9-服务起停记录.md     # 启动/停止 ComfyUI 服务 + 「重启中继」正名（v0.6）
 │   ├── 待办与验收清单.md     # ← 当前待办与人工验收项
 │   └── m0-results\ m2-results\   # 原始证据（输出摘要、截图）
 ├── app\                     # ★ v2 App 源码（开发仓；宿主副本 = %HANA_HOME%\apps\comfyui-hana\）
@@ -45,7 +49,7 @@ D:\HanakoWorks\ComfyUI\
 ```
 app\
 ├── manifest.json            # v2 清单：6 能力词（runtime.execute/local-machine/network + tools.expose-to-model + tasks.manage + session.start-turn）
-├── index.js                 # 入口：受管 runtime 控制器 + 工具面(7动作) + 任务桥 + 路由面
+├── index.js                 # 入口：受管 runtime 控制器 + 工具面(8动作) + 任务桥 + 路由面
 ├── runtime\comfy-relay.mjs  # 中继（Node 单文件零依赖）：HTTP/WS 反代 + 进度事件缓存 + fs/upload + 日志落盘
 ├── ui\                      # workspace（整页工作区）/ panel（状态面板）/ settings / task（任务卡）
 ├── skills\comfyui-hana\     # 随包技能（工具手册 + 排错表）

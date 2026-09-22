@@ -38,8 +38,8 @@
 import http from "node:http";
 import net from "node:net";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { execFile, spawnSync } from "node:child_process";
 import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 
@@ -619,6 +619,221 @@ function metricsPayload() {
   };
 }
 
+// ── ComfyUI 服务进程管理（启动 / 停止）─────────────────────────────────────
+// 为什么要绕「计划任务」这一圈（2026-09-23 实测，非推断）：
+//   中继自身跑在宿主的受限令牌 + job object 里（hana-win-sandbox --normal-token-job）。
+//   中继直接 spawn 的子进程即使 detached + unref，也会在中继退出时被 job 连带回收
+//   （实测：沙箱父进程退出后子进程消失）。宿主一重启 / App 一重载，正在跑的 ComfyUI 就没了。
+//   改由 Task Scheduler 以当前用户身份拉起：天然脱离沙箱与 job，Hana 退出后服务仍在
+//   （实测：沙箱退出后 8188 继续服务，ComfyUI 0.37.0，45s 就绪）。
+// 撤下：受限令牌下 taskkill 能终止该进程（实测成功）；计划任务只当启动器，不常驻。
+// 生命周期口径：服务一旦由本入口拉起就独立于 Hana 存活，中继重启不影响它；
+//   只有「停止服务」入口（或外部手段）能把它撤下。
+const BACKEND_TASK_NAME = "HanaComfyUI-Backend";
+const LAUNCHER_NAME = "backend-launcher.cmd";
+const PID_CACHE_MS = 5_000;
+const backendProc = {
+  startedAt: null,
+  install: null,
+  python: null,
+  mainPy: null,
+  launcher: null,
+  logFile: null,
+  lastError: null,
+  lastStop: null,
+};
+let pidCache = { at: 0, pids: [] };
+
+function backendStatePath() {
+  const dir = logFilePath ? dirname(logFilePath) : process.cwd();
+  return join(dir, "backend-state.json");
+}
+
+function loadBackendState() {
+  try {
+    const raw = JSON.parse(readFileSync(backendStatePath(), "utf8"));
+    for (const k of ["startedAt", "install", "python", "mainPy", "launcher", "logFile"]) {
+      if (raw && typeof raw[k] === "string" && raw[k]) backendProc[k] = raw[k];
+    }
+  } catch { /* 首次运行没有状态文件，正常 */ }
+}
+
+function saveBackendState() {
+  try {
+    mkdirSync(dirname(backendStatePath()), { recursive: true });
+    writeFileSync(backendStatePath(), JSON.stringify({ ...backendProc, savedAt: new Date().toISOString() }, null, 2), "utf8");
+  } catch (e) {
+    warn(`backend-state 写入失败：${(e && e.message) || e}`);
+  }
+}
+
+function runExe(exe, args, timeoutMs = 20_000) {
+  try {
+    const r = spawnSync(exe, args, { encoding: "utf8", timeout: timeoutMs, windowsHide: true, env: CHILD_ENV });
+    return {
+      code: r.status === null || r.status === undefined ? -1 : r.status,
+      stdout: String(r.stdout || "").trim(),
+      stderr: String(r.stderr || "").trim(),
+      error: r.error ? String(r.error.message) : null,
+    };
+  } catch (e) {
+    return { code: -1, stdout: "", stderr: "", error: String((e && e.message) || e) };
+  }
+}
+
+// 8188 上正在监听的进程（撤下按钮的靶子；按端口找，不依赖进程名，兼容外部启动方式）
+function listeningPids() {
+  if (Date.now() - pidCache.at < PID_CACHE_MS) return pidCache.pids;
+  const r = runExe("netstat.exe", ["-ano", "-p", "TCP"], 15_000);
+  const pids = new Set();
+  for (const line of String(r.stdout || "").split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 5 || parts[0].toUpperCase() !== "TCP") continue;
+    if (!parts[1].endsWith(`:${backend.port}`)) continue;
+    if (String(parts[3]).toUpperCase() !== "LISTENING") continue;
+    const pid = Number(parts[4]);
+    if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+  }
+  pidCache = { at: Date.now(), pids: [...pids] };
+  return pidCache.pids;
+}
+
+// 解析可启动目标：安装根 → venv python → main.py。策略与 probeEnv 同一套指纹，不硬编码路径。
+function resolveLaunchTarget(overridePath) {
+  const cands = [];
+  const push = (p) => { if (p && !cands.includes(p)) cands.push(p); };
+  if (overridePath) push(overridePath);
+  for (const r of customRoots) push(r);
+  const env = probeEnv(true);
+  for (const i of env.installs || []) push(i.path);
+
+  const tried = [];
+  for (const root of cands) {
+    const hit = detectInstall(root);
+    if (!hit || !hit.mainPy) continue;
+    const mainDir = dirname(hit.mainPy);
+    const outer = dirname(mainDir);
+    const pyCands = [];
+    if (hit.kind === "portable") {
+      pyCands.push(join(outer, "python_embeded", "python.exe"), join(mainDir, "python_embeded", "python.exe"));
+    }
+    for (const r of [outer, mainDir]) {
+      pyCands.push(join(r, "venv", "Scripts", "python.exe"), join(r, ".venv", "Scripts", "python.exe"));
+    }
+    for (const p of pyCands) {
+      if (existsSync(p)) return { ok: true, install: hit, python: p, mainPy: hit.mainPy, cwd: mainDir };
+      tried.push(p);
+    }
+  }
+  return { ok: false, tried, roots: cands };
+}
+
+async function startBackendService(overridePath) {
+  if (backend.reachable) return { ok: true, already: true, reachable: true, url: `http://${backend.host}:${backend.port}` };
+  const t = resolveLaunchTarget(overridePath);
+  if (!t.ok) {
+    backendProc.lastError = "未找到可启动的 ComfyUI 安装（缺 main.py 或缺 venv python）";
+    saveBackendState();
+    return { ok: false, error: backendProc.lastError, tried: t.tried, roots: t.roots };
+  }
+
+  const dir = logFilePath ? dirname(logFilePath) : process.cwd();
+  const launcher = join(dir, LAUNCHER_NAME);
+  const logFile = join(dir, "backend.log");
+  const script = [
+    "@echo off",
+    "chcp 65001 >nul",
+    `cd /d "${t.cwd}"`,
+    `"${t.python}" main.py --listen ${backend.host} --port ${backend.port} >> "${logFile}" 2>&1`,
+    "",
+  ].join("\r\n");
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(launcher, script, "utf8");
+  } catch (e) {
+    backendProc.lastError = `启动器写入失败：${(e && e.message) || e}`;
+    saveBackendState();
+    return { ok: false, error: backendProc.lastError };
+  }
+
+  runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000); // 任务不存在会非零退出，忽略
+  // /tr 必须显式带引号：启动器路径落在用户目录（含空格，如 "John Galt"）时，schtasks 存进
+  // 任务 XML 的命令行不会自己加引号，任务会以 0x800704C1（1217，找不到可执行文件）失败。
+  // 2026-09-23 实测：不加引号 → Last Result -2147024703；加引号 → 任务 Running、服务起得来。
+  const cr = runExe("schtasks.exe", ["/create", "/tn", BACKEND_TASK_NAME, "/tr", `"${launcher}"`, "/sc", "once", "/st", "00:00", "/f"], 20_000);
+  if (cr.code !== 0) {
+    backendProc.lastError = `计划任务创建失败：${cr.stderr || cr.error || `exit ${cr.code}`}`;
+    saveBackendState();
+    logErr(`启动 ComfyUI 服务失败：${backendProc.lastError}`);
+    return { ok: false, error: backendProc.lastError, launcher };
+  }
+  const rr = runExe("schtasks.exe", ["/run", "/tn", BACKEND_TASK_NAME], 20_000);
+  if (rr.code !== 0) {
+    backendProc.lastError = `计划任务启动失败：${rr.stderr || rr.error || `exit ${rr.code}`}`;
+    saveBackendState();
+    logErr(`启动 ComfyUI 服务失败：${backendProc.lastError}`);
+    return { ok: false, error: backendProc.lastError, launcher };
+  }
+
+  backendProc.startedAt = new Date().toISOString();
+  backendProc.install = t.install.path;
+  backendProc.python = t.python;
+  backendProc.mainPy = t.mainPy;
+  backendProc.launcher = launcher;
+  backendProc.logFile = logFile;
+  backendProc.lastError = null;
+  saveBackendState();
+  pidCache = { at: 0, pids: [] };
+  log(`请求启动 ComfyUI 服务：${t.python} main.py（cwd=${t.cwd}，日志 ${logFile}）`);
+  return {
+    ok: true,
+    accepted: true,
+    install: t.install.path,
+    python: t.python,
+    mainPy: t.mainPy,
+    cwd: t.cwd,
+    launcher,
+    logFile,
+    url: `http://${backend.host}:${backend.port}`,
+  };
+}
+
+async function stopBackendService() {
+  pidCache = { at: 0, pids: [] }; // 强制重查：不强依赖「可达」判断（端口有监听但 HTTP 不响时也要能撤）
+  const pids = listeningPids();
+  const stopped = [];
+  const failed = [];
+  for (const pid of pids) {
+    const r = runExe("taskkill.exe", ["/PID", String(pid), "/T", "/F"], 20_000);
+    if (r.code === 0) stopped.push(pid);
+    else failed.push({ pid, error: r.stderr || r.error || `exit ${r.code}` });
+  }
+  runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000); // 顺手清理启动器任务
+  await new Promise((r) => setTimeout(r, 800));
+  await probeBackend();
+  pidCache = { at: 0, pids: [] };
+  backendProc.lastStop = { at: new Date().toISOString(), pids, stopped, alive: backend.reachable };
+  backendProc.lastError = failed.length ? `部分进程未能终止：${JSON.stringify(failed)}` : null;
+  saveBackendState();
+  log(`停止 ComfyUI 服务：pids=${JSON.stringify(pids)} stopped=${JSON.stringify(stopped)} 仍可达=${backend.reachable}`);
+  return { ok: !backend.reachable, pids, stopped, failed, alive: backend.reachable, already: pids.length === 0 };
+}
+
+function backendProcPayload() {
+  return {
+    taskName: BACKEND_TASK_NAME,
+    startedAt: backendProc.startedAt,
+    install: backendProc.install,
+    python: backendProc.python,
+    mainPy: backendProc.mainPy,
+    launcher: backendProc.launcher,
+    logFile: backendProc.logFile,
+    pids: backend.reachable ? listeningPids() : [],
+    lastError: backendProc.lastError,
+    lastStop: backendProc.lastStop,
+  };
+}
+
 function startMetricsSampler() {
   sampleCpu(); // 建立首帧基线（下一次采样才有 usagePct）
   refreshGpu();
@@ -981,6 +1196,7 @@ function statusPayload() {
       checkedAt: backend.checkedAt ? new Date(backend.checkedAt).toISOString() : null,
       lastError: backend.lastError,
       system: backend.system,
+      proc: backendProcPayload(),
     },
     queue: queueInfo,
     events: {
@@ -1430,6 +1646,36 @@ const server = http.createServer((req, res) => {
     jsonOut(res, 405, { error: "method not allowed" }, req.method);
     return;
   }
+  if (pathOnly === "/_relay/backend/start" || pathOnly === "/_relay/backend/stop") {
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    if (!controlOk(req)) {
+      jsonOut(res, 403, { error: "comfy-relay: control key required" });
+      return;
+    }
+    void (async () => {
+      try {
+        const body = await readBodyJson(req).catch(() => ({}));
+        const out = pathOnly.endsWith("/start")
+          ? await startBackendService(typeof body.path === "string" ? body.path.trim() : null)
+          : await stopBackendService();
+        jsonOut(res, out.ok ? 200 : 502, out);
+      } catch (e) {
+        jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });
+      }
+    })();
+    return;
+  }
+  if (pathOnly === "/_relay/backend/proc") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    jsonOut(res, 200, { ok: true, reachable: backend.reachable, proc: backendProcPayload() }, req.method);
+    return;
+  }
   if (pathOnly === "/_relay/prompts") {
     if (req.method !== "GET" && req.method !== "HEAD") {
       jsonOut(res, 405, { error: "method not allowed" }, req.method);
@@ -1543,6 +1789,7 @@ async function main() {
   if (config.logFile) {
     if (initLogFile(config.logFile)) log(`日志落盘：${config.logFile}`);
   }
+  loadBackendState(); // 服务进程状态（上次由哪个入口拉起、日志位置）跨中继重启保留
   if (!config.controlKey && config.mode === "managed") {
     warn("受管模式未配置 controlKey：/_relay 管理端点将开放（应由 App 配置）");
   }

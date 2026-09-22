@@ -350,13 +350,6 @@ async function copyText(text) {
   }
 }
 
-// 顶栏按钮上的复制反馈
-async function copyGuide(text) {
-  const ok = await copyText(text);
-  els.barAction.textContent = ok ? "已复制 ✓" : "复制失败";
-  setTimeout(() => { els.barAction.textContent = "复制引导语"; }, 2000);
-}
-
 // ── 安装引导弹窗（未检测到 ComfyUI 时）─────────────────────────────────────
 // 流程：step1 选方式（助手装 / 自己装）→ step2 选位置 + 动作（直接发起 / 复制指令）→ step3 完成
 const GUIDE_SEEN_KEY = "comfyui-hana.install-guide.seen";
@@ -522,6 +515,25 @@ async function postRetryStart() {
   const r = await hana.api.fetch("/comfyui-hana/relay/start", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   return r.json().catch(() => ({}));
 }
+// 启动/停止 8188 上的 ComfyUI 本体（与重启中继是两件事）
+async function postBackendStart() {
+  const r = await hana.api.fetch("/comfyui-hana/backend/start", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  return r.json().catch(() => ({}));
+}
+async function startBackend() {
+  setBar("info", "已请求启动 ComfyUI 服务，等待就绪（首次约 30～90 秒）…", []);
+  try {
+    const j = await postBackendStart();
+    if (j && j.ok === false) {
+      setBar("warn", `启动失败：${j.error || "未知原因"}`, [{ label: "重启中继", fn: () => { void statusTick(); void postRetryStart().catch(() => {}); } }]);
+      return;
+    }
+  } catch (e) {
+    setBar("warn", `启动失败：${String((e && e.message) || e)}`, []);
+    return;
+  }
+  setTimeout(() => { void statusTick(); }, 1500);
+}
 
 // ── iframe 目标构造（两种形式；auto = sdk → 凭据路径 → raw 逐级回落）──────
 // 说明（宿主段实测发现并修复，2026-09-21）：
@@ -651,16 +663,16 @@ async function statusTick() {
     if (!reachable) {
       const env = st.relay && st.relay.env ? st.relay.env : null;
       const hit = env && Array.isArray(env.installs) && env.installs.length ? env.installs[0] : null;
-      const retry = { label: "重试", fn: () => { void statusTick(); void postRetryStart().catch(() => {}); } };
+      const retryRelay = { label: "重启中继", fn: () => { void statusTick(); void postRetryStart().catch(() => {}); } };
       if (hit) {
-        setBar("warn", `ComfyUI 服务未运行（已检测到安装：${hit.path}）。启动后可自动恢复。`, [
-          { label: "复制启动语", fn: () => copyGuide(`帮我启动 ComfyUI（安装位置：${hit.path}）`) },
-          retry,
+        setBar("warn", `ComfyUI 服务未运行（已检测到安装：${hit.path}）。`, [
+          { label: "启动服务", fn: () => { void startBackend(); } },
+          retryRelay,
         ]);
       } else {
         setBar("warn", "未检测到 ComfyUI 环境。", [
           { label: "安装引导", fn: () => { guideShow(1); } },
-          retry,
+          retryRelay,
         ]);
         // 首次检测到「未安装」自动弹引导（每浏览器一次；关掉后可从顶栏重开）
         if (env && env.found === false && !guideSeen() && !guideOpen) {

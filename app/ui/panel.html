@@ -41,6 +41,15 @@ button:hover { background: var(--accent); color: #fff; }
 }
 .gpu-release:hover { background: var(--bad); border-color: var(--bad); color: #fff; }
 .gpu-release.loading { opacity: .55; cursor: default; }
+/* ── 服务起停按钮组（启动 / 停止 ComfyUI 本体，不是中继）── */
+.btn-row { display: flex; gap: 6px; }
+.btn-row button { flex: 1; }
+button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+button.primary:hover { filter: brightness(1.08); background: var(--accent); color: #fff; }
+button.danger { color: var(--bad); border-color: var(--bad); }
+button.danger:hover { background: var(--bad); border-color: var(--bad); color: #fff; }
+button[disabled] { opacity: .5; cursor: default; }
+button[disabled]:hover { background: var(--bg-card); color: var(--accent); }
 .chart-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .chart-meta { width: 92px; flex-shrink: 0; }
 .chart-label { font-size: 10.5px; color: var(--text-muted); margin-bottom: 1px; }
@@ -66,7 +75,11 @@ button:hover { background: var(--accent); color: #fff; }
   <div class="chart-row"><div class="chart-meta"><div class="chart-label">内存</div><div class="chart-val" id="v-ram">—</div></div><canvas class="chart" id="c-ram"></canvas></div>
   <div class="note" id="m-note"></div>
 
-  <button id="p-retry" style="margin-top:10px">重试启动</button>
+  <div class="btn-row" style="margin-top:10px">
+    <button id="p-start" class="primary" title="按本机探测到的安装根拉起 ComfyUI（由计划任务以当前用户身份起，独立于 Hana 存活）">启动服务</button>
+    <button id="p-stop" class="danger" title="终止 8188 上的 ComfyUI 进程（正在跑的任务会中断）">停止服务</button>
+  </div>
+  <button id="p-retry" style="margin-top:6px" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>
   <div class="note" id="p-note"></div>
   <div class="err" id="p-err"></div>
   <script type="module" src="./assets/panel-status.js"></script>

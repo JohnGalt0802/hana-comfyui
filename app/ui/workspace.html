@@ -115,7 +115,7 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
         <div class="row"><span class="spinner"></span><span id="boot-note">正在读取状态……</span></div>
         <div class="note meta" id="boot-meta"></div>
         <div class="row">
-          <button class="primary" id="btn-retry">重试启动</button>
+          <button class="primary" id="btn-retry" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不启动 ComfyUI 服务本身">重启中继</button>
           <button id="btn-reload-boot">刷新状态</button>
           <span class="meta">连接方式</span>
           <select id="sel-mode">
@@ -135,7 +135,7 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
         <div class="note" id="err-note">—</div>
         <div class="note meta" id="err-meta"></div>
         <div class="row">
-          <button class="primary" id="btn-retry2">重试启动</button>
+          <button class="primary" id="btn-retry2" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不启动 ComfyUI 服务本身">重启中继</button>
           <button id="btn-reload2">刷新页面</button>
           <span class="meta">连接方式</span>
           <select id="sel-mode2">
