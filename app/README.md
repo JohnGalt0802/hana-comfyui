@@ -1,4 +1,4 @@
-# ComfyUI-Hana（v2 App，开发仓）· v0.4
+# ComfyUI-Hana（v2 App，开发仓）· v0.5
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
@@ -17,6 +17,10 @@
 - 状态面板（v0.4 新增）：整页工作区左侧栏（functionPanel）带 GPU/CPU/内存实时图表（任务管理器风格曲线）
   与「释放显存」按钮（`POST /comfyui-hana/release` → 中继反代后端 `/free`）；指标经中继 `/_relay/metrics`
   （nvidia-smi 4s 缓存 + os 模块 CPU/内存采样；零新增能力）
+- 安装引导（v0.5 新增）：检测到「未装 ComfyUI」时弹窗——选安装位置（中继盘位探测给候选 + 剩余空间 + 推荐）/ 自定义目录（宿主目录选择器，写回配置）；
+  两个动作：直接发起安装（`session:create` + `session:send` 在默认工作区建会话投递提示词）/ 复制安装指令；
+  路由 `install-targets|install-target|install-prompt|install-launch`；中继新增 `/_relay/drives`、`/_relay/custom-roots`；
+  能力新增 `app/resources.read`（目录选择器用）
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok
 

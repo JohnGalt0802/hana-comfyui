@@ -17,11 +17,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { defineApp } from "./sdk/app-contract/server-client.js";
 import { createHash, randomInt, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const APP_ID = "comfyui-hana";
-const APP_VERSION = "0.4.0";
+const APP_VERSION = "0.5.0";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
@@ -369,6 +369,65 @@ export default defineApp(async (sdk) => {
     return { status: res.status, ok: res.ok, data };
   }
 
+  // ── 安装位置（引导弹窗用）────────────────────────────────────────────────
+  // 自定义安装位置持久化在 app-data，并推给中继（probeEnv 优先检查它）——
+  // 这样即使用户选了非常规目录，装完也会被自动发现。
+  const installTargetFile = join(dataDir, "install-target.json");
+
+  function readInstallTarget() {
+    try {
+      const raw = JSON.parse(readFileSync(installTargetFile, "utf8"));
+      return { path: raw && typeof raw.path === "string" && raw.path.trim() ? raw.path.trim() : null };
+    } catch { return { path: null }; }
+  }
+
+  function writeInstallTarget(path) {
+    try {
+      writeFileSync(installTargetFile, JSON.stringify({ path: path || null, at: new Date().toISOString() }, null, 2), { mode: 0o600 });
+      return true;
+    } catch (e) {
+      warn(`install-target 写入失败：${msgOf(e)}`);
+      return false;
+    }
+  }
+
+  let lastRelayPid = 0;
+  async function syncCustomRoots(force = false) {
+    if (!relayReady()) return;
+    const snap = state.snapshot;
+    const pid = (snap && snap.relay && snap.relay.relay && snap.relay.relay.pid) || 0;
+    if (!force && pid && pid === lastRelayPid) return; // 同一中继实例不重复推
+    const { path } = readInstallTarget();
+    try {
+      await relayJson("/_relay/custom-roots", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ roots: path ? [path] : [] }),
+        timeoutMs: 6_000,
+      });
+      lastRelayPid = pid || lastRelayPid;
+    } catch (e) {
+      warn(`custom-roots 同步失败：${msgOf(e)}`);
+    }
+  }
+
+  // 安装提示词模板（后端单点维护；前端“复制指令”也从这里取）
+  function buildInstallPrompt(targetPath) {
+    return [
+      "请帮我安装 ComfyUI（供 ComfyUI-Hana 使用）。",
+      "",
+      `安装位置（已确认，请装到这里）：${targetPath}`,
+      "",
+      "执行要求：",
+      "1. 读取 comfyui-hana 技能目录下的 INSTALL.md，按 Windows 主线步骤执行；",
+      `2. 目录约定：仓库放在 ${targetPath}\\ComfyUI，Python 环境放 ${targetPath}\\venv；`,
+      "3. 安装完成后启动服务（127.0.0.1:8188）并验证 /system_stats 返回 200；",
+      "4. 遇到必须由用户决定的事先询问，其余按手册自主执行；",
+      "5. 每完成一个阶段（克隆完 / 依赖装完 / 服务起来）简短汇报一次；",
+      "6. 完成后回报：安装路径、ComfyUI 版本、服务状态。",
+    ].join("\n");
+  }
+
   // ── 状态快照轮询（1.5s）──────────────────────────────────────────────────
   function startStatusPolling() {
     if (state.statusTimer || !state.runtimeId) return;
@@ -416,6 +475,7 @@ export default defineApp(async (sdk) => {
       }
     }
     state.snapshot = { at: Date.now(), relay: relay || null, error: lastErrText };
+    void syncCustomRoots(); // 中继重启（pid 变化）时自动重推自定义安装位置
 
     if (!relay && state.phase === "ready") {
       try {
@@ -1544,6 +1604,62 @@ export default defineApp(async (sdk) => {
         }
       });
 
+      // 安装位置候选（盘位探测 + 当前自定义位置）
+      app.get("/comfyui-hana/install-targets", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/drives", { timeoutMs: 8_000 });
+          const base = ok && data && typeof data === "object" ? data : { ok: false, error: `relay HTTP ${status}` };
+          return c.json({ ...base, custom: readInstallTarget().path }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      // 设置 / 清除自定义安装位置（持久化 + 立即推给中继）
+      app.post("/comfyui-hana/install-target", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const raw = typeof body.path === "string" ? body.path.trim() : "";
+          if (raw && !/^[A-Za-z]:[\\/]/.test(raw) && !raw.startsWith("/")) {
+            return c.json({ ok: false, error: "需要绝对路径（如 D:\\ComfyUI）" }, 400);
+          }
+          if (!writeInstallTarget(raw || null)) return c.json({ ok: false, error: "写入失败" }, 500);
+          await syncCustomRoots(true);
+          return c.json({ ok: true, custom: raw || null });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      // 安装提示词（供前端「复制安装指令」；模板在后端单点维护）
+      app.get("/comfyui-hana/install-prompt", (c) => {
+        const path = String(c.req.query("path") || "").trim();
+        if (!path) return c.json({ ok: false, error: "需要 ?path=<安装位置>" }, 400);
+        return c.json({ ok: true, path, prompt: buildInstallPrompt(path) });
+      });
+
+      // 直接发起安装：在默认工作区 / 默认 agent 下建会话并投递安装提示词
+      app.post("/comfyui-hana/install-launch", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const path = typeof body.path === "string" ? body.path.trim() : "";
+          if (!path) return c.json({ ok: false, error: "缺少 path" }, 400);
+          writeInstallTarget(path); // 记住位置：装完能被自动发现
+          await syncCustomRoots(true);
+          const prompt = buildInstallPrompt(path);
+          const created = await sdk.sessions.create({});
+          const sessionId = (created && (created.sessionId || (created.sessionRef && created.sessionRef.sessionId))) || null;
+          if (!sessionId) return c.json({ ok: false, error: "会话创建返回异常", created }, 502);
+          await sdk.sessions.send({ sessionId, text: prompt });
+          log(`安装会话已创建 | sessionId=${sessionId} | target=${path}`);
+          return c.json({ ok: true, sessionId, sessionPath: created.sessionPath || null, path });
+        } catch (e) {
+          error(`install-launch 失败：${msgOf(e)}`);
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
       app.get("/comfyui-hana/task", async (c) => {
         try {
           const id = String(c.req.query("id") || "").trim();
@@ -1572,7 +1688,7 @@ export default defineApp(async (sdk) => {
         return c.json({ ok: true, accepted: true, phase: state.phase }, 202);
       });
     });
-    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|task|relay/start）");
+    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-targets|install-target|install-prompt|install-launch|task|relay/start）");
   } catch (e) {
     error(`ctx.routes.register 失败（壳页诊断面不可用，工具面仍可用）：${msgOf(e)}`);
   }

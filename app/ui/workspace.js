@@ -335,21 +335,176 @@ function setBar(kind, text, actions = []) {
   });
 }
 
-// 复制引导语：优先 clipboard API，旧环境回落 execCommand；按钮上给 2s 反馈
-async function copyGuide(text) {
-  let ok = false;
-  try { await navigator.clipboard.writeText(text); ok = true; }
+// 复制：优先 clipboard API，旧环境回落 execCommand
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; }
   catch {
     try {
       const ta = document.createElement("textarea");
       ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
       document.body.appendChild(ta); ta.select();
-      ok = document.execCommand("copy");
+      const ok = document.execCommand("copy");
       ta.remove();
-    } catch { ok = false; }
+      return ok;
+    } catch { return false; }
   }
+}
+
+// 顶栏按钮上的复制反馈
+async function copyGuide(text) {
+  const ok = await copyText(text);
   els.barAction.textContent = ok ? "已复制 ✓" : "复制失败";
   setTimeout(() => { els.barAction.textContent = "复制引导语"; }, 2000);
+}
+
+// ── 安装引导弹窗（未检测到 ComfyUI 时）─────────────────────────────────────
+// 流程：step1 选方式（助手装 / 自己装）→ step2 选位置 + 动作（直接发起 / 复制指令）→ step3 完成
+const GUIDE_SEEN_KEY = "comfyui-hana.install-guide.seen";
+let guideOpen = false;
+let guideSelected = null;
+let guideCustomPath = null;
+
+function guideSeen() { try { return localStorage.getItem(GUIDE_SEEN_KEY) === "1"; } catch { return false; } }
+function markGuideSeen() { try { localStorage.setItem(GUIDE_SEEN_KEY, "1"); } catch { /* 忽略 */ } }
+
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function guideShow(step) {
+  $("guide-mask").classList.add("show");
+  guideOpen = true;
+  $("guide-step1").hidden = step !== 1;
+  $("guide-step2").hidden = step !== 2;
+  $("guide-done").hidden = step !== 3;
+}
+function guideHide() {
+  $("guide-mask").classList.remove("show");
+  guideOpen = false;
+}
+function guideDone(title, noteText) {
+  $("g-done-title").textContent = title;
+  $("g-done-note").textContent = noteText;
+  guideShow(3);
+}
+function guideNote(text) {
+  const el = $("g-note");
+  if (el) el.textContent = text || "";
+}
+
+function renderTargets(j) {
+  const box = $("g-targets");
+  const list = Array.isArray(j && j.targets) ? j.targets.slice() : [];
+  const custom = (j && j.custom) || guideCustomPath;
+  if (custom && !list.some((t) => t.path === custom)) {
+    list.unshift({ path: custom, label: "自定义", freeGB: null, custom: true, recommended: true });
+  }
+  if (!list.length) {
+    box.innerHTML = '<div class="sub" style="margin:0">未能读取磁盘信息；可点下方「自定义目录…」手动指定。</div>';
+  } else {
+    const anyRec = list.some((t) => t.recommended);
+    box.innerHTML = list.map((t) => {
+      const meta = [
+        t.freeGB != null ? `剩余 ${t.freeGB} GB` : "",
+        t.isSystem ? "系统盘" : "",
+        t.exists ? "已存在" : "",
+        t.recommended ? "<b>推荐</b>" : "",
+      ].filter(Boolean).join(" · ");
+      const checked = t.recommended || (!anyRec && t === list[0]);
+      return `<label class="tgt ${t.recommended ? "rec" : ""}"><input type="radio" name="g-tgt" value="${escHtml(t.path)}" ${checked ? "checked" : ""}>
+
+      <span class="p">${escHtml(t.path)}</span><span class="m">${meta}</span></label>`;
+    }).join("");
+  }
+  box.insertAdjacentHTML("beforeend", '<button class="tgt-custom" id="g-pick">＋ 自定义目录…</button>');
+  box.querySelectorAll('input[name="g-tgt"]').forEach((el) => {
+    el.addEventListener("change", () => { guideSelected = el.value; });
+  });
+  const checked = box.querySelector('input[name="g-tgt"]:checked');
+  guideSelected = checked ? checked.value : null;
+  const pick = $("g-pick");
+  if (pick) pick.addEventListener("click", () => { void pickCustomDir(); });
+}
+
+async function loadTargets() {
+  const box = $("g-targets");
+  box.innerHTML = '<div class="sub" style="margin:0">正在读取磁盘信息…</div>';
+  guideNote("");
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/install-targets", { cache: "no-store" });
+    const j = await r.json();
+    if (!j || j.ok === false) throw new Error((j && j.error) || `HTTP ${r.status}`);
+    renderTargets(j);
+  } catch (e) {
+    box.innerHTML = `<div class="sub" style="margin:0">磁盘信息读取失败：${escHtml(String((e && e.message) || e))}</div>`;
+    box.insertAdjacentHTML("beforeend", '<button class="tgt-custom" id="g-pick">＋ 自定义目录…</button>');
+    const pick = $("g-pick");
+    if (pick) pick.addEventListener("click", () => { void pickCustomDir(); });
+  }
+}
+
+// 自定义目录：走宿主目录选择器（resource.pick），选完写回 app 配置
+async function pickCustomDir() {
+  guideNote("");
+  try {
+    const res = await hana.resources.pick({ mode: "directory" });
+    const ref = res && Array.isArray(res.resources) ? res.resources[0] : null;
+    const path = ref && typeof ref.path === "string" ? ref.path.replace(/[\\/]+$/, "") : null;
+    if (!path) return; // 用户取消
+    guideCustomPath = path;
+    const s = await hana.api.fetch("/comfyui-hana/install-target", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }),
+    });
+    if (!s.ok) throw new Error(`保存失败（HTTP ${s.status}）`);
+    await loadTargets();
+  } catch (e) {
+    guideNote("选择目录失败：" + String((e && e.message) || e));
+  }
+}
+
+async function guideLaunch() {
+  if (!guideSelected) { guideNote("请先选择一个安装位置"); return; }
+  const btn = $("g-launch");
+  btn.disabled = true;
+  guideNote("正在创建安装会话…");
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/install-launch", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: guideSelected }),
+    });
+    const j = await r.json().catch(() => null);
+    if (!(r.ok && j && j.ok)) throw new Error((j && j.error) || `HTTP ${r.status}`);
+    guideDone("已发起安装", `Hana 正在 ${guideSelected} 安装 ComfyUI（已新建安装会话），进度可在会话列表里查看。装好后本页会自动载入；也可随时点上方「检测安装情况」。`);
+  } catch (e) {
+    guideNote("发起失败：" + String((e && e.message) || e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function guideCopyPrompt() {
+  if (!guideSelected) { guideNote("请先选择一个安装位置"); return; }
+  try {
+    const r = await hana.api.fetch(`/comfyui-hana/install-prompt?path=${encodeURIComponent(guideSelected)}`);
+    const j = await r.json();
+    if (!(r.ok && j && j.ok)) throw new Error((j && j.error) || `HTTP ${r.status}`);
+    const ok = await copyText(j.prompt);
+    if (ok) guideDone("安装指令已复制", "把这段指令粘给任意 Hana 会话（或你的 agent），它就会按选定的位置安装。");
+    else { guideNote("复制失败（可在浏览器控制台取文本）"); console.log(j.prompt); }
+  } catch (e) {
+    guideNote("复制失败：" + String((e && e.message) || e));
+  }
+}
+
+async function guideSelfInstall() {
+  const lines = [
+    "ComfyUI 官方仓库：https://github.com/comfyanonymous/ComfyUI",
+    "国内镜像：https://ghproxy.net/https://github.com/comfyanonymous/ComfyUI.git",
+    "安装文档：ComfyUI-Hana 技能目录下的 INSTALL.md（Windows 主线）",
+    "装好后以 127.0.0.1:8188 启动服务，本工作区会自动识别。",
+  ];
+  const ok = await copyText(lines.join("\n"));
+  if (ok) guideDone("仓库地址已复制", "包含官方地址、国内镜像与启动说明。装完回到本页点「检测安装情况」即可接入。");
+  else guideNote("复制失败，请手动获取地址。");
 }
 
 // ── 数据读取 ──────────────────────────────────────────────────────────────
@@ -498,15 +653,20 @@ async function statusTick() {
       const hit = env && Array.isArray(env.installs) && env.installs.length ? env.installs[0] : null;
       const retry = { label: "重试", fn: () => { void statusTick(); void postRetryStart().catch(() => {}); } };
       if (hit) {
-        setBar("warn", `ComfyUI 服务未运行（已检测到安装：${hit.path}）。启动后可自动恢复，也可让 Hana 助手协助。`, [
-          { label: "复制引导语", fn: () => copyGuide(`帮我启动 ComfyUI（安装位置：${hit.path}）`) },
+        setBar("warn", `ComfyUI 服务未运行（已检测到安装：${hit.path}）。启动后可自动恢复。`, [
+          { label: "复制启动语", fn: () => copyGuide(`帮我启动 ComfyUI（安装位置：${hit.path}）`) },
           retry,
         ]);
       } else {
-        setBar("warn", "未检测到 ComfyUI 环境（常见位置无安装、服务不可达）。尚未安装？可让 Hana 助手引导安装。", [
-          { label: "复制引导语", fn: () => copyGuide("帮我安装 ComfyUI") },
+        setBar("warn", "未检测到 ComfyUI 环境。", [
+          { label: "安装引导", fn: () => { guideShow(1); } },
           retry,
         ]);
+        // 首次检测到「未安装」自动弹引导（每浏览器一次；关掉后可从顶栏重开）
+        if (env && env.found === false && !guideSeen() && !guideOpen) {
+          markGuideSeen();
+          guideShow(1);
+        }
       }
     } else {
       setBar(null);
@@ -524,6 +684,16 @@ function bindModeSelect(sel) {
     else { frameRuntimeId = null; void tick(); }
   });
 }
+// ── 安装引导弹窗交互 ──────────────────────────────────────────────────────
+$("g-ai").addEventListener("click", () => { guideShow(2); void loadTargets(); });
+$("g-self").addEventListener("click", () => { void guideSelfInstall(); });
+$("g-later").addEventListener("click", () => { guideHide(); });
+$("g-back").addEventListener("click", () => { guideShow(1); });
+$("g-close").addEventListener("click", () => { guideHide(); });
+$("g-launch").addEventListener("click", () => { void guideLaunch(); });
+$("g-copy").addEventListener("click", () => { void guideCopyPrompt(); });
+$("guide-mask").addEventListener("click", (e) => { if (e.target === $("guide-mask")) guideHide(); });
+
 bindModeSelect($("sel-mode"));
 bindModeSelect($("sel-mode2"));
 $("btn-retry").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.bootNote.textContent = "已请求启动，等待中继就绪……"; });

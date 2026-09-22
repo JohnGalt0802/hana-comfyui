@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "comfyui-hana",
   "name": "ComfyUI-Hana",
-  "version": "0.4.0",
-  "description": "把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区内嵌官方前端（零改造），comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传，生成即宿主任务（含任务卡与回执）；左侧状态面板带 GPU/CPU/内存实时图表与「释放显存」按钮；未装/未启动 ComfyUI 时提供环境检测与安装引导。",
+  "version": "0.5.0",
+  "description": "把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区内嵌官方前端（零改造），comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传，生成即宿主任务（含任务卡与回执）；左侧状态面板带 GPU/CPU/内存实时图表与「释放显存」按钮；未装 ComfyUI 时提供安装引导（选位置 → 让助手装 / 复制指令 / 自行安装）。",
   "entry": "index.js",
   "icon": "assets/icon.png",
   "minAppVersion": "0.1013.0",
@@ -22,6 +22,7 @@
     "app/runtime.execute",
     "app/runtime.local-machine",
     "app/runtime.network",
+    "app/resources.read",
     "app/tools.expose-to-model",
     "app/tasks.manage",
     "app/session.start-turn"

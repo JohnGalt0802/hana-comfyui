@@ -79,6 +79,26 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 .chip { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); }
 .chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
 .chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
+
+/* ── 安装引导弹窗 ── */
+#guide-mask { position: fixed; inset: 0; background: rgba(0,0,0,.42); display: none; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+#guide-mask.show { display: flex; }
+.modal { width: min(540px, 100%); max-height: 86vh; overflow: auto; background: var(--bg-page); border: 0.5px solid var(--border); border-radius: 14px; padding: 20px 22px; box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+.modal h2 { margin: 0 0 6px; font-size: 16px; font-weight: 700; }
+.modal .sub { color: var(--text-muted); font-size: 12px; margin: 0 0 14px; line-height: 1.65; }
+.modal .opts { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 16px; }
+.modal button { font-size: 12.5px; padding: 7px 16px; border-radius: 8px; cursor: pointer; border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent); }
+.modal button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.modal button.link { border: 0; background: transparent; color: var(--text-muted); padding: 7px 4px; }
+.modal button:hover { filter: brightness(1.06); }
+.modal button[disabled] { opacity: .55; cursor: default; filter: none; }
+.tgt { display: flex; align-items: center; gap: 10px; padding: 8px 11px; border: 0.5px solid var(--border); border-radius: 9px; margin-bottom: 6px; cursor: pointer; background: var(--bg-card); }
+.tgt.rec { border-color: var(--accent); }
+.tgt input { accent-color: var(--accent); flex: none; }
+.tgt .p { font-size: 12.5px; flex: 1; word-break: break-all; font-variant-numeric: tabular-nums; }
+.tgt .m { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.tgt.rec .m b { color: var(--accent); }
+.tgt-custom { width: 100%; text-align: left; padding: 8px 11px; border: 0.5px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -126,6 +146,39 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
         </div>
         <details id="err-raw-wrap" style="display:none"><summary>原始错误</summary><pre id="err-raw"></pre></details>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- 安装引导弹窗（未检测到 ComfyUI 时弹出；不依赖原生对话框） -->
+<div id="guide-mask">
+  <div class="modal">
+    <div id="guide-step1">
+      <h2>没检测到 ComfyUI</h2>
+      <p class="sub">本机没有正在运行的 ComfyUI 服务，常见安装位置也没找到。要现在装吗？</p>
+      <div class="opts">
+        <button class="primary" id="g-ai">让 Hana 助手帮我装</button>
+        <button id="g-self">我自己装</button>
+        <button class="link" id="g-later">稍后再说</button>
+      </div>
+    </div>
+
+    <div id="guide-step2" hidden>
+      <h2>选个安装位置</h2>
+      <p class="sub">ComfyUI 程序与依赖约 6 GB，模型动辄几十 GB；建议选剩余空间大的非系统盘。</p>
+      <div id="g-targets"><div class="sub" style="margin:0">正在读取磁盘信息…</div></div>
+      <div class="sub" id="g-note" style="margin:10px 0 0"></div>
+      <div class="opts">
+        <button class="primary" id="g-launch">直接发起安装</button>
+        <button id="g-copy">复制安装指令</button>
+        <button class="link" id="g-back">‹ 返回</button>
+      </div>
+    </div>
+
+    <div id="guide-done" hidden>
+      <h2 id="g-done-title">已发起</h2>
+      <p class="sub" id="g-done-note"></p>
+      <div class="opts"><button class="primary" id="g-close">好</button></div>
     </div>
   </div>
 </div>

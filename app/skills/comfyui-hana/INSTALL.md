@@ -36,6 +36,8 @@ Get-ChildItem C:\,D:\,E:\ -Directory -ErrorAction SilentlyContinue | Where-Objec
 ### 1.1 目录与磁盘
 - 预留 ≥ 20 GB（程序 + 依赖 ≈ 6 GB；模型另算，单个模型 2~20 GB 常见）。
 - 路径用纯英文、无空格，建议 `D:\ComfyUI`（盘符按用户实际情况）。
+- **若提示词/用户已指定安装位置，以指定位置为准**——目录约定：仓库放 `<安装位置>\ComfyUI`，Python 环境放 `<安装位置>\venv`（ComfyUI-Hana 的安装引导会按此约定生成提示词）。
+- 选盘参考：优先剩余 ≥ 30 GB 的非系统盘（安装引导已直接给出候选与剩余空间，照用即可）。
 
 ### 1.2 Git
 ```powershell

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// runtime/comfy-relay.mjs — ComfyUI-Hana 受管中继（Node 单文件，无第三方依赖）· v0.4
+// runtime/comfy-relay.mjs — ComfyUI-Hana 受管中继（Node 单文件，无第三方依赖）· v0.5
 // ─────────────────────────────────────────────────────────────────────────────
 // 干什么：把宿主受管服务代理（/api/apps/comfyui-hana/routes/_runtime/<runtimeId>/…）
 //         转发来的请求，HTTP/WS 全量反代到本机 ComfyUI（默认 127.0.0.1:8188）。
@@ -10,6 +10,8 @@
 //   GET  /_relay/prompts/<id>      单个 prompt 的事件记录
 //   GET  /_relay/history?id=&max=  历史摘要（裁剪版：status/error/outputs，避免全量历史体积）
 //   GET  /_relay/metrics           主机指标（GPU / CPU / 内存；GPU 走 nvidia-smi 定时缓存）
+//   GET  /_relay/drives            安装位置候选（各盘剩余空间/可写性 + 推荐 <盘>:\ComfyUI）
+//   GET/POST /_relay/custom-roots  App 推送的自定义安装位置（POST 需 controlKey）
 //   POST /_relay/fs/stat           文件 stat（本机路径；{path}）
 //   POST /_relay/fs/read           读取文本/二进制（{path, encoding, maxBytes}，上限 8 MiB）
 //   POST /_relay/upload            读取本机图片并 multipart 上传到后端 /upload/image
@@ -36,7 +38,7 @@
 import http from "node:http";
 import net from "node:net";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
@@ -414,11 +416,29 @@ function extractSystem(data) {
 // 策略：有限候选路径 + 指纹判定，绝不做全盘扫描；结果按 TTL 缓存（同步、廉价）。
 const ENV_PROBE_TTL_MS = 15_000;
 const envProbe = { at: 0, result: null };
+let customRoots = []; // App 推送的自定义安装位置（优先于常见路径检查）
+
+// 受管 runtime 的环境被宿主重写过（USERPROFILE/HOME 可能指向 app 的 .runtime-tmp），
+// os.homedir() 在那里拿到的不是真实用户目录。逐级回退并排除污染路径。
+function realHome() {
+  const cands = [];
+  const push = (p) => { if (p && !cands.includes(p)) cands.push(p); };
+  if (process.env.USERPROFILE) push(process.env.USERPROFILE);
+  if (process.env.HOMEDRIVE && process.env.HOMEPATH) push(`${process.env.HOMEDRIVE}${process.env.HOMEPATH}`);
+  push(homedir());
+  if (process.env.HOME) push(process.env.HOME);
+  for (const c of cands) {
+    if (/[\\/]app-data[\\/]|[\\/]\.runtime-tmp/i.test(c)) continue; // 运行时临时目录，不是真家目录
+    if (existsSync(c)) return c.replace(/[\\/]+$/, "");
+  }
+  return null;
+}
 
 function candidateRoots() {
-  const home = homedir();
+  const home = realHome();
   const roots = [];
   const push = (p) => { if (p && !roots.includes(p)) roots.push(p); };
+  for (const r of customRoots) push(r); // 自定义优先
   if (process.env.COMFYUI_PATH) push(process.env.COMFYUI_PATH.trim());
   if (process.platform === "win32") {
     for (const d of ["C", "D", "E", "F", "G"]) {
@@ -464,13 +484,18 @@ function detectInstall(root) {
         existsSync(join(parent, d, "Scripts", "python.exe")) || existsSync(join(parent, d, "bin", "python")));
       return { path: root, kind: "source", version, hasVenv, mainPy: join(root, "main.py") };
     }
-    // 便携包：python_embeded + ComfyUI/main.py（双指纹，缺一不判——避免把「外层包着源码仓」的目录误判）
-    if (existsSync(join(root, "ComfyUI", "main.py")) && existsSync(join(root, "python_embeded", "python.exe"))) {
-      return {
-        path: root, kind: "portable", version: null,
-        hasVenv: true,
-        mainPy: join(root, "ComfyUI", "main.py"),
-      };
+    // 外层布局：root/ComfyUI/main.py + 自带环境（便携包的 python_embeded，或外层源码布局的兄弟 venv）
+    if (existsSync(join(root, "ComfyUI", "main.py"))) {
+      const hasEmbeded = existsSync(join(root, "python_embeded", "python.exe"));
+      const hasSiblingVenv = ["venv", ".venv"].some((d) =>
+        existsSync(join(root, d, "Scripts", "python.exe")) || existsSync(join(root, d, "bin", "python")));
+      if (hasEmbeded || hasSiblingVenv) {
+        return {
+          path: root, kind: hasEmbeded ? "portable" : "source",
+          version: null, hasVenv: true,
+          mainPy: join(root, "ComfyUI", "main.py"),
+        };
+      }
     }
     return null;
   } catch { return null; }
@@ -602,6 +627,56 @@ function startMetricsSampler() {
     if (Date.now() - gpuCache.at > GPU_CACHE_MS) refreshGpu();
   }, CPU_SAMPLE_MS);
   t.unref?.();
+}
+
+// ── 安装位置候选（盘位探测）─────────────────────────────────────────────────
+// 供 App 引导弹窗：列出各盘剩余空间与可写性，给出推荐的 <盘>:\ComfyUI。
+// fs.statfsSync 在 Windows 可用（Node 18+）；写权限用 accessSync(W_OK) 探。
+const MIN_FREE_GB = 30; // ComfyUI 程序 + 依赖 ≈ 6GB，模型另算；低于此值不建议作为安装盘
+
+function driveTargets() {
+  const targets = [];
+  const sysDrive = (process.env.SystemRoot || "C:\\").slice(0, 2).toUpperCase();
+  if (process.platform === "win32") {
+    for (const d of ["C", "D", "E", "F", "G", "H"]) {
+      const root = `${d}:\\`;
+      if (!existsSync(root)) continue;
+      let freeGB = null, totalGB = null, writable = false;
+      try {
+        const st = statfsSync(root);
+        freeGB = Math.round(((st.bsize * st.bavail) / 1073741824) * 10) / 10;
+        totalGB = Math.round(((st.bsize * st.blocks) / 1073741824) * 10) / 10;
+      } catch { /* 读不到空间 */ }
+      try { accessSync(root, fsConstants.W_OK); writable = true; } catch { writable = false; }
+      targets.push({
+        path: `${d}:\\ComfyUI`,
+        label: `${d} 盘`,
+        freeGB, totalGB, writable,
+        isSystem: root.slice(0, 2).toUpperCase() === sysDrive,
+        exists: existsSync(`${d}:\\ComfyUI`),
+      });
+    }
+  }
+  // 用户目录候选（永远可写，兜底）
+  const home = realHome();
+  if (home) {
+    const homeTarget = join(home, "ComfyUI");
+    if (!targets.some((t) => t.path === homeTarget)) {
+      let homeFree = null;
+      try {
+        const st = statfsSync(home);
+        homeFree = Math.round(((st.bsize * st.bavail) / 1073741824) * 10) / 10;
+      } catch { /* 忽略 */ }
+      targets.push({ path: homeTarget, label: "用户目录", freeGB: homeFree, totalGB: null, writable: true, isSystem: false, exists: existsSync(homeTarget), fallback: true });
+    }
+  }
+  // 推荐：可写 + 非系统盘 + 空间充足 → 空间最大者；否则退系统盘；再退用户目录
+  const pick = (list) => list.filter((t) => t.writable && t.freeGB !== null && t.freeGB >= MIN_FREE_GB).sort((a, b) => b.freeGB - a.freeGB);
+  let best = pick(targets.filter((t) => !t.isSystem && !t.fallback))[0];
+  if (!best) best = pick(targets.filter((t) => !t.fallback))[0];
+  if (!best) best = targets.find((t) => t.fallback);
+  if (best) best.recommended = true;
+  return { ok: true, platform: process.platform, minFreeGB: MIN_FREE_GB, targets };
 }
 
 async function probeQueue() {
@@ -1297,6 +1372,62 @@ const server = http.createServer((req, res) => {
       return;
     }
     jsonOut(res, 200, metricsPayload(), req.method);
+    return;
+  }
+  if (pathOnly === "/_relay/env") {
+    // 诊断（只读）：受管 runtime 的环境被宿主裁剪/重写过，这里导出关键变量与推断结果供排错
+    jsonOut(res, 200, {
+      ok: true,
+      platform: process.platform,
+      homedir: homedir(),
+      realHome: realHome(),
+      userprofile: process.env.USERPROFILE || null,
+      home: process.env.HOME || null,
+      homedrive: process.env.HOMEDRIVE || null,
+      homepath: process.env.HOMEPATH || null,
+      appdata: process.env.APPDATA || null,
+      localappdata: process.env.LOCALAPPDATA || null,
+      cwd: process.cwd(),
+      hanaHome: process.env.HANA_HOME || null,
+      envHomeKeys: Object.keys(process.env).filter((k) => /HOME|USER|HANA/i.test(k)),
+    }, req.method);
+    return;
+  }
+  if (pathOnly === "/_relay/drives") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    jsonOut(res, 200, driveTargets(), req.method);
+    return;
+  }
+  if (pathOnly === "/_relay/custom-roots") {
+    if (req.method === "GET" || req.method === "HEAD") {
+      jsonOut(res, 200, { ok: true, roots: customRoots }, req.method);
+      return;
+    }
+    if (req.method === "POST") {
+      if (!controlOk(req)) {
+        jsonOut(res, 403, { error: "comfy-relay: control key required" });
+        return;
+      }
+      void (async () => {
+        try {
+          const body = await readBodyJson(req);
+          const roots = Array.isArray(body && body.roots)
+            ? body.roots.filter((r) => typeof r === "string" && r.trim()).slice(0, 8).map((r) => r.trim())
+            : [];
+          customRoots = roots;
+          envProbe.at = 0; // 立即失效探测缓存，下一次状态读取就能看到新位置
+          log(`custom-roots 更新：${customRoots.length ? customRoots.join(" | ") : "（清空）"}`);
+          jsonOut(res, 200, { ok: true, roots: customRoots }, req.method);
+        } catch (e) {
+          jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) });
+        }
+      })();
+      return;
+    }
+    jsonOut(res, 405, { error: "method not allowed" }, req.method);
     return;
   }
   if (pathOnly === "/_relay/prompts") {
