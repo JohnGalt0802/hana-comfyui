@@ -489,7 +489,7 @@ async function guideSelfInstall() {
   const lines = [
     "ComfyUI 官方仓库：https://github.com/comfyanonymous/ComfyUI",
     "国内镜像：https://ghproxy.net/https://github.com/comfyanonymous/ComfyUI.git",
-    "安装文档：ComfyUI-Hana 技能目录下的 INSTALL.md（Windows 主线）",
+    "安装文档：Hana-ComfyUI 技能目录下的 INSTALL.md（Windows 主线）",
     "装好后以 127.0.0.1:8188 启动服务，本工作区会自动识别。",
   ];
   const ok = await copyText(lines.join("\n"));

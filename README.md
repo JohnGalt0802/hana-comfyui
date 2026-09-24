@@ -1,4 +1,4 @@
-# ComfyUI-Hana
+# Hana-ComfyUI
 
 把本机 ComfyUI（`D:\ComfyUI`，服务在 `127.0.0.1:8188`）接进 HanaAgent 的 **v2 App 项目**（开发工作台 = 本目录）。
 

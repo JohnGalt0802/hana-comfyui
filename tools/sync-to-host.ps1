@@ -1,4 +1,4 @@
-# sync-to-host.ps1 — ComfyUI-Hana 开发仓 → 宿主副本同步
+# sync-to-host.ps1 — Hana-ComfyUI 开发仓 → 宿主副本同步
 # ─────────────────────────────────────────────────────────────────────────────
 # 用法：
 #   powershell -File D:\HanakoWorks\ComfyUI\tools\sync-to-host.ps1 -DryRun    # 只打印将发生的差异（不写盘）

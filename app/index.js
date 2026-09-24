@@ -1,4 +1,4 @@
-// app/index.js — ComfyUI-Hana · v2 App 入口（v0.2：工具面 + 任务桥 + 任务卡）
+// app/index.js — Hana-ComfyUI · v2 App 入口（v0.2：工具面 + 任务桥 + 任务卡）
 // ─────────────────────────────────────────────────────────────────────────────
 // 职责：
 //   1. 受管 runtime 拉起中继进程 runtime/comfy-relay.mjs（local-machine / external）
@@ -418,7 +418,7 @@ export default defineApp(async (sdk) => {
   // 安装提示词模板（后端单点维护；前端“复制指令”也从这里取）
   function buildInstallPrompt(targetPath) {
     return [
-      "请帮我安装 ComfyUI（供 ComfyUI-Hana 使用）。",
+      "请帮我安装 ComfyUI（供 Hana-ComfyUI 使用）。",
       "",
       `安装位置（已确认，请装到这里）：${targetPath}`,
       "",
@@ -1023,7 +1023,7 @@ export default defineApp(async (sdk) => {
     const relay = snap && snap.relay ? snap.relay : null;
     const jobs = jobsSummary();
     const lines = [];
-    lines.push(`ComfyUI-Hana 状态（v${APP_VERSION}）`);
+    lines.push(`Hana-ComfyUI 状态（v${APP_VERSION}）`);
     lines.push(`- 中继：${boot.phase}${boot.runtimeId ? ` · runtimeId=${boot.runtimeId}` : ""}${boot.service.port ? ` · 服务端口 ${boot.service.port}` : ""}`);
     if (relay && relay.backend) {
       const b = relay.backend;
@@ -1565,7 +1565,7 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "comfyui",
       description:
-        "ComfyUI-Hana：操作本机 ComfyUI（127.0.0.1:8188）的工具（一个 App 一个同名工具，action 选动作）。" +
+        "Hana-ComfyUI：操作本机 ComfyUI（127.0.0.1:8188）的工具（一个 App 一个同名工具，action 选动作）。" +
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",

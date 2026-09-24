@@ -1,4 +1,4 @@
-// ui/assets/panel-status.js — ComfyUI-Hana 功能面板（整页工作区左侧栏）
+// ui/assets/panel-status.js — Hana-ComfyUI 功能面板（整页工作区左侧栏）
 // 三块：连接状态（/comfyui-hana/status）+ 主机指标图表（/comfyui-hana/metrics）+ 释放显存
 import { hana } from "./sdk.js";
 

@@ -1,4 +1,4 @@
-# ComfyUI-Hana（v2 App，开发仓）· v0.5
+# Hana-ComfyUI（v2 App，开发仓）· v0.6
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。

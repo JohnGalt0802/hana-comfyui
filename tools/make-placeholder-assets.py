@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""生成 ComfyUI-Hana 的占位图资产（纯标准库，无第三方依赖）。· v2 简洁扁平版
+"""生成 Hana-ComfyUI 的占位图资产（纯标准库，无第三方依赖）。· v2 简洁扁平版
 
 产物：
   app/assets/icon.png     256x256  App 身份图标

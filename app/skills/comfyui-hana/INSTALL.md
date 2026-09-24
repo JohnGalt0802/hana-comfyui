@@ -1,6 +1,6 @@
 # ComfyUI 安装引导（Windows 主线）
 
-> 面向：Hana 助手（agent）与动手能力较强的用户；配合 ComfyUI-Hana 工作区使用。
+> 面向：Hana 助手（agent）与动手能力较强的用户；配合 Hana-ComfyUI 工作区使用。
 > 场景：本机没有 ComfyUI（或环境损坏需重装），需要装好并以 `127.0.0.1:8188` 提供服务。
 > 原则：每步都有「预期结果」与「失败对策」；不确定就停下来问用户，不要连续盲试。
 > 环境：Windows 10/11 + NVIDIA 显卡为主线；AMD / Intel / 无独显 / macOS / Linux 见 §10。
@@ -19,7 +19,7 @@
 # ① 服务是否在跑
 Invoke-RestMethod http://127.0.0.1:8188/system_stats
 
-# ② 常见位置探测（ComfyUI-Hana 自带，只读；Hana 数据目录自定义时按实际替换路径）
+# ② 常见位置探测（Hana-ComfyUI 自带，只读；Hana 数据目录自定义时按实际替换路径）
 node "$env:USERPROFILE\.hanako\apps\comfyui-hana\runtime\comfy-relay.mjs" --probe-env
 
 # ③ 粗扫盘补漏（可选）
@@ -36,7 +36,7 @@ Get-ChildItem C:\,D:\,E:\ -Directory -ErrorAction SilentlyContinue | Where-Objec
 ### 1.1 目录与磁盘
 - 预留 ≥ 20 GB（程序 + 依赖 ≈ 6 GB；模型另算，单个模型 2~20 GB 常见）。
 - 路径用纯英文、无空格，建议 `D:\ComfyUI`（盘符按用户实际情况）。
-- **若提示词/用户已指定安装位置，以指定位置为准**——目录约定：仓库放 `<安装位置>\ComfyUI`，Python 环境放 `<安装位置>\venv`（ComfyUI-Hana 的安装引导会按此约定生成提示词）。
+- **若提示词/用户已指定安装位置，以指定位置为准**——目录约定：仓库放 `<安装位置>\ComfyUI`，Python 环境放 `<安装位置>\venv`（Hana-ComfyUI 的安装引导会按此约定生成提示词）。
 - 选盘参考：优先剩余 ≥ 30 GB 的非系统盘（安装引导已直接给出候选与剩余空间，照用即可）。
 
 ### 1.2 Git
@@ -178,7 +178,7 @@ Write-Output "等待超时：请看 $root\comfyui.err.log"; exit 1
 | 杀软拦截 python | 安装目录加白名单 |
 | 页面打开但空白 | 等几秒；看浏览器控制台与 `comfyui.err.log` |
 
-## 9. 接入 ComfyUI-Hana 并验证
+## 9. 接入 Hana-ComfyUI 并验证
 
 1. 服务在 `127.0.0.1:8188` 上跑着 → 打开/刷新「ComfyUI 工作区」卡（中继每 5s 探测，自动恢复）。
 2. 让 Hana 验证：`comfyui(action="status")` 应显示后端可达。
@@ -206,4 +206,4 @@ Write-Output "等待超时：请看 $root\comfyui.err.log"; exit 1
 - [ ] `venv\Scripts\python.exe --version` 版本正确
 - [ ] `torch.cuda.is_available()` 为 True（NVIDIA 卡）
 - [ ] `GET /system_stats` 返回 200
-- [ ] ComfyUI-Hana 工作区显示后端可达
+- [ ] Hana-ComfyUI 工作区显示后端可达
