@@ -31,14 +31,16 @@
     原因：自定义节点的扩展脚本习惯用**绝对路径**（`/extensions/<node>/*.js`、`/scripts/app.js`、`/scripts/ui.js`），
     走宿主代理路径时这些请求会绕过 App 前缀、打到宿主根（不是本 App 路由）被 **403**；直连后 ComfyUI 站在自己的根上，
     官方前端与自定义节点全部可用（后端实测：这些路径在 8188 上均 200，且无 `X-Frame-Options`，可被 iframe 嵌入）。
-    代价：iframe 跨源 → 壳页摸不到 `contentWindow`。主题改为**改道**：工作区在 iframe 加载**之前**把宿主主题
-    写成 ComfyUI 的**自定义色板**（`Comfy.CustomColorPalettes.hana`，键名与 `HANA_CSS_MAP` / `HANA_JS_MAP` 同源）
-    并选中它（`Comfy.ColorPalette = "hana"`），前端一起来就带着宿主配色（面板 + 画布/节点/连线）。
-    切宿主主题后：写入立即完成，顶栏提示「刷新工作区生效」（不强制重载正在编辑的画布）。
+    代价：iframe 跨源 → 壳页摸不到 `contentWindow`。主题改为**改道**：订阅宿主主题钩子
+    `hana.theme.subscribe`（回调直给快照）→ `POST /comfyui-hana/theme` → 中继把宿主主题写成
+    ComfyUI 的**自定义色板**（`Comfy.CustomColorPalettes.hana`，键名与 `HANA_CSS_MAP`/`HANA_JS_MAP` 同源）
+    并选中（`Comfy.ColorPalette = "hana"`）→ **自动重载 ComfyUI 那层 iframe**（加 `_hana_t` 时间戳强制；
+    同 src 浏览器不会重载），前端起来即带宿主配色（面板 + 画布/节点/连线），无需手动刷新。
+    另有两道兜底：轮询（每 2.5s 重拉宿主主题 CSS 比对色值签名）、iframe 首帧加载前预推送。
     路由 `theme`（GET 查 / POST 写）→ 中继 `/_relay/theme`。
-    （ComfyUI 的 `POST /settings` 是 `{**settings, **new_settings}` **合并写**，实测不会动用户其他设置；
-    色板 schema 实测接受 `colors:{comfy_base,litegraph_base,node_slot}`，键名与内置色板一致。）
-    「连接方式」下拉保留原 `hana.api.url` / 直接相对路径两种代理方式，可随时切回。
+    踩坑：① `POST /settings` 成功是 **200 空 body**，不能按 JSON 解析（`docs/踩坑记录.md` 第 4 条）；
+    ② 它是 `{**settings, **new_settings}` **合并写**，实测不动用户其他设置；
+    ③ 色板 schema 实测接受 `colors:{comfy_base,litegraph_base,node_slot}`，键名与内置色板一致。
     「连接方式」下拉保留原 `hana.api.url` / 直接相对路径两种代理方式，可随时切回。
   - **服务控制提到工作区顶栏**：服务运行中时顶栏常驻「停止服务 / 重启中继」，与左侧状态面板互为入口（此前工作区内只能启动、不能关闭）。  - **设置页可自定义 ComfyUI 安装目录**（`ui/settings.html`，v0 只读骨架重做）：复用原有 `install-targets|install-target` 路由，
     支持探测/手填/清除；中继侧 `customRoots` 优先于常见路径检查，保存即生效。

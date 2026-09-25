@@ -1827,28 +1827,6 @@ const server = http.createServer((req, res) => {
     jsonOut(res, 405, { error: "method not allowed" }, req.method);
     return;
   }
-  // 诊断通道（临时）：壳页把主题轮询看到的状态写进 relay.log，供跨源主题排查。
-  // 定位完可删；保留也无害（仅写日志，需 control key）。
-  if (pathOnly === "/_relay/diag") {
-    if (req.method !== "POST") {
-      jsonOut(res, 405, { error: "method not allowed" }, req.method);
-      return;
-    }
-    if (!controlOk(req)) {
-      jsonOut(res, 403, { error: "comfy-relay: control key required" });
-      return;
-    }
-    void (async () => {
-      try {
-        const body = await readBodyJson(req).catch(() => ({}));
-        log(`[diag] ${JSON.stringify(body).slice(0, 900)}`);
-        jsonOut(res, 200, { ok: true }, req.method);
-      } catch (e) {
-        jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) });
-      }
-    })();
-    return;
-  }
   if (pathOnly === "/_relay/prompts") {
     if (req.method !== "GET" && req.method !== "HEAD") {
       jsonOut(res, 405, { error: "method not allowed" }, req.method);

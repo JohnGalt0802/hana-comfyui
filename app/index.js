@@ -1910,25 +1910,8 @@ export default defineApp(async (sdk) => {
           return c.json({ ok: false, error: msgOf(e) }, 502);
         }
       });
-      // 诊断中转（临时）：壳页把主题钩子/轮询看到的状态写进 relay.log，供跨源主题排查。
-      // 定位完可删；保留也无害（仅写日志，需 control key）。
-      app.post("/comfyui-hana/diag", async (c) => {
-        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready" }, 503);
-        try {
-          const body = await c.req.json().catch(() => ({}));
-          const { ok } = await relayJson("/_relay/diag", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(body && typeof body === "object" ? body : {}),
-            timeoutMs: 8_000,
-          });
-          return c.json({ ok }, ok ? 200 : 502);
-        } catch (e) {
-          return c.json({ ok: false, error: msgOf(e) }, 502);
-        }
-      });
     });
-    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|task|relay/start|backend/start|backend/stop|backend|theme|diag）");
+    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|task|relay/start|backend/start|backend/stop|backend|theme）");
   } catch (e) {
     error(`ctx.routes.register 失败（壳页诊断面不可用，工具面仍可用）：${msgOf(e)}`);
   }
