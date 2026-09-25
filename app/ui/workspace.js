@@ -312,6 +312,7 @@ function themeSignature() {
 // 主题变化检测：不依赖宿主向 App iframe 推送主题变化事件（实测切主题后壳页收不到 subscribe 回调），
 // 也不依赖 SDK 快照的实时性——直接重新拉宿主主题 CSS，比对解析后的色值签名。
 let themeSigSeen = null;
+let themeHeartbeatAt = 0;
 async function themeWatchTick() {
   const url = hostThemeCssUrl();
   if (!url) return;
@@ -321,10 +322,15 @@ async function themeWatchTick() {
     const vars = parseThemeCssVars(await r.text());
     const sig = `${vars["--bg"] || ""}|${hostThemeIsDark() ? "dark" : "light"}`;
     if (!themeSigSeen) { themeSigSeen = sig; hanaThemeVars = vars; hanaThemeVarsUrl = url; return; } // 首帧只记录
+    if (Date.now() - themeHeartbeatAt > 30_000) { // 心跳：确认轮询在跑且看到什么值
+      themeHeartbeatAt = Date.now();
+      void reportDiag({ at: "themePollHeartbeat", sig, seen: themeSigSeen, vars: Object.keys(vars).length, direct: frameIsDirect, frame: !!frameRuntimeId });
+    }
     if (sig === themeSigSeen) return;
     themeSigSeen = sig;
     hanaThemeVars = vars;      // 用刚取到的新值，绕开按 URL 的缓存
     hanaThemeVarsUrl = url;
+    void reportDiag({ at: "themePollChanged", sig, direct: frameIsDirect, frame: !!frameRuntimeId });
     onThemeMaybeChanged();
   } catch { /* 下一拍再试 */ }
 }
@@ -392,9 +398,46 @@ function scheduleThemeRefresh() {
   themeRefreshTimer = setTimeout(() => {
     themeRefreshTimer = null;
     if (!frameIsDirect) return;
-    console.log("[comfyui-hana] 宿主主题已更新，刷新工作区");
+    // 只重载 ComfyUI 那层 iframe：同一个 src 浏览器不会重载，加一个无害的时间戳强制刷新
+    try {
+      const cur = els.frame && els.frame.src;
+      if (cur) {
+        const u = new URL(cur);
+        u.searchParams.set("_hana_t", String(Date.now()));
+        console.log("[comfyui-hana] 宿主主题已变，重载 ComfyUI iframe");
+        themeStaleAfterLoad = false;
+        els.frame.src = u.toString();
+        void reportDiag({ at: "themeReloadIframe", url: u.origin + u.pathname });
+        return;
+      }
+    } catch { /* 落到整页刷新 */ }
     try { location.reload(); } catch { /* 忽略 */ }
-  }, 1500);
+  }, 1200);
+}
+
+// 诊断上报（临时）：把主题链路的关键状态写给中继日志。定位完可删。
+function reportDiag(payload) {
+  try {
+    void hana.api.fetch("/comfyui-hana/diag", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    }).catch(() => {});
+  } catch { /* 忽略 */ }
+}
+
+// 宿主主题钩子回调：用快照刷新变量缓存 → 推送色板 → 重载 ComfyUI iframe（仅跨源直连时需要）
+function onHostThemeChanged(snap) {
+  const url = (snap && snap.cssUrl) || hostThemeCssUrl();
+  if (url) { hanaThemeVars = null; hanaThemeVarsUrl = null; fetchHostThemeVars(true); }
+  themeSigSeen = null; // 让轮询重新建立基线
+  if (!frameRuntimeId || !frameIsDirect) return;
+  void (async () => {
+    for (let i = 0; i < 15 && !hanaThemeVars; i++) await new Promise((r) => setTimeout(r, 200));
+    const r = await pushThemeToComfyServer(true);
+    if (r && r.ok) scheduleThemeRefresh();
+    else void reportDiag({ at: "themeHookPushFailed", err: (r && r.error) || "unknown" });
+  })();
 }
 
 function onThemeMaybeChanged() {
@@ -905,7 +948,22 @@ els.frame.addEventListener("load", () => {
 // ── 启动 ──────────────────────────────────────────────────────────────────
 async function main() {
   syncTheme();
-  try { hana.theme?.subscribe?.(() => syncTheme()); } catch { /* 订阅不可用则靠下面的轮询 */ }
+  // 宿主主题钩子：回调直接给主题快照（theme/cssUrl/appearance/palettes），比自己嗅 CSS 可靠
+  try {
+    hana.theme?.subscribe?.((snap) => {
+      console.log("[comfyui-hana] 宿主主题钩子触发", snap && snap.theme, snap && snap.appearance);
+      void reportDiag({
+        at: "themeHook",
+        theme: (snap && snap.theme) || null,
+        appearance: (snap && snap.appearance) || null,
+        cssUrl: (snap && snap.cssUrl) || null,
+        direct: frameIsDirect,
+        frame: !!frameRuntimeId,
+      });
+      onHostThemeChanged(snap);
+      syncTheme();
+    });
+  } catch { /* 订阅不可用则靠下面的轮询兜底 */ }
   try { await hana.ready(); } catch (e) { console.warn("[comfyui-hana] hana.ready 失败：", e); }
   void tick();
   // 主题变化轮询：不依赖宿主向 App iframe 推送主题变化事件
