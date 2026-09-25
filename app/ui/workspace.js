@@ -330,7 +330,9 @@ async function pushThemeToComfyServer(force = false) {
     const lightTheme = lightByColor === null ? !dark : lightByColor;
     const comfy_base = {};
     const litegraph_base = {};
-    for (const [k, hostVar] of HANA_CSS_MAP) { const v = hanaVar(hostVar); if (v) comfy_base[k] = v; }
+    // 色板的 comfy_base 键名**不带 `--`**（内置色板就是 "bg-color" 这种写法，应用时才加前缀）。
+    // 早前直接照搬 CSS 变量名（--bg-color）导致整块色板对不上号，面板/顶栏停在内置原色（2026-09-25 定位）。
+    for (const [k, hostVar] of HANA_CSS_MAP) { const v = hanaVar(hostVar); if (v) comfy_base[k.replace(/^--/, "")] = v; }
     for (const [k, hostVar] of HANA_JS_MAP) { const v = hanaVar(hostVar); if (v) litegraph_base[k] = v; }
     // 拿得到宿主变量 → 自定义色板（面板 + 画布/节点）；拿不到 → 退化为只跟随明暗
     const body = Object.keys(comfy_base).length
