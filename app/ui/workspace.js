@@ -348,7 +348,10 @@ function themeIsLightByColor() {
 async function pushThemeToComfyServer(force = false) {
   const sig = themeSignature();
   if (!force && sig === themePushedFor) return { ok: true, skipped: "unchanged" };
-  if (themePushInflight) return { ok: false, error: "inflight" };
+  // 前一次还在飞就等它落地，不要直接失败：主题钩子常与 iframe 首帧加载的推送撞车
+  // （2026-09-25 实测：hook 拿到 inflight 直接放弃 → 主题没写进 ComfyUI，也没触发重载）
+  for (let i = 0; i < 30 && themePushInflight; i++) await new Promise((r) => setTimeout(r, 200));
+  if (themePushInflight) return { ok: false, error: "inflight-timeout" };
   themePushInflight = true;
   try {
     fetchHostThemeVars(force); // 幂等；force 时强制重取（主题同名换肤时 URL 不变，缓存会拦住）
