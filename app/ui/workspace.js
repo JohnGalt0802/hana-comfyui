@@ -190,11 +190,11 @@ function parseThemeCssVars(cssText) {
   return vars;
 }
 
-function fetchHostThemeVars() {
+function fetchHostThemeVars(force = false) {
   const url = hostThemeCssUrl();
   if (!url) return;
-  if (hanaThemeVars && hanaThemeVarsUrl === url) return;
-  if (hanaThemeVarsInflight && hanaThemeVarsInflight.url === url) return; // 已在取
+  if (!force && hanaThemeVars && hanaThemeVarsUrl === url) return;
+  if (!force && hanaThemeVarsInflight && hanaThemeVarsInflight.url === url) return; // 已在取
   const promise = fetch(url, { credentials: "same-origin", cache: "no-store" })
     .then((r) => (r.ok ? r.text() : Promise.reject(new Error("theme css HTTP " + r.status))))
     .then((text) => {
@@ -306,7 +306,27 @@ let frameIsDirect = false;  // 当前工作区 iframe 是否跨源直连（跨�
 let themeRefreshTimer = null;
 
 function themeSignature() {
-  return `${hostThemeIsDark() ? "dark" : "light"}|${hostThemeCssUrl() || ""}`;
+  return `${hostThemeIsDark() ? "dark" : "light"}|${hanaVar("--bg") || ""}|${hostThemeCssUrl() || ""}`;
+}
+
+// 主题变化检测：不依赖宿主向 App iframe 推送主题变化事件（实测切主题后壳页收不到 subscribe 回调），
+// 也不依赖 SDK 快照的实时性——直接重新拉宿主主题 CSS，比对解析后的色值签名。
+let themeSigSeen = null;
+async function themeWatchTick() {
+  const url = hostThemeCssUrl();
+  if (!url) return;
+  try {
+    const r = await fetch(url, { credentials: "same-origin", cache: "no-store" });
+    if (!r.ok) return;
+    const vars = parseThemeCssVars(await r.text());
+    const sig = `${vars["--bg"] || ""}|${hostThemeIsDark() ? "dark" : "light"}`;
+    if (!themeSigSeen) { themeSigSeen = sig; hanaThemeVars = vars; hanaThemeVarsUrl = url; return; } // 首帧只记录
+    if (sig === themeSigSeen) return;
+    themeSigSeen = sig;
+    hanaThemeVars = vars;      // 用刚取到的新值，绕开按 URL 的缓存
+    hanaThemeVarsUrl = url;
+    onThemeMaybeChanged();
+  } catch { /* 下一拍再试 */ }
 }
 
 // 明暗判定（看色值，不看主题名）：跨源后壳页拿到的快照字段可能缺 appearance，
@@ -325,7 +345,8 @@ async function pushThemeToComfyServer(force = false) {
   if (themePushInflight) return { ok: false, error: "inflight" };
   themePushInflight = true;
   try {
-    fetchHostThemeVars(); // 幂等：已缓存则不再取
+    fetchHostThemeVars(force); // 幂等；force 时强制重取（主题同名换肤时 URL 不变，缓存会拦住）
+    if (force) { hanaThemeVars = null; hanaThemeVarsUrl = null; fetchHostThemeVars(true); }
     for (let i = 0; i < 25 && !hanaThemeVars; i++) await new Promise((r) => setTimeout(r, 200));
     const dark = hostThemeIsDark();
     const lightByColor = themeIsLightByColor(); // 色值优先：主题名/系统偏好都不可靠
@@ -361,25 +382,24 @@ async function pushThemeToComfyServer(force = false) {
   }
 }
 
-// 主题变化时：只在 iframe 已加载且处于直连模式时推服务端，然后自动重载 iframe。
-// ComfyUI 的 Comfy.Workflow.Persist 默认为 true（“Persist workflow state and restore on page (re)load”），
-// 重载会恢复工作流草稿，所以不必再让用户手按 Ctrl+R。
+// 主题变化时：只在 iframe 已加载且处于直连模式时推服务端，然后刷新工作区。
+// 刷新用 location.reload()（等价用户手按 Ctrl+R）——早前只置空 frameRuntimeId 重设 iframe.src，
+// 但同一个 src 浏览器不会重新加载，等于按了个空键。
+// ComfyUI 的 Comfy.Workflow.Persist 默认 true（“Persist workflow state and restore on page (re)load”），
+// 重载会恢复工作流草稿。
 function scheduleThemeRefresh() {
   if (themeRefreshTimer) return;
   themeRefreshTimer = setTimeout(() => {
     themeRefreshTimer = null;
-    if (!frameRuntimeId || !frameIsDirect) return;
-    console.log("[comfyui-hana] 宿主主题已更新，重载工作区 iframe");
-    themeStaleAfterLoad = false;
-    frameRuntimeId = null; // 置空即触发 tick() 重新装载 iframe（重载前会再推一次主题）
-    void tick();
+    if (!frameIsDirect) return;
+    console.log("[comfyui-hana] 宿主主题已更新，刷新工作区");
+    try { location.reload(); } catch { /* 忽略 */ }
   }, 1500);
 }
 
 function onThemeMaybeChanged() {
-  if (!frameRuntimeId) return;              // 未加载：下次开就带上了
-  if (!frameIsDirect) return;               // 代理模式：同源直控，实时生效，无需重载
-  if (themeSignature() === themePushedFor) return;
+  if (!frameIsDirect) return; // 代理模式：同源直控，实时生效，无需重载
+  if (!frameRuntimeId) return; // 未加载：下次开就带上了
   void (async () => {
     const r = await pushThemeToComfyServer(true);
     if (r && r.ok) {
@@ -885,8 +905,10 @@ els.frame.addEventListener("load", () => {
 // ── 启动 ──────────────────────────────────────────────────────────────────
 async function main() {
   syncTheme();
-  try { hana.theme?.subscribe?.(() => syncTheme()); } catch { /* 订阅不可用则保留首帧 */ }
+  try { hana.theme?.subscribe?.(() => syncTheme()); } catch { /* 订阅不可用则靠下面的轮询 */ }
   try { await hana.ready(); } catch (e) { console.warn("[comfyui-hana] hana.ready 失败：", e); }
   void tick();
+  // 主题变化轮询：不依赖宿主向 App iframe 推送主题变化事件
+  setInterval(() => { void themeWatchTick(); }, 2500);
 }
 void main();
