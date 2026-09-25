@@ -871,7 +871,13 @@ async function backendJsonOrNull(path, method = "GET", body = null) {
       log(`[theme] 后端 ${method} ${path} → HTTP ${res.status}`);
       return null;
     }
-    return await res.json().catch(() => null);
+    // 注意：ComfyUI 的 POST /settings 成功时返回 **200 空 body**（app_settings.py 里是
+    // web.Response(status=200)，不带 JSON）。不能假设响应体是 JSON——早前用 res.json()
+    // 解析空体失败被当成“写入失败”，导致色板其实写成功了、壳页却收到 502 而没去重载界面
+    // （2026-09-25 据 relay.log 定位）。所以：空体 / 非 JSON 都视为成功。
+    const text = (await res.text()).trim();
+    if (!text) return {};
+    try { return JSON.parse(text); } catch { return {}; }
   } catch (e) {
     log(`[theme] 后端 ${method} ${path} 异常：${String((e && e.message) || e)}`);
     return null;
