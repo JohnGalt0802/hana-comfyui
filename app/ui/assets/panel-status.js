@@ -265,6 +265,87 @@ async function releaseVram() {
   }
 }
 
+// ── ComfyUI 更新（版本检查 / 一键更新；仅源码安装）────────────────────────
+// 机制：中继 GET /_relay/update（git fetch 比对）/ POST（停服务→pull→pip，后台跑）/ status。
+let updTimer = null;
+let updUntil = 0;
+
+function fmtVer(v) {
+  return v ? `${v.describe || v.commit || "?"}${v.dirty ? "（有改动）" : ""}` : "—";
+}
+
+function renderUpdateStatus(st) {
+  if (!st) return false;
+  const phaseText = { idle: "空闲", stopping: "停服务", fetching: "抓取", pulling: "拉取", installing: "装依赖", done: "已完成", failed: "失败" }[st.phase] || st.phase;
+  $("u-state").innerHTML = st.running
+    ? chip("进行中", "warn")
+    : (st.phase === "failed" ? chip("失败", "bad") : (st.phase === "done" ? chip("已完成", "ok") : chip(phaseText)));
+  if (st.before) $("u-local").textContent = st.after ? `${fmtVer(st.before)} → ${fmtVer(st.after)}` : fmtVer(st.before);
+  const steps = (st.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}${s.detail ? `：${String(s.detail).split("\n").slice(-1)[0]}` : ""}`);
+  $("u-log").textContent = [...steps, ...(st.logTail || []).slice(-10)].filter(Boolean).join("\n");
+  if (st.lastError) $("u-note").textContent = `更新失败：${st.lastError}`;
+  else if (st.phase === "done") $("u-note").textContent = "更新完成。点「启动服务」重新拉起 ComfyUI。";
+  return !!st.running;
+}
+
+async function updStatusTick() {
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/update/status", { cache: "no-store" });
+    const running = renderUpdateStatus(await r.json());
+    if (!running && updTimer && Date.now() > updUntil) { clearInterval(updTimer); updTimer = null; }
+  } catch { /* 下一拍再试 */ }
+}
+
+function startUpdPolling() {
+  if (updTimer) return;
+  updUntil = Date.now() + 30 * 60_000; // 上限 30 分钟（pip 可能很久）
+  updTimer = setInterval(() => { void updStatusTick(); }, 2000);
+  void updStatusTick();
+}
+
+async function checkUpdate() {
+  const btn = $("u-check");
+  btn.disabled = true; btn.textContent = "检查中…";
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/update?force=1", { cache: "no-store" });
+    const d = await r.json().catch(() => null);
+    if (!d || d.ok === false) { $("u-note").textContent = `检查失败：${(d && d.error) || `HTTP ${r.status}`}`; return; }
+    if (d.isGit === false) {
+      if (d.local) $("u-local").textContent = fmtVer(d.local);
+      $("u-note").textContent = d.note || "该安装不是 Git 仓库，无法代为更新。";
+      return;
+    }
+    $("u-local").textContent = fmtVer(d.local);
+    if (d.local && d.local.dirty) $("u-note").textContent = "本地有未提交改动，git 会拒绝拉取（不擅自 merge/reset）。";
+    else if (d.upToDate) $("u-note").textContent = `已是最新（${d.local?.describe || ""}）。`;
+    else $("u-note").textContent = `落后 ${d.behind} 个提交：${fmtVer(d.local)} → ${fmtVer(d.remote)}`;
+  } catch (e) {
+    $("u-note").textContent = `检查失败：${String((e && e.message) || e)}`;
+  } finally {
+    btn.disabled = false; btn.textContent = "检查更新";
+  }
+}
+
+async function applyUpdate() {
+  if (!window.confirm("将先停止 ComfyUI 服务，然后 git pull --ff-only + pip install -r requirements.txt。\n本地有未提交改动会被 git 拒绝；pip 装过的新依赖不会自动回退。继续？")) return;
+  const btn = $("u-apply");
+  btn.disabled = true; btn.textContent = "更新中…";
+  $("u-note").textContent = "已发起更新（先停服务）…";
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/update", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "apply" }),
+    });
+    const d = await r.json().catch(() => null);
+    if (!d || d.accepted !== true) { $("u-note").textContent = `发起失败：${(d && (d.reason || d.error)) || `HTTP ${r.status}`}`; return; }
+    startUpdPolling();
+    void poll();
+  } catch (e) {
+    $("u-note").textContent = `发起失败：${String((e && e.message) || e)}`;
+  } finally {
+    btn.disabled = false; btn.textContent = "更新";
+  }
+}
+
 // ── 交互 ──────────────────────────────────────────────────────────────────
 $("p-retry").addEventListener("click", async () => {
   $("p-note").textContent = "已请求重启中继，等待就绪……";
@@ -278,6 +359,8 @@ $("p-retry").addEventListener("click", async () => {
 $("p-start").addEventListener("click", () => { void startService(); });
 $("p-stop").addEventListener("click", () => { void stopService(); });
 $("m-release").addEventListener("click", () => { void releaseVram(); });
+$("u-check").addEventListener("click", () => { void checkUpdate(); });
+$("u-apply").addEventListener("click", () => { void applyUpdate(); });
 window.addEventListener("resize", () => { redrawAll(); });
 
 // ── 启动 ──────────────────────────────────────────────────────────────────
@@ -289,5 +372,6 @@ async function main() {
   setInterval(() => { void poll(); }, 2000);
   void metricsTick();
   setInterval(() => { void metricsTick(); }, 1000);
+  void updStatusTick(); // 初始显示当前版本 / 上次更新结果
 }
 void main();

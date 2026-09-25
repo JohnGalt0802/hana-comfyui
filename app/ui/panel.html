@@ -55,6 +55,15 @@ button[disabled]:hover { background: var(--bg-card); color: var(--accent); }
 .chart-label { font-size: 10.5px; color: var(--text-muted); margin-bottom: 1px; }
 .chart-val { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
 .chart { flex: 1; height: 38px; min-width: 80px; display: block; }
+/* ── ComfyUI 更新区（版本检查 / 一键更新）── */
+.up-sec { margin: 10px 0 2px; }
+.up-head { font-size: 12px; font-weight: 600; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
+pre.uplog {
+  margin: 6px 0 0; padding: 6px 8px; border-radius: 7px; max-height: 120px; overflow: auto;
+  background: rgba(127,127,127,.08); font-size: 10.5px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-all; font-variant-numeric: tabular-nums;
+}
+pre.uplog:empty { display: none; }
 </style>
 </head>
 <body>
@@ -65,6 +74,16 @@ button[disabled]:hover { background: var(--bg-card); color: var(--accent); }
     <div class="row"><span class="k">后端</span><span class="v" id="p-backend">—</span></div>
     <div class="row"><span class="k">ComfyUI</span><span class="v" id="p-ver">—</span></div>
     <div class="row"><span class="k">队列</span><span class="v" id="p-queue">—</span></div>
+  </div>
+  <div class="up-sec">
+    <div class="up-head"><span>ComfyUI 更新</span><span class="sec-spacer"></span><span class="chip" id="u-state">—</span></div>
+    <div class="row"><span class="k">版本</span><span class="v" id="u-local">—</span></div>
+    <div class="btn-row" style="margin-top:6px">
+      <button id="u-check" title="git fetch 后与远端对比 commit（不做任何改动）">检查更新</button>
+      <button id="u-apply" class="primary" title="停服务 → git pull --ff-only → pip install -r requirements.txt（后台执行）">更新</button>
+    </div>
+    <div class="note" id="u-note"></div>
+    <pre class="uplog" id="u-log"></pre>
   </div>
   <div class="mon-sec"><span id="m-gpu-name">GPU</span><span class="sec-spacer"></span><button class="gpu-release" id="m-release" title="让 ComfyUI 卸载全部模型、释放显存（后端 /free）">释放显存</button></div>
   <div class="chart-row"><div class="chart-meta"><div class="chart-label">GPU 利用率</div><div class="chart-val" id="v-util">—</div></div><canvas class="chart" id="c-util"></canvas></div>
