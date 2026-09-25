@@ -301,7 +301,9 @@ function applyHanaThemeVars() {
 // 代价：切换宿主主题后需刷新工作区才生效（不自动重载，避免打断编辑）。
 let themePushedFor = null;   // 已推送成功的主题签名（明暗 + cssUrl），避免重复推
 let themePushInflight = false;
-let themeStaleAfterLoad = false; // 已写入服务端，但当前 iframe 还是旧色板 → 顶栏提示刷新
+let themeStaleAfterLoad = false; // 已写入服务端，但当前 iframe 还是旧色板 → 自动重载工作区
+let frameIsDirect = false;  // 当前工作区 iframe 是否跨源直连（跨源才需要“推送 + 重载”这条路）
+let themeRefreshTimer = null;
 
 function themeSignature() {
   return `${hostThemeIsDark() ? "dark" : "light"}|${hostThemeCssUrl() || ""}`;
@@ -359,13 +361,31 @@ async function pushThemeToComfyServer(force = false) {
   }
 }
 
-// 主题变化时：只在 iframe 已加载的情况下推服务端并标记待刷新（未加载时下次开就带上了）
+// 主题变化时：只在 iframe 已加载且处于直连模式时推服务端，然后自动重载 iframe。
+// ComfyUI 的 Comfy.Workflow.Persist 默认为 true（“Persist workflow state and restore on page (re)load”），
+// 重载会恢复工作流草稿，所以不必再让用户手按 Ctrl+R。
+function scheduleThemeRefresh() {
+  if (themeRefreshTimer) return;
+  themeRefreshTimer = setTimeout(() => {
+    themeRefreshTimer = null;
+    if (!frameRuntimeId || !frameIsDirect) return;
+    console.log("[comfyui-hana] 宿主主题已更新，重载工作区 iframe");
+    themeStaleAfterLoad = false;
+    frameRuntimeId = null; // 置空即触发 tick() 重新装载 iframe（重载前会再推一次主题）
+    void tick();
+  }, 1500);
+}
+
 function onThemeMaybeChanged() {
-  if (!frameRuntimeId) return;
+  if (!frameRuntimeId) return;              // 未加载：下次开就带上了
+  if (!frameIsDirect) return;               // 代理模式：同源直控，实时生效，无需重载
   if (themeSignature() === themePushedFor) return;
   void (async () => {
     const r = await pushThemeToComfyServer(true);
-    if (r && r.ok) themeStaleAfterLoad = true;
+    if (r && r.ok) {
+      themeStaleAfterLoad = true;
+      scheduleThemeRefresh();
+    }
   })();
 }
 
@@ -745,7 +765,10 @@ async function tick() {
       els.loading.classList.add("show");
       // 直连（跨源）：先把宿主主题写进 ComfyUI 设置，iframe 一起来就带着宿主配色
       if (built.kind === "direct") {
+        frameIsDirect = true;
         try { await pushThemeToComfyServer(); } catch { /* 主题失败不阻塞加载 */ }
+      } else {
+        frameIsDirect = false;
       }
       themeStaleAfterLoad = false; // 新文档会读到刚推送的色板
       els.frame.src = built.url; // 含短期凭证，不落存储、不写日志
@@ -813,10 +836,7 @@ async function statusTick() {
       }
       // 服务运行中：顶栏常驻服务控制（与左侧状态面板互为入口，工作区内也能直接关）
       if (themeStaleAfterLoad) {
-        setBar("info", "宿主主题已变更，刷新工作区后生效", [
-          { label: "刷新工作区", fn: () => { themeStaleAfterLoad = false; try { location.reload(); } catch { /* 忽略 */ } } },
-          { label: "稍后", fn: () => { themeStaleAfterLoad = false; setBar(null); } },
-        ]);
+        setBar("info", "宿主主题已更新，正在刷新工作区…", []);
       } else {
         setBar("info", "ComfyUI 服务运行中", [
           { label: "停止服务", fn: () => { void stopBackend(); } },
