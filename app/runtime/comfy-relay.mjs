@@ -867,19 +867,31 @@ async function backendJsonOrNull(path, method = "GET", body = null) {
       headers: body ? { accept: "application/json", "content-type": "application/json" } : { accept: "application/json" },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      log(`[theme] 后端 ${method} ${path} → HTTP ${res.status}`);
+      return null;
+    }
     return await res.json().catch(() => null);
-  } catch { return null; }
+  } catch (e) {
+    log(`[theme] 后端 ${method} ${path} 异常：${String((e && e.message) || e)}`);
+    return null;
+  }
 }
 
 async function applyThemeSettings(body) {
-  if (!backend.reachable) return { ok: false, error: `后端 ${backend.host}:${backend.port} 不可达` };
+  if (!backend.reachable) {
+    log("[theme] 写主题失败：后端不可达");
+    return { ok: false, error: `后端 ${backend.host}:${backend.port} 不可达` };
+  }
   const b = body && typeof body === "object" ? body : {};
   const colors = b.colors && typeof b.colors === "object" ? b.colors : null;
   const patch = {};
   if (colors) {
     const cur = await backendJsonOrNull("/api/settings");
-    if (!cur) return { ok: false, error: "读取 ComfyUI 现有设置失败（后端未就绪或拒绝）" };
+    if (!cur) {
+      log("[theme] 写主题失败：读取 /api/settings 未成功（后端未就绪 / 超时 / 非 2xx）");
+      return { ok: false, error: "读取 ComfyUI 现有设置失败（后端未就绪或拒绝）" };
+    }
     const existing = cur["Comfy.CustomColorPalettes"];
     const customs = existing && typeof existing === "object" ? { ...existing } : {};
     const def = {
@@ -901,7 +913,10 @@ async function applyThemeSettings(body) {
     return { ok: false, error: "需要 colors（自定义色板）或 palette（内置色板名）" };
   }
   const out = await backendJsonOrNull("/api/settings", "POST", patch);
-  if (out === null) return { ok: false, error: "写入 ComfyUI 设置失败（后端未接受）" };
+  if (out === null) {
+    log("[theme] 写主题失败：POST /api/settings 未接受（超时 / 非 2xx / 连接错误）");
+    return { ok: false, error: "写入 ComfyUI 设置失败（后端未接受）" };
+  }
   const d = colors && patch["Comfy.CustomColorPalettes"] ? patch["Comfy.CustomColorPalettes"][THEME_PALETTE_ID] : null;
   log(`主题已写入 ComfyUI 设置：palette=${patch["Comfy.ColorPalette"]}` +
     (d ? `（自定义色板 comfy_base=${Object.keys(d.colors.comfy_base).length} 项 litegraph_base=${Object.keys(d.colors.litegraph_base).length} 项）` : "（仅明暗）"));

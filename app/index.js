@@ -1900,7 +1900,12 @@ export default defineApp(async (sdk) => {
             body: JSON.stringify(body && typeof body === "object" ? body : {}),
             timeoutMs: 20_000,
           });
-          return c.json(ok && data && typeof data === "object" ? data : { ok: false, error: `relay HTTP ${status}` }, ok ? 200 : 502);
+          // 失败时把中继的具体原因透出来（早前直接吞成 `relay HTTP 502`，排查时看不出哪一步）
+          return c.json(
+            ok ? (data && typeof data === "object" ? data : { ok: true })
+               : { ok: false, error: (data && data.error) || `relay HTTP ${status}` },
+            ok ? 200 : 502,
+          );
         } catch (e) {
           return c.json({ ok: false, error: msgOf(e) }, 502);
         }
