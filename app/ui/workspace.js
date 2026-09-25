@@ -133,6 +133,14 @@ const HANA_CSS_MAP = [
   ["--node-component-header", "--text"],
   ["--node-component-header-surface", "--sidebar-bg"],
   ["--node-component-header-icon", "--text-muted"],
+  // 新前端（1.x）新增的面板/顶栏变量（2026-09-25 从内置色板键表对比补齐；
+  // 缺这几个时“左侧设置栏 / 顶部标签栏”会停在内置色板的原色）
+  ["--interface-panel-hover-surface", "--accent-light"],
+  ["--interface-panel-selected-surface", "--accent-light"],
+  ["--interface-panel-box-shadow", "--shadow"],
+  ["--interface-panel-drop-shadow", "--shadow"],
+  ["--bar-shadow", "--shadow"],
+  ["--contrast-mix-color", "--text-muted"],
 ];
 const HANA_JS_MAP = [
   ["NODE_TITLE_COLOR", "--text"],
@@ -152,8 +160,13 @@ const HANA_JS_MAP = [
   ["EVENT_LINK_COLOR", "--coral"],
   ["CONNECTING_LINK_COLOR", "--accent-hover"],
   ["CLEAR_BACKGROUND_COLOR", "--bg"],
+  ["BADGE_BG_COLOR", "--accent"],
+  ["BADGE_FG_COLOR", "--bg"],
+  ["NODE_ERROR_COLOUR", "--danger"],
+  ["NODE_BYPASS_BGCOLOR", "--bg-card"],
+  ["DEFAULT_SHADOW_COLOR", "--border"],
 ];
-const HANA_VAR_FALLBACK = { "--coral": "--accent-hover", "--sidebar-bg": "--bg-card" };
+const HANA_VAR_FALLBACK = { "--coral": "--accent-hover", "--sidebar-bg": "--bg-card", "--shadow": "--border" };
 const CANVAS_SHADE_DARK = 0.15;  // 画布底色：深色主题相对 --bg 加深比例（朝黑）
 const CANVAS_SHADE_LIGHT = 0.4;  // 浅色主题相对 --bg 提亮比例（朝白）
 let hanaThemeVars = null;
@@ -294,6 +307,16 @@ function themeSignature() {
   return `${hostThemeIsDark() ? "dark" : "light"}|${hostThemeCssUrl() || ""}`;
 }
 
+// 明暗判定（看色值，不看主题名）：跨源后壳页拿到的快照字段可能缺 appearance，
+// 早期实现回落到系统偏好，结果浅色主题被标成 dark（light_theme=false），基座跑深色默认值。
+// 改用 --bg 的实际亮度：luma > 0.5 即浅色。
+function themeIsLightByColor() {
+  const rgb = cssColorToRgb(hanaVar("--bg") || "");
+  if (!rgb) return null;
+  const luma = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+  return luma > 0.5;
+}
+
 async function pushThemeToComfyServer(force = false) {
   const sig = themeSignature();
   if (!force && sig === themePushedFor) return { ok: true, skipped: "unchanged" };
@@ -303,14 +326,16 @@ async function pushThemeToComfyServer(force = false) {
     fetchHostThemeVars(); // 幂等：已缓存则不再取
     for (let i = 0; i < 25 && !hanaThemeVars; i++) await new Promise((r) => setTimeout(r, 200));
     const dark = hostThemeIsDark();
+    const lightByColor = themeIsLightByColor(); // 色值优先：主题名/系统偏好都不可靠
+    const lightTheme = lightByColor === null ? !dark : lightByColor;
     const comfy_base = {};
     const litegraph_base = {};
     for (const [k, hostVar] of HANA_CSS_MAP) { const v = hanaVar(hostVar); if (v) comfy_base[k] = v; }
     for (const [k, hostVar] of HANA_JS_MAP) { const v = hanaVar(hostVar); if (v) litegraph_base[k] = v; }
     // 拿得到宿主变量 → 自定义色板（面板 + 画布/节点）；拿不到 → 退化为只跟随明暗
     const body = Object.keys(comfy_base).length
-      ? { colors: { comfy_base, litegraph_base }, lightTheme: !dark }
-      : { palette: dark ? "dark" : "light" };
+      ? { colors: { comfy_base, litegraph_base }, lightTheme }
+      : { palette: lightTheme ? "light" : "dark" };
     const r = await hana.api.fetch("/comfyui-hana/theme", {
       method: "POST",
       headers: { "content-type": "application/json" },
