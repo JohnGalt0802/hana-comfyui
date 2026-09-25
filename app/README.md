@@ -1,4 +1,4 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.6
+# Hana-ComfyUI（v2 App，开发仓）· v0.7
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
@@ -26,6 +26,19 @@
   会随中继退出被回收（detached 也逃不出），走计划任务才**独立于 Hana 存活**；撤下走 `taskkill /T /F`（受限令牌实测可终止）；
   中继新增 `/_relay/backend/{start,stop,proc}`，App 新增路由 `backend/start|stop|backend`；服务日志 `app-data/comfyui-hana/logs/backend.log`；
   同时把面板原「重试启动」正名为「重启中继」（它只重启受管 runtime，与 ComfyUI 服务本体是两件事）
+- 工作区直连 + 服务控制 + 安装目录（v0.7 新增，M10）：
+  - **工作区 iframe 直连 `127.0.0.1:8188`**（auto/direct 默认；manifest 新增 `ui.csp.frameDomains` 放行）。
+    原因：自定义节点的扩展脚本习惯用**绝对路径**（`/extensions/<node>/*.js`、`/scripts/app.js`、`/scripts/ui.js`），
+    走宿主代理路径时这些请求会绕过 App 前缀、打到宿主根（不是本 App 路由）被 **403**；直连后 ComfyUI 站在自己的根上，
+    官方前端与自定义节点全部可用（后端实测：这些路径在 8188 上均 200，且无 `X-Frame-Options`，可被 iframe 嵌入）。
+    代价：iframe 跨源 → 壳页同源直控的「宿主主题跟随」自动停用（`ensureComfySync` 会一次告警后内部停用）。
+    「连接方式」下拉保留原 `hana.api.url` / 直接相对路径两种代理方式，可随时切回。
+  - **服务控制提到工作区顶栏**：服务运行中时顶栏常驻「停止服务 / 重启中继」，与左侧状态面板互为入口（此前工作区内只能启动、不能关闭）。
+  - **设置页可自定义 ComfyUI 安装目录**（`ui/settings.html`，v0 只读骨架重做）：复用原有 `install-targets|install-target` 路由，
+    支持探测/手填/清除；中继侧 `customRoots` 优先于常见路径检查，保存即生效。
+  - **服务自动拉起开关**（默认**关**）：持久化在 `app-data/comfyui-hana/auto-start.json`。Hana 启动且中继就绪后，
+    若本机已装 ComfyUI、8188 上没有服务，则自动拉起一次（中继 `startBackendService` 自身幂等，已运行返回 `already`）。
+    路由 `auto-start`（GET/POST）；服务由计划任务拉起，仍独立于 Hana 存活。
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok
 
@@ -58,4 +71,6 @@ pwsh -NoProfile -File ..\tools\sync-to-host.ps1 -DryRun
 
 - 不在用户队列非空时提交测试任务；测试工作流一律极小（纯 CPU）。
 - 宿主安装/重启由主脑统一安排；App 级 reload 可自行执行（本仓流程）。
+- 改 `manifest.json` 后走 `reload` 即可让宿主认到新版本（实测：reload 响应 `record.version` 会更新）；**无需**重装。
+  但若 `apps/comfyui-hana` 目录被占用，`install+confirm` 重装会报 `EPERM`（详见 `docs/踩坑记录.md`）。
 - 项目全景与待办见 `..\README.md` 与 `..\docs\待办与验收清单.md`。

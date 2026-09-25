@@ -533,6 +533,26 @@ async function startBackend() {
   setTimeout(() => { void statusTick(); }, 1500);
 }
 
+// 停止 8188 上的 ComfyUI 本体（与「重启中继」是两件事；正在跑的任务会中断）
+async function postBackendStop() {
+  const r = await hana.api.fetch("/comfyui-hana/backend/stop", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  return r.json().catch(() => ({}));
+}
+async function stopBackend() {
+  setBar("info", "正在停止 ComfyUI 服务…", []);
+  try {
+    const j = await postBackendStop();
+    if (j && j.ok === false) {
+      setBar("warn", `停止失败：${j.error || "未知原因"}`, [{ label: "重试", fn: () => { void stopBackend(); } }]);
+      return;
+    }
+    setBar("info", "已请求停止服务，等待退出…", []);
+  } catch (e) {
+    setBar("warn", `停止失败：${String((e && e.message) || e)}`, []);
+  }
+  setTimeout(() => { void statusTick(); }, 1500);
+}
+
 // 服务不可达时的覆盖层（盖住 iframe，不让用户直接看到中继的 ECONNREFUSED JSON）
 let svcRequestedAt = 0;
 function showOffline(st) {
@@ -570,6 +590,14 @@ function buildFrameUrl(boot) {
   const rid = encodeURIComponent(boot.runtimeId);
   const session = readSurfaceSession();
   const notes = [];
+  // 直连（auto 首选）：ComfyUI 站在自己的根路径上 —— 自定义节点的扩展脚本习惯用绝对路径
+  // （/extensions/<node>/*.js、/scripts/app.js、/scripts/ui.js），只有直连才走得通；
+  // 走宿主代理路径时这些绝对路径会绕过 App 前缀、打到宿主根（不是本 App 的路由）被 403。
+  // 代价：iframe 变跨源，壳页同源直控的「主题跟随」自动停用（色板改由 ComfyUI 自身设置持久化）。
+  if (mode === "direct" || mode === "auto") {
+    const origin = String(boot.backendUrl || "http://127.0.0.1:8188").replace(/\/+$/, "");
+    return { url: `${origin}/`, kind: "direct", note: "跨源直连，宿主主题跟随停用" };
+  }
   if (mode === "sdk" || mode === "auto") {
     try {
       return { url: hana.api.url(`/_runtime/${rid}/index.html`), kind: "sdk" };
@@ -689,7 +717,11 @@ async function statusTick() {
         showView("ready");
         ensureComfySync(); // 服务刚回来，重新对齐主题
       }
-      setBar(null);
+      // 服务运行中：顶栏常驻服务控制（与左侧状态面板互为入口，工作区内也能直接关）
+      setBar("info", "ComfyUI 服务运行中", [
+        { label: "停止服务", fn: () => { void stopBackend(); } },
+        { label: "重启中继", fn: () => { void postRetryStart().catch(() => {}); } },
+      ]);
     }
   } catch { /* 状态读取失败不打扰界面 */ }
 }

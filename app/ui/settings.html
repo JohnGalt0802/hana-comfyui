@@ -19,11 +19,12 @@ body.t-dark {
 body { margin: 0; padding: 18px 20px; background: transparent; color: var(--text); font: 13px/1.6 system-ui, -apple-system, 'Segoe UI', sans-serif; }
 h1 { font-size: 16px; font-weight: 700; margin: 0 0 4px; }
 .sub { color: var(--text-muted); font-size: 12px; margin-bottom: 16px; }
-.sec { background: var(--bg-card); border: 0.5px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; max-width: 640px; }
+.sec { background: var(--bg-card); border: 0.5px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; max-width: 680px; }
 .sec h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
 .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 0.5px dashed var(--border); }
 .row:last-child { border-bottom: 0; }
-.k { color: var(--text-muted); }
+.row.top { align-items: flex-start; }
+.k { color: var(--text-muted); white-space: nowrap; }
 .v { text-align: right; word-break: break-all; font-variant-numeric: tabular-nums; }
 .chip { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); }
 .chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
@@ -31,11 +32,58 @@ h1 { font-size: 16px; font-weight: 700; margin: 0 0 4px; }
 p.note { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; }
 ul.note { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; padding-left: 18px; }
 code { background: rgba(127,127,127,.12); border-radius: 4px; padding: 0 4px; font-size: 11.5px; }
+.ed { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.ed input[type=text] {
+  flex: 1; min-width: 220px; font-size: 12px; padding: 6px 10px; border-radius: 8px;
+  color: var(--text); border: 0.5px solid var(--border); background: rgba(127,127,127,.08);
+  font-variant-numeric: tabular-nums;
+}
+.ed button {
+  font-size: 12px; padding: 6px 14px; border-radius: 8px; cursor: pointer;
+  border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent);
+}
+.ed button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.ed button:hover { filter: brightness(1.06); }
+.ed button[disabled] { opacity: .55; cursor: default; }
+label.chk { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
+label.chk input { accent-color: var(--accent); }
+.msg { font-size: 12px; margin-top: 8px; }
+.msg.ok { color: var(--ok); }
+.msg.bad { color: var(--bad); }
 </style>
 </head>
 <body>
   <h1>Hana-ComfyUI · 设置</h1>
-  <div class="sub">v0 骨架：连接参数目前为固定值（只读）；后续里程碑开放可编辑项。</div>
+  <div class="sub">安装位置、服务启动与连接状态。改动即时生效，无需重启。</div>
+
+  <div class="sec">
+    <h2>ComfyUI 安装目录</h2>
+    <div class="row top"><span class="k">当前安装</span><span class="v" id="s-install-now">读取中…</span></div>
+    <div class="row top"><span class="k">自定义目录</span><span class="v" id="s-install-custom">—</span></div>
+    <p class="note">
+      没检测到你的 ComfyUI 时，在这里指定安装根目录：填含 <code>main.py</code> 的那一层，
+      或它的外层（例如 <code>D:\ComfyUI</code>、<code>D:\ComfyUI_windows_portable</code>）。
+      保存后立即生效，「启动服务」与安装探测都会按它走。
+    </p>
+    <div class="ed">
+      <input id="s-install-input" type="text" placeholder="例如 D:\ComfyUI" spellcheck="false" autocomplete="off">
+      <button class="primary" id="s-install-save">保存</button>
+      <button id="s-install-detect">重新探测</button>
+      <button id="s-install-clear">清除</button>
+    </div>
+    <div class="msg" id="s-install-msg"></div>
+    <div class="note" id="s-install-cands"></div>
+  </div>
+
+  <div class="sec">
+    <h2>服务启动</h2>
+    <label class="chk"><input type="checkbox" id="s-auto-start"> Hana 启动时自动拉起 ComfyUI</label>
+    <p class="note">
+      默认关闭。开启后，Hana 启动时若本机已装 ComfyUI 且 8188 上没有服务，会自动拉起一次
+      （服务由计划任务以当前用户身份启动，独立于 Hana 存活；注意会占用显存）。
+      不常驻就保持关闭，需要时在工作区顶栏或左侧状态面板点「启动服务」。
+    </p>
+  </div>
 
   <div class="sec">
     <h2>连接（只读）</h2>
@@ -50,14 +98,20 @@ code { background: rgba(127,127,127,.12); border-radius: 4px; padding: 0 4px; fo
     <ul class="note">
       <li><code>app/runtime.local-machine</code> + <code>app/runtime.network</code>：以本机权限拉起"中继"受管进程，并允许它连接 127.0.0.1:8188（本机 ComfyUI）。</li>
       <li><code>app/runtime.execute</code>：启动/监督该受管进程并注册其回环服务代理（HTTP/WS）。</li>
-      <li><code>app/tools.expose-to-model</code>：向模型提供 <code>comfyui</code> 工具（v0 仅 status）。</li>
+      <li><code>app/tools.expose-to-model</code>：向模型提供 <code>comfyui</code> 工具（提交工作流 / 查询进度 / 取回产物 / 服务起停）。</li>
     </ul>
     <p class="note">本 App 不修改 ComfyUI 安装；所有转发都是到 127.0.0.1:8188 的只读/直通访问。</p>
   </div>
 
   <div class="sec">
     <h2>说明</h2>
-    <p class="note">v0 为 attach 模式：连接已在运行的外部 ComfyUI 实例；不会自行启动或停止 ComfyUI。中继端口为每次启动随机分配（38000-52000），不对外开放。</p>
+    <ul class="note">
+      <li>工作区把 ComfyUI 官方前端嵌在 iframe 里，且<b>直连</b> <code>127.0.0.1:8188</code>——自定义节点的扩展脚本用绝对路径（<code>/extensions/…</code>、<code>/scripts/app.js</code>），只有直连才走得通；经宿主代理路径访问时这些请求会被挡（403）。</li>
+      <li>直连意味着 iframe 与宿主页面<b>跨源</b>：「宿主主题跟随 ComfyUI 色板」因此停用，ComfyUI 用自己的色板（可在 ComfyUI 设置里改，会记在它服务端）。想换回代理方式，工作区「连接方式」下拉里选 <code>hana.api.url</code> 或 <code>直接相对路径</code>。</li>
+      <li>中继端口每次启动随机分配（38000–52000），仅 127.0.0.1 可达，不对外开放。</li>
+      <li>「启动/停止服务」管的是 8188 上的 ComfyUI 本体（Windows 计划任务 <code>HanaComfyUI-Backend</code> 拉起，独立于 Hana 存活）；「重启中继」只管本 App 的代理进程，是两件事。</li>
+      <li>服务日志：<code>app-data/comfyui-hana/logs/backend.log</code>（服务）与 <code>relay.log</code>（中继）。</li>
+    </ul>
   </div>
 
   <script type="module" src="./assets/settings.js"></script>

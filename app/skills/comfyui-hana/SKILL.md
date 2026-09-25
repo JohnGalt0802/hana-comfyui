@@ -1,21 +1,34 @@
 ---
 name: comfyui-hana
-description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；工作区左侧面板可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、帮我安装 ComfyUI、未检测到 ComfyUI 环境。
+description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端（iframe 直连 8188，自定义节点扩展可用）；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；工作区顶栏与左侧面板均可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；可自定义 ComfyUI 安装目录；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、自定义 ComfyUI 目录/ComfyUI 装在别处、自定义节点不显示/扩展脚本 403、帮我安装 ComfyUI、未检测到 ComfyUI 环境。
 ---
 
-# Hana-ComfyUI（v0.5）
+# Hana-ComfyUI（v0.7）
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。环境不存在时工作区会弹安装引导（选位置 → 让助手装 / 复制指令 / 自行安装）。
 
 ## 架构一句话
 
-受管 runtime 拉起「中继」（`runtime/comfy-relay.mjs`）→ 宿主代理路径提供 HTTP/WS 通道 → 整页工作区嵌入官方前端；`comfyui` 工具经中继操作 8188；每次提交在宿主建一条正式任务（next-step 回执）并有任务卡。
+受管 runtime 拉起「中继」（`runtime/comfy-relay.mjs`）→ 宿主代理路径提供 HTTP/WS 通道 + 工具/任务/卡片面；
+整页工作区的 iframe **直连 `127.0.0.1:8188`**（不经过代理前缀，见下）；`comfyui` 工具经中继操作 8188；
+每次提交在宿主建一条正式任务（next-step 回执）并有任务卡。
+
+### 工作区为什么直连 8188（v0.7，2026-09-25 实测定位）
+
+ComfyUI 官方前端的资源引用是**相对路径**，经代理前缀能正常加载；但**自定义节点的扩展脚本**习惯写**绝对路径**
+（`/extensions/<node>/*.js`、`/scripts/app.js`、`/scripts/ui.js`），在宿主域下这些请求会绕过 App 前缀、
+打到宿主根（不是本 App 路由）→ **403**，表现为“页面能开但节点/面板缺块”。
+后端实测这些路径在 8188 上均 200，且无 `X-Frame-Options`，因此工作区 iframe 改为**直连**（manifest 声明 `ui.csp.frameDomains`）。
+代价：iframe 跨源 → 壳页同源直控的「宿主主题跟随」停用（ComfyUI 用自己的色板，可在它自己的设置里改）。
+工作区「连接方式」下拉保留 `auto` / `hana.api.url` / `直接相对路径` 三种，可随时切回代理。
 
 ## 启动 / 停止 ComfyUI 服务（首选，别先去开终端）
 
 App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 
 - 工作区**左侧面板**：「启动服务」/「停止服务」按钮（按当前可达性二选一显示）。
+- 工作区**顶栏**（v0.7）：服务运行中时常驻「停止服务 / 重启中继」（之前工作区内只能启动、不能关闭）。
+- 设置页（v0.7）还有「Hana 启动时自动拉起 ComfyUI」开关（默认关）。
 - 工具：`comfyui(action="service", op="status"|"start"|"stop")`，start 可用 `path` 指定安装根。
 
 机制（2026-09-23 实测，不是推断）：服务由 **Windows 计划任务**（`HanaComfyUI-Backend`）以当前用户身份拉起，
@@ -49,6 +62,8 @@ App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 4. 完成后 `GET /system_stats` 返回 200 → 告诉用户“回工作区刷新即可”（中继每 5s 探测，会自动恢复）。
 
 **安装位置**：工作区安装引导给出的选定路径会写进提示词（并记入 App 配置）；若提示词里指定了位置，以它为准，目录约定 = `<位置>\ComfyUI`（仓库）+ `<位置>\venv`（环境）。装在非常规位置的，让引导记录一次该路径，中继探测会优先检查它。
+**已装但探测不到时**（v0.7）：在**设置页 → ComfyUI 安装目录**里手填（存 `app-data/comfyui-hana/install-target.json`，中继 `customRoots` 优先于常见路径；
+也可用路由 `install-targets`（候选+当前值）/ `install-target`（保存/清除）），保存即生效，无需重启。
 
 安装步骤、镜像配置与排错表全在同目录 `INSTALL.md`，动手前先读它。
 
@@ -59,7 +74,7 @@ App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 | 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service**（单工具 action 分派；service 管 8188 服务进程起停） |
 | 任务桥 | submit → 宿主任务（`delivery:"next-step"`）→ 2s 轮询结算（完成回执含产物路径；失败/中断给原因） |
 | 任务卡 | 每次 submit 返回 `details.card`（进度/队列位/耗时/产物缩略），数据经 `GET /comfyui-hana/task?id=` |
-| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` |
+| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start`（v0.7 后两者） |
 | 中继增强 | 订阅 8188 `/ws` 做进度事件缓存；`/_relay/history` 裁剪历史；日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`） |
 | 卡片 | 「ComfyUI 工作区」整页卡（含状态面板）、「ComfyUI 任务卡」 |
 
@@ -146,6 +161,8 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
 | 服务起不来但日志为空 | 计划任务 `HanaComfyUI-Backend` 的 Last Result | 非 0 就是任务层失败（如 0x800704C1=启动器路径解析失败）；任务只作启动器，手动 `schtasks /run /tn HanaComfyUI-Backend` 等价 |
 | `cancel all:true` 慎重 | 会清空整个队列 | 默认只取消指定 prompt |
 | 工作区打不开 | `boot-state` 的 note | 见 M0 记录 §8 的宿主段排错 |
+| 工作区能开但**节点面板/扩展缺块**，控制台报 `/scripts/app.js`、`/extensions/...` 403 | 工作区「连接方式」下拉 | 自定义节点扩展用绝对路径，代理前缀下会打到宿主根被 403；选 `direct`（默认）或 `auto` 直连 8188 即可（v0.7） |
+| 探测不到已装的 ComfyUI | 设置页「ComfyUI 安装目录」/ `install-targets` | 手填安装根（含 `main.py` 的那层或其外层），保存即生效 |
 
 ## 数据与日志
 
@@ -155,3 +172,4 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
 - 私有运行时配置：`app-data/comfyui-hana/integration/relay-*.json`（0600，中继读取后自删；含 controlKey，管理端点 `/_relay/fs/*`、`/_relay/upload` 需该密钥）。
 - 产物定位：ComfyUI 安装根的 `output\<subfolder>\<filename>`（安装根由本机环境探测自动识别，不硬编码；经 `/_relay/fs/stat` 验证存在）。
 - 端口随机（38000-52000）、仅绑定 127.0.0.1。
+- 配置文件（v0.7，均在 `app-data/comfyui-hana/`）：`install-target.json`（自定义安装根）、`auto-start.json`（服务自动拉起开关，默认关）。

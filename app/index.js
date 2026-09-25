@@ -325,6 +325,7 @@ export default defineApp(async (sdk) => {
       state.phase = "ready";
       state.lastError = null;
       startStatusPolling();
+      void maybeAutoStartBackend(); // 中继就绪后按配置决定是否拉起 ComfyUI 服务（不阻塞启动）
       return result;
     } catch (e) {
       state.phase = "error";
@@ -378,6 +379,25 @@ export default defineApp(async (sdk) => {
   // 这样即使用户选了非常规目录，装完也会被自动发现。
   const installTargetFile = join(dataDir, "install-target.json");
 
+  // 服务自动拉起（可选，默认关）：Hana 启动时若已装 ComfyUI 且 8188 无服务，自动拉起一次。
+  const autoStartFile = join(dataDir, "auto-start.json");
+
+  function readAutoStart() {
+    try {
+      return JSON.parse(readFileSync(autoStartFile, "utf8")).enabled === true;
+    } catch { return false; }
+  }
+
+  function writeAutoStart(enabled) {
+    try {
+      writeFileSync(autoStartFile, JSON.stringify({ enabled: !!enabled, at: new Date().toISOString() }, null, 2), { mode: 0o600 });
+      return true;
+    } catch (e) {
+      warn(`auto-start 写入失败：${msgOf(e)}`);
+      return false;
+    }
+  }
+
   function readInstallTarget() {
     try {
       const raw = JSON.parse(readFileSync(installTargetFile, "utf8"));
@@ -396,6 +416,29 @@ export default defineApp(async (sdk) => {
   }
 
   let lastRelayPid = 0;
+
+  // 自动拉起：仅当开关开启且本机已装 ComfyUI 时执行。中继的 startBackendService 自身幂等
+  // （8188 已有服务时返回 already:true），因此无需预判可达性，不会重复起服务。
+  async function maybeAutoStartBackend() {
+    try {
+      if (!readAutoStart()) return;
+      await new Promise((r) => setTimeout(r, 6000)); // 等状态轮询拿到首帧快照（含安装探测）
+      if (!relayReady()) return;
+      try { await syncCustomRoots(true); } catch { /* 推不动不致命，下面的探测会兜底 */ }
+      const env = (state.snapshot && state.snapshot.relay && state.snapshot.relay.env) || null;
+      if (!env || !env.found) { log("自动拉起：跳过（本机未探测到 ComfyUI 安装）"); return; }
+      const { ok, data } = await relayJson("/_relay/backend/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+        timeoutMs: 40_000,
+      });
+      const d = data && typeof data === "object" ? data : {};
+      log(`自动拉起 ComfyUI：ok=${ok}${d.already ? "（已在运行）" : ""}${d.error ? ` err=${d.error}` : ""}`);
+    } catch (e) {
+      warn(`自动拉起 ComfyUI 失败（不影响 App）：${msgOf(e)}`);
+    }
+  }
   async function syncCustomRoots(force = false) {
     if (!relayReady()) return;
     const snap = state.snapshot;
@@ -1705,6 +1748,21 @@ export default defineApp(async (sdk) => {
           if (!writeInstallTarget(raw || null)) return c.json({ ok: false, error: "写入失败" }, 500);
           await syncCustomRoots(true);
           return c.json({ ok: true, custom: raw || null });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      // 服务自动拉起开关（持久化；开关详情见 maybeAutoStartBackend）
+      app.get("/comfyui-hana/auto-start", (c) => {
+        try { return c.json({ ok: true, enabled: readAutoStart() }); } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
+      });
+
+      app.post("/comfyui-hana/auto-start", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          if (!writeAutoStart(body.enabled === true)) return c.json({ ok: false, error: "写入失败" }, 500);
+          return c.json({ ok: true, enabled: readAutoStart() });
         } catch (e) {
           return c.json({ ok: false, error: msgOf(e) }, 500);
         }

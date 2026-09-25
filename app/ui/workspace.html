@@ -121,7 +121,8 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
           <button id="btn-reload-boot">刷新状态</button>
           <span class="meta">连接方式</span>
           <select id="sel-mode">
-            <option value="auto">自动（首选 hana.api.url）</option>
+            <option value="direct">直连 127.0.0.1:8188（推荐）</option>
+            <option value="auto">自动（直连 → 代理路径逐级回落）</option>
             <option value="sdk">hana.api.url</option>
             <option value="raw">直接相对路径</option>
           </select>
@@ -155,7 +156,8 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
           <button id="btn-reload2">刷新页面</button>
           <span class="meta">连接方式</span>
           <select id="sel-mode2">
-            <option value="auto">自动（首选 hana.api.url）</option>
+            <option value="direct">直连 127.0.0.1:8188（推荐）</option>
+            <option value="auto">自动（直连 → 代理路径逐级回落）</option>
             <option value="sdk">hana.api.url</option>
             <option value="raw">直接相对路径</option>
           </select>
