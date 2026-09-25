@@ -1,4 +1,4 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.7
+# Hana-ComfyUI（v2 App，开发仓）· v0.8
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
@@ -42,11 +42,22 @@
     ② 它是 `{**settings, **new_settings}` **合并写**，实测不动用户其他设置；
     ③ 色板 schema 实测接受 `colors:{comfy_base,litegraph_base,node_slot}`，键名与内置色板一致。
     「连接方式」下拉保留原 `hana.api.url` / 直接相对路径两种代理方式，可随时切回。
-  - **服务控制提到工作区顶栏**：服务运行中时顶栏常驻「停止服务 / 重启中继」，与左侧状态面板互为入口（此前工作区内只能启动、不能关闭）。  - **设置页可自定义 ComfyUI 安装目录**（`ui/settings.html`，v0 只读骨架重做）：复用原有 `install-targets|install-target` 路由，
+  - **服务控制提到工作区顶栏**：服务运行中时顶栏常驻「停止服务 / 重启中继」，与左侧状态面板互为入口（此前工作区内只能启动、不能关闭）。
+  - **设置页可自定义 ComfyUI 安装目录**（`ui/settings.html`，v0 只读骨架重做）：复用原有 `install-targets|install-target` 路由，
     支持探测/手填/清除；中继侧 `customRoots` 优先于常见路径检查，保存即生效。
   - **服务自动拉起开关**（默认**关**）：持久化在 `app-data/comfyui-hana/auto-start.json`。Hana 启动且中继就绪后，
     若本机已装 ComfyUI、8188 上没有服务，则自动拉起一次（中继 `startBackendService` 自身幂等，已运行返回 `already`）。
     路由 `auto-start`（GET/POST）；服务由计划任务拉起，仍独立于 Hana 存活。
+- ComfyUI 本体更新（v0.8 新增，M11）：
+  - **检查**：`GET /comfyui-hana/update` → 中继 `GET /_relay/update`（`git fetch` + 跟 `origin/<branch>` 比 commit，
+    给出 `behind/ahead` 与本地/远端 tag 描述；结果 60s TTL 缓存，`?force=1` 绕过）。
+  - **执行**：`POST /comfyui-hana/update` `{op:"apply"}` → 中继**后台**跑：停服务 → `git fetch` → `git pull --ff-only`
+    → `pip install -r requirements.txt`。用异步 `spawn`（**绝不 spawnSync 卡事件循环**，pip 可数分钟）；
+    只用 `--ff-only`（不产生 merge commit；本地有未提交改动会明确失败，**不擅自 merge/reset**）；
+    更新前记录旧 commit（与更新后一并写入 `logs/update-state.json`）；更新后**不自动起服务**（交用户决定）。
+  - **进度**：`GET /comfyui-hana/update/status`（阶段 stopping/fetching/pulling/installing/done/failed + 步骤 + 日志尾），
+    设置页「ComfyUI 更新」区块轮询它；工具面 `comfyui(action="update", op="check"|"apply"|"status")`。
+  - 边界：仅**源码安装**（Git 仓库）可代为更新；便携包/手工解压会明确回报“无法代为更新”。
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok
 

@@ -151,6 +151,94 @@ $("s-auto-start").addEventListener("change", async () => {
   }
 });
 
+// ── ComfyUI 更新（M11）────────────────────────────────────────────────────
+let updatePollTimer = null;
+let updatePollUntil = 0;
+
+function fmtVer(v) {
+  if (!v) return "—";
+  return `${v.describe || v.commit || "?"}${v.dirty ? "（有未提交改动）" : ""}`;
+}
+
+function renderUpdateCheck(d) {
+  if (!d) return;
+  if (d.isGit === false) {
+    $("s-up-local").textContent = d.local ? fmtVer(d.local) : "—";
+    $("s-up-remote").innerHTML = '<span class="chip">不适用</span>';
+    setMsg("s-up-msg", d.note || "该安装不是 Git 仓库，App 无法代为更新。", "bad");
+    return;
+  }
+  $("s-up-local").textContent = fmtVer(d.local);
+  $("s-up-remote").textContent = fmtVer(d.remote);
+  if (d.local && d.local.dirty) setMsg("s-up-msg", "本地有未提交改动，git 会拒绝拉取（不擅自 merge/reset）。", "bad");
+  else if (d.upToDate) setMsg("s-up-msg", "已是最新，无待更新提交。", "ok");
+  else setMsg("s-up-msg", `落后 ${d.behind} 个提交${d.ahead ? `（本地领先 ${d.ahead} 个）` : ""}。`, "ok");
+}
+
+async function checkUpdate(force) {
+  setMsg("s-up-msg", "检查中（git fetch 可能需要几秒）…", "");
+  try {
+    const { data } = await apiJson(`/comfyui-hana/update${force ? "?force=1" : ""}`);
+    if (!data || data.ok === false) { setMsg("s-up-msg", `检查失败：${(data && data.error) || "未知原因"}`, "bad"); return; }
+    renderUpdateCheck(data);
+  } catch (e) {
+    setMsg("s-up-msg", `检查失败：${String((e && e.message) || e)}`, "bad");
+  }
+}
+
+function renderUpdateStatus(st) {
+  if (!st) return false;
+  const phaseText = { idle: "空闲", stopping: "正在停服务", fetching: "抓取远端", pulling: "拉取更新", installing: "安装依赖", done: "已完成", failed: "失败" }[st.phase] || st.phase;
+  $("s-up-state").innerHTML = st.running
+    ? `<span class="chip">进行中</span> ${esc(phaseText)}`
+    : (st.phase === "failed" ? '<span class="chip bad">失败</span>' : (st.phase === "done" ? '<span class="chip ok">已完成</span>' : esc(phaseText)));
+  if (st.before) $("s-up-local").textContent = fmtVer(st.before);
+  if (st.after) $("s-up-remote").textContent = `更新后 ${fmtVer(st.after)}`;
+  const steps = (st.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}${s.detail ? `：${String(s.detail).split("\n").slice(-1)[0]}` : ""}`);
+  $("s-up-log").textContent = [...steps, ...(st.logTail || []).slice(-12)].filter(Boolean).join("\n");
+  if (st.lastError) setMsg("s-up-msg", `更新失败：${st.lastError}`, "bad");
+  else if (st.phase === "done") setMsg("s-up-msg", "更新完成。请到工作区点「启动服务」重新拉起 ComfyUI。", "ok");
+  return !!st.running;
+}
+
+async function pollUpdateStatus() {
+  try {
+    const { data } = await apiJson("/comfyui-hana/update/status");
+    const running = renderUpdateStatus(data);
+    if (!running && updatePollTimer && Date.now() > updatePollUntil) stopUpdatePolling();
+  } catch { /* 下一拍再试 */ }
+}
+
+function startUpdatePolling() {
+  if (updatePollTimer) return;
+  updatePollUntil = Date.now() + 30 * 60_000; // 上限 30 分钟（pip 可能很久）
+  updatePollTimer = setInterval(() => { void pollUpdateStatus(); }, 2000);
+  void pollUpdateStatus();
+}
+function stopUpdatePolling() {
+  if (updatePollTimer) { clearInterval(updatePollTimer); updatePollTimer = null; }
+}
+
+$("s-up-check").addEventListener("click", () => { void checkUpdate(true); });
+$("s-up-apply").addEventListener("click", async () => {
+  setMsg("s-up-msg", "已发起更新（先停服务，随后 git pull + pip install）…", "");
+  try {
+    const { data } = await apiJson("/comfyui-hana/update", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "apply" }),
+    });
+    if (!data || data.accepted !== true) {
+      setMsg("s-up-msg", `发起失败：${(data && (data.reason || data.error)) || "未知原因"}`, "bad");
+      return;
+    }
+    startUpdatePolling();
+    void loadInstall();
+  } catch (e) {
+    setMsg("s-up-msg", `发起失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
 // ── 启动 ──────────────────────────────────────────────────────────────────
 async function main() {
   syncTheme();
@@ -159,6 +247,7 @@ async function main() {
   void poll();
   void loadInstall();
   void loadAutoStart();
+  void pollUpdateStatus();
   setInterval(() => { void poll(); }, 3000);
   setInterval(() => { void loadInstall(); }, 20000);
 }

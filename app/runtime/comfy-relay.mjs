@@ -16,6 +16,10 @@
 //   POST /_relay/fs/read           读取文本/二进制（{path, encoding, maxBytes}，上限 8 MiB）
 //   POST /_relay/upload            读取本机图片并 multipart 上传到后端 /upload/image
 //                                  （{path, subfolder?, type?, overwrite?}）
+//   GET  /_relay/theme             宿主主题写入状态（跨源主题跟随，见「主题同步」区）
+//   GET  /_relay/update            ComfyUI 本体更新检查（git fetch + 比较，带 TTL 缓存）
+//   POST /_relay/update            执行更新（{op:"check"|"apply"}；apply 后台跑，需 controlKey）
+//   GET  /_relay/update/status     更新进度（阶段 / 步骤 / 日志尾）
 //
 // 启动方式：
 //   受管模式（生产）：node comfy-relay.mjs <runtime-config.json>
@@ -39,7 +43,7 @@ import http from "node:http";
 import net from "node:net";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 
@@ -932,6 +936,266 @@ async function applyThemeSettings(body) {
   };
 }
 
+// ── ComfyUI 本体更新（M11）──────────────────────────────────────────────
+// 目标：源码安装的 ComfyUI 能在 App 里检查 / 执行更新（git pull + pip install -r requirements.txt）。
+// 设计要点：
+//   · 长任务（pip 可数分钟）必须后台跑 —— 用异步 spawn，绝不 spawnSync 卡住中继事件循环；
+//   · 只用 git pull --ff-only：不产生 merge commit；本地有未提交改动会明确失败，不擅自处理；
+//   · 更新前记录旧 commit（更新后一并记录），失败时把成因与回退线索写清楚；
+//   · 更新前先停服务（pip 覆盖文件时 8188 进程占用会失败）；更新后**不自动起服务**。
+const UPDATE_LOG_TAIL_MAX = 60;
+const GIT_TIMEOUT_MS = 120_000;
+const PIP_TIMEOUT_MS = 30 * 60_000;
+const UPDATE_CHECK_TTL_MS = 60_000;
+
+const updateProc = {
+  running: false,
+  phase: "idle",      // idle | stopping | fetching | pulling | installing | done | failed
+  startedAt: null,
+  finishedAt: null,
+  before: null,       // { commit, describe, branch, dirty, dirtyDetail }
+  after: null,
+  steps: [],          // [{ name, ok, detail, at }]
+  logTail: [],
+  lastError: null,
+};
+let updateCheckCache = { at: 0, data: null };
+let updateStateLoaded = false;
+
+function updateStatePath() {
+  const dir = logFilePath ? dirname(logFilePath) : process.cwd();
+  return join(dir, "update-state.json");
+}
+
+function pushUpdateLog(line) {
+  const s = String(line || "").replace(/\s+$/, "");
+  if (!s) return;
+  updateProc.logTail.push(s);
+  if (updateProc.logTail.length > UPDATE_LOG_TAIL_MAX) {
+    updateProc.logTail.splice(0, updateProc.logTail.length - UPDATE_LOG_TAIL_MAX);
+  }
+}
+
+function saveUpdateState() {
+  try {
+    mkdirSync(dirname(updateStatePath()), { recursive: true });
+    writeFileSync(updateStatePath(), JSON.stringify({ ...updateProc, savedAt: new Date().toISOString() }, null, 2), "utf8");
+  } catch (e) { warn(`update-state 写入失败：${(e && e.message) || e}`); }
+}
+
+function loadUpdateState() {
+  try {
+    const raw = JSON.parse(readFileSync(updateStatePath(), "utf8"));
+    Object.assign(updateProc, {
+      running: false, // 进程已换，过期运行态不认
+      phase: raw.phase === "done" || raw.phase === "failed" ? raw.phase : "idle",
+      startedAt: raw.startedAt || null,
+      finishedAt: raw.finishedAt || null,
+      before: raw.before || null,
+      after: raw.after || null,
+      steps: Array.isArray(raw.steps) ? raw.steps.slice(-12) : [],
+      logTail: Array.isArray(raw.logTail) ? raw.logTail.slice(-UPDATE_LOG_TAIL_MAX) : [],
+      lastError: raw.lastError || null,
+    });
+  } catch { /* 首次运行没有状态文件，正常 */ }
+}
+
+// git 可执行文件：先 PATH，再常见安装位置（中继在宿主沙箱里，PATH 可能不全）
+function resolveGit() {
+  for (const exe of ["git.exe", "C:\\Program Files\\Git\\cmd\\git.exe", "C:\\Program Files (x86)\\Git\\cmd\\git.exe"]) {
+    const r = runExe(exe, ["--version"], 8_000);
+    if (r.code === 0) return { path: exe, version: r.stdout };
+  }
+  return null;
+}
+
+// 异步子进程（流式）：长任务专用。返回 { code, ok, tail }
+function runStream(exe, args, { cwd = null, timeoutMs = GIT_TIMEOUT_MS, onLine = null } = {}) {
+  return new Promise((resolve) => {
+    const lines = [];
+    const keep = (chunk) => {
+      for (const raw of String(chunk || "").split(/\r?\n/)) {
+        const s = raw.replace(/\s+$/, "");
+        if (!s) continue;
+        if (lines.length < 40) lines.push(s); else lines[lines.length - 1] = s;
+        pushUpdateLog(s);
+        if (onLine) onLine(s);
+      }
+    };
+    let child;
+    try {
+      child = spawn(exe, args, { cwd: cwd || undefined, windowsHide: true, env: CHILD_ENV });
+    } catch (e) {
+      return resolve({ code: -1, ok: false, tail: String((e && e.message) || e) });
+    }
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* 忽略 */ }
+      pushUpdateLog(`[超时] ${basename(exe)} 超过 ${Math.round(timeoutMs / 1000)}s，已终止`);
+    }, timeoutMs);
+    child.stdout?.on("data", keep);
+    child.stderr?.on("data", keep);
+    child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, ok: false, tail: String((e && e.message) || e) }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? -1, ok: code === 0, tail: lines.slice(-12).join("\n") }); });
+  });
+}
+
+// 仓库信息（未跟踪文件不算 dirty，否则 requirements.core.txt 这类会一直报脏）
+function gitInfo(git, repoDir) {
+  const g = (args) => runExe(git, ["-C", repoDir, ...args], 15_000);
+  const status = String(g(["status", "--porcelain"]).stdout || "");
+  const dirtyLines = status.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith("?? "));
+  return {
+    commit: g(["rev-parse", "--short", "HEAD"]).stdout || null,
+    describe: g(["describe", "--tags", "--always"]).stdout || null,
+    branch: g(["rev-parse", "--abbrev-ref", "HEAD"]).stdout || null,
+    dirty: dirtyLines.length > 0,
+    dirtyDetail: dirtyLines.slice(0, 5),
+  };
+}
+
+// 更新上下文：ComfyUI 源码目录（git 仓库）+ venv python
+function resolveUpdateContext() {
+  const t = resolveLaunchTarget(null);
+  if (!t.ok) return { ok: false, error: "未找到可更新的 ComfyUI 安装（缺 main.py 或缺 venv python）" };
+  const git = resolveGit();
+  if (!git) return { ok: false, error: "本机未找到 git 可执行文件（更新需要 Git）" };
+  const repoDir = dirname(t.mainPy); // main.py 所在目录即源码根
+  return { ok: true, git, repoDir, python: t.python, install: t.install, isRepo: existsSync(join(repoDir, ".git")) };
+}
+
+// 检查更新（fetch + 比较；带 TTL 缓存，避免 UI 反复触发网络）
+async function checkUpdate(force = false) {
+  if (!force && updateCheckCache.data && Date.now() - updateCheckCache.at < UPDATE_CHECK_TTL_MS) return updateCheckCache.data;
+  const ctx = resolveUpdateContext();
+  if (!ctx.ok) return { ok: false, error: ctx.error };
+  const local = gitInfo(ctx.git.path, ctx.repoDir);
+  if (!ctx.isRepo) {
+    const out = { ok: true, isGit: false, note: "该安装不是 Git 仓库（便携包 / 手工解压），App 无法代为更新", local, checkedAt: new Date().toISOString() };
+    updateCheckCache = { at: Date.now(), data: out };
+    return out;
+  }
+  const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "origin"], { timeoutMs: GIT_TIMEOUT_MS });
+  if (!f.ok) {
+    const out = { ok: false, isGit: true, local, error: `git fetch 失败：${f.tail}`, checkedAt: new Date().toISOString() };
+    updateCheckCache = { at: Date.now(), data: out };
+    return out;
+  }
+  const g = (args) => runExe(ctx.git.path, ["-C", ctx.repoDir, ...args], 20_000);
+  const branch = local.branch || "master";
+  const remoteRef = `origin/${branch}`;
+  const behind = Number(g(["rev-list", "--count", `HEAD..${remoteRef}`]).stdout || 0) || 0;
+  const ahead = Number(g(["rev-list", "--count", `${remoteRef}..HEAD`]).stdout || 0) || 0;
+  const out = {
+    ok: true,
+    isGit: true,
+    repoDir: ctx.repoDir,
+    git: { path: ctx.git.path, version: ctx.git.version },
+    local,
+    remote: {
+      ref: remoteRef,
+      commit: g(["rev-parse", "--short", remoteRef]).stdout || null,
+      describe: g(["describe", "--tags", "--always", remoteRef]).stdout || null,
+    },
+    behind,
+    ahead,
+    upToDate: behind === 0,
+    checkedAt: new Date().toISOString(),
+  };
+  updateCheckCache = { at: Date.now(), data: out };
+  return out;
+}
+
+// 执行更新（后台；结果不在这里返回，进度看 status）
+function startUpdateJob() {
+  if (updateProc.running) return { accepted: false, reason: "already-running", phase: updateProc.phase };
+  const ctx = resolveUpdateContext();
+  if (!ctx.ok) return { accepted: false, reason: ctx.error };
+  if (!ctx.isRepo) return { accepted: false, reason: "该安装不是 Git 仓库（便携包），无法代为更新" };
+
+  updateProc.running = true;
+  updateProc.phase = "stopping";
+  updateProc.startedAt = new Date().toISOString();
+  updateProc.finishedAt = null;
+  updateProc.steps = [];
+  updateProc.logTail = [];
+  updateProc.lastError = null;
+  updateProc.after = null;
+  updateProc.before = gitInfo(ctx.git.path, ctx.repoDir);
+  updateStateLoaded = true;
+  saveUpdateState();
+  log(`开始更新 ComfyUI：repo=${ctx.repoDir} 当前=${updateProc.before.describe || updateProc.before.commit}`);
+
+  const step = (name, ok, detail) => {
+    updateProc.steps.push({ name, ok: !!ok, detail: detail ? String(detail).slice(0, 400) : null, at: new Date().toISOString() });
+    if (!ok) updateProc.lastError = `${name}：${detail || "失败"}`;
+    saveUpdateState();
+  };
+
+  void (async () => {
+    try {
+      // 1) 停服务：pip 覆盖文件时被占用会失败，务必先停
+      if (backend.reachable) {
+        pushUpdateLog("停 ComfyUI 服务（更新期间必须停止）…");
+        const s = await stopBackendService();
+        step("停止服务", s.ok, s.ok ? null : `仍有进程存活：${JSON.stringify(s.failed || [])}`);
+        if (!s.ok) throw new Error("停止服务失败，已中止更新（避免文件占用导致半更新）");
+      } else {
+        step("停止服务", true, "服务本来就没在跑");
+      }
+      // 2) fetch
+      updateProc.phase = "fetching"; saveUpdateState();
+      pushUpdateLog("git fetch --prune origin …");
+      const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "origin"], { timeoutMs: GIT_TIMEOUT_MS });
+      step("抓取远端", f.ok, f.ok ? null : f.tail);
+      if (!f.ok) throw new Error("git fetch 失败（网络或镜像不可用）");
+      // 3) pull --ff-only
+      updateProc.phase = "pulling"; saveUpdateState();
+      pushUpdateLog("git pull --ff-only …");
+      const p = await runStream(ctx.git.path, ["-C", ctx.repoDir, "pull", "--ff-only"], { timeoutMs: GIT_TIMEOUT_MS });
+      step("拉取更新", p.ok, p.tail);
+      if (!p.ok) throw new Error("git pull --ff-only 失败：本地可能有未提交改动或历史分叉（不擅自 merge/reset，请人工处理后重试）");
+      // 4) pip install -r requirements.txt
+      updateProc.phase = "installing"; saveUpdateState();
+      pushUpdateLog("pip install -r requirements.txt …（可能数分钟）");
+      const i = await runStream(ctx.python, ["-m", "pip", "install", "-r", "requirements.txt"], { cwd: ctx.repoDir, timeoutMs: PIP_TIMEOUT_MS });
+      step("安装依赖", i.ok, i.tail);
+      if (!i.ok) throw new Error("pip install 失败（依赖可能处于半更新状态，请按日志处理后再启动服务）");
+      updateProc.after = gitInfo(ctx.git.path, ctx.repoDir);
+      updateProc.phase = "done";
+      step("完成", true, `${updateProc.before?.describe || "?"} → ${updateProc.after?.describe || "?"}`);
+      log(`ComfyUI 更新完成：${updateProc.before?.commit} → ${updateProc.after?.commit}`);
+      updateCheckCache = { at: 0, data: null };
+    } catch (e) {
+      updateProc.phase = "failed";
+      if (!updateProc.lastError) updateProc.lastError = String((e && e.message) || e);
+      logErr(`ComfyUI 更新失败：${updateProc.lastError}`);
+    } finally {
+      updateProc.running = false;
+      updateProc.finishedAt = new Date().toISOString();
+      saveUpdateState();
+    }
+  })();
+
+  return { accepted: true, phase: updateProc.phase, before: updateProc.before, repoDir: ctx.repoDir, python: ctx.python };
+}
+
+function updateStatusPayload() {
+  if (!updateStateLoaded) { updateStateLoaded = true; loadUpdateState(); }
+  return {
+    ok: true,
+    running: updateProc.running,
+    phase: updateProc.phase,
+    startedAt: updateProc.startedAt,
+    finishedAt: updateProc.finishedAt,
+    before: updateProc.before,
+    after: updateProc.after,
+    steps: updateProc.steps,
+    lastError: updateProc.lastError,
+    logTail: updateProc.logTail.slice(-24),
+    hint: "失败后可人工在仓库目录用 git 处理；pip 装过的新依赖不会自动回退。更新完成后需要重新启动 ComfyUI 服务。",
+  };
+}
+
 function backendProcPayload() {
   return {
     taskName: BACKEND_TASK_NAME,
@@ -1818,6 +2082,59 @@ const server = http.createServer((req, res) => {
           const body = await readBodyJson(req).catch(() => ({}));
           const out = await applyThemeSettings(body);
           jsonOut(res, out.ok ? 200 : 502, out);
+        } catch (e) {
+          jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });
+        }
+      })();
+      return;
+    }
+    jsonOut(res, 405, { error: "method not allowed" }, req.method);
+    return;
+  }
+  // ComfyUI 本体更新（M11）：check=检查（带缓存）/ apply=后台执行 / status=进度
+  if (pathOnly === "/_relay/update" || pathOnly === "/_relay/update/status") {
+    const wantStatus = pathOnly.endsWith("/status");
+    if (wantStatus) {
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        jsonOut(res, 405, { error: "method not allowed" }, req.method);
+        return;
+      }
+      jsonOut(res, 200, updateStatusPayload(), req.method);
+      return;
+    }
+    if (req.method === "GET" || req.method === "HEAD") {
+      const url = new URL(String(req.url || "/"), "http://relay.invalid");
+      const force = url.searchParams.get("force") === "1";
+      void (async () => {
+        try {
+          const out = await checkUpdate(force);
+          jsonOut(res, out.ok ? 200 : 502, out, req.method);
+        } catch (e) {
+          jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }, req.method);
+        }
+      })();
+      return;
+    }
+    if (req.method === "POST") {
+      if (!controlOk(req)) {
+        jsonOut(res, 403, { error: "comfy-relay: control key required" });
+        return;
+      }
+      void (async () => {
+        try {
+          const body = await readBodyJson(req).catch(() => ({}));
+          const op = String((body && body.op) || "apply");
+          if (op === "check") {
+            const out = await checkUpdate(true);
+            jsonOut(res, out.ok ? 200 : 502, out);
+            return;
+          }
+          if (op !== "apply") {
+            jsonOut(res, 400, { ok: false, error: 'op 只支持 "check" / "apply"' });
+            return;
+          }
+          const out = startUpdateJob();
+          jsonOut(res, out.accepted ? 202 : 409, out);
         } catch (e) {
           jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });
         }

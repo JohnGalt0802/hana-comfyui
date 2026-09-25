@@ -1459,6 +1459,57 @@ export default defineApp(async (sdk) => {
     };
   }
 
+  // ── ComfyUI 本体更新（M11）───────────────────────────────────────────────
+  // 中继侧机制（git pull --ff-only + pip install -r requirements.txt；后台跑、失败不回退）
+  // 见 runtime/comfy-relay.mjs 的「ComfyUI 本体更新」区。
+  async function actionUpdate(args) {
+    const op = String(args.op || "check").trim().toLowerCase();
+    if (op === "status") {
+      const { ok, status, data } = await relayJson("/_relay/update/status", { timeoutMs: 10_000 });
+      if (!ok || !data) throw new Error(`读取更新状态失败（HTTP ${status}）`);
+      const lines = [
+        `更新状态：${data.running ? `进行中（${data.phase}）` : data.phase}`,
+        data.before ? `当前：${data.before.describe || data.before.commit}${data.before.dirty ? "（有未提交改动）" : ""}` : "",
+        data.after ? `更新后：${data.after.describe || data.after.commit}` : "",
+        ...(data.steps || []).map((s) => `- ${s.ok ? "✓" : "✗"} ${s.name}${s.detail ? `：${String(s.detail).split("\n").slice(-1)[0]}` : ""}`),
+        data.lastError ? `错误：${data.lastError}` : "",
+      ].filter(Boolean);
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { comfyui: { action: "update", op, ...data } } };
+    }
+    if (op === "check") {
+      const { ok, status, data } = await relayJson("/_relay/update?force=1", { timeoutMs: 150_000 });
+      if (!ok || !data || data.ok === false) throw new Error(`检查更新失败：${(data && data.error) || `HTTP ${status}`}`);
+      const lines = data.isGit === false
+        ? [`无法代为更新：${data.note}`, data.local ? `当前：${data.local.describe || data.local.commit}` : ""]
+        : [
+            `当前：${data.local?.describe || data.local?.commit}（分支 ${data.local?.branch}）`,
+            `远端：${data.remote?.describe || data.remote?.commit}`,
+            data.upToDate ? "已是最新，无待更新提交。" : `落后 ${data.behind} 个提交${data.ahead ? `，本地领先 ${data.ahead} 个` : ""}。`,
+            data.local?.dirty ? "注意：本地有未提交改动，更新可能被 git 拒绝。" : "",
+          ];
+      return { content: [{ type: "text", text: lines.filter(Boolean).join("\n") }], details: { comfyui: { action: "update", op, ...data } } };
+    }
+    if (op === "apply") {
+      const { ok, status, data } = await relayJson("/_relay/update", { method: "POST", body: JSON.stringify({ op: "apply" }), timeoutMs: 30_000 });
+      if (!ok || !data || data.accepted !== true) {
+        throw new Error(`发起更新失败：${(data && (data.reason || data.error)) || `HTTP ${status}`}`);
+      }
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `已发起 ComfyUI 更新（后台执行，当前阶段 ${data.phase}）。`,
+            data.before ? `当前版本：${data.before.describe || data.before.commit}` : "",
+            "流程：停服务 → git fetch → git pull --ff-only → pip install -r requirements.txt。",
+            "用 comfyui(action=\"update\", op=\"status\") 查进度；完成后需要重新启动服务。",
+          ].filter(Boolean).join("\n"),
+        }],
+        details: { comfyui: { action: "update", op, ...data } },
+      };
+    }
+    throw new Error(`update 的 op 只支持 check / apply / status（收到 "${op}"）`);
+  }
+
   // ── 服务进程（启动 / 停止）───────────────────────────────────────────────
   // 中继侧落到「计划任务拉起 + taskkill 撤下」，原因见 runtime/comfy-relay.mjs 服务管理区。
   function serviceSnapshot() {
@@ -1600,6 +1651,13 @@ export default defineApp(async (sdk) => {
           overwrite: { type: "boolean", description: "true 时覆盖同名文件" },
         },
       },
+      {
+        command: "update",
+        required: [],
+        fields: {
+          op: { type: "string", enum: ["check", "apply", "status"], description: "check=检查更新（与远端比 commit，默认）；apply=执行更新（停服务 → git pull --ff-only → pip install -r requirements.txt，后台跑）；status=查更新进度" },
+        },
+      },
     ];
   }
 
@@ -1610,7 +1668,8 @@ export default defineApp(async (sdk) => {
       description:
         "Hana-ComfyUI：操作本机 ComfyUI（127.0.0.1:8188）的工具（一个 App 一个同名工具，action 选动作）。" +
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
-        "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）。" +
+        "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
+        "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",
@@ -1668,9 +1727,10 @@ export default defineApp(async (sdk) => {
             case "cancel": return await actionCancel(args);
             case "workflows": return await actionWorkflows(args);
             case "service": return await actionService(args);
+            case "update": return await actionUpdate(args);
             case "upload": return await actionUpload(args);
             default:
-              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service（收到 "${action}"）`);
+              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update（收到 "${action}"）`);
           }
         } catch (e) {
           const text = `comfyui(${action || "?"}) 失败：${msgOf(e)}`;
@@ -1679,7 +1739,7 @@ export default defineApp(async (sdk) => {
         }
       },
     });
-    log("工具注册：comfyui（v0.2：status/submit/query/result/cancel/workflows/upload）");
+    log("工具注册：comfyui（v0.2：status/submit/query/result/cancel/workflows/upload/service/update）");
   } catch (e) {
     error(`工具注册失败：${msgOf(e)}`);
   }
@@ -1910,8 +1970,47 @@ export default defineApp(async (sdk) => {
           return c.json({ ok: false, error: msgOf(e) }, 502);
         }
       });
+      // ── ComfyUI 本体更新（M11）───────────────────────────────────────
+      // check（带缓存）→ 跟远端比 commit；apply → 后台跑（停服务→fetch→pull→pip）；
+      // status → 阶段/步骤/日志尾。机制见 runtime/comfy-relay.mjs 的「ComfyUI 本体更新」区。
+      app.get("/comfyui-hana/update", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const force = String(c.req.query("force") || "") === "1" ? "?force=1" : "";
+          const { ok, status, data } = await relayJson(`/_relay/update${force}`, { timeoutMs: 150_000 });
+          return c.json(ok ? (data || { ok: true }) : { ok: false, error: (data && data.error) || `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.get("/comfyui-hana/update/status", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/update/status", { timeoutMs: 10_000 });
+          return c.json(ok ? (data || { ok: true }) : { ok: false, error: (data && data.error) || `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.post("/comfyui-hana/update", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const { ok, status, data } = await relayJson("/_relay/update", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body && typeof body === "object" ? body : {}),
+            timeoutMs: 180_000,
+          });
+          return c.json(ok ? (data || { ok: true }) : { ok: false, error: (data && data.error) || `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
     });
-    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|task|relay/start|backend/start|backend/stop|backend|theme）");
+    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|task|relay/start|backend/start|backend/stop|backend|theme|update*）");
   } catch (e) {
     error(`ctx.routes.register 失败（壳页诊断面不可用，工具面仍可用）：${msgOf(e)}`);
   }

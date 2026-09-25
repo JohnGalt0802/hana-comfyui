@@ -3,7 +3,7 @@ name: comfyui-hana
 description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端（iframe 直连 8188，自定义节点扩展可用）；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；工作区顶栏与左侧面板均可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；可自定义 ComfyUI 安装目录；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、自定义 ComfyUI 目录/ComfyUI 装在别处、自定义节点不显示/扩展脚本 403、帮我安装 ComfyUI、未检测到 ComfyUI 环境。
 ---
 
-# Hana-ComfyUI（v0.7）
+# Hana-ComfyUI（v0.8）
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。环境不存在时工作区会弹安装引导（选位置 → 让助手装 / 复制指令 / 自行安装）。
 
@@ -77,10 +77,10 @@ App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 
 | 面 | 内容 |
 |----|------|
-| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service**（单工具 action 分派；service 管 8188 服务进程起停） |
+| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service / update**（单工具 action 分派；service 管 8188 服务进程起停；update 管源码安装的本体更新） |
 | 任务桥 | submit → 宿主任务（`delivery:"next-step"`）→ 2s 轮询结算（完成回执含产物路径；失败/中断给原因） |
 | 任务卡 | 每次 submit 返回 `details.card`（进度/队列位/耗时/产物缩略），数据经 `GET /comfyui-hana/task?id=` |
-| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start` / `theme`（v0.7 后三个） |
+| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start` / `theme` / `update` / `update/status`（v0.7-0.8） |
 | 中继增强 | 订阅 8188 `/ws` 做进度事件缓存；`/_relay/history` 裁剪历史；日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`） |
 | 卡片 | 「ComfyUI 工作区」整页卡（含状态面板）、「ComfyUI 任务卡」 |
 
@@ -100,6 +100,7 @@ comfyui(action="...", ...)
 | `workflows` | — | 无参列 userdata/workflows；`name` 读取节点结构摘要（id/type/title） | 结构清单 |
 | `upload` | `path` | 上传本机图片到 input（图生图） | 存储名（供 inputs 引用） |
 | `service` | — | ComfyUI 服务进程起停：`op=status`（默认）查状态/监听 PID/安装根/日志路径；`op=start` 拉起服务（可带 `path` 指定安装根）；`op=stop` 撤下服务（taskkill 8188 上的进程） | `details.comfyui.{reachable,proc,install,python,mainPy,logFile}` |
+| `update` | — | ComfyUI 本体更新（仅源码安装）：`op=check` 检查（git fetch + 比 commit，默认）；`op=apply` 执行（停服务→git pull --ff-only→pip install -r requirements.txt，后台跑）；`op=status` 查进度 | `details.comfyui.{behind,ahead,local,remote}` / `{accepted,phase}` / `{running,phase,steps,logTail,lastError}` |
 
 ### submit 的工作流三形态
 
