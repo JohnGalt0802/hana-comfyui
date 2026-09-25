@@ -19,8 +19,12 @@ ComfyUI 官方前端的资源引用是**相对路径**，经代理前缀能正�
 （`/extensions/<node>/*.js`、`/scripts/app.js`、`/scripts/ui.js`），在宿主域下这些请求会绕过 App 前缀、
 打到宿主根（不是本 App 路由）→ **403**，表现为“页面能开但节点/面板缺块”。
 后端实测这些路径在 8188 上均 200，且无 `X-Frame-Options`，因此工作区 iframe 改为**直连**（manifest 声明 `ui.csp.frameDomains`）。
-代价：iframe 跨源 → 壳页同源直控的「宿主主题跟随」停用（ComfyUI 用自己的色板，可在它自己的设置里改）。
-工作区「连接方式」下拉保留 `auto` / `hana.api.url` / `直接相对路径` 三种，可随时切回代理。
+代价：iframe 跨源 → 壳页摸不到 `contentWindow`。主题改为**改道**：工作区在 iframe 加载**之前**把宿主主题
+写成 ComfyUI 的自定义色板（`Comfy.CustomColorPalettes.hana`，键名与壳页 `HANA_CSS_MAP` / `HANA_JS_MAP` 同源）
+并选中它（`Comfy.ColorPalette="hana"`），前端一起来就带着宿主配色（面板 + 画布/节点/连线）。
+切宿主主题后：写入立即完成，顶栏提示「刷新工作区生效」（不自动重载，避免打断正在编辑的画布）。
+路由 `theme`（GET 查 / POST 写）→ 中继 `/_relay/theme`。
+工作区「连接方式」下拉保留 `direct` / `auto` / `hana.api.url` / `直接相对路径`，可随时切回代理（代理模式下主题走同源直控，不受此限）。
 
 ## 启动 / 停止 ComfyUI 服务（首选，别先去开终端）
 
@@ -74,7 +78,7 @@ App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 | 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service**（单工具 action 分派；service 管 8188 服务进程起停） |
 | 任务桥 | submit → 宿主任务（`delivery:"next-step"`）→ 2s 轮询结算（完成回执含产物路径；失败/中断给原因） |
 | 任务卡 | 每次 submit 返回 `details.card`（进度/队列位/耗时/产物缩略），数据经 `GET /comfyui-hana/task?id=` |
-| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start`（v0.7 后两者） |
+| 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start` / `theme`（v0.7 后三个） |
 | 中继增强 | 订阅 8188 `/ws` 做进度事件缓存；`/_relay/history` 裁剪历史；日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`） |
 | 卡片 | 「ComfyUI 工作区」整页卡（含状态面板）、「ComfyUI 任务卡」 |
 

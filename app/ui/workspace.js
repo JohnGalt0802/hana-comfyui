@@ -41,6 +41,7 @@ function hostThemeIsDark() {
 function syncTheme() {
   document.body.classList.toggle("t-dark", hostThemeIsDark());
   ensureComfySync();
+  onThemeMaybeChanged(); // 跨源（直连）时：主题走 ComfyUI 服务端设置
 }
 
 // ── ComfyUI 前端色板跟随（内层 iframe 同源直控）───────────────────────────
@@ -278,6 +279,67 @@ function applyHanaThemeVars() {
     console.warn("[comfyui-hana] ComfyUI 主题色写入失败：", e);
   }
   return true;
+}
+
+// ── 宿主主题 → ComfyUI 服务端（跨源下的主题跟随）─────────────────────────────
+// iframe 直连 8188 后跨源：壳页摸不到 contentWindow，applyHanaThemeVars / applyHanaThemeVars 全会被 blocked。
+// 改道：把宿主主题写成 ComfyUI 自己的**自定义色板**（id = hana，键名与 HANA_CSS_MAP / HANA_JS_MAP 同源），
+// 并在 iframe 加载**之前**推送，前端一起来就带着宿主配色（无需强刷正在编辑的画布）。
+// 代价：切换宿主主题后需刷新工作区才生效（不自动重载，避免打断编辑）。
+let themePushedFor = null;   // 已推送成功的主题签名（明暗 + cssUrl），避免重复推
+let themePushInflight = false;
+let themeStaleAfterLoad = false; // 已写入服务端，但当前 iframe 还是旧色板 → 顶栏提示刷新
+
+function themeSignature() {
+  return `${hostThemeIsDark() ? "dark" : "light"}|${hostThemeCssUrl() || ""}`;
+}
+
+async function pushThemeToComfyServer(force = false) {
+  const sig = themeSignature();
+  if (!force && sig === themePushedFor) return { ok: true, skipped: "unchanged" };
+  if (themePushInflight) return { ok: false, error: "inflight" };
+  themePushInflight = true;
+  try {
+    fetchHostThemeVars(); // 幂等：已缓存则不再取
+    for (let i = 0; i < 25 && !hanaThemeVars; i++) await new Promise((r) => setTimeout(r, 200));
+    const dark = hostThemeIsDark();
+    const comfy_base = {};
+    const litegraph_base = {};
+    for (const [k, hostVar] of HANA_CSS_MAP) { const v = hanaVar(hostVar); if (v) comfy_base[k] = v; }
+    for (const [k, hostVar] of HANA_JS_MAP) { const v = hanaVar(hostVar); if (v) litegraph_base[k] = v; }
+    // 拿得到宿主变量 → 自定义色板（面板 + 画布/节点）；拿不到 → 退化为只跟随明暗
+    const body = Object.keys(comfy_base).length
+      ? { colors: { comfy_base, litegraph_base }, lightTheme: !dark }
+      : { palette: dark ? "dark" : "light" };
+    const r = await hana.api.fetch("/comfyui-hana/theme", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (j && j.ok) {
+      themePushedFor = sig;
+      console.log("[comfyui-hana] 宿主主题已写入 ComfyUI 设置：", j.applied || j);
+    } else {
+      console.warn("[comfyui-hana] 主题写入失败：", j && j.error);
+    }
+    return j;
+  } catch (e) {
+    console.warn("[comfyui-hana] 主题写入异常：", e);
+    return { ok: false, error: String((e && e.message) || e) };
+  } finally {
+    themePushInflight = false;
+  }
+}
+
+// 主题变化时：只在 iframe 已加载的情况下推服务端并标记待刷新（未加载时下次开就带上了）
+function onThemeMaybeChanged() {
+  if (!frameRuntimeId) return;
+  if (themeSignature() === themePushedFor) return;
+  void (async () => {
+    const r = await pushThemeToComfyServer(true);
+    if (r && r.ok) themeStaleAfterLoad = true;
+  })();
 }
 
 // 组合同步：基座（dark/light）→ 主题色覆盖；轮询直到两者就绪。
@@ -654,6 +716,11 @@ async function tick() {
       frameRuntimeId = boot.runtimeId;
       frameLoaded = false;
       els.loading.classList.add("show");
+      // 直连（跨源）：先把宿主主题写进 ComfyUI 设置，iframe 一起来就带着宿主配色
+      if (built.kind === "direct") {
+        try { await pushThemeToComfyServer(); } catch { /* 主题失败不阻塞加载 */ }
+      }
+      themeStaleAfterLoad = false; // 新文档会读到刚推送的色板
       els.frame.src = built.url; // 含短期凭证，不落存储、不写日志
       console.log("[comfyui-hana] iframe 连接方式：", built.kind, built.note ? `（${built.note}）` : "");
     }
@@ -718,10 +785,17 @@ async function statusTick() {
         ensureComfySync(); // 服务刚回来，重新对齐主题
       }
       // 服务运行中：顶栏常驻服务控制（与左侧状态面板互为入口，工作区内也能直接关）
-      setBar("info", "ComfyUI 服务运行中", [
-        { label: "停止服务", fn: () => { void stopBackend(); } },
-        { label: "重启中继", fn: () => { void postRetryStart().catch(() => {}); } },
-      ]);
+      if (themeStaleAfterLoad) {
+        setBar("info", "宿主主题已变更，刷新工作区后生效", [
+          { label: "刷新工作区", fn: () => { themeStaleAfterLoad = false; try { location.reload(); } catch { /* 忽略 */ } } },
+          { label: "稍后", fn: () => { themeStaleAfterLoad = false; setBar(null); } },
+        ]);
+      } else {
+        setBar("info", "ComfyUI 服务运行中", [
+          { label: "停止服务", fn: () => { void stopBackend(); } },
+          { label: "重启中继", fn: () => { void postRetryStart().catch(() => {}); } },
+        ]);
+      }
     }
   } catch { /* 状态读取失败不打扰界面 */ }
 }

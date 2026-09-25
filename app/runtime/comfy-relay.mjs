@@ -848,6 +848,69 @@ async function stopBackendService() {
   return { ok: !backend.reachable, pids, stopped, failed, alive: backend.reachable, already: pids.length === 0 };
 }
 
+// ── 主题同步（跨源下的宿主主题跟随）─────────────────────────────────────────
+// 背景：工作区 iframe 直连 8188 后变成跨源（见 UI 注释），壳页再也摸不到 contentWindow，
+// 于是把「写样式」改成「写信给 ComfyUI 服务端」：
+//   ① Comfy.CustomColorPalettes.hana = { colors: { comfy_base, litegraph_base } } —— 面板/DOM + 画布/节点/连线
+//   ② Comfy.ColorPalette = "hana" —— 选中它
+// ComfyUI 的 POST /settings 是 {**settings, **new_settings} 合并写（app/app_settings.py 实测），
+// 不会碰用户其他设置；色板由前端下次加载时读取，因此无需强刷正在编辑的画布。
+// 键名与壳页 HANA_CSS_MAP / HANA_JS_MAP 同源（comfy_base / litegraph_base），直接复用。
+const THEME_PALETTE_ID = "hana";
+
+async function backendJsonOrNull(path, method = "GET", body = null) {
+  if (!backend.reachable) return null;
+  try {
+    const res = await fetch(`http://${backend.host}:${backend.port}${path}`, {
+      method,
+      signal: AbortSignal.timeout(10_000),
+      headers: body ? { accept: "application/json", "content-type": "application/json" } : { accept: "application/json" },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    if (!res.ok) return null;
+    return await res.json().catch(() => null);
+  } catch { return null; }
+}
+
+async function applyThemeSettings(body) {
+  if (!backend.reachable) return { ok: false, error: `后端 ${backend.host}:${backend.port} 不可达` };
+  const b = body && typeof body === "object" ? body : {};
+  const colors = b.colors && typeof b.colors === "object" ? b.colors : null;
+  const patch = {};
+  if (colors) {
+    const cur = await backendJsonOrNull("/api/settings");
+    if (!cur) return { ok: false, error: "读取 ComfyUI 现有设置失败（后端未就绪或拒绝）" };
+    const existing = cur["Comfy.CustomColorPalettes"];
+    const customs = existing && typeof existing === "object" ? { ...existing } : {};
+    const def = {
+      id: THEME_PALETTE_ID,
+      name: "Hana（跟随宿主主题）",
+      colors: {
+        comfy_base: colors.comfy_base && typeof colors.comfy_base === "object" ? colors.comfy_base : {},
+        litegraph_base: colors.litegraph_base && typeof colors.litegraph_base === "object" ? colors.litegraph_base : {},
+        node_slot: colors.node_slot && typeof colors.node_slot === "object" ? colors.node_slot : {},
+      },
+    };
+    if (typeof b.lightTheme === "boolean") def.light_theme = b.lightTheme;
+    customs[THEME_PALETTE_ID] = def;
+    patch["Comfy.CustomColorPalettes"] = customs;
+    patch["Comfy.ColorPalette"] = THEME_PALETTE_ID;
+  } else if (typeof b.palette === "string" && b.palette) {
+    patch["Comfy.ColorPalette"] = b.palette; // 无细粒度配色时只跟随明暗（用 ComfyUI 内置色板）
+  } else {
+    return { ok: false, error: "需要 colors（自定义色板）或 palette（内置色板名）" };
+  }
+  const out = await backendJsonOrNull("/api/settings", "POST", patch);
+  if (out === null) return { ok: false, error: "写入 ComfyUI 设置失败（后端未接受）" };
+  const d = colors && patch["Comfy.CustomColorPalettes"] ? patch["Comfy.CustomColorPalettes"][THEME_PALETTE_ID] : null;
+  log(`主题已写入 ComfyUI 设置：palette=${patch["Comfy.ColorPalette"]}` +
+    (d ? `（自定义色板 comfy_base=${Object.keys(d.colors.comfy_base).length} 项 litegraph_base=${Object.keys(d.colors.litegraph_base).length} 项）` : "（仅明暗）"));
+  return {
+    ok: true,
+    applied: { palette: patch["Comfy.ColorPalette"], custom: !!d, comfyBaseKeys: d ? Object.keys(d.colors.comfy_base).length : 0 },
+  };
+}
+
 function backendProcPayload() {
   return {
     taskName: BACKEND_TASK_NAME,
@@ -1703,6 +1766,44 @@ const server = http.createServer((req, res) => {
       return;
     }
     jsonOut(res, 200, { ok: true, reachable: backend.reachable, proc: backendProcPayload() }, req.method);
+    return;
+  }
+  // 宿主主题 → ComfyUI 服务端设置（跨源下的主题跟随；键名同 HANA_CSS_MAP / HANA_JS_MAP）
+  if (pathOnly === "/_relay/theme") {
+    if (req.method === "GET" || req.method === "HEAD") {
+      void (async () => {
+        try {
+          const cur = await backendJsonOrNull("/api/settings");
+          const customs = cur && cur["Comfy.CustomColorPalettes"];
+          jsonOut(res, 200, {
+            ok: !!cur,
+            reachable: backend.reachable,
+            palette: cur ? cur["Comfy.ColorPalette"] || null : null,
+            hasHanaPalette: !!(customs && typeof customs === "object" && customs[THEME_PALETTE_ID]),
+          }, req.method);
+        } catch (e) {
+          jsonOut(res, 502, { ok: false, error: String((e && e.message) || e) }, req.method);
+        }
+      })();
+      return;
+    }
+    if (req.method === "POST") {
+      if (!controlOk(req)) {
+        jsonOut(res, 403, { error: "comfy-relay: control key required" });
+        return;
+      }
+      void (async () => {
+        try {
+          const body = await readBodyJson(req).catch(() => ({}));
+          const out = await applyThemeSettings(body);
+          jsonOut(res, out.ok ? 200 : 502, out);
+        } catch (e) {
+          jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });
+        }
+      })();
+      return;
+    }
+    jsonOut(res, 405, { error: "method not allowed" }, req.method);
     return;
   }
   if (pathOnly === "/_relay/prompts") {

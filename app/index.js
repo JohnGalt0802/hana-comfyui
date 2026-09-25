@@ -1874,8 +1874,39 @@ export default defineApp(async (sdk) => {
           return c.json({ ok: false, error: msgOf(e) }, 502);
         }
       });
+
+      // ── 宿主主题 → ComfyUI 服务端设置 ──────────────────────────────
+      // 工作区 iframe 直连 8188 后为跨源，壳页无法直接改 iframe 样式，改为把主题
+      // 写进 ComfyUI 自己的设置（自定义色板 hana），iframe 下次加载即生效。
+      // 机制与键名见 runtime/comfy-relay.mjs 的「主题同步」区；POST /settings 是合并写，
+      // 不会动用户的其它设置。
+      app.get("/comfyui-hana/theme", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/theme", { timeoutMs: 15_000 });
+          return c.json(ok && data && typeof data === "object" ? data : { ok: false, error: `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.post("/comfyui-hana/theme", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const { ok, status, data } = await relayJson("/_relay/theme", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body && typeof body === "object" ? body : {}),
+            timeoutMs: 20_000,
+          });
+          return c.json(ok && data && typeof data === "object" ? data : { ok: false, error: `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
     });
-    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|task|relay/start|backend/start|backend/stop|backend）");
+    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|task|relay/start|backend/start|backend/stop|backend|theme）");
   } catch (e) {
     error(`ctx.routes.register 失败（壳页诊断面不可用，工具面仍可用）：${msgOf(e)}`);
   }
