@@ -66,6 +66,9 @@ except ValueError:
 _frontend = {"sid": None}
 # 进行中的调用：reqId → asyncio.Future
 _pending = {}
+# 在线前端账本：sid → {workflow, path, href, at, seenAt}。
+# 多页面路由靠它：一个页面对应一个工作流名（对应一个 json），定向时按工作流名找 sid。
+_frontends = {}
 # 最近一次画布状态快照：由前端扩展在画布变化后主动推来。
 # 为何缓在服务端：人与 agent 的对话不是持续态，agent 多半在「宿主聊天页」对话、
 # ComfyUI 页面并不开着；缓一份在服务端，agent 就随时拿得到「手边快照」，
@@ -110,6 +113,42 @@ def _token_ok(request):
     return bool(got) and secrets.compare_digest(got, TOKEN)
 
 
+def _note_frontend(sid, data, kind):
+    """记录/更新一个前端的身份（它开着哪个工作流）。"""
+    if not sid:
+        return
+    wf = data.get("workflow") if isinstance(data.get("workflow"), dict) else {}
+    _frontends[sid] = {
+        "workflow": str(wf.get("name") or "").strip() or None,
+        "path": wf.get("path"),
+        "modified": wf.get("modified"),
+        "href": str(data.get("href") or "").strip() or None,
+        "at": data.get("at"),
+        "seenAt": time.time(),
+        "kind": kind,
+    }
+    _frontend["sid"] = sid
+
+
+def _pages_payload():
+    now = time.time()
+    pages = []
+    for s, v in _frontends.items():
+        pages.append(
+            {
+                "sid": (s or "")[:8],
+                "workflow": v.get("workflow"),
+                "path": v.get("path"),
+                "modified": v.get("modified"),
+                "ageSec": round(now - (v.get("seenAt") or now), 1),
+                "href": v.get("href"),
+                "kind": v.get("kind"),
+            }
+        )
+    pages.sort(key=lambda p: p["ageSec"])
+    return {"pages": pages, "count": len(pages)}
+
+
 def _state_age_sec():
     """快照年龄（秒）；无快照返回 None。"""
     ts = _state.get("ts")
@@ -141,7 +180,7 @@ if _ROUTES is not None:
         if sid:
             if _frontend["sid"] != sid:
                 LOG.info("hana_bridge: 前端已上报（sid=%s）", sid)
-            _frontend["sid"] = sid
+            _note_frontend(sid, data, "hello")
         return web.json_response({"ok": True})
 
     @_ROUTES.post("/hana_bridge/result")
@@ -168,10 +207,34 @@ if _ROUTES is not None:
         if op == "canvas.state":
             return web.json_response({"ok": True, "data": _state_payload()})
 
-        # 分发一律走广播（sid=None）：页面刷新 / 重连不会重跑 setup，hello 上报的 sid 可能已失效，
-        # 而 server.py 实测 send_json(sid=None) 会发给当前所有连接——只要有一个前端在就能收到。
-        # 多标签时都会收到并回传，这里只取最先到的那份（_pending.pop 幂等）。
+        # 页面清单（多页面路由的「眼睛」）：现在有谁在线、各自开着哪个工作流
+        if op == "canvas.pages":
+            return web.json_response({"ok": True, "data": _pages_payload()})
+
+        # 定向策略（2026-09-27，多页面）：
+        # ① 给了 workflow → 找同名页面定向；找不到就明确报错，**不退回广播**（避免误伤别的页面）
+        # ② 没给 → 广播（向后兼容；单页面时行为不变。页面刷新/重连不会重跑 setup，
+        #    而 server.py 实测 send_json(sid=None) 会发给当前所有连接，只要有一个前端在就能收到）
+        want_wf = str(body.get("workflow") or "").strip()
         sid = str(body.get("sid") or "").strip() or None
+        routed = None
+        if want_wf:
+            hits = [s for s, v in _frontends.items() if (v.get("workflow") or "") == want_wf]
+            if not hits:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "no_page",
+                        "detail": "没有页面正打开「%s」" % want_wf,
+                        "pages": [
+                            {"sid": (k or "")[:8], "workflow": v.get("workflow")}
+                            for k, v in _frontends.items()
+                        ],
+                    },
+                    status=409,
+                )
+            sid = hits[0]
+            routed = {"workflow": want_wf, "matched": len(hits)}
 
         rid = secrets.token_hex(8)
         fut = asyncio.get_running_loop().create_future()
@@ -202,6 +265,8 @@ if _ROUTES is not None:
             payload["data"] = res["data"]
         if res.get("error"):
             payload["error"] = res["error"]
+        if routed:
+            payload["routed"] = routed
         return web.json_response(payload)
 
     @_ROUTES.post("/hana_bridge/state")
@@ -221,6 +286,7 @@ if _ROUTES is not None:
             }
         )
         _frontend["sid"] = _state["sid"] or _frontend["sid"]
+        _note_frontend(_state["sid"], data, "state")
         return web.json_response({"ok": True, "revision": _state["revision"]})
 
     @_ROUTES.get("/hana_bridge/ping")
@@ -233,6 +299,7 @@ if _ROUTES is not None:
                 "timeoutSec": CALL_TIMEOUT_SEC,
                 "stateAgeSec": _state_age_sec(),
                 "stateRevision": _state["revision"],
+                "pages": [{"sid": (k or "")[:8], "workflow": v.get("workflow")} for k, v in _frontends.items()],
             }
         )
 

@@ -103,7 +103,25 @@ const CHANGE_POLL_MS = 1500;
 const CHANGE_KEEP = 50;
 let graphRevision = 0;
 let lastSignature = null;
+let lastWorkflowName = null;
 let changes = [];
+
+// 当前页面的「身份」：它打开的是哪个工作流。
+// 多页面路由靠它：一个页面对应一个工作流名（对应一个 json 文件）。
+function currentWorkflowInfo() {
+  try {
+    const wf = app.workflowManager && app.workflowManager.activeWorkflow;
+    if (!wf) return { name: "(未命名)", path: null, modified: null };
+    const name = String(wf.filename || wf.name || "").trim() || "(未命名)";
+    return {
+      name,
+      path: wf.path || null,
+      modified: typeof wf.isModified === "boolean" ? wf.isModified : null,
+    };
+  } catch {
+    return { name: "(未命名)", path: null, modified: null };
+  }
+}
 // agent 自己写入的 undo 栈（存 before 值）。
 // 为何需要：实测新版前端的 ChangeTracker 不记录「外部对 graph 的直接修改」
 // （graph.onBeforeChange / canvas.onBeforeChange 都不存在，Comfy.Undo 对这类改动无效），
@@ -177,7 +195,10 @@ function graphSignature() {
 
 function pollGraph() {
   const sig = graphSignature();
-  if (lastSignature && sig.hash !== lastSignature.hash) {
+  // 工作流身份也算一种变化：切了/重命名了工作流，页面就该重报一次
+  const wfName = currentWorkflowInfo().name;
+  const wfChanged = lastWorkflowName !== null && wfName !== lastWorkflowName;
+  if ((lastSignature && sig.hash !== lastSignature.hash) || wfChanged) {
     graphRevision += 1;
     // 按节点算差异：agent 不只该知道“变了”，还该知道“哪个节点变了”
     const changed = [];
@@ -200,6 +221,7 @@ function pollGraph() {
     if (changes.length > CHANGE_KEEP) changes = changes.slice(-CHANGE_KEEP);
     scheduleStatePush();
   }
+  lastWorkflowName = wfName;
   lastSignature = sig;
   return sig;
 }
@@ -225,6 +247,7 @@ async function pushStateSnapshot() {
       ts: Date.now(),
       revision: graphRevision,
       sid: api.clientId || null,
+      workflow: currentWorkflowInfo(),
       summary: graphSummary(),
     });
   } catch (err) {
@@ -582,7 +605,11 @@ app.registerExtension({
   name: "hana.bridge",
   async setup() {
     try {
-      await postJson(PATH_HELLO, { clientId: api.clientId || null, href: location.href });
+      await postJson(PATH_HELLO, {
+        clientId: api.clientId || null,
+        href: location.href,
+        workflow: currentWorkflowInfo(),
+      });
       // 变更感知轮询（P2）：先建一次基线，之后定期比对签名
       pollGraph();
       setInterval(pollGraph, CHANGE_POLL_MS);
