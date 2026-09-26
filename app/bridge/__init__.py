@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 
 from aiohttp import web
 
@@ -65,6 +66,11 @@ except ValueError:
 _frontend = {"sid": None}
 # 进行中的调用：reqId → asyncio.Future
 _pending = {}
+# 最近一次画布状态快照：由前端扩展在画布变化后主动推来。
+# 为何缓在服务端：人与 agent 的对话不是持续态，agent 多半在「宿主聊天页」对话、
+# ComfyUI 页面并不开着；缓一份在服务端，agent 就随时拿得到「手边快照」，
+# 不依赖「此刻页面在线」。
+_state = {"at": None, "ts": None, "revision": None, "summary": None, "sid": None}
 
 
 def _load_token():
@@ -104,6 +110,28 @@ def _token_ok(request):
     return bool(got) and secrets.compare_digest(got, TOKEN)
 
 
+def _state_age_sec():
+    """快照年龄（秒）；无快照返回 None。"""
+    ts = _state.get("ts")
+    if not ts:
+        return None
+    try:
+        return round(time.time() - (float(ts) / 1000.0), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _state_payload():
+    return {
+        "at": _state["at"],
+        "ageSec": _state_age_sec(),
+        "revision": _state["revision"],
+        "summary": _state["summary"],
+        "sid": _state["sid"],
+        "hasState": _state["summary"] is not None,
+    }
+
+
 if _ROUTES is not None:
 
     @_ROUTES.post("/hana_bridge/hello")
@@ -134,6 +162,11 @@ if _ROUTES is not None:
         op = str(body.get("op") or "").strip()
         if not op:
             return web.json_response({"ok": False, "error": "missing_op"}, status=400)
+
+        # 状态快照不走前端：直接回服务端缓存（这正是「提前做」的意义——
+        # ComfyUI 页面没开着也能拿到上次的快照）
+        if op == "canvas.state":
+            return web.json_response({"ok": True, "data": _state_payload()})
 
         # 分发一律走广播（sid=None）：页面刷新 / 重连不会重跑 setup，hello 上报的 sid 可能已失效，
         # 而 server.py 实测 send_json(sid=None) 会发给当前所有连接——只要有一个前端在就能收到。
@@ -171,6 +204,25 @@ if _ROUTES is not None:
             payload["error"] = res["error"]
         return web.json_response(payload)
 
+    @_ROUTES.post("/hana_bridge/state")
+    async def _hana_state_push(request):
+        """前端扩展在画布变化后推来的快照（同源，不校验 token，只存摘要）。"""
+        data = await _json(request)
+        summary = data.get("summary")
+        if not isinstance(summary, dict):
+            return web.json_response({"ok": False, "error": "missing_summary"}, status=400)
+        _state.update(
+            {
+                "at": data.get("at"),
+                "ts": data.get("ts"),
+                "revision": data.get("revision"),
+                "summary": summary,
+                "sid": str(data.get("sid") or "").strip() or None,
+            }
+        )
+        _frontend["sid"] = _state["sid"] or _frontend["sid"]
+        return web.json_response({"ok": True, "revision": _state["revision"]})
+
     @_ROUTES.get("/hana_bridge/ping")
     async def _hana_ping(request):
         return web.json_response(
@@ -179,6 +231,8 @@ if _ROUTES is not None:
                 "frontend": _frontend["sid"],
                 "pending": len(_pending),
                 "timeoutSec": CALL_TIMEOUT_SEC,
+                "stateAgeSec": _state_age_sec(),
+                "stateRevision": _state["revision"],
             }
         )
 

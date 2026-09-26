@@ -60,7 +60,10 @@
 - **画布共驾（v0.9 新增，M12）：只读桥 + 变更感知 + 写入**：让 agent 读/改**人正在看的同一张画布**。
   - 链路：`comfyui(action="canvas", op=…)` → 路由 `canvas` → 中继 `/_relay/bridge` → ComfyUI
     `POST /api/hana_bridge/call` → `send_sync` 经自带 `/ws` → 前端扩展读 `window.app.graph` → 同源回传。
-  - 只读 op：`summary`（结构摘要，默认）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）/
+  - 默认 op `state`：读**服务端缓存**的最近一次画布快照（零往返，**ComfyUI 页面没开着也能拿到**）。
+    快照由前端在画布变化后主动推（debounce 1.5s）缓在 ComfyUI 侧，带 `ageSec` 时间戳；
+    无快照或过期时改用 `op=summary` 现抓（需页面在线）。
+  - 只读 op：`summary`（现抓结构摘要）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）/
     `revision`（变更序号，只问变没变）/ `events`（变更记录，可按 `since` 增量查，含按节点的 added/removed/changed）。
   - 变更感知为 500ms 轮询签名比对（新版 LiteGraph 没有可用的变更事件），签名**不含节点位置**。
   - 写入 op（v0.9 新增，P3 最小集）：`setWidget`（改某节点参数，返回 before/after）/ `undo`（撤销 agent 上一步写入，最多 20 步）。

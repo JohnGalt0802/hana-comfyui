@@ -96,9 +96,10 @@ function graphSummary() {
 // ── 变更感知（P2）───────────────────────────────────────────────────────
 // 新版 @comfyorg/litegraph 没留可用的变更事件（探查：graph 上只有 onTrigger /
 // onConfigure / onConnectionChange，LGraph 原型没有任何 on* 事件），所以不用事件驱动，
-// 改用轮询签名比对：500ms 算一次轻量签名，变了就记一条并递增 revision。
+// 改用轮询签名比对：定期算一次轻量签名，变了就记一条并递增 revision。
+// 间隔 1.5s：口径修正（2026-09-26）—— 对话不是持续态，不需要 500ms 那么密。
 // 签名刻意**不含节点位置**——拖动节点不该算“画布变化”，否则噪声太大。
-const CHANGE_POLL_MS = 500;
+const CHANGE_POLL_MS = 1500;
 const CHANGE_KEEP = 50;
 let graphRevision = 0;
 let lastSignature = null;
@@ -163,9 +164,38 @@ function pollGraph() {
       changed: changed.slice(0, 20),
     });
     if (changes.length > CHANGE_KEEP) changes = changes.slice(-CHANGE_KEEP);
+    scheduleStatePush();
   }
   lastSignature = sig;
   return sig;
+}
+
+// ── 状态快照推送（口径修正：对话不是持续态，变化后推一次就够）───────────────
+// 把摘要缓到 ComfyUI 侧，agent 随时拿得到「手边快照」，不依赖「此刻页面在线」。
+// 变化后 debounce，避免连续拖动时刷屏。
+const STATE_DEBOUNCE_MS = 1500;
+let statePushTimer = null;
+
+function scheduleStatePush() {
+  if (statePushTimer) clearTimeout(statePushTimer);
+  statePushTimer = setTimeout(() => {
+    statePushTimer = null;
+    void pushStateSnapshot();
+  }, STATE_DEBOUNCE_MS);
+}
+
+async function pushStateSnapshot() {
+  try {
+    await postJson("/hana_bridge/state", {
+      at: new Date().toISOString(),
+      ts: Date.now(),
+      revision: graphRevision,
+      sid: api.clientId || null,
+      summary: graphSummary(),
+    });
+  } catch (err) {
+    console.warn(LOG_TAG, "状态推送失败", err);
+  }
 }
 
 const OPS = {
@@ -351,9 +381,11 @@ app.registerExtension({
   async setup() {
     try {
       await postJson(PATH_HELLO, { clientId: api.clientId || null, href: location.href });
-      // 变更感知轮询（P2）：先建一次基线，之后每 500ms 比对签名
+      // 变更感知轮询（P2）：先建一次基线，之后定期比对签名
       pollGraph();
       setInterval(pollGraph, CHANGE_POLL_MS);
+      // 页面加载后推一次基线快照（否则服务端要等到首次变化才有状态）
+      void pushStateSnapshot();
       console.info(LOG_TAG + " 已挂载 clientId=" + (api.clientId || "?") + " ops=" + Object.keys(OPS).join(","));
     } catch (err) {
       console.warn(LOG_TAG, "上报失败（后端未就绪？）", err);
