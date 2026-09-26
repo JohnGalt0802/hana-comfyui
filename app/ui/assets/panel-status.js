@@ -176,6 +176,9 @@ async function metricsTick() {
 
 // ── 服务起停（启动/停止 8188 上的 ComfyUI 本体）─────────────────────────
 let svcBusy = false;
+// 停止的二次确认（同理不能用 window.confirm）
+let stopArmed = false;
+let stopArmTimer = null;
 
 function setSvcBusy(on, label) {
   svcBusy = on;
@@ -208,7 +211,23 @@ async function startService() {
 
 async function stopService() {
   if (svcBusy) return;
-  if (!window.confirm("停止 ComfyUI 服务会终止 8188 上的进程，正在跑的任务会中断。继续？")) return;
+  const btn = $("p-stop");
+  // 同样不能用 window.confirm（沙箱 iframe 会静默拦掉），改用两步点击
+  if (!stopArmed) {
+    stopArmed = true;
+    btn.textContent = "再点一次确认停止";
+    $("p-note").textContent = "停止 ComfyUI 会终止 8188 上的进程，正在跑的任务会中断。确认请再点一次（3 秒内）。";
+    if (stopArmTimer) clearTimeout(stopArmTimer);
+    stopArmTimer = setTimeout(() => {
+      stopArmed = false;
+      stopArmTimer = null;
+      btn.textContent = "停止服务";
+      $("p-note").textContent = "";
+    }, 3000);
+    return;
+  }
+  stopArmed = false;
+  if (stopArmTimer) { clearTimeout(stopArmTimer); stopArmTimer = null; }
   setSvcBusy(true, "停止中…");
   let msg = "";
   try {
@@ -269,20 +288,31 @@ async function releaseVram() {
 // 机制：中继 GET /_relay/update（git fetch 比对）/ POST（停服务→pull→pip，后台跑）/ status。
 let updTimer = null;
 let updUntil = 0;
+let updStartedAt = null; // 前端记的发起到刻，用于显示已耗时
+// 二次确认不能靠 window.confirm：工作区是沙箱 iframe，confirm 会被静默拦掉
+// （返回 false，函数一声不响 return）——那样“点了等于没点”。改用按钮自身承载。
+let updArmed = false;
+let updArmTimer = null;
 
 function fmtVer(v) {
   return v ? `${v.describe || v.commit || "?"}${v.dirty ? "（有改动）" : ""}` : "—";
+}
+
+function fmtAgo(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
 }
 
 function renderUpdateStatus(st) {
   if (!st) return false;
   const phaseText = { idle: "空闲", stopping: "停服务", fetching: "抓取", pulling: "拉取", installing: "装依赖", done: "已完成", failed: "失败" }[st.phase] || st.phase;
   $("u-state").innerHTML = st.running
-    ? chip("进行中", "warn")
+    ? chip(`进行中 ${updStartedAt ? fmtAgo(Date.now() - updStartedAt) : ""}`.trim(), "warn")
     : (st.phase === "failed" ? chip("失败", "bad") : (st.phase === "done" ? chip("已完成", "ok") : chip(phaseText)));
   if (st.before) $("u-local").textContent = st.after ? `${fmtVer(st.before)} → ${fmtVer(st.after)}` : fmtVer(st.before);
   const steps = (st.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}${s.detail ? `：${String(s.detail).split("\n").slice(-1)[0]}` : ""}`);
-  $("u-log").textContent = [...steps, ...(st.logTail || []).slice(-10)].filter(Boolean).join("\n");
+  // 日志尾给到 30 行：git pull / pip install 的输出更有参考价值
+  $("u-log").textContent = [...steps, ...(st.logTail || []).slice(-30)].filter(Boolean).join("\n");
   if (st.lastError) $("u-note").textContent = `更新失败：${st.lastError}`;
   else if (st.phase === "done") $("u-note").textContent = "更新完成。点「启动服务」重新拉起 ComfyUI。";
   return !!st.running;
@@ -327,22 +357,49 @@ async function checkUpdate() {
 }
 
 async function applyUpdate() {
-  if (!window.confirm("将先停止 ComfyUI 服务，然后 git pull --ff-only + pip install -r requirements.txt。\n本地有未提交改动会被 git 拒绝；pip 装过的新依赖不会自动回退。继续？")) return;
   const btn = $("u-apply");
-  btn.disabled = true; btn.textContent = "更新中…";
+  // 二次确认由按钮自身承载（沙箱下 window.confirm 会被静默拦掉）
+  if (!updArmed) {
+    updArmed = true;
+    btn.textContent = "再点一次确认更新";
+    btn.classList.add("danger");
+    $("u-note").textContent =
+      "更新会先停止 ComfyUI 服务，然后 git pull --ff-only + pip install -r requirements.txt。确认请再点一次（3 秒内）。";
+    if (updArmTimer) clearTimeout(updArmTimer);
+    updArmTimer = setTimeout(() => {
+      updArmed = false;
+      updArmTimer = null;
+      btn.textContent = "更新";
+      btn.classList.remove("danger");
+      $("u-note").textContent = "";
+    }, 3000);
+    return;
+  }
+  updArmed = false;
+  if (updArmTimer) { clearTimeout(updArmTimer); updArmTimer = null; }
+  btn.classList.remove("danger");
+  // 立即给反馈（不再有任何前置分支）
+  btn.disabled = true;
+  btn.textContent = "更新中…";
   $("u-note").textContent = "已发起更新（先停服务）…";
+  updStartedAt = Date.now();
   try {
     const r = await hana.api.fetch("/comfyui-hana/update", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "apply" }),
     });
     const d = await r.json().catch(() => null);
-    if (!d || d.accepted !== true) { $("u-note").textContent = `发起失败：${(d && (d.reason || d.error)) || `HTTP ${r.status}`}`; return; }
+    if (!d || d.accepted !== true) {
+      $("u-note").textContent = `发起失败：${(d && (d.reason || d.error)) || `HTTP ${r.status}`}`;
+      return;
+    }
     startUpdPolling();
     void poll();
   } catch (e) {
     $("u-note").textContent = `发起失败：${String((e && e.message) || e)}`;
   } finally {
     btn.disabled = false; btn.textContent = "更新";
+    // 若确实跑起来了，轮询会接管显示；没跑起来就清掉计时
+    setTimeout(() => { if (!updTimer) updStartedAt = null; }, 4000);
   }
 }
 
