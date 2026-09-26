@@ -1485,7 +1485,70 @@ export default defineApp(async (sdk) => {
   // ── ComfyUI 本体更新（M11）───────────────────────────────────────────────
   // 中继侧机制（git pull --ff-only + pip install -r requirements.txt；后台跑、失败不回退）
   // 见 runtime/comfy-relay.mjs 的「ComfyUI 本体更新」区。
-  async function actionUpdate(args) {
+  // 更新任务：建一个宿主任务，后台轮询中继，结束时 complete / fail。
+  // 为何需要：更新要几分钟，用户大概率已经切到别的会话；靠任务卡与完成回执把结果送到。
+  // 面板按钮走 HTTP 路由、没有 callToken，所以只在这里（工具通道）建任务。
+  const updateWatch = { active: false, taskId: null, startedAt: 0, timer: null };
+
+  async function beginUpdateWatch(callToken, before) {
+    if (updateWatch.active) return;
+    updateWatch.active = true;
+    updateWatch.startedAt = Date.now();
+    try {
+      const t = await sdk.tasks.create({
+        callToken,
+        label: "ComfyUI 本体更新",
+        delivery: "next-step",
+        metadata: { comfyui: { action: "update", op: "apply", startedAt: new Date(updateWatch.startedAt).toISOString(), before } },
+      });
+      updateWatch.taskId = t && t.taskId ? String(t.taskId) : null;
+      log(`更新任务已建：taskId=${updateWatch.taskId || "(none)"}`);
+    } catch (e) {
+      warn(`更新任务创建失败：${msgOf(e).slice(0, 200)}`);
+    }
+    const tick = async () => {
+      try {
+        const { ok, data } = await relayJson("/_relay/update/status", { timeoutMs: 8_000 });
+        const st = ok && data && typeof data === "object" ? data : {};
+        if (st.running) {
+          updateWatch.timer = setTimeout(tick, 3000);
+          return;
+        }
+        await finishUpdateWatch(st);
+      } catch {
+        updateWatch.timer = setTimeout(tick, 5000); // 中继may重启，下一拍再试
+      }
+    };
+    updateWatch.timer = setTimeout(tick, 3000);
+  }
+
+  async function finishUpdateWatch(st) {
+    updateWatch.active = false;
+    if (updateWatch.timer) { clearTimeout(updateWatch.timer); updateWatch.timer = null; }
+    const tid = updateWatch.taskId;
+    const secs = Math.round((Date.now() - updateWatch.startedAt) / 1000);
+    const steps = (st.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}`).join(" · ");
+    const after = st.after ? st.after.describe || st.after.commit : null;
+    if (tid) {
+      try {
+        if (st.phase === "failed" || st.lastError) {
+          await sdk.tasks.fail(tid, `ComfyUI 更新失败（${secs}s）：${st.lastError || "未知原因"}${steps ? `\n${steps}` : ""}`);
+        } else {
+          await sdk.tasks.complete(tid, [
+            `ComfyUI 更新完成（耗时 ${secs}s）`,
+            after ? `现版本：${after}` : "",
+            steps ? `步骤：${steps}` : "",
+            "服务已停止，用工作区顶栏或左侧面板「启动服务」重新拉起。",
+          ].filter(Boolean).join("\n"));
+        }
+      } catch (e) {
+        warn(`更新任务结算失败：${msgOf(e).slice(0, 200)}`);
+      }
+    }
+    log(`更新任务结束：phase=${st.phase} 耗时 ${secs}s`);
+  }
+
+  async function actionUpdate(args, context) {
     const op = String(args.op || "check").trim().toLowerCase();
     if (op === "status") {
       const { ok, status, data } = await relayJson("/_relay/update/status", { timeoutMs: 10_000 });
@@ -1517,6 +1580,10 @@ export default defineApp(async (sdk) => {
       if (!ok || !data || data.accepted !== true) {
         throw new Error(`发起更新失败：${(data && (data.reason || data.error)) || `HTTP ${status}`}`);
       }
+      // 建宿主任务 + 后台轮询：更新要几分钟，用户大概率已切走，靠任务卡 + 完成回执送到
+      const d0 = data && typeof data === "object" ? data : {};
+      const callToken = context && typeof context.callToken === "string" ? context.callToken : "";
+      if (callToken) void beginUpdateWatch(callToken, d0.before || null);
       return {
         content: [{
           type: "text",
@@ -1947,7 +2014,7 @@ export default defineApp(async (sdk) => {
             case "cancel": return await actionCancel(args);
             case "workflows": return await actionWorkflows(args);
             case "service": return await actionService(args);
-            case "update": return await actionUpdate(args);
+            case "update": return await actionUpdate(args, context);
             case "canvas": return await actionCanvas(args);
             case "upload": return await actionUpload(args);
             default:
