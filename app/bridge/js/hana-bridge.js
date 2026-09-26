@@ -480,6 +480,35 @@ const OPS = {
     };
   },
 
+  // 落盘：把当前图写成工作流文件（这样即使页面没开、或换个实例，打开就能看到改动）。
+  // 覆盖前先备份一份 <name>.bak.json（备份失败不阻断写入）。
+  "canvas.save": async (args) => {
+    const a = args || {};
+    const wf = app.workflowManager && app.workflowManager.activeWorkflow;
+    const raw = String(a.name || (wf && (wf.filename || wf.name)) || "").trim();
+    if (!raw) throw new Error("无法确定工作流名：传 {name}，或先在前端打开/保存过一张工作流");
+    const clean = raw.replace(/\.json$/i, "");
+    const json = app.graph.toJSON();
+    const body = JSON.stringify(json);
+    const put = async (file) => {
+      const res = await api.fetchApi(`/api/userdata/${encodeURIComponent(file)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      if (!res.ok) throw new Error(`${file} 写入失败：HTTP ${res.status}`);
+    };
+    let backup = null;
+    try {
+      // 路径要带 workflows/ 前缀：/api/userdata/<file> 的 <file> 是相对 user/default/ 的，
+      // 不带前缀会写到 user/default/ 根下（实测踩过）。
+      await put(`workflows/${clean}.bak.json`);
+      backup = `workflows/${clean}.bak.json`;
+    } catch { /* 备份失败不阻断主写入 */ }
+    await put(`workflows/${clean}.json`);
+    return { saved: `workflows/${clean}.json`, backup, nodes: json.nodes ? json.nodes.length : null };
+  },
+
   // 撤销最后一步。先试官方命令（与人的 Ctrl+Z 同一条路），再按 agent 自己的逆操作栈回退。
   // 实测：新版 @comfyorg/litegraph 已移除 LGraphCanvas.undo，撤销由 ChangeTracker + 命令系统接管，
   // 而它**不记录外部对 graph 的直接修改**——所以真正生效的是下面这个栈（精确回退 agent 那一步，

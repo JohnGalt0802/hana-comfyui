@@ -1559,6 +1559,7 @@ export default defineApp(async (sdk) => {
     connect: { drive: "canvas.connect", desc: "连线", write: true },
     disconnect: { drive: "canvas.disconnect", desc: "断开一条输入连线", write: true },
     setNodeMode: { drive: "canvas.setNodeMode", desc: "mute / bypass / 恢复正常", write: true },
+    save: { drive: "canvas.save", desc: "把当前图落盘为工作流文件", write: true },
     undo: { drive: "canvas.undo", desc: "撤销 agent 上一步", write: true },
   };
 
@@ -1586,6 +1587,7 @@ export default defineApp(async (sdk) => {
       "toSlot",
       "slot",
       "mode",
+      "name",
     ]) {
       if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
     }
@@ -1658,6 +1660,8 @@ export default defineApp(async (sdk) => {
       text = `已断开 #${payload.nodeId} 的 ${payload.slot}（linkId=${payload.linkId}）`;
     } else if (op === "setNodeMode" && payload) {
       text = `#${payload.nodeId} 已设为 ${payload.label}（mode=${payload.mode}，原 ${payload.before}）`;
+    } else if (op === "save" && payload) {
+      text = `已落盘：${payload.saved}（${payload.nodes} 节点）${payload.backup ? `，备份 ${payload.backup}` : ""}`;
     } else if (op === "undo" && payload) {
       text = payload.undone
         ? `已撤销「${payload.undone}」（剩余可撤销 ${payload.stackLeft} 步）`
@@ -1842,13 +1846,14 @@ export default defineApp(async (sdk) => {
               "connect",
               "disconnect",
               "setNodeMode",
+              "save",
               "undo",
             ],
             description:
-              "读/改人正在看的同一张画布。读：state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录。写（需授权）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；undo=撤销 agent 上一步",
+              "读/改人正在看的同一张画布。读：state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录。写（需授权）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=把当前图落盘为工作流文件；undo=撤销 agent 上一步",
           },
           nodeId: { type: "string", description: "目标节点 id（从 canvas state/summary 的 \"#<id>\" 取）" },
-          name: { type: "string", description: "setWidget 用：参数名（如 steps / cfg / text）" },
+          name: { type: "string", description: "setWidget 用参数名；save 用工作流名（省略则用当前工作流）" },
           value: { description: "setWidget 用：新值（数字/字符串/布尔，按参数类型给）" },
           type: { type: "string", description: "addNode 用：节点类型（如 KSampler / CLIPTextEncode / EmptyLatentImage）" },
           pos: { type: "array", items: { type: "number" }, description: "addNode 用：画布坐标 [x, y]（可选）" },
