@@ -20,6 +20,8 @@
 //   GET  /_relay/update            ComfyUI 本体更新检查（git fetch + 比较，带 TTL 缓存）
 //   POST /_relay/update            执行更新（{op:"check"|"apply"}；apply 后台跑，需 controlKey）
 //   GET  /_relay/update/status     更新进度（阶段 / 步骤 / 日志尾）
+  //   POST /_relay/bridge           画布桥（只读阶段）：{op,args} → ComfyUI 内 hana_bridge 扩展执行
+  //                                 （需 controlKey；token 读 custom_nodes/hana_bridge/.token）
 //
 // 启动方式：
 //   受管模式（生产）：node comfy-relay.mjs <runtime-config.json>
@@ -1063,6 +1065,25 @@ function resolveUpdateContext() {
   return { ok: true, git, repoDir, python: t.python, install: t.install, isRepo: existsSync(join(repoDir, ".git")) };
 }
 
+// 画布桥 token：custom_nodes/hana_bridge/.token 由 Python 侧首次加载时生成，中继读同一文件比对。
+// 缓存 5s（路径探测要碰文件系统，没必要每次调用都做）。
+let bridgeTokenCache = { at: 0, token: null };
+function readBridgeToken() {
+  if (Date.now() - bridgeTokenCache.at < 5_000) return bridgeTokenCache.token;
+  let token = null;
+  try {
+    const t = resolveLaunchTarget(null);
+    if (t.ok && t.mainPy) {
+      const p = join(dirname(t.mainPy), "custom_nodes", "hana_bridge", ".token");
+      if (existsSync(p)) token = readFileSync(p, "utf8").trim() || null;
+    }
+  } catch (e) {
+    warn(`[bridge] 读取 token 失败：${String((e && e.message) || e)}`);
+  }
+  bridgeTokenCache = { at: Date.now(), token };
+  return token;
+}
+
 // 检查更新（fetch + 比较；带 TTL 缓存，避免 UI 反复触发网络）
 async function checkUpdate(force = false) {
   if (!force && updateCheckCache.data && Date.now() - updateCheckCache.at < UPDATE_CHECK_TTL_MS) return updateCheckCache.data;
@@ -1986,6 +2007,51 @@ const server = http.createServer((req, res) => {
     }, req.method);
     return;
   }
+  if (pathOnly === "/_relay/userdata") {
+    // 代读后端 userdata 文件。存在的理由：App 侧经宿主 ctx.runtime.fetch 发起请求，
+    // 其校验禁止 pathname 含编码斜杠（/userdata/workflows%2Fxxx.json 会被拒），
+    // 而 ComfyUI 的 /userdata/{file} 路由又必须把斜杠编成 %2F。中继走 node:http，不受此限。
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    const uq = new URL(String(req.url || "/"), "http://relay.invalid");
+    const file = (uq.searchParams.get("file") || "").trim();
+    if (!file) {
+      jsonOut(res, 400, { ok: false, error: "缺少 file 参数" }, req.method);
+      return;
+    }
+    const upPath = `/userdata/${encodeURIComponent(file)}`;
+    void (async () => {
+      try {
+        const out = await new Promise((resolve, reject) => {
+          const up = http.request({
+            host: backend.host,
+            port: backend.port,
+            method: "GET",
+            path: upPath,
+            headers: { accept: "*/*", host: `${backend.host}:${backend.port}` },
+          }, (r) => {
+            const chunks = [];
+            r.on("data", (c) => chunks.push(c));
+            r.on("end", () => resolve({ status: r.statusCode, body: Buffer.concat(chunks) }));
+          });
+          up.on("error", reject);
+          up.setTimeout(15_000, () => up.destroy(new Error("upstream timeout")));
+          up.end();
+        });
+        if (out.status !== 200) {
+          jsonOut(res, 502, { ok: false, error: `后端 /userdata HTTP ${out.status}` }, req.method);
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "content-length": out.body.length });
+        if (req.method === "HEAD") res.end(); else res.end(out.body);
+      } catch (e) {
+        jsonOut(res, 502, { ok: false, error: String((e && e.message) || e) }, req.method);
+      }
+    })();
+    return;
+  }
   if (pathOnly === "/_relay/drives") {
     if (req.method !== "GET" && req.method !== "HEAD") {
       jsonOut(res, 405, { error: "method not allowed" }, req.method);
@@ -2021,6 +2087,59 @@ const server = http.createServer((req, res) => {
       return;
     }
     jsonOut(res, 405, { error: "method not allowed" }, req.method);
+    return;
+  }
+  if (pathOnly === "/_relay/bridge") {
+    // 画布桥（只读阶段）：转发到 ComfyUI 里 hana_bridge 注册的同源路由。
+    // 为何不直连前端：ComfyUI 的 CSP 是 connect-src 'self' data:（server.py），前端连不出 8188。
+    // 所以链路是：中继 → 8188 /api/hana_bridge/call → send_sync → 前端扩展 → 同源回传。
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    if (!controlOk(req)) {
+      jsonOut(res, 403, { error: "comfy-relay: control key required" });
+      return;
+    }
+    void (async () => {
+      try {
+        if (!backend.reachable) {
+          jsonOut(res, 502, { ok: false, error: "backend_unreachable", detail: `ComfyUI ${backend.host}:${backend.port} 不可达` }, req.method);
+          return;
+        }
+        const body = await readBodyJson(req).catch(() => ({}));
+        const op = String((body && body.op) || "").trim();
+        if (!op) {
+          jsonOut(res, 400, { ok: false, error: "missing_op" }, req.method);
+          return;
+        }
+        const token = readBridgeToken();
+        if (!token) {
+          jsonOut(res, 502, {
+            ok: false,
+            error: "bridge_not_deployed",
+            detail: "未找到 custom_nodes/hana_bridge/.token（桥未部署，或 ComfyUI 尚未加载过它）",
+          }, req.method);
+          return;
+        }
+        const upstream = await fetch(`http://${backend.host}:${backend.port}/api/hana_bridge/call`, {
+          method: "POST",
+          signal: AbortSignal.timeout(20_000),
+          headers: { accept: "application/json", "content-type": "application/json", "x-hana-token": token },
+          body: JSON.stringify({ op, args: (body && body.args) || {} }),
+        });
+        const text = (await upstream.text()).trim();
+        let data;
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch {
+          data = { ok: false, error: `桥返回非 JSON（HTTP ${upstream.status}）` };
+        }
+        jsonOut(res, upstream.ok ? 200 : 502, data, req.method);
+      } catch (e) {
+        jsonOut(res, 502, { ok: false, error: String((e && e.message) || e) }, req.method);
+      }
+    })();
     return;
   }
   if (pathOnly === "/_relay/backend/start" || pathOnly === "/_relay/backend/stop") {

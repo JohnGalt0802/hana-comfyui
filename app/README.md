@@ -57,6 +57,14 @@
     更新前记录旧 commit（与更新后一并写入 `logs/update-state.json`）；更新后**不自动起服务**（交用户决定）。
   - **进度**：`GET /comfyui-hana/update/status`（阶段 stopping/fetching/pulling/installing/done/failed + 步骤 + 日志尾），
     设置页「ComfyUI 更新」区块轮询它；工具面 `comfyui(action="update", op="check"|"apply"|"status")`。
+- **画布共驾 P1：只读桥（v0.9 新增，M12）**：让 agent 读**人正在看的同一张画布**。
+  - 链路：`comfyui(action="canvas", op=…)` → 路由 `canvas` → 中继 `/_relay/bridge` → ComfyUI
+    `POST /api/hana_bridge/call` → `send_sync` 经自带 `/ws` → 前端扩展读 `window.app.graph` → 同源回传。
+  - 只读 op：`summary`（结构摘要，默认）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）。
+  - **前置**：`custom_nodes/hana_bridge/`，用 `tools/deploy-bridge.ps1` 装 / 卸 / 查；
+    改 `__init__.py` 需重启 ComfyUI，改 JS 只需刷新页面（静态服务带 `Cache-Control: no-store`）。
+  - 安全：`/call` 校验 `X-Hana-Token`（token 由 Python 侧首启生成、中继读同一文件），无 token → 403。
+  - 记录 `docs/M12-画布共驾-P1记录.md`；方案 `docs/画布共驾方案-20260926.md`。
   - 边界：仅**源码安装**（Git 仓库）可代为更新；便携包/手工解压会明确回报“无法代为更新”。
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok

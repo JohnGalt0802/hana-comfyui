@@ -833,8 +833,12 @@ export default defineApp(async (sdk) => {
       const avail = items.slice(0, 12).map((i) => i.path).join(" / ");
       throw new Error(`userdata 工作流里找不到「${name}」。可用：${avail || "（空——请先在 ComfyUI 里保存一个工作流，或用「导出 API 格式」的文件路径）"}`);
     }
-    const rel = String(target.path).split("/").map((s) => encodeURIComponent(s)).join("/");
-    const res = await relayJson(`/userdata/${rel}`, { timeoutMs: 30_000 });
+    // 读 userdata 经中继的 /_relay/userdata 代理：宿主 ctx.runtime.fetch 会拒绝含 %2F 的
+    // pathname，而 /userdata/{file} 必须把斜杠编成 %2F，所以交给中继（node:http）代取。
+    // 这里只把"相对路径"放进 query（斜杠原样、其余段编码），避开宿主那段校验。
+    const p = String(target.path).replace(/\\/g, "/");
+    const file = p.startsWith("workflows/") ? p : `workflows/${p}`;
+    const res = await relayJson(`/_relay/userdata?file=${encodeURI(file)}`, { timeoutMs: 30_000 });
     if (!res.ok || res.data === null || res.data === undefined) throw new Error(`读取模板内容失败：${target.path}`);
     const parsed = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
     return { parsed, source: `userdata:${target.path}` };
@@ -1518,6 +1522,59 @@ export default defineApp(async (sdk) => {
     return { reachable: !!(b && b.reachable), proc: (b && b.proc) || null, url: b ? b.url : `http://${BACKEND.host}:${BACKEND.port}` };
   }
 
+  // ── 画布桥（只读感知：agent 读的正是人眼前那张图）────────────────────────
+  // 链路：App → 中继 /_relay/bridge → ComfyUI /api/hana_bridge/call → 前端扩展。
+  const CANVAS_OPS = {
+    summary: { drive: "canvas.summary", desc: "画布结构摘要（节点 / 连线）" },
+    get: { drive: "canvas.get", desc: "全量 UI 格式 JSON" },
+    prompt: { drive: "canvas.prompt", desc: "可提交形态（prompt 对象）" },
+    running: { drive: "exec.running", desc: "当前执行到哪个节点" },
+    probe: { drive: "api.probe", desc: "桥自检（关键 API 存在性）" },
+  };
+
+  async function actionCanvas(args) {
+    const op = String((args && args.op) || "summary").trim().toLowerCase();
+    const spec = CANVAS_OPS[op];
+    if (!spec) throw new Error(`op 必须是 ${Object.keys(CANVAS_OPS).join(" / ")}（收到 "${op}"）`);
+    const { ok, status, data } = await relayJson("/_relay/bridge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: spec.drive }),
+      timeoutMs: 30_000,
+    });
+    const d = data && typeof data === "object" ? data : {};
+    if (!ok || d.ok === false) {
+      const why = d.error || `HTTP ${status}`;
+      throw new Error(`读画布失败（${op}）：${why}${d.detail ? " · " + d.detail : ""}`);
+    }
+    const payload = d.data === undefined ? null : d.data;
+    let text;
+    if (op === "summary" && payload && typeof payload === "object") {
+      const rows = (payload.nodes || []).map((n) => `  #${n.id} ${n.type}${n.title && n.title !== n.type ? ` （${n.title}）` : ""}`);
+      text = [`画布：${payload.nodeCount} 个节点 / ${payload.linkCount} 条连线`, ...rows].filter(Boolean).join("\n");
+    } else if (op === "running") {
+      text = payload && payload.runningNodeId != null ? `当前执行节点：#${payload.runningNodeId}` : "当前没有节点在执行。";
+    } else if (op === "prompt" && payload && typeof payload === "object") {
+      const n = payload.output && typeof payload.output === "object" ? Object.keys(payload.output).length : 0;
+      text = `可提交形态：${n} 个节点（已就绪）。`;
+    } else {
+      const s = JSON.stringify(payload, null, op === "probe" || op === "running" ? 2 : 0);
+      text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
+    }
+    return {
+      content: [{ type: "text", text }],
+      details: {
+        comfyui: {
+          action: "canvas",
+          op,
+          ok: true,
+          ...(op === "summary" && payload ? { nodeCount: payload.nodeCount, linkCount: payload.linkCount } : {}),
+          ...(op === "probe" || op === "running" ? { payload } : {}),
+        },
+      },
+    };
+  }
+
   async function actionService(args) {
     const op = String(args.op || "status").trim().toLowerCase();
     const cur = serviceSnapshot();
@@ -1658,6 +1715,13 @@ export default defineApp(async (sdk) => {
           op: { type: "string", enum: ["check", "apply", "status"], description: "check=检查更新（与远端比 commit，默认）；apply=执行更新（停服务 → git pull --ff-only → pip install -r requirements.txt，后台跑）；status=查更新进度" },
         },
       },
+      {
+        command: "canvas",
+        required: [],
+        fields: {
+          op: { type: "string", enum: ["summary", "get", "prompt", "running", "probe"], description: "读人正在看的同一张画布：summary=结构摘要（默认）；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检。只读，无副作用" },
+        },
+      },
     ];
   }
 
@@ -1669,7 +1733,8 @@ export default defineApp(async (sdk) => {
         "Hana-ComfyUI：操作本机 ComfyUI（127.0.0.1:8188）的工具（一个 App 一个同名工具，action 选动作）。" +
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
-        "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）。" +
+        "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
+        "canvas=读人正在看的同一张画布（op=summary 结构摘要（默认）/ get 全量 UI JSON / prompt 可提交形态 / running 当前执行节点 / probe 桥自检）——只读，用于和人共驾（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",
@@ -1728,9 +1793,10 @@ export default defineApp(async (sdk) => {
             case "workflows": return await actionWorkflows(args);
             case "service": return await actionService(args);
             case "update": return await actionUpdate(args);
+            case "canvas": return await actionCanvas(args);
             case "upload": return await actionUpload(args);
             default:
-              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update（收到 "${action}"）`);
+              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update / canvas（收到 "${action}"）`);
           }
         } catch (e) {
           const text = `comfyui(${action || "?"}) 失败：${msgOf(e)}`;
@@ -1739,7 +1805,7 @@ export default defineApp(async (sdk) => {
         }
       },
     });
-    log("工具注册：comfyui（v0.2：status/submit/query/result/cancel/workflows/upload/service/update）");
+    log("工具注册：comfyui（v0.3：status/submit/query/result/cancel/workflows/upload/service/update/canvas）");
   } catch (e) {
     error(`工具注册失败：${msgOf(e)}`);
   }
@@ -1855,6 +1921,23 @@ export default defineApp(async (sdk) => {
           return c.json({ ok: false, error: msgOf(e) }, 502);
         }
       });
+
+      // 画布桥（只读）：读人正在看的同一张图（op 走 ?op= 或 JSON body）
+      const canvasRoute = async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          let op = String(c.req.query("op") || "").trim();
+          if (!op) {
+            const body = await c.req.json().catch(() => ({}));
+            op = String((body && body.op) || "").trim();
+          }
+          return c.json(await actionCanvas({ op: op || "summary" }));
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      };
+      app.get("/comfyui-hana/canvas", canvasRoute);
+      app.post("/comfyui-hana/canvas", canvasRoute);
 
       app.get("/comfyui-hana/task", async (c) => {
         try {
