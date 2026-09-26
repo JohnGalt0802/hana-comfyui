@@ -84,6 +84,76 @@ function graphSummary() {
   };
 }
 
+// ── 变更感知（P2）───────────────────────────────────────────────────────
+// 新版 @comfyorg/litegraph 没留可用的变更事件（探查：graph 上只有 onTrigger /
+// onConfigure / onConnectionChange，LGraph 原型没有任何 on* 事件），所以不用事件驱动，
+// 改用轮询签名比对：500ms 算一次轻量签名，变了就记一条并递增 revision。
+// 签名刻意**不含节点位置**——拖动节点不该算“画布变化”，否则噪声太大。
+const CHANGE_POLL_MS = 500;
+const CHANGE_KEEP = 50;
+let graphRevision = 0;
+let lastSignature = null;
+let changes = [];
+
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
+function graphSignature() {
+  const g = app.graph;
+  const nodes = nodeList(g);
+  const perNode = {};
+  const types = {};
+  for (const n of nodes) {
+    let w = "";
+    for (const x of n.widgets || []) {
+      const v = x && x.value;
+      const s = v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      w += (x.name || "?") + "=" + s + ";";
+    }
+    perNode[n.id] = fnv1a(`${n.type}:${n.mode === undefined ? 0 : n.mode}:${n.title || ""}:${w}`);
+    types[n.id] = n.type;
+  }
+  let linkCount = 0;
+  const lm = g && g.links;
+  if (lm && typeof lm.forEach === "function") lm.forEach(() => { linkCount += 1; });
+  const hash = fnv1a(Object.keys(perNode).map((k) => k + perNode[k]).join("|") + "#" + linkCount);
+  return { nodeCount: nodes.length, linkCount, hash, perNode, types };
+}
+
+function pollGraph() {
+  const sig = graphSignature();
+  if (lastSignature && sig.hash !== lastSignature.hash) {
+    graphRevision += 1;
+    // 按节点算差异：agent 不只该知道“变了”，还该知道“哪个节点变了”
+    const changed = [];
+    for (const id of Object.keys(sig.perNode)) {
+      if (!(id in lastSignature.perNode)) changed.push({ id, type: sig.types[id], kind: "added" });
+      else if (sig.perNode[id] !== lastSignature.perNode[id]) changed.push({ id, type: sig.types[id], kind: "changed" });
+    }
+    for (const id of Object.keys(lastSignature.perNode)) {
+      if (!(id in sig.perNode)) changed.push({ id, type: lastSignature.types[id], kind: "removed" });
+    }
+    changes.push({
+      rev: graphRevision,
+      at: new Date().toISOString(),
+      nodes: sig.nodeCount,
+      links: sig.linkCount,
+      deltaNodes: sig.nodeCount - lastSignature.nodeCount,
+      deltaLinks: sig.linkCount - lastSignature.linkCount,
+      changed: changed.slice(0, 20),
+    });
+    if (changes.length > CHANGE_KEEP) changes = changes.slice(-CHANGE_KEEP);
+  }
+  lastSignature = sig;
+  return sig;
+}
+
 const OPS = {
   // 全量 UI 格式（等价 Ctrl+S 写出的结构）
   "canvas.get": () => app.graph.toJSON(),
@@ -119,6 +189,40 @@ const OPS = {
     nodeCount: nodeList(app && app.graph).length,
     href: location.href,
   }),
+
+  // 变更感知（P2）：只问“变没变”，轻量
+  "canvas.revision": () => {
+    const sig = pollGraph();
+    return {
+      revision: graphRevision,
+      changeCount: changes.length,
+      nodes: sig.nodeCount,
+      links: sig.linkCount,
+      lastChangeAt: changes.length ? changes[changes.length - 1].at : null,
+    };
+  },
+
+  // 变更列表（P2）：最近若干条；可传 { since: <rev> } 只取更新的
+  "canvas.events": (args) => {
+    const since = Number(args && args.since);
+    pollGraph();
+    const list = Number.isFinite(since) ? changes.filter((c) => c.rev > since) : changes.slice(-20);
+    return { revision: graphRevision, total: changes.length, changes: list };
+  },
+};
+
+// 诊断出口（只读）：用于确认“当前页面加载的是哪一版脚本、当前 revision 多少”。
+// 只暴露版本与计数，不做任何写操作、也不抛出内部对象。
+window.__hanaBridge = {
+  version: "p2.1",
+  ops: Object.keys(OPS),
+  state: () => ({
+    version: "p2.1",
+    revision: graphRevision,
+    lastChangeAt: changes.length ? changes[changes.length - 1].at : null,
+    nodes: lastSignature ? lastSignature.nodeCount : null,
+    links: lastSignature ? lastSignature.linkCount : null,
+  }),
 };
 
 async function postJson(path, body) {
@@ -152,6 +256,9 @@ app.registerExtension({
   async setup() {
     try {
       await postJson(PATH_HELLO, { clientId: api.clientId || null, href: location.href });
+      // 变更感知轮询（P2）：先建一次基线，之后每 500ms 比对签名
+      pollGraph();
+      setInterval(pollGraph, CHANGE_POLL_MS);
       console.info(LOG_TAG + " 已挂载 clientId=" + (api.clientId || "?") + " ops=" + Object.keys(OPS).join(","));
     } catch (err) {
       console.warn(LOG_TAG, "上报失败（后端未就绪？）", err);

@@ -60,7 +60,9 @@
 - **画布共驾 P1：只读桥（v0.9 新增，M12）**：让 agent 读**人正在看的同一张画布**。
   - 链路：`comfyui(action="canvas", op=…)` → 路由 `canvas` → 中继 `/_relay/bridge` → ComfyUI
     `POST /api/hana_bridge/call` → `send_sync` 经自带 `/ws` → 前端扩展读 `window.app.graph` → 同源回传。
-  - 只读 op：`summary`（结构摘要，默认）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）。
+  - 只读 op：`summary`（结构摘要，默认）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）/
+    `revision`（变更序号，只问变没变）/ `events`（变更记录，可按 `since` 增量查，含按节点的 added/removed/changed）。
+    变更感知为 500ms 轮询签名比对（新版 LiteGraph 没有可用的变更事件），签名**不含节点位置**。
   - **前置**：`custom_nodes/hana_bridge/`，用 `tools/deploy-bridge.ps1` 装 / 卸 / 查；
     改 `__init__.py` 需重启 ComfyUI，改 JS 只需刷新页面（静态服务带 `Cache-Control: no-store`）。
   - 安全：`/call` 校验 `X-Hana-Token`（token 由 Python 侧首启生成、中继读同一文件），无 token → 403。

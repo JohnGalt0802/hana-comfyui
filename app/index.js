@@ -1530,6 +1530,8 @@ export default defineApp(async (sdk) => {
     prompt: { drive: "canvas.prompt", desc: "可提交形态（prompt 对象）" },
     running: { drive: "exec.running", desc: "当前执行到哪个节点" },
     probe: { drive: "api.probe", desc: "桥自检（关键 API 存在性）" },
+    revision: { drive: "canvas.revision", desc: "画布变更序号（只问变没变，轻量）" },
+    events: { drive: "canvas.events", desc: "画布变更记录（最近若干条）" },
   };
 
   async function actionCanvas(args) {
@@ -1557,6 +1559,22 @@ export default defineApp(async (sdk) => {
     } else if (op === "prompt" && payload && typeof payload === "object") {
       const n = payload.output && typeof payload.output === "object" ? Object.keys(payload.output).length : 0;
       text = `可提交形态：${n} 个节点（已就绪）。`;
+    } else if (op === "revision" && payload) {
+      text =
+        `画布变更序号 rev=${payload.revision}（记录 ${payload.changeCount} 条）｜` +
+        `当前 ${payload.nodes} 节点 / ${payload.links} 连线` +
+        (payload.lastChangeAt ? `｜最后变更 ${payload.lastChangeAt}` : "");
+    } else if (op === "events" && payload) {
+      const KIND = { added: "新增", removed: "删除", changed: "修改" };
+      const rows = (payload.changes || []).map((c) => {
+        const bits = [];
+        if (c.deltaNodes) bits.push(`节点${c.deltaNodes > 0 ? "+" : ""}${c.deltaNodes}`);
+        if (c.deltaLinks) bits.push(`连线${c.deltaLinks > 0 ? "+" : ""}${c.deltaLinks}`);
+        const detail = (c.changed || []).map((x) => `#${x.id} ${x.type} ${KIND[x.kind] || x.kind}`).join("；");
+        return `  rev${c.rev} ${c.at}${bits.length ? " " + bits.join(" ") : ""}${detail ? ` ｜${detail}` : ""}（现 ${c.nodes}/${c.links}）`;
+      });
+      text = [`画布变更：rev=${payload.revision}，共记录 ${payload.total} 条`, ...rows].join("\n");
+      if (!rows.length) text = `画布变更：rev=${payload.revision}，暂无可列出的记录。`;
     } else {
       const s = JSON.stringify(payload, null, op === "probe" || op === "running" ? 2 : 0);
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
@@ -1569,7 +1587,8 @@ export default defineApp(async (sdk) => {
           op,
           ok: true,
           ...(op === "summary" && payload ? { nodeCount: payload.nodeCount, linkCount: payload.linkCount } : {}),
-          ...(op === "probe" || op === "running" ? { payload } : {}),
+          ...(op === "probe" || op === "running" || op === "revision" ? { payload } : {}),
+          ...(op === "events" ? { changeCount: payload && payload.total } : {}),
         },
       },
     };
@@ -1719,7 +1738,7 @@ export default defineApp(async (sdk) => {
         command: "canvas",
         required: [],
         fields: {
-          op: { type: "string", enum: ["summary", "get", "prompt", "running", "probe"], description: "读人正在看的同一张画布：summary=结构摘要（默认）；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检。只读，无副作用" },
+          op: { type: "string", enum: ["summary", "get", "prompt", "running", "probe", "revision", "events"], description: "读人正在看的同一张画布：summary=结构摘要（默认）；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号（只问变没变）；events=变更记录。均只读、无副作用" },
         },
       },
     ];
@@ -1734,7 +1753,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读人正在看的同一张画布（op=summary 结构摘要（默认）/ get 全量 UI JSON / prompt 可提交形态 / running 当前执行节点 / probe 桥自检）——只读，用于和人共驾（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读人正在看的同一张画布（op=summary 结构摘要（默认）/ get 全量 UI JSON / prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录）——只读，用于和人共驾（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",
