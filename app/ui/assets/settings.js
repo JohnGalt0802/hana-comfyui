@@ -159,6 +159,7 @@ async function main() {
   void poll();
   void loadInstall();
   void loadAutoStart();
+  void loadAllowWrite();
   setInterval(() => { void poll(); }, 3000);
   setInterval(() => { void loadInstall(); }, 20000);
 }

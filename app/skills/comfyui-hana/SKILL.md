@@ -77,7 +77,7 @@ App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 
 | 面 | 内容 |
 |----|------|
-| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service / update / canvas**（单工具 action 分派；service 管 8188 服务进程起停；update 管源码安装的本体更新；canvas 读人正在看的同一张画布，只读） |
+| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service / update / canvas**（单工具 action 分派；service 管 8188 服务进程起停；update 管源码安装的本体更新；canvas 读/改人正在看的同一张画布，写入需授权） |
 | 任务桥 | submit → 宿主任务（`delivery:"next-step"`）→ 2s 轮询结算（完成回执含产物路径；失败/中断给原因） |
 | 任务卡 | 每次 submit 返回 `details.card`（进度/队列位/耗时/产物缩略），数据经 `GET /comfyui-hana/task?id=` |
 | 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start` / `theme` / `update` / `update/status`（v0.7-0.9） |

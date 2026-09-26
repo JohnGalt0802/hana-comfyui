@@ -86,6 +86,17 @@ label.chk input { accent-color: var(--accent); }
   </div>
 
   <div class="sec">
+    <h2>画布（共驾）</h2>
+    <label class="chk"><input type="checkbox" id="s-allow-write"> 允许 agent 修改画布</label>
+    <p class="note">
+      默认关闭。开启后，agent 才能用 canvas 工具的写入动作（setWidget 改参数 / undo 撤销）改你眼前的画布。
+      所有改动都走 LiteGraph 的变更记账，你按 Ctrl+Z 能像撤销自己操作一样撤回；关掉即立刻禁止
+      （只读的 canvas 动作不受影响）。
+    </p>
+    <div class="msg" id="s-aw-msg"></div>
+  </div>
+
+  <div class="sec">
     <h2>连接（只读）</h2>
     <div class="row"><span class="k">ComfyUI 后端</span><span class="v" id="s-backend">127.0.0.1:8188</span></div>
     <div class="row"><span class="k">后端状态</span><span class="v" id="s-reachable">读取中…</span></div>

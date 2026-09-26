@@ -382,6 +382,25 @@ export default defineApp(async (sdk) => {
   // 服务自动拉起（可选，默认关）：Hana 启动时若已装 ComfyUI 且 8188 无服务，自动拉起一次。
   const autoStartFile = join(dataDir, "auto-start.json");
 
+  // 画布写入授权（默认关）：agent 改的是人眼前的画布，不给默认放行。
+  const allowWriteFile = join(dataDir, "allow-write.json");
+
+  function readAllowWrite() {
+    try {
+      return JSON.parse(readFileSync(allowWriteFile, "utf8")).enabled === true;
+    } catch { return false; }
+  }
+
+  function writeAllowWrite(enabled) {
+    try {
+      writeFileSync(allowWriteFile, JSON.stringify({ enabled: !!enabled, at: new Date().toISOString() }, null, 2), { mode: 0o600 });
+      return true;
+    } catch (e) {
+      warn(`allow-write 写入失败：${msgOf(e)}`);
+      return false;
+    }
+  }
+
   function readAutoStart() {
     try {
       return JSON.parse(readFileSync(autoStartFile, "utf8")).enabled === true;
@@ -1532,16 +1551,28 @@ export default defineApp(async (sdk) => {
     probe: { drive: "api.probe", desc: "桥自检（关键 API 存在性）" },
     revision: { drive: "canvas.revision", desc: "画布变更序号（只问变没变，轻量）" },
     events: { drive: "canvas.events", desc: "画布变更记录（最近若干条）" },
+    // 以下为写入（需授权：设置页「允许 agent 修改画布」）
+    setWidget: { drive: "canvas.setWidget", desc: "改一个节点参数", write: true },
+    undo: { drive: "canvas.undo", desc: "撤销一步（等价 Ctrl+Z）", write: true },
   };
 
   async function actionCanvas(args) {
     const op = String((args && args.op) || "summary").trim().toLowerCase();
     const spec = CANVAS_OPS[op];
     if (!spec) throw new Error(`op 必须是 ${Object.keys(CANVAS_OPS).join(" / ")}（收到 "${op}"）`);
+    // 写入类 op 需显式授权（默认关）
+    if (spec.write && !readAllowWrite()) {
+      throw new Error(`「${op}」会修改你的画布，当前未授权。请在 Hana-ComfyUI 设置页打开「允许 agent 修改画布」后再试。`);
+    }
+    // 写入参数原样透传给桥（桥侧做具体校验）
+    const bridgeArgs = {};
+    for (const k of ["nodeId", "name", "value"]) {
+      if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
+    }
     const { ok, status, data } = await relayJson("/_relay/bridge", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ op: spec.drive }),
+      body: JSON.stringify({ op: spec.drive, args: bridgeArgs }),
       timeoutMs: 30_000,
     });
     const d = data && typeof data === "object" ? data : {};
@@ -1575,6 +1606,12 @@ export default defineApp(async (sdk) => {
       });
       text = [`画布变更：rev=${payload.revision}，共记录 ${payload.total} 条`, ...rows].join("\n");
       if (!rows.length) text = `画布变更：rev=${payload.revision}，暂无可列出的记录。`;
+    } else if (op === "setWidget" && payload) {
+      text =
+        `已修改 #${payload.nodeId}（${payload.type}）的 ${payload.name}：${payload.before} → ${payload.after}\n` +
+        `（要撤回就说一声，可用 op=undo）`;
+    } else if (op === "undo" && payload) {
+      text = `已撤销一步（当前变更序号 rev=${payload.revision}）。`;
     } else {
       const s = JSON.stringify(payload, null, op === "probe" || op === "running" ? 2 : 0);
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
@@ -1738,7 +1775,15 @@ export default defineApp(async (sdk) => {
         command: "canvas",
         required: [],
         fields: {
-          op: { type: "string", enum: ["summary", "get", "prompt", "running", "probe", "revision", "events"], description: "读人正在看的同一张画布：summary=结构摘要（默认）；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号（只问变没变）；events=变更记录。均只读、无副作用" },
+          op: {
+            type: "string",
+            enum: ["summary", "get", "prompt", "running", "probe", "revision", "events", "setWidget", "undo"],
+            description:
+              "读/改人正在看的同一张画布：summary=结构摘要（默认）；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录；setWidget=改一个参数（写，需授权）；undo=撤销一步（写，需授权）",
+          },
+          nodeId: { type: "string", description: "setWidget 用：目标节点 id（从 canvas summary 的 \"#<id>\" 取）" },
+          name: { type: "string", description: "setWidget 用：参数名（widget 名，如 steps / cfg / text）" },
+          value: { description: "setWidget 用：新值（数字/字符串/布尔，按参数本身类型给）" },
         },
       },
     ];
@@ -1753,7 +1798,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读人正在看的同一张画布（op=summary 结构摘要（默认）/ get 全量 UI JSON / prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录）——只读，用于和人共驾（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读/改人正在看的同一张画布（op=summary 结构摘要（默认）/ get 全量 UI JSON / prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录 / setWidget 改一个参数（写）/ undo 撤销一步（写））——写入类 op 需用户在设置页开启「允许 agent 修改画布」；改动走 LiteGraph 变更记账，人的 Ctrl+Z 可撤回（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",
@@ -1957,6 +2002,22 @@ export default defineApp(async (sdk) => {
       };
       app.get("/comfyui-hana/canvas", canvasRoute);
       app.post("/comfyui-hana/canvas", canvasRoute);
+
+      // 画布写入授权开关（默认关）：agent 改画布前必须先得到明确允许
+      app.get("/comfyui-hana/allow-write", (c) => {
+        try { return c.json({ ok: true, enabled: readAllowWrite() }); } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
+      });
+
+      app.post("/comfyui-hana/allow-write", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          if (!writeAllowWrite(body.enabled === true)) return c.json({ ok: false, error: "写入失败" }, 500);
+          log(`画布写入授权：${readAllowWrite() ? "已开启" : "已关闭"}`);
+          return c.json({ ok: true, enabled: readAllowWrite() });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
 
       app.get("/comfyui-hana/task", async (c) => {
         try {

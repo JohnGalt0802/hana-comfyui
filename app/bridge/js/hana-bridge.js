@@ -59,6 +59,15 @@ function nodeList(graph) {
   return [];
 }
 
+function findNode(id) {
+  const g = app.graph;
+  if (g && typeof g.getNodeById === "function") {
+    const n = g.getNodeById(Number(id)) || g.getNodeById(id);
+    if (n) return n;
+  }
+  return nodeList(g).find((n) => String(n.id) === String(id)) || null;
+}
+
 function graphSummary() {
   const g = app.graph;
   const nodes = nodeList(g);
@@ -94,6 +103,11 @@ const CHANGE_KEEP = 50;
 let graphRevision = 0;
 let lastSignature = null;
 let changes = [];
+// agent 自己写入的 undo 栈（存 before 值）。
+// 为何需要：实测新版前端的 ChangeTracker 不记录「外部对 graph 的直接修改」
+// （graph.onBeforeChange / canvas.onBeforeChange 都不存在，Comfy.Undo 对这类改动无效），
+// 所以 agent 的改动要能撤销，得自己记一份。最多保留 20 步。
+let writeStack = [];
 
 function fnv1a(str) {
   let h = 0x811c9dc5;
@@ -209,15 +223,96 @@ const OPS = {
     const list = Number.isFinite(since) ? changes.filter((c) => c.rev > since) : changes.slice(-20);
     return { revision: graphRevision, total: changes.length, changes: list };
   },
+
+  // ── 写入（P3；需 App 侧的授权开关打开）───────────────────────────────
+  // 所有改图都包在 graph.beforeChange() / afterChange() 里：这是 LiteGraph 的变更记账，
+  // 人的 Ctrl+Z（app.canvas.undo()）能像撤销自己操作一样撤销 agent 的改动。
+  "canvas.setWidget": (args) => {
+    const a = args || {};
+    if (a.nodeId === undefined || a.nodeId === null || !a.name) throw new Error("需要 nodeId 与 name");
+    const node = findNode(a.nodeId);
+    if (!node) throw new Error("找不到节点：" + a.nodeId);
+    const w = (node.widgets || []).find((x) => x.name === a.name);
+    if (!w) throw new Error(`节点 #${a.nodeId} 没有名为 ${a.name} 的参数`);
+    const before = w.value;
+    app.graph.beforeChange();
+    try {
+      w.value = a.value;
+      if (typeof w.callback === "function") {
+        // 回调只为了触发联动 / 重绘；它报错不应把写入判成失败
+        try { w.callback(a.value, app.canvas, node, [0, 0], null); } catch { /* 忽略 */ }
+      }
+    } finally {
+      app.graph.afterChange();
+    }
+    pollGraph();
+    writeStack.push({ nodeId: node.id, name: a.name, before });
+    if (writeStack.length > 20) writeStack.shift();
+    return {
+      nodeId: node.id,
+      type: node.type,
+      name: a.name,
+      before: clip(String(before)),
+      after: clip(String(w.value)),
+    };
+  },
+
+  // 撤销最后一步：走官方命令 Comfy.Undo（与人的 Ctrl+Z 同一条路）。
+  // 实测：新版 @comfyorg/litegraph 已移除 LGraphCanvas.undo，撤销由 ChangeTracker +
+  // 命令系统接管；graph.beforeChange()/afterChange() 会触发 onBeforeChange/onAfterChange，
+  // ChangeTracker 正是靠这两个回调记账——所以写入包在那两行里，人的 Ctrl+Z 就能撤。
+  "canvas.undo": async () => {
+    const sigBefore = graphSignature().hash;
+    const cmd = app.extensionManager && app.extensionManager.command;
+    let via = null;
+    if (cmd && typeof cmd.execute === "function") {
+      try { await cmd.execute("Comfy.Undo"); via = "Comfy.Undo"; } catch { /* 落到下面的兜底 */ }
+    } else if (app.canvas && typeof app.canvas.undo === "function") {
+      app.canvas.undo();
+      via = "canvas.undo";
+    }
+    pollGraph();
+    if (graphSignature().hash !== sigBefore) {
+      return { ok: true, via, note: "官方撤销已生效" };
+    }
+    // 官方撤销没改变图（ChangeTracker 不记录外部直接改动）→ 按 agent 自己记的栈回写
+    const last = writeStack.pop();
+    if (last) {
+      const node = findNode(last.nodeId);
+      const w = node && (node.widgets || []).find((x) => x.name === last.name);
+      if (w) {
+        app.graph.beforeChange();
+        try {
+          w.value = last.before;
+          if (typeof w.callback === "function") {
+            try { w.callback(last.before, app.canvas, node, [0, 0], null); } catch { /* 忽略 */ }
+          }
+        } finally {
+          app.graph.afterChange();
+        }
+        pollGraph();
+        return {
+          ok: true,
+          via: "agent-rewind",
+          note: "官方撤销对该改动未生效，已按记录回写",
+          nodeId: node.id,
+          name: last.name,
+          restored: clip(String(last.before)),
+          stackLeft: writeStack.length,
+        };
+      }
+    }
+    return { ok: true, via, note: "已执行撤销，图未变化（可能已无可撤销步骤）" };
+  },
 };
 
 // 诊断出口（只读）：用于确认“当前页面加载的是哪一版脚本、当前 revision 多少”。
 // 只暴露版本与计数，不做任何写操作、也不抛出内部对象。
 window.__hanaBridge = {
-  version: "p2.1",
+  version: "p3.1",
   ops: Object.keys(OPS),
   state: () => ({
-    version: "p2.1",
+    version: "p3.1",
     revision: graphRevision,
     lastChangeAt: changes.length ? changes[changes.length - 1].at : null,
     nodes: lastSignature ? lastSignature.nodeCount : null,
