@@ -110,6 +110,40 @@ let changes = [];
 // 所以 agent 的改动要能撤销，得自己记一份。最多保留 20 步。
 let writeStack = [];
 
+// 逆操作栈：每个写 op 自带一个「怎么撤回去」的闭包。
+// 为何不用快照式撤销：整图快照会把人在此期间对别处的改动一起回滚，也不便宜；
+// 逆操作只回退 agent 自己那一步，精确且支持连续撤销。
+function withChange(fn) {
+  app.graph.beforeChange();
+  try {
+    fn();
+  } finally {
+    app.graph.afterChange();
+  }
+}
+
+function pushUndo(label, undo) {
+  writeStack.push({ label, undo, at: new Date().toISOString() });
+  if (writeStack.length > 20) writeStack.shift();
+}
+
+// slot 可以是索引，也可以是名字（名字优先，纯数字字符串按索引）
+function slotIndex(slots, which) {
+  const arr = slots || [];
+  if (typeof which === "number") return which >= 0 && which < arr.length ? which : -1;
+  const s = String(which == null ? "" : which).trim();
+  if (!s) return -1;
+  for (let i = 0; i < arr.length; i++) if (arr[i] && arr[i].name === s) return i;
+  const n = Number(s);
+  return Number.isInteger(n) && n >= 0 && n < arr.length ? n : -1;
+}
+
+function liteGraph() {
+  if (typeof window.LiteGraph !== "undefined") return window.LiteGraph;
+  if (typeof LiteGraph !== "undefined") return LiteGraph;
+  return null;
+}
+
 function fnv1a(str) {
   let h = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {
@@ -276,8 +310,16 @@ const OPS = {
       app.graph.afterChange();
     }
     pollGraph();
-    writeStack.push({ nodeId: node.id, name: a.name, before });
-    if (writeStack.length > 20) writeStack.shift();
+    const restore = before;
+    pushUndo(`setWidget #${node.id}.${a.name}`, () => {
+      withChange(() => {
+        w.value = restore;
+        if (typeof w.callback === "function") {
+          try { w.callback(restore, app.canvas, node, [0, 0], null); } catch { /* 忽略 */ }
+        }
+      });
+      pollGraph();
+    });
     return {
       nodeId: node.id,
       type: node.type,
@@ -287,62 +329,193 @@ const OPS = {
     };
   },
 
-  // 撤销最后一步：走官方命令 Comfy.Undo（与人的 Ctrl+Z 同一条路）。
-  // 实测：新版 @comfyorg/litegraph 已移除 LGraphCanvas.undo，撤销由 ChangeTracker +
-  // 命令系统接管；graph.beforeChange()/afterChange() 会触发 onBeforeChange/onAfterChange，
-  // ChangeTracker 正是靠这两个回调记账——所以写入包在那两行里，人的 Ctrl+Z 就能撤。
+  // ── 结构写入（P3 扩展；需授权）──────────────────────────────────────
+  // 加/删节点、连线、断线、mute/bypass。每个写 op 都把自己的逆操作压栈。
+  "canvas.addNode": (args) => {
+    const a = args || {};
+    const type = String(a.type || "").trim();
+    if (!type) throw new Error("需要 type（节点类型，如 KSampler）");
+    const LG = liteGraph();
+    if (!LG || typeof LG.createNode !== "function") throw new Error("当前前端没有 LiteGraph.createNode");
+    const node = LG.createNode(type);
+    if (!node) throw new Error(`未知节点类型：${type}（可用 op=workflows 或 /object_info 查可用类型）`);
+    withChange(() => {
+      if (Array.isArray(a.pos) && a.pos.length === 2) node.pos = a.pos.slice();
+      if (a.title) node.title = String(a.title);
+      app.graph.add(node);
+    });
+    pollGraph();
+    pushUndo(`addNode #${node.id} ${type}`, () => {
+      withChange(() => app.graph.removeNode(node));
+      pollGraph();
+    });
+    return {
+      nodeId: node.id,
+      type: node.type,
+      title: node.title,
+      inputs: (node.inputs || []).map((i) => i.name),
+      outputs: (node.outputs || []).map((o) => o.name),
+      widgets: (node.widgets || []).map((w) => w.name),
+    };
+  },
+
+  "canvas.removeNode": (args) => {
+    const a = args || {};
+    const node = findNode(a.nodeId);
+    if (!node) throw new Error("找不到节点：" + a.nodeId);
+    const graph = app.graph;
+    // 先记完整序列化 + 它参与的连线，保证可回退（删是最重的操作）
+    const snap = typeof node.serialize === "function" ? node.serialize() : null;
+    const incoming = [];
+    for (let si = 0; si < (node.inputs || []).length; si++) {
+      const inp = node.inputs[si];
+      if (inp && inp.link != null) {
+        const l = graph.links && typeof graph.links.get === "function" ? graph.links.get(inp.link) : null;
+        if (l) incoming.push({ origin_id: l.origin_id, origin_slot: l.origin_slot, target_slot: si });
+      }
+    }
+    // 出线也得记：删除节点时它的出线会一并消失，不记就恢复不回来
+    const outgoing = [];
+    for (let so = 0; so < (node.outputs || []).length; so++) {
+      const outs = (node.outputs[so] && node.outputs[so].links) || [];
+      for (const lid of outs) {
+        const l = graph.links && typeof graph.links.get === "function" ? graph.links.get(lid) : null;
+        if (l) outgoing.push({ origin_slot: so, target_id: l.target_id, target_slot: l.target_slot });
+      }
+    }
+    const removedId = node.id;
+    const removedType = node.type;
+    withChange(() => graph.removeNode(node));
+    pollGraph();
+    pushUndo(`removeNode #${removedId} ${removedType}`, () => {
+      if (!snap) throw new Error("该节点不支持序列化，无法恢复");
+      const LG = liteGraph();
+      const n2 = LG && typeof LG.createNode === "function" ? LG.createNode(removedType) : null;
+      if (!n2) throw new Error("恢复失败：无法重建 " + removedType);
+      if (typeof n2.configure === "function") n2.configure(snap);
+      withChange(() => graph.add(n2));
+      for (const l of incoming) {
+        const src = graph.getNodeById(l.origin_id);
+        if (src && typeof src.connect === "function") {
+          try { src.connect(l.origin_slot, n2, l.target_slot); } catch { /* 单个连线恢复失败不阻断 */ }
+        }
+      }
+      for (const l of outgoing) {
+        const tgt = graph.getNodeById(l.target_id);
+        if (tgt && typeof n2.connect === "function") {
+          try { n2.connect(l.origin_slot, tgt, l.target_slot); } catch { /* 同上 */ }
+        }
+      }
+      pollGraph();
+    });
+    return { removed: removedId, type: removedType, incomingLinks: incoming.length, outgoingLinks: outgoing.length };
+  },
+
+  "canvas.connect": (args) => {
+    const a = args || {};
+    const from = findNode(a.fromNode);
+    const to = findNode(a.toNode);
+    if (!from || !to) throw new Error("找不到 fromNode 或 toNode");
+    const outIdx = slotIndex(from.outputs, a.fromSlot);
+    const inIdx = slotIndex(to.inputs, a.toSlot);
+    if (outIdx < 0) throw new Error(`输出槽不存在：${a.fromSlot}（可用：${(from.outputs || []).map((o) => o.name).join(", ")}）`);
+    if (inIdx < 0) throw new Error(`输入槽不存在：${a.toSlot}（可用：${(to.inputs || []).map((i) => i.name).join(", ")}）`);
+    if (typeof from.connect !== "function") throw new Error("该节点不支持 connect");
+    let link = null;
+    withChange(() => { link = from.connect(outIdx, to, inIdx); });
+    pollGraph();
+    const linkId = link && link.id != null ? link.id : null;
+    pushUndo(`connect #${from.id} → #${to.id}`, () => {
+      if (linkId != null) withChange(() => app.graph.removeLink(linkId));
+      pollGraph();
+    });
+    return { from: from.id, to: to.id, outSlot: outIdx, inSlot: inIdx, linkId };
+  },
+
+  "canvas.disconnect": (args) => {
+    const a = args || {};
+    const node = findNode(a.nodeId);
+    if (!node) throw new Error("找不到节点：" + a.nodeId);
+    const inIdx = slotIndex(node.inputs, a.slot);
+    if (inIdx < 0) throw new Error(`输入槽不存在：${a.slot}（可用：${(node.inputs || []).map((i) => i.name).join(", ")}）`);
+    const inp = node.inputs[inIdx];
+    const linkId = inp && inp.link != null ? inp.link : null;
+    if (linkId == null) throw new Error(`输入 ${a.slot} 本来就没有连线`);
+    const graph = app.graph;
+    const l = graph.links && typeof graph.links.get === "function" ? graph.links.get(linkId) : null;
+    const rec = l ? { origin_id: l.origin_id, origin_slot: l.origin_slot, target_slot: inIdx } : null;
+    withChange(() => graph.removeLink(linkId));
+    pollGraph();
+    pushUndo(`disconnect #${node.id}.${inp.name || a.slot}`, () => {
+      if (!rec) return;
+      const src = graph.getNodeById(rec.origin_id);
+      if (src && typeof src.connect === "function") {
+        withChange(() => {
+          try { src.connect(rec.origin_slot, node, rec.target_slot); } catch { /* 忽略 */ }
+        });
+        pollGraph();
+      }
+    });
+    return { nodeId: node.id, slot: inp.name, linkId };
+  },
+
+  "canvas.setNodeMode": (args) => {
+    const a = args || {};
+    const node = findNode(a.nodeId);
+    if (!node) throw new Error("找不到节点：" + a.nodeId);
+    const mode = Number(a.mode);
+    if (![0, 2, 4].includes(mode)) throw new Error("mode 必须是 0（正常）/ 2（mute）/ 4（bypass）");
+    const before = node.mode;
+    withChange(() => { node.mode = mode; });
+    pollGraph();
+    pushUndo(`setNodeMode #${node.id}`, () => {
+      withChange(() => { node.mode = before; });
+      pollGraph();
+    });
+    return {
+      nodeId: node.id,
+      mode,
+      label: mode === 2 ? "mute" : mode === 4 ? "bypass" : "正常",
+      before,
+    };
+  },
+
+  // 撤销最后一步。先试官方命令（与人的 Ctrl+Z 同一条路），再按 agent 自己的逆操作栈回退。
+  // 实测：新版 @comfyorg/litegraph 已移除 LGraphCanvas.undo，撤销由 ChangeTracker + 命令系统接管，
+  // 而它**不记录外部对 graph 的直接修改**——所以真正生效的是下面这个栈（精确回退 agent 那一步，
+  // 不会动人在此期间的改动）。
   "canvas.undo": async () => {
-    const sigBefore = graphSignature().hash;
-    const cmd = app.extensionManager && app.extensionManager.command;
     let via = null;
+    const cmd = app.extensionManager && app.extensionManager.command;
     if (cmd && typeof cmd.execute === "function") {
-      try { await cmd.execute("Comfy.Undo"); via = "Comfy.Undo"; } catch { /* 落到下面的兜底 */ }
+      try { await cmd.execute("Comfy.Undo"); via = "Comfy.Undo"; } catch { /* 忽略 */ }
     } else if (app.canvas && typeof app.canvas.undo === "function") {
       app.canvas.undo();
       via = "canvas.undo";
     }
     pollGraph();
-    if (graphSignature().hash !== sigBefore) {
-      return { ok: true, via, note: "官方撤销已生效" };
-    }
-    // 官方撤销没改变图（ChangeTracker 不记录外部直接改动）→ 按 agent 自己记的栈回写
     const last = writeStack.pop();
-    if (last) {
-      const node = findNode(last.nodeId);
-      const w = node && (node.widgets || []).find((x) => x.name === last.name);
-      if (w) {
-        app.graph.beforeChange();
-        try {
-          w.value = last.before;
-          if (typeof w.callback === "function") {
-            try { w.callback(last.before, app.canvas, node, [0, 0], null); } catch { /* 忽略 */ }
-          }
-        } finally {
-          app.graph.afterChange();
-        }
-        pollGraph();
-        return {
-          ok: true,
-          via: "agent-rewind",
-          note: "官方撤销对该改动未生效，已按记录回写",
-          nodeId: node.id,
-          name: last.name,
-          restored: clip(String(last.before)),
-          stackLeft: writeStack.length,
-        };
-      }
+    if (!last) {
+      return { ok: true, via, note: "已执行撤销，未发现 agent 的待回退改动" };
     }
-    return { ok: true, via, note: "已执行撤销，图未变化（可能已无可撤销步骤）" };
+    try {
+      await last.undo();
+    } catch (err) {
+      writeStack.push(last); // 没撤成，放回栈里，不吞错
+      throw new Error(`撤销「${last.label}」失败：${(err && err.message) || err}`);
+    }
+    pollGraph();
+    return { ok: true, via: "agent-rewind", undone: last.label, at: last.at, stackLeft: writeStack.length };
   },
 };
 
 // 诊断出口（只读）：用于确认“当前页面加载的是哪一版脚本、当前 revision 多少”。
 // 只暴露版本与计数，不做任何写操作、也不抛出内部对象。
 window.__hanaBridge = {
-  version: "p3.1",
+  version: "p4.0",
   ops: Object.keys(OPS),
   state: () => ({
-    version: "p3.1",
+    version: "p4.0",
     revision: graphRevision,
     lastChangeAt: changes.length ? changes[changes.length - 1].at : null,
     nodes: lastSignature ? lastSignature.nodeCount : null,

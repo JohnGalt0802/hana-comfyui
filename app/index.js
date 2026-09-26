@@ -1554,7 +1554,12 @@ export default defineApp(async (sdk) => {
     events: { drive: "canvas.events", desc: "画布变更记录（最近若干条）" },
     // 以下为写入（需授权：设置页「允许 agent 修改画布」）
     setWidget: { drive: "canvas.setWidget", desc: "改一个节点参数", write: true },
-    undo: { drive: "canvas.undo", desc: "撤销一步（等价 Ctrl+Z）", write: true },
+    addNode: { drive: "canvas.addNode", desc: "新建节点入图", write: true },
+    removeNode: { drive: "canvas.removeNode", desc: "删除节点", write: true },
+    connect: { drive: "canvas.connect", desc: "连线", write: true },
+    disconnect: { drive: "canvas.disconnect", desc: "断开一条输入连线", write: true },
+    setNodeMode: { drive: "canvas.setNodeMode", desc: "mute / bypass / 恢复正常", write: true },
+    undo: { drive: "canvas.undo", desc: "撤销 agent 上一步", write: true },
   };
 
   async function actionCanvas(args) {
@@ -1568,7 +1573,20 @@ export default defineApp(async (sdk) => {
     }
     // 写入参数原样透传给桥（桥侧做具体校验）
     const bridgeArgs = {};
-    for (const k of ["nodeId", "name", "value"]) {
+    for (const k of [
+      "nodeId",
+      "name",
+      "value",
+      "type",
+      "pos",
+      "title",
+      "fromNode",
+      "fromSlot",
+      "toNode",
+      "toSlot",
+      "slot",
+      "mode",
+    ]) {
       if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
     }
     const { ok, status, data } = await relayJson("/_relay/bridge", {
@@ -1627,8 +1645,23 @@ export default defineApp(async (sdk) => {
       text =
         `已修改 #${payload.nodeId}（${payload.type}）的 ${payload.name}：${payload.before} → ${payload.after}\n` +
         `（要撤回就说一声，可用 op=undo）`;
+    } else if (op === "addNode" && payload) {
+      text =
+        `已新建 #${payload.nodeId}（${payload.type}）${payload.title ? `「${payload.title}」` : ""}\n` +
+        `输入：${(payload.inputs || []).join(", ") || "无"}｜输出：${(payload.outputs || []).join(", ") || "无"}\n` +
+        `可用参数：${(payload.widgets || []).join(", ") || "无"}（用 op=setWidget 赋值，op=connect 连线）`;
+    } else if (op === "removeNode" && payload) {
+      text = `已删除 #${payload.removed}（${payload.type}），同时移除 ${payload.incomingLinks} 条入线。（要恢复用 op=undo）`;
+    } else if (op === "connect" && payload) {
+      text = `已连线 #${payload.from}[${payload.outSlot}] → #${payload.to}[${payload.inSlot}]（linkId=${payload.linkId}）`;
+    } else if (op === "disconnect" && payload) {
+      text = `已断开 #${payload.nodeId} 的 ${payload.slot}（linkId=${payload.linkId}）`;
+    } else if (op === "setNodeMode" && payload) {
+      text = `#${payload.nodeId} 已设为 ${payload.label}（mode=${payload.mode}，原 ${payload.before}）`;
     } else if (op === "undo" && payload) {
-      text = `已撤销一步（当前变更序号 rev=${payload.revision}）。`;
+      text = payload.undone
+        ? `已撤销「${payload.undone}」（剩余可撤销 ${payload.stackLeft} 步）`
+        : payload.note || "已执行撤销";
     } else {
       const s = JSON.stringify(payload, null, op === "probe" || op === "running" ? 2 : 0);
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
@@ -1794,13 +1827,38 @@ export default defineApp(async (sdk) => {
         fields: {
           op: {
             type: "string",
-            enum: ["state", "summary", "get", "prompt", "running", "probe", "revision", "events", "setWidget", "undo"],
+            enum: [
+              "state",
+              "summary",
+              "get",
+              "prompt",
+              "running",
+              "probe",
+              "revision",
+              "events",
+              "setWidget",
+              "addNode",
+              "removeNode",
+              "connect",
+              "disconnect",
+              "setNodeMode",
+              "undo",
+            ],
             description:
-              "读/改人正在看的同一张画布：state=最近一次快照（默认，读服务端缓存，零往返）；summary=现抓结构摘要；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录；setWidget=改一个参数（写，需授权）；undo=撤销一步（写，需授权）",
+              "读/改人正在看的同一张画布。读：state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录。写（需授权）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；undo=撤销 agent 上一步",
           },
-          nodeId: { type: "string", description: "setWidget 用：目标节点 id（从 canvas summary 的 \"#<id>\" 取）" },
-          name: { type: "string", description: "setWidget 用：参数名（widget 名，如 steps / cfg / text）" },
-          value: { description: "setWidget 用：新值（数字/字符串/布尔，按参数本身类型给）" },
+          nodeId: { type: "string", description: "目标节点 id（从 canvas state/summary 的 \"#<id>\" 取）" },
+          name: { type: "string", description: "setWidget 用：参数名（如 steps / cfg / text）" },
+          value: { description: "setWidget 用：新值（数字/字符串/布尔，按参数类型给）" },
+          type: { type: "string", description: "addNode 用：节点类型（如 KSampler / CLIPTextEncode / EmptyLatentImage）" },
+          pos: { type: "array", items: { type: "number" }, description: "addNode 用：画布坐标 [x, y]（可选）" },
+          title: { type: "string", description: "addNode 用：节点标题（可选）" },
+          fromNode: { type: "string", description: "connect 用：源节点 id" },
+          fromSlot: { description: "connect 用：源输出槽（名字或索引）" },
+          toNode: { type: "string", description: "connect 用：目标节点 id" },
+          toSlot: { description: "connect 用：目标输入槽（名字或索引）" },
+          slot: { description: "disconnect 用：要断开的输入槽（名字或索引）" },
+          mode: { type: "number", enum: [0, 2, 4], description: "setNodeMode 用：0=正常 / 2=mute / 4=bypass" },
         },
       },
     ];
@@ -1815,7 +1873,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读/改人正在看的同一张画布（op=state 最近一次快照（默认，读服务端缓存、零往返）/ summary 现抓结构摘要 / get 全量 UI JSON / prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录 / setWidget 改一个参数（写）/ undo 撤销一步（写））——写入类 op 需用户在设置页开启「允许 agent 修改画布」；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读/改人正在看的同一张画布（读：state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON / prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / undo 撤销 agent 上一步）——写入类 op 需用户在设置页开启「允许 agent 修改画布」，且需 ComfyUI 页面在线；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",

@@ -66,7 +66,8 @@
   - 只读 op：`summary`（现抓结构摘要）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）/
     `revision`（变更序号，只问变没变）/ `events`（变更记录，可按 `since` 增量查，含按节点的 added/removed/changed）。
   - 变更感知为 500ms 轮询签名比对（新版 LiteGraph 没有可用的变更事件），签名**不含节点位置**。
-  - 写入 op（v0.9 新增，P3 最小集）：`setWidget`（改某节点参数，返回 before/after）/ `undo`（撤销 agent 上一步写入，最多 20 步）。
+  - 写入 op（均需授权）：`setWidget`（改参数）/ `addNode`（加节点）/ `removeNode`（删节点）/ `connect` / `disconnect`（连线、断线）/ `setNodeMode`（mute / bypass）/ `undo`（撤销 agent 上一步，最多 20 步）。
+    撤销是**逆操作栈**（不是整图快照）：只回退 agent 那一步，不会动人在此期间的改动。
     **默认关闭**，需在设置页打开「允许 agent 修改画布」才可用；未授权时直接报错。
     注意：新版前端的撤销栈**不记录**外部直接改图，所以人的 Ctrl+Z 撤不掉 agent 的改动，要用 `op=undo`。
   - **前置**：`custom_nodes/hana_bridge/`，用 `tools/deploy-bridge.ps1` 装 / 卸 / 查；
