@@ -60,6 +60,7 @@
 - **画布共驾（v0.9 新增，M12）：只读桥 + 变更感知 + 写入**：让 agent 读/改**人正在看的同一张画布**。
   - 链路：`comfyui(action="canvas", op=…)` → 路由 `canvas` → 中继 `/_relay/bridge` → ComfyUI
     `POST /api/hana_bridge/call` → `send_sync` 经自带 `/ws` → 前端扩展读 `window.app.graph` → 同源回传。
+  - 多页面按工作流定向：op `pages` 列在线页面（各自开着哪个工作流）；各 op 带 `workflow` 参数 → 只发给正打开该工作流的页面（找不到明确报错，不误伤别页）。
   - 默认 op `state`：读**服务端缓存**的最近一次画布快照（零往返，**ComfyUI 页面没开着也能拿到**）。
     快照由前端在画布变化后主动推（debounce 1.5s）缓在 ComfyUI 侧，带 `ageSec` 时间戳；
     无快照或过期时改用 `op=summary` 现抓（需页面在线）。
