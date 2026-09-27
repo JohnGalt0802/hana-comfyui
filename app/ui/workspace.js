@@ -861,6 +861,18 @@ function stopStatusPolling() {
   setBar(null);
 }
 
+// 服务从「不可达」恢复时，强制重载内层 iframe。
+// 原因：服务不在时 iframe 早已加载过一次（连不上，必为空白页），
+// 服务起来后它不会自动重试 —— 覆盖层一撤就是黑屏。这里带时间戳强制重载。
+function reloadFrameForBackend(boot) {
+  const built = buildFrameUrl(boot);
+  if (!built || !built.url) return;
+  frameLoaded = false;
+  els.loading.classList.add("show");
+  const u = built.url + (built.url.indexOf("?") >= 0 ? "&" : "?") + "_hr=" + Date.now();
+  els.frame.src = u;
+}
+
 async function statusTick() {
   try {
     const st = await getFullStatus();
@@ -879,17 +891,14 @@ async function statusTick() {
     } else {
       if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; }
       if (els.offline.classList.contains("show")) {
+        reloadFrameForBackend(boot); // 服务刚回来：重载内层（启动前的加载必然失败，不重载会黑屏）
         showView("ready");
         ensureComfySync(); // 服务刚回来，重新对齐主题
+        setBar(null); // 清掉「已请求启动…」等操作提示
       }
-      // 服务运行中：顶栏常驻服务控制（与左侧状态面板互为入口，工作区内也能直接关）
+      // 服务运行中的常驻控制条已移除（2026-09-27）：服务控制只留左侧状态面板
       if (themeStaleAfterLoad) {
         setBar("info", "宿主主题已更新，正在刷新工作区…", []);
-      } else {
-        setBar("info", "ComfyUI 服务运行中", [
-          { label: "停止服务", fn: () => { void stopBackend(); } },
-          { label: "重启中继", fn: () => { void postRetryStart().catch(() => {}); } },
-        ]);
       }
     }
   } catch { /* 状态读取失败不打扰界面 */ }

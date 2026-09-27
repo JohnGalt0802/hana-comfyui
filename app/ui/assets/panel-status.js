@@ -176,9 +176,6 @@ async function metricsTick() {
 
 // ── 服务起停（启动/停止 8188 上的 ComfyUI 本体）─────────────────────────
 let svcBusy = false;
-// 停止的二次确认（同理不能用 window.confirm）
-let stopArmed = false;
-let stopArmTimer = null;
 
 function setSvcBusy(on, label) {
   svcBusy = on;
@@ -211,23 +208,8 @@ async function startService() {
 
 async function stopService() {
   if (svcBusy) return;
-  const btn = $("p-stop");
-  // 同样不能用 window.confirm（沙箱 iframe 会静默拦掉），改用两步点击
-  if (!stopArmed) {
-    stopArmed = true;
-    btn.textContent = "再点一次确认停止";
-    $("p-note").textContent = "停止 ComfyUI 会终止 8188 上的进程，正在跑的任务会中断。确认请再点一次（3 秒内）。";
-    if (stopArmTimer) clearTimeout(stopArmTimer);
-    stopArmTimer = setTimeout(() => {
-      stopArmed = false;
-      stopArmTimer = null;
-      btn.textContent = "停止服务";
-      $("p-note").textContent = "";
-    }, 3000);
-    return;
-  }
-  stopArmed = false;
-  if (stopArmTimer) { clearTimeout(stopArmTimer); stopArmTimer = null; }
+  // 一点即停（与顶栏原行为一致）："停止服务"是随时可重新拉起的可逆操作，不做二次确认。
+  // （二次确认仅在沙箱下替代 window.confirm 的权宜；实测用户预期是点一下即停。）
   setSvcBusy(true, "停止中…");
   let msg = "";
   try {
