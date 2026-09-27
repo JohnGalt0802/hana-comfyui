@@ -280,6 +280,9 @@ const OPS = {
 
   // 自检：一次性报出关键 API 的存在性（P0 核验用，转"推断"为"实测"）
   "api.probe": () => ({
+    bridgeBuild: "2026-09-27T08:40-diag",
+    opsCount: Object.keys(OPS).length,
+    opsHasDiag: typeof OPS["api.diag"] === "function",
     hasApp: !!app,
     hasGraph: !!(app && app.graph),
     hasToJSON: !!(app && app.graph && typeof app.graph.toJSON === "function"),
@@ -290,6 +293,79 @@ const OPS = {
     nodeCount: nodeList(app && app.graph).length,
     href: location.href,
   }),
+
+  // 接口形状探查：把 workflowManager / 命令表的真实形状报出来，
+  // 目的是把"打开工作流该调哪个 API"从推断变实测。只读，不改任何状态。
+  "api.diag": () => {
+    const out = { href: location.href };
+    const wm = app && app.workflowManager;
+    if (wm) {
+      const proto = Object.getPrototypeOf(wm) || {};
+      const aw = wm.activeWorkflow || null;
+      out.workflowManager = {
+        ownKeys: Object.keys(wm).slice(0, 60),
+        protoMethods: Object.getOwnPropertyNames(proto).slice(0, 80),
+        activeWorkflowKeys: aw ? Object.keys(aw).slice(0, 40) : null,
+        activeWorkflow: aw
+          ? { name: aw.name ?? null, filename: aw.filename ?? null, path: aw.path ?? null, key: aw.key ?? null }
+          : null,
+      };
+      try {
+        const all = wm.workflows;
+        if (all && typeof all[Symbol.iterator] === "function") {
+          out.workflowManager.workflows = [...all].slice(0, 30).map((w) => ({
+            name: (w && w.name) ?? null,
+            filename: (w && w.filename) ?? null,
+            path: (w && w.path) ?? null,
+          }));
+        } else if (all && typeof all === "object") {
+          out.workflowManager.workflows = Object.keys(all).slice(0, 30);
+        }
+      } catch (e) { out.workflowManager.workflowsErr = String(e); }
+      try {
+        if (Array.isArray(wm.openWorkflows)) {
+          out.workflowManager.openWorkflows = wm.openWorkflows.slice(0, 20).map((w) => (w && (w.filename || w.name)) ?? null);
+        }
+      } catch (e) { out.workflowManager.openWorkflowsErr = String(e); }
+    }
+    const em = app && app.extensionManager;
+    if (em) {
+      out.extensionManager = { ownKeys: Object.keys(em).slice(0, 40) };
+      // 工作流服务：打开/保存工作流的真正入口很可能在这里
+      try {
+        const svc = em.workflow;
+        if (svc) {
+          out.workflowService = {
+            ownKeys: Object.keys(svc).slice(0, 60),
+            protoMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(svc) || {}).slice(0, 80),
+            activeWorkflowKeys: svc.activeWorkflow ? Object.keys(svc.activeWorkflow).slice(0, 40) : null,
+          };
+          const aw = svc.activeWorkflow;
+          if (aw) {
+            const ap = Object.getPrototypeOf(aw) || {};
+            out.workflowService.activeWorkflowMethods = Object.getOwnPropertyNames(ap).slice(0, 60);
+          }
+        }
+      } catch (e) { out.workflowServiceErr = String(e); }
+      const cmd = em.command;
+      if (cmd) {
+        out.command = { ownKeys: Object.keys(cmd).slice(0, 40) };
+        // 尽力把命令 id 列表捞出来，只保留与 workflow/open/load 相关的
+        const collect = (src) => {
+          try {
+            let ids = [];
+            if (src instanceof Map) ids = [...src.keys()];
+            else if (Array.isArray(src)) ids = src.map((x) => (typeof x === "string" ? x : x && (x.id || x.commandId)));
+            else if (src && typeof src === "object") ids = Object.keys(src);
+            return ids.filter((k) => typeof k === "string" && /workflow|open|load|tab/i.test(k)).slice(0, 60);
+          } catch { return null; }
+        };
+        out.command.commands = collect(cmd.commands);
+        out.command.registry = collect(cmd.registry || cmd._commands || cmd.store);
+      }
+    }
+    return out;
+  },
 
   // 变更感知（P2）：只问“变没变”，轻量
   "canvas.revision": () => {
@@ -309,6 +385,75 @@ const OPS = {
     pollGraph();
     const list = Number.isFinite(since) ? changes.filter((c) => c.rev > since) : changes.slice(-20);
     return { revision: graphRevision, total: changes.length, changes: list };
+  },
+
+  // 打开工作流（共驾核心：agent 主动把某个工作流推到前台，人在画布上看得见）
+  //
+  // 入参：{ name | path, force }
+  //   name  工作流名（不含 .json 也可）
+  //   path  相对 user/default/ 的路径（如 workflows/xxx.json）
+  //   force true 时即使当前图有未保存改动也切换（默认拒绝，避免静默丢掉人的编辑）
+  // 返回：{ opened, matched, activeBefore, blocked? }
+  "canvas.openWorkflow": async (args) => {
+    const a = args || {};
+    const target = String(a.path || a.name || "").trim();
+    if (!target) throw new Error("需要 name 或 path");
+    const svc = app.extensionManager && app.extensionManager.workflow;
+    if (!svc || typeof svc.openWorkflow !== "function") {
+      throw new Error("前端没有 workflowService.openWorkflow（版本不支持）");
+    }
+
+    const aw = svc.activeWorkflow || null;
+    const before = aw ? (aw.filename || aw.path || aw.name || null) : null;
+    // 未保存保护：默认不抢掉人正在改的图
+    let dirty = false;
+    try {
+      if (aw && typeof aw.isModified === "function") dirty = !!aw.isModified();
+    } catch { dirty = false; }
+    if (dirty && a.force !== true) {
+      return { opened: false, blocked: "dirty", activeBefore: before };
+    }
+
+    // 在已保存的工作流里找目标（按 path 精确、按文件名/去扩展名的名字宽松）
+    const list = (() => {
+      try {
+        const l = svc.workflows;
+        if (Array.isArray(l)) return l;
+        if (l && typeof l[Symbol.iterator] === "function") return [...l];
+        if (l && typeof l === "object") return Object.values(l);
+      } catch { /* 忽略 */ }
+      return [];
+    })();
+    const norm = (s) => String(s || "").replace(/\\/g, "/").toLowerCase();
+    const tNorm = norm(target);
+    const tNoExt = tNorm.replace(/\.json$/, "");
+    let hit = null;
+    for (const w of list) {
+      if (!w) continue;
+      const p = norm(w.path);
+      const f = norm(w.filename);
+      const n = norm(w.name);
+      if (tNorm === p || tNorm === f || tNorm === n) { hit = w; break; }
+      if (tNoExt === p.replace(/\.json$/, "") || tNoExt === f.replace(/\.json$/, "") || tNoExt === n) { hit = w; break; }
+    }
+    if (!hit) {
+      // 交回可选的候选名，便于上层解释「没找到」而不是静默失败
+      return {
+        opened: false,
+        blocked: "not_found",
+        activeBefore: before,
+        candidates: list.slice(0, 40).map((w) => w && (w.path || w.filename || w.name)).filter(Boolean),
+      };
+    }
+
+    await svc.openWorkflow(hit);
+    const aw2 = svc.activeWorkflow || null;
+    return {
+      opened: true,
+      matched: (hit && (hit.path || hit.filename || hit.name)) || null,
+      activeBefore: before,
+      activeAfter: aw2 ? (aw2.filename || aw2.path || aw2.name || null) : null,
+    };
   },
 
   // ── 写入（P3；需 App 侧的授权开关打开）───────────────────────────────

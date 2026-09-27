@@ -137,6 +137,7 @@ def _pages_payload():
         pages.append(
             {
                 "sid": (s or "")[:8],
+                "sidFull": s,
                 "workflow": v.get("workflow"),
                 "path": v.get("path"),
                 "modified": v.get("modified"),
@@ -217,6 +218,11 @@ if _ROUTES is not None:
         #    而 server.py 实测 send_json(sid=None) 会发给当前所有连接，只要有一个前端在就能收到）
         want_wf = str(body.get("workflow") or "").strip()
         sid = str(body.get("sid") or "").strip() or None
+        # 页面清单里给的是 8 位短 sid（便于人读），定向时允许前缀匹配；
+        # 只有唯一命中才认，多个命中视为歧义、不猜。
+        if sid and sid not in _frontends:
+            pref = [k for k in _frontends if (k or "").startswith(sid)]
+            sid = pref[0] if len(pref) == 1 else None
         routed = None
         if want_wf:
             hits = [s for s, v in _frontends.items() if (v.get("workflow") or "") == want_wf]
@@ -288,6 +294,38 @@ if _ROUTES is not None:
         _frontend["sid"] = _state["sid"] or _frontend["sid"]
         _note_frontend(_state["sid"], data, "state")
         return web.json_response({"ok": True, "revision": _state["revision"]})
+
+    @_ROUTES.get("/hana_bridge/diag")
+    async def _hana_diag(request):
+        """自检：把扩展挂载的真实状况报出来（只读）。
+        目的：弄清前端到底从哪里加载 hana-bridge.js。"""
+        try:
+            import nodes as _nodes
+            dirs = dict(getattr(_nodes, "EXTENSION_WEB_DIRS", {}) or {})
+        except Exception as exc:  # noqa: BLE001
+            dirs = {"__err__": str(exc)}
+        here = os.path.dirname(os.path.abspath(__file__))
+        js_file = os.path.join(here, "js", "hana-bridge.js")
+        try:
+            with open(js_file, "r", encoding="utf-8") as fh:
+                txt = fh.read()
+            info = {
+                "jsPath": js_file,
+                "jsBytes": len(txt.encode("utf-8")),
+                "hasDiag": "api.diag" in txt,
+                "hasBuildTag": "08:40-diag" in txt,
+            }
+        except Exception as exc:  # noqa: BLE001
+            info = {"jsErr": str(exc)}
+        return web.json_response(
+            {
+                "ok": True,
+                "extensionWebDirs": {k: str(v) for k, v in dirs.items()},
+                "pkgDir": here,
+                "webDirectory": WEB_DIRECTORY,
+                "file": info,
+            }
+        )
 
     @_ROUTES.get("/hana_bridge/ping")
     async def _hana_ping(request):
