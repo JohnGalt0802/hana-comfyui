@@ -10,3 +10,8 @@ tools/**/*.log
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 开发期备份（不许进仓库）
+*.bak-*
+*.probe-hold
+
