@@ -931,6 +931,196 @@ els.frame.addEventListener("load", () => {
 });
 
 // ── 启动 ──────────────────────────────────────────────────────────────────
+// ── 壳页桥：把 iframe 里的 ComfyUI 画布暴露给 Hana agent ──────────────────
+//
+// 为何在壳页做：代理模式下 iframe 挂在宿主 …/routes/_runtime/<id>/ 下，源是宿主；
+// ComfyUI 前端加载扩展用的绝对路径（/extensions/…）会丢前缀而 403，旧桥在 hui 里够不着画布。
+// 壳页与 iframe 同源（主题跟随就是这么做的），够得到 iframe.contentWindow.app。
+const SHELL_POLL_MS = 800;
+
+function comfyWin() {
+  try {
+    return (els.frame && els.frame.contentWindow) || null;
+  } catch {
+    return null; // 跨源（直连模式）时会抛，此时本桥不适用
+  }
+}
+
+// 新版前端把 app 挂在哪：优先 window.app，其次 comfyAPI.app.app
+function comfyApp() {
+  const w = comfyWin();
+  if (!w) return null;
+  try {
+    if (w.app) return w.app;
+    if (w.comfyAPI && w.comfyAPI.app && w.comfyAPI.app.app) return w.comfyAPI.app.app;
+  } catch { /* 忽略 */ }
+  return null;
+}
+
+// 诊断：壳页到底看到了什么（排查"够不到 app"用）
+function shellDiag() {
+  const w = comfyWin();
+  let keys = [];
+  try { keys = w ? Object.keys(w).slice(0, 60) : []; } catch { keys = ["<keys 读取失败>"]; }
+  let hasApp = false, hasComfyAPI = false, appKeys = [];
+  try { hasApp = !!(w && w.app); } catch { /* 忽略 */ }
+  try { hasComfyAPI = !!(w && w.comfyAPI); } catch { /* 忽略 */ }
+  try { appKeys = (w && w.app) ? Object.keys(w.app).slice(0, 40) : []; } catch { /* 忽略 */ }
+  return {
+    via: "shell",
+    hasFrame: !!els.frame,
+    hasContentWindow: !!w,
+    frameSrc: (() => { try { return els.frame ? els.frame.src : null; } catch { return null; } })(),
+    hasWindowApp: hasApp,
+    hasComfyAPI: hasComfyAPI,
+    windowKeys: keys,
+    appKeys: appKeys,
+    href: location.href,
+  };
+}
+
+function wfListOf(svc) {
+  try {
+    const l = svc.workflows;
+    if (Array.isArray(l)) return l;
+    if (l && typeof l[Symbol.iterator] === "function") return [...l];
+    if (l && typeof l === "object") return Object.values(l);
+  } catch { /* 忽略 */ }
+  return [];
+}
+
+async function shellOp(op, args) {
+  const a = args || {};
+
+  // 内层重载：壳页能重设 iframe.src，是唯一能穿透套娃的手。
+  // 用途：扩展换了新文件后，已开页面不会自动重载 js，这里强制重载一次。
+  if (op === "frame.reload") {
+    try {
+      const u = new URL(els.frame.src, location.href);
+      u.searchParams.set("_hr", String(Date.now()));
+      els.frame.src = u.toString();
+      return { reloaded: true, src: els.frame.src };
+    } catch (e) {
+      return { reloaded: false, error: String((e && e.message) || e) };
+    }
+  }
+
+  // 诊断类：不要求 app 就绪，否则"够不到 app"这种问题永远查不出来
+  if (op === "shell.diag" || op === "api.probe") {
+    const app0 = comfyApp();
+    const diag = shellDiag();
+    if (op === "shell.diag") return diag;
+    return Object.assign({}, diag, {
+      hasApp: !!app0,
+      hasGraph: !!(app0 && app0.graph),
+      hasWorkflowManager: !!(app0 && app0.workflowManager),
+      hasExtensionManager: !!(app0 && app0.extensionManager),
+      hasOpenWorkflow: !!(app0 && app0.extensionManager && app0.extensionManager.workflow && typeof app0.extensionManager.workflow.openWorkflow === "function"),
+      nodeCount: app0 && app0.graph && Array.isArray(app0.graph._nodes) ? app0.graph._nodes.length : null,
+    });
+  }
+
+  const app = comfyApp();
+  if (!app) throw new Error("工作区 iframe 未就绪或不可访问（ComfyUI 前端还没起来？）");
+
+  if (op === "canvas.pages") {
+    const wf = app.workflowManager && app.workflowManager.activeWorkflow;
+    return {
+      pages: [{ workflow: wf ? (wf.filename || wf.name || "(未命名)") : "(未命名)", href: location.href }],
+      count: 1,
+    };
+  }
+
+  if (op === "canvas.summary") {
+    const g = app.graph;
+    return {
+      nodeCount: g && Array.isArray(g._nodes) ? g._nodes.length : null,
+      linkCount: g && g.links ? Object.keys(g.links).length : null,
+      runningNodeId: typeof app.runningNodeId === "number" ? app.runningNodeId : null,
+    };
+  }
+
+  if (op === "shell.diag") {
+    return shellDiag();
+  }
+
+  if (op === "canvas.openWorkflow") {
+    const target = String(a.path || a.name || "").trim();
+    if (!target) throw new Error("需要 name 或 path");
+    const svc = app.extensionManager && app.extensionManager.workflow;
+    if (!svc || typeof svc.openWorkflow !== "function") {
+      throw new Error("前端没有 workflowService.openWorkflow（版本不支持）");
+    }
+    const aw0 = svc.activeWorkflow || null;
+    const before = aw0 ? (aw0.filename || aw0.path || aw0.name || null) : null;
+    let dirty = false;
+    try {
+      if (aw0 && typeof aw0.isModified === "function") dirty = !!aw0.isModified();
+    } catch { dirty = false; }
+    if (dirty && a.force !== true) {
+      return { opened: false, blocked: "dirty", activeBefore: before };
+    }
+    const list = wfListOf(svc);
+    const norm = (s) => String(s || "").replace(/\\/g, "/").toLowerCase();
+    const t = norm(target);
+    const tNoExt = t.replace(/\.json$/, "");
+    let hit = null;
+    for (const w of list) {
+      if (!w) continue;
+      const p = norm(w.path), f = norm(w.filename), n = norm(w.name);
+      if (t === p || t === f || t === n) { hit = w; break; }
+      if (tNoExt === p.replace(/\.json$/, "") || tNoExt === f.replace(/\.json$/, "") || tNoExt === n) { hit = w; break; }
+    }
+    if (!hit) {
+      return {
+        opened: false,
+        blocked: "not_found",
+        activeBefore: before,
+        candidates: list.slice(0, 40).map((w) => w && (w.path || w.filename || w.name)).filter(Boolean),
+      };
+    }
+    await svc.openWorkflow(hit);
+    const aw1 = svc.activeWorkflow || null;
+    return {
+      opened: true,
+      via: "shell",
+      matched: (hit && (hit.path || hit.filename || hit.name)) || null,
+      activeBefore: before,
+      activeAfter: aw1 ? (aw1.filename || aw1.path || aw1.name || null) : null,
+    };
+  }
+
+  throw new Error(`壳页桥暂不支持的 op：${op}`);
+}
+
+async function shellTick() {
+  let r;
+  try {
+    r = await hana.api.fetch("/comfyui-hana/shell/poll?t=" + Date.now(), { cache: "no-store" });
+  } catch {
+    return; // 工作区还没起来或网络抖动
+  }
+  if (!r || !r.ok) return;
+  let j = null;
+  try { j = await r.json(); } catch { return; }
+  const ops = (j && j.ops) || [];
+  for (const item of ops) {
+    let payload;
+    try {
+      payload = { ok: true, data: await shellOp(item.op, item.args) };
+    } catch (e) {
+      payload = { ok: false, error: String((e && e.message) || e) };
+    }
+    try {
+      await hana.api.fetch("/comfyui-hana/shell/result", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rid: item.rid, ...payload }),
+      });
+    } catch { /* 单条回传失败不影响后续 */ }
+  }
+}
+
 async function main() {
   syncTheme();
   // 宿主主题钩子：回调直接给主题快照（theme/cssUrl/appearance/palettes），比自己嗅 CSS 可靠
@@ -944,5 +1134,10 @@ async function main() {
   void tick();
   // 主题变化轮询：不依赖宿主向 App iframe 推送主题变化事件
   setInterval(() => { void themeWatchTick(); }, 2500);
+// 壳页桥：向 App 报到并开始轮询待执行的画布 op
+try {
+  void hana.api.fetch("/comfyui-hana/shell/hello", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+} catch { /* 忽略 */ }
+setInterval(() => { void shellTick(); }, SHELL_POLL_MS);
 }
 void main();

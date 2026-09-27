@@ -1620,6 +1620,8 @@ export default defineApp(async (sdk) => {
     probe: { drive: "api.probe", desc: "桥自检（关键 API 存在性）" },
     revision: { drive: "canvas.revision", desc: "画布变更序号（只问变没变，轻量）" },
     events: { drive: "canvas.events", desc: "画布变更记录（最近若干条）" },
+    frameReload: { drive: "frame.reload", desc: "强制重载工作区内层 iframe（扩展换文件后用）" },
+    openWorkflow: { drive: "canvas.openWorkflow", desc: "打开指定工作流并推到前台（不修改图内容，自带未保存保护）" },
     // 以下为写入（需授权：设置页「允许 agent 修改画布」）
     setWidget: { drive: "canvas.setWidget", desc: "改一个节点参数", write: true },
     addNode: { drive: "canvas.addNode", desc: "新建节点入图", write: true },
@@ -1631,11 +1633,41 @@ export default defineApp(async (sdk) => {
     undo: { drive: "canvas.undo", desc: "撤销 agent 上一步", write: true },
   };
 
+  // 壳页桥：工作区壳页与 iframe 同源，直接够得到 iframe.contentWindow.app。
+  //
+  // 为何需要：代理模式下 iframe 挂在宿主 …/routes/_runtime/<id>/ 下，源是 hana server；
+  // 而 ComfyUI 前端拼的绝对路径（/extensions/…、/scripts/…、/hana_bridge/hello）会丢前缀，
+  // 打进宿主根 → 403。于是扩展加载不了、hello 上报也失败，旧桥在 hui 工作区里够不着画布。
+  // 壳页同源直控 iframe（主题跟随就是这么做的），故把执行者搬到壳页。
+  const shellBridge = {
+    lastSeenAt: 0,
+    lastHello: null,
+    queue: [],          // 待壳页取走的 op
+    pending: new Map(), // rid → { resolve, timer }
+  };
+  const SHELL_ALIVE_MS = 5000;
+  const shellAlive = () => Date.now() - shellBridge.lastSeenAt < SHELL_ALIVE_MS;
+
+  function shellCall(drive, args, timeoutMs = 20_000) {
+    return new Promise((resolve, reject) => {
+      const rid = `sh_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const timer = setTimeout(() => {
+        shellBridge.pending.delete(rid);
+        reject(new Error("工作区壳页未在超时内回传（工作区可能已关闭或正在忙）"));
+      }, timeoutMs);
+      shellBridge.pending.set(rid, { resolve, timer });
+      shellBridge.queue.push({ rid, op: drive, args: args || {} });
+    });
+  }
+
   async function actionCanvas(args) {
     // 默认 state：对话开始时最常用——读服务端缓存的「手边快照」，零往返
-    const op = String((args && args.op) || "state").trim().toLowerCase();
-    const spec = CANVAS_OPS[op];
-    if (!spec) throw new Error(`op 必须是 ${Object.keys(CANVAS_OPS).join(" / ")}（收到 "${op}"）`);
+    // 注意：白名单 key 是驼峰（openWorkflow / setWidget / addNode…），
+    // 不能先把 op 名 toLowerCase 再查表，否则写入类 op 永远对不上。
+    const opRaw = String((args && args.op) || "state").trim();
+    const op = Object.keys(CANVAS_OPS).find((k) => k.toLowerCase() === opRaw.toLowerCase()) || "";
+    const spec = op ? CANVAS_OPS[op] : null;
+    if (!spec) throw new Error(`op 必须是 ${Object.keys(CANVAS_OPS).join(" / ")}（收到 "${opRaw}"）`);
     // 写入类 op 需显式授权（默认关）
     if (spec.write && !readAllowWrite()) {
       throw new Error(`「${op}」会修改你的画布，当前未授权。请在 Hana-ComfyUI 设置页打开「允许 agent 修改画布」后再试。`);
@@ -1657,19 +1689,42 @@ export default defineApp(async (sdk) => {
       "mode",
       "name",
       "workflow",
+      "path",
+      "force",
     ]) {
       if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
     }
-    const { ok, status, data } = await relayJson("/_relay/bridge", {
+    // 两条腿互补：直连模式下壳页跨源够不到 app，代理模式下扩展加载不了。
+    // 所以先试壳页（活且能应答就用它），失败则回退到扩展那条路。
+    const bridgeCall = () => relayJson("/_relay/bridge", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ op: spec.drive, args: bridgeArgs }),
       timeoutMs: 30_000,
     });
+    let via = "bridge";
+    let res;
+    if (shellAlive()) {
+      try {
+        const r = await shellCall(spec.drive, bridgeArgs);
+        if (r.ok) {
+          via = "shell";
+          res = { ok: true, status: 200, data: { ok: true, data: r.data } };
+        } else {
+          // 壳页活着但执行失败（典型：直连模式跨源够不到 app）→ 回退扩展
+          res = await bridgeCall();
+        }
+      } catch {
+        res = await bridgeCall();
+      }
+    } else {
+      res = await bridgeCall();
+    }
+    const { ok, status, data } = res;
     const d = data && typeof data === "object" ? data : {};
     if (!ok || d.ok === false) {
       const why = d.error || `HTTP ${status}`;
-      throw new Error(`读画布失败（${op}）：${why}${d.detail ? " · " + d.detail : ""}`);
+      throw new Error(`读画布失败（${op}，经 ${via}）：${why}${d.detail ? " · " + d.detail : ""}`);
     }
     const payload = d.data === undefined ? null : d.data;
     let text;
@@ -2144,7 +2199,53 @@ export default defineApp(async (sdk) => {
         }
       });
 
-      // 画布桥（只读）：读人正在看的同一张图（op 走 ?op= 或 JSON body）
+  
+    app.post("/comfyui-hana/shell/hello", async (c) => {
+      try {
+        const body = await c.req.json().catch(() => ({}));
+        shellBridge.lastSeenAt = Date.now();
+        shellBridge.lastHello = body && typeof body === "object" ? body : {};
+        return c.json({ ok: true, alive: true });
+      } catch (e) {
+        return c.json({ ok: false, error: msgOf(e) }, 500);
+      }
+    });
+
+    app.get("/comfyui-hana/shell/poll", (c) => {
+      shellBridge.lastSeenAt = Date.now();
+      const ops = shellBridge.queue.splice(0, 20);
+      return c.json({ ok: true, ops, count: ops.length });
+    });
+
+    app.post("/comfyui-hana/shell/result", async (c) => {
+      try {
+        const body = await c.req.json().catch(() => ({}));
+        const rid = String((body && body.rid) || "");
+        shellBridge.lastSeenAt = Date.now();
+        const slot = shellBridge.pending.get(rid);
+        if (slot) {
+          shellBridge.pending.delete(rid);
+          clearTimeout(slot.timer);
+          slot.resolve({ ok: body.ok !== false, data: body.data, error: body.error });
+        }
+        return c.json({ ok: true, matched: !!slot });
+      } catch (e) {
+        return c.json({ ok: false, error: msgOf(e) }, 500);
+      }
+    });
+
+    app.get("/comfyui-hana/shell/status", (c) => {
+      return c.json({
+        ok: true,
+        alive: shellAlive(),
+        lastSeenAgoMs: shellBridge.lastSeenAt ? Date.now() - shellBridge.lastSeenAt : null,
+        queued: shellBridge.queue.length,
+        inflight: shellBridge.pending.size,
+        hello: shellBridge.lastHello,
+      });
+    });
+
+    // 画布桥（只读）：读人正在看的同一张图（op 走 ?op= 或 JSON body）
       const canvasRoute = async (c) => {
         if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
         try {
