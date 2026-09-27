@@ -1621,6 +1621,7 @@ export default defineApp(async (sdk) => {
     revision: { drive: "canvas.revision", desc: "画布变更序号（只问变没变，轻量）" },
     events: { drive: "canvas.events", desc: "画布变更记录（最近若干条）" },
     frameReload: { drive: "frame.reload", desc: "强制重载工作区内层 iframe（扩展换文件后用）" },
+    loadWorkflowFile: { drive: "canvas.loadWorkflowFile", desc: "按文件路径直接加载工作流（绕过前端列表，写）", write: true },
     openWorkflow: { drive: "canvas.openWorkflow", desc: "打开指定工作流并推到前台（不修改图内容，自带未保存保护）" },
     // 以下为写入（需授权：设置页「允许 agent 修改画布」）
     setWidget: { drive: "canvas.setWidget", desc: "改一个节点参数", write: true },
@@ -1691,6 +1692,7 @@ export default defineApp(async (sdk) => {
       "workflow",
       "path",
       "force",
+      "file",
     ]) {
       if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
     }
@@ -2249,12 +2251,18 @@ export default defineApp(async (sdk) => {
       const canvasRoute = async (c) => {
         if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
         try {
-          let op = String(c.req.query("op") || "").trim();
-          if (!op) {
-            const body = await c.req.json().catch(() => ({}));
-            op = String((body && body.op) || "").trim();
-          }
-          return c.json(await actionCanvas({ op: op || "summary" }));
+          let body = {};
+          try { body = await c.req.json(); } catch { body = {}; }
+          if (!body || typeof body !== "object") body = {};
+          const op = String(c.req.query("op") || body.op || "").trim();
+          // 关键：args 必须原样传给 actionCanvas。
+          // 此前这里把整个 body 丢了、只传 op，导致所有带参数的画布操作
+          // （setWidget / addNode / loadWorkflowFile …）拿到的是空参数。
+          const args = (body.args && typeof body.args === "object") ? body.args : {};
+          const merged = Object.assign({}, args, body);
+          delete merged.args;
+          merged.op = op || "state";
+          return c.json(await actionCanvas(merged));
         } catch (e) {
           return c.json({ ok: false, error: msgOf(e) }, 502);
         }

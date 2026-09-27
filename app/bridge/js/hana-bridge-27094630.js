@@ -394,6 +394,38 @@ const OPS = {
   //   path  相对 user/default/ 的路径（如 workflows/xxx.json）
   //   force true 时即使当前图有未保存改动也切换（默认拒绝，避免静默丢掉人的编辑）
   // 返回：{ opened, matched, activeBefore, blocked? }
+  // 直接按文件路径加载工作流（绕过前端工作流列表）。
+  // 为何需要：前端的工作流列表在启动时加载并可能本地缓存，agent 之后新增的
+  // 工作流文件不在列表里，openWorkflow 会 not_found。这条路读文件内容直接进画布。
+  "canvas.loadWorkflowFile": async (args) => {
+    const a = args || {};
+    const file = String(a.file || a.path || "").trim();
+    if (!file) throw new Error("需要 file（相对 user/default/ 的路径，如 workflows/xxx.json）");
+    const aw = app.workflowManager && app.workflowManager.activeWorkflow;
+    let dirty = false;
+    try { if (aw && typeof aw.isModified === "function") dirty = !!aw.isModified(); } catch { dirty = false; }
+    if (dirty && a.force !== true) {
+      return { loaded: false, blocked: "dirty", activeBefore: aw ? (aw.filename || aw.name) : null };
+    }
+    const rel = file.replace(/^\\+/, "").replace(/\\\\/g, "/");
+    const res = await api.fetchApi("/api/userdata/" + encodeURIComponent(rel), { cache: "no-store" });
+    if (!res.ok) throw new Error("读取工作流文件失败：HTTP " + res.status + "（" + rel + "）");
+    const graph = await res.json();
+    if (!graph || typeof graph !== "object") throw new Error("工作流文件不是合法 JSON 对象");
+    if (typeof app.loadGraphData !== "function") throw new Error("前端没有 app.loadGraphData");
+    // 不 await：loadGraphData 会等整图渲染完，节点多时远超前端 6s 回传上限。
+    // 发起后立即回报，加载在后台继续。
+    void Promise.resolve(app.loadGraphData(graph)).catch((e) => {
+      console.warn(LOG_TAG, "loadGraphData 失败", e);
+    });
+    return {
+      loaded: true,
+      file: rel,
+      nodeCount: Array.isArray(graph.nodes) ? graph.nodes.length : null,
+      note: "已发起加载（异步），画布稍后刷新",
+    };
+  },
+
   "canvas.openWorkflow": async (args) => {
     const a = args || {};
     const target = String(a.path || a.name || "").trim();
@@ -401,6 +433,12 @@ const OPS = {
     const svc = app.extensionManager && app.extensionManager.workflow;
     if (!svc || typeof svc.openWorkflow !== "function") {
       throw new Error("前端没有 workflowService.openWorkflow（版本不支持）");
+    }
+    // 先刷新工作流列表：前端列表在启动时加载，agent 之后新增的文件不在其中
+    for (const m of ["syncWorkflows", "loadWorkflows"]) {
+      try {
+        if (typeof svc[m] === "function") { await svc[m](); break; }
+      } catch { /* 刷新失败不阻断，下面按现有列表匹配 */ }
     }
 
     const aw = svc.activeWorkflow || null;
