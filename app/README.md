@@ -74,6 +74,9 @@
   - **前置**：`custom_nodes/hana_bridge/`，用 `tools/deploy-bridge.ps1` 装 / 卸 / 查；
     改 `__init__.py` 需重启 ComfyUI，改 JS 只需刷新页面（静态服务带 `Cache-Control: no-store`）。
   - 安全：`/call` 校验 `X-Hana-Token`（token 由 Python 侧首启生成、中继读同一文件），无 token → 403。
+  - **排布与命令（2026-09-27 新增）**：`canvas` 增 `organize`（把命令递给前端扩展执行，默认 `node-organizer.organize` 自动排布，`command` 参数可换）/ `commands`（列已注册命令 id）/ `commandShape`（探命令表形状）；
+    工作流“直接进画布”用 `loadWorkflowFile {file}`（读文件 + loadGraphData，自带未保存保护）；`openWorkflow` 管“打开/切换到已保存工作流”的服务层语义，两者别混（见踩坑 §18）。
+    **纪律：排画布走 node-organizer 插件（先 `commands` 摸一下），不手算坐标；不要主动重排（尊重手调布局）。**
   - 记录 `docs/M12-画布共驾-P1记录.md`；方案 `docs/画布共驾方案-20260926.md`。
   - 边界：仅**源码安装**（Git 仓库）可代为更新；便携包/手工解压会明确回报“无法代为更新”。
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；

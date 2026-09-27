@@ -278,6 +278,53 @@ const OPS = {
       (app.workflowManager && app.workflowManager.activeWorkflow && app.workflowManager.activeWorkflow.name) || null,
   }),
 
+  // 调用前端扩展的已注册命令（如 node-organizer.organize 自动排版）
+  // 这让我们不必自己算坐标：把命令表交给前端扩展自己执行。
+  "canvas.organize": async (args) => {
+    const id = (args && args.command) || "node-organizer.organize";
+    const em = app && app.extensionManager;
+    const cmd = em && em.command;
+    // 实测（09-23）：命令表是 { commands, execute }，执行入口叫 execute，不是 executeCommand
+    const run = cmd && (cmd.execute || cmd.executeCommand);
+    if (typeof run !== "function") {
+      return { error: "no_command_api", keys: cmd ? Object.keys(cmd) : null };
+    }
+    await run.call(cmd, id);
+    return { command: id, nodeCount: nodeList(app && app.graph).length };
+  },
+
+  // 列出当前注册的命令（找可调命令的 id 用）
+  "canvas.commands": () => {
+    const em = app && app.extensionManager;
+    const cmds = (em && em.command && em.command.commands) || null;
+    let ids = [];
+    try {
+      if (cmds && typeof cmds[Symbol.iterator] === "function") {
+        ids = [...cmds].map((c) => (c && c.id) || null).filter(Boolean);
+      } else if (cmds && typeof cmds === "object") {
+        ids = Object.keys(cmds);
+      }
+    } catch (err) {
+      return { error: String(err) };
+    }
+    return { count: ids.length, ids: ids.slice(0, 200) };
+  },
+
+  // 探 command 表的真实形状（找执行入口叫什么名字）
+  "canvas.commandShape": () => {
+    const em = app && app.extensionManager;
+    const cmd = em && em.command;
+    if (!cmd) return { hasExtensionManager: !!em, hasCommand: false };
+    const proto = Object.getPrototypeOf(cmd) || {};
+    return {
+      hasCommand: true,
+      ownKeys: Object.keys(cmd).slice(0, 40),
+      protoMethods: Object.getOwnPropertyNames(proto).slice(0, 60),
+      fnKeys: Object.keys(cmd).filter((k) => typeof cmd[k] === "function"),
+      hasExecuteCommand: typeof cmd.executeCommand === "function",
+    };
+  },
+
   // 自检：一次性报出关键 API 的存在性（P0 核验用，转"推断"为"实测"）
   "api.probe": () => ({
     bridgeBuild: "2026-09-27T08:40-diag",

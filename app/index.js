@@ -1621,6 +1621,8 @@ export default defineApp(async (sdk) => {
     revision: { drive: "canvas.revision", desc: "画布变更序号（只问变没变，轻量）" },
     events: { drive: "canvas.events", desc: "画布变更记录（最近若干条）" },
     frameReload: { drive: "frame.reload", desc: "强制重载工作区内层 iframe（扩展换文件后用）" },
+    commands: { drive: "canvas.commands", desc: "列前端已注册命令 id（排布插件自检）" },
+    commandShape: { drive: "canvas.commandShape", desc: "探前端命令表形状（自检）" },
     loadWorkflowFile: { drive: "canvas.loadWorkflowFile", desc: "按文件路径直接加载工作流（绕过前端列表，写）", write: true },
     openWorkflow: { drive: "canvas.openWorkflow", desc: "打开指定工作流并推到前台（不修改图内容，自带未保存保护）" },
     // 以下为写入（需授权：设置页「允许 agent 修改画布」）
@@ -1632,6 +1634,8 @@ export default defineApp(async (sdk) => {
     setNodeMode: { drive: "canvas.setNodeMode", desc: "mute / bypass / 恢复正常", write: true },
     save: { drive: "canvas.save", desc: "把当前图落盘为工作流文件", write: true },
     undo: { drive: "canvas.undo", desc: "撤销 agent 上一步", write: true },
+    // 排布：把命令递交给前端扩展自己执行（默认走 node-organizer 插件）
+    organize: { drive: "canvas.organize", desc: "调前端扩展已注册命令（默认 node-organizer.organize 自动排布；args.command 可换）", write: true },
   };
 
   // 壳页桥：工作区壳页与 iframe 同源，直接够得到 iframe.contentWindow.app。
@@ -1693,6 +1697,7 @@ export default defineApp(async (sdk) => {
       "path",
       "force",
       "file",
+      "command",
     ]) {
       if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
     }

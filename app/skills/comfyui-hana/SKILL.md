@@ -77,7 +77,7 @@ App 自己就能拉起和撤下 8188 上的 ComfyUI 本体：
 
 | 面 | 内容 |
 |----|------|
-| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service / update / canvas**（单工具 action 分派；service 管 8188 服务进程起停；update 管源码安装的本体更新；canvas 读/改人正在看的同一张画布，写入需授权） |
+| 工具 | `comfyui`：**status / submit / query / result / cancel / workflows / upload / service / update / canvas**（单工具 action 分派；service 管 8188 服务进程起停；update 管源码安装的本体更新；canvas 读/改人正在看的同一张画布（含排布 organize / 命令表 commands / 直接加载 loadWorkflowFile 等），写入需授权） |
 | 任务桥 | submit → 宿主任务（`delivery:"next-step"`）→ 2s 轮询结算（完成回执含产物路径；失败/中断给原因） |
 | 任务卡 | 每次 submit 返回 `details.card`（进度/队列位/耗时/产物缩略），数据经 `GET /comfyui-hana/task?id=` |
 | 路由 | `boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start` / `theme` / `update` / `update/status`（v0.7-0.9） |
@@ -142,6 +142,17 @@ comfyui(action="result", promptId="…")
 comfyui(action="upload", path="D:\\pics\\ref.png")
 #   → {"1.image": "ref.png"} 注入到 LoadImage 节点
 ```
+
+### 画布排布（node-organizer 插件）
+
+排画布一律用已装的 `comfyui-node-organizer` 前端扩展，不要自己算坐标（用户 2026-09-27 叮嘱：「每次排画布，记得摸一下自动排画布的插件」）：
+
+- **先摸**：`comfyui(action="canvas", op="commands")` —— 命令表里应能看到 `node-organizer.organize` / `.organize-workflow` / `.organize-groups`（总计约 109 条命令）
+- **再排**：`comfyui(action="canvas", op="organize")` —— 默认走智能命令（选中了组就只排选中的组，没选就排全图）；`command` 参数可指定其它命令名
+- 前置：ComfyUI 页面在线；organize 归写入类，需「允许 agent 修改画布」已开
+- 纪律：**不要主动重排**（尊重用户手调的布局）；插件不可用时才退备用（插件自带纯函数库 `lib/core.js` 可算坐标）
+
+底层通道：桥 op `canvas.organize` / `canvas.commands` / `canvas.commandShape`（前端扩展执行 `app.extensionManager.command.execute(id)`；实测入口名是 `execute`，不是 `executeCommand`）。
 
 ## 任务卡状态（现象 → 怎么办）
 
