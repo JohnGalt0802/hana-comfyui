@@ -22,6 +22,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import { join } from "node:path";
 import { projectGraph } from "./lib/canvas-project.mjs";
 import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
+import { outlineGraph } from "./lib/canvas-outline.mjs";
 
 const APP_ID = "comfyui-hana";
 // v0.6.0（M9）：ComfyUI 服务进程起停（中继 /_relay/backend/{start,stop,proc} + App 路由 + 工具 action=service
@@ -1619,6 +1620,7 @@ export default defineApp(async (sdk) => {
     get: { drive: "canvas.get", desc: "全量 UI 格式 JSON" },
     check: { drive: "canvas.get", desc: "体检：悬空/输出未接/mute·bypass（app 层分析）" },
     trace: { drive: "canvas.get", desc: "追踪：某端口的直接来源/去向（app 层分析）" },
+    outline: { drive: "canvas.get", desc: "大纲：功能块与块间连线（app 层分析）" },
     prompt: { drive: "canvas.prompt", desc: "可提交形态（prompt 对象）" },
     running: { drive: "exec.running", desc: "当前执行到哪个节点" },
     probe: { drive: "api.probe", desc: "桥自检（关键 API 存在性）" },
@@ -1781,6 +1783,9 @@ export default defineApp(async (sdk) => {
       if (nodeId == null || String(nodeId).trim() === "") throw new Error("trace 需要 nodeId（目标节点 id）");
       if (slot == null || String(slot).trim() === "") throw new Error("trace 需要 slot（名字或索引）");
       const s = JSON.stringify(traceGraph(payload, { node: nodeId, slot, dir: args && args.dir }));
+      text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
+    } else if (op === "outline") {
+      const s = JSON.stringify(outlineGraph(payload));
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     } else if (op === "running") {
       text = payload && payload.runningNodeId != null ? `当前执行节点：#${payload.runningNodeId}` : "当前没有节点在执行。";
@@ -1998,6 +2003,7 @@ export default defineApp(async (sdk) => {
               "get",
               "check",
               "trace",
+              "outline",
               "prompt",
               "running",
               "probe",
@@ -2013,7 +2019,7 @@ export default defineApp(async (sdk) => {
               "undo",
             ],
             description:
-              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass）；trace=追踪端口来源/去向；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录。写（需授权）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步。多页面时用 workflow 参数定向（不传则广播）",
+              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass）；trace=追踪端口来源/去向；outline=大纲（功能块+块间连线）；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录。写（需授权）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步。多页面时用 workflow 参数定向（不传则广播）",
           },
           workflow: { type: "string", description: "多页面定向：只发给正打开这个工作流名的页面（不传则广播给所有页面）" },
           select: { type: "string", description: "投影过滤：只保留匹配节点（#8 / #8,#27 / type=PrimitiveInt / title~尺寸，逗号分隔取并集）；与 fields 搭配替代全量 get" },
@@ -2045,7 +2051,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass）/ trace 追踪端口来源/去向 / prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / undo 撤销 agent 上一步）——写入类 op 需用户在设置页开启「允许 agent 修改画布」，且需 ComfyUI 页面在线；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass）/ trace 追踪端口来源/去向 / outline 大纲（功能块+块间连线）/ prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / undo 撤销 agent 上一步）——写入类 op 需用户在设置页开启「允许 agent 修改画布」，且需 ComfyUI 页面在线；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",
