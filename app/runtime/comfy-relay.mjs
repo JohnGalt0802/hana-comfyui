@@ -749,11 +749,20 @@ async function startBackendService(overridePath) {
   const launcher = join(dir, LAUNCHER_NAME);
   const launcherVbs = join(dir, LAUNCHER_VBS_NAME);
   const logFile = join(dir, "backend.log");
+  // ComfyUI-Manager（pip 版，2025-12 起官方集成）：site-packages 里装了 comfyui_manager 就在启动参数里启用。
+  // 没装则不加参数——对未配置 Manager 的环境保持原行为兼容。
+  // 参考：blog.comfy.org/p/meet-the-new-comfyui-manager（非 Desktop 需 pip 包 + --enable-manager）
+  const pyDir = dirname(t.python);
+  const useManager = [
+    join(pyDir, "..", "Lib", "site-packages", "comfyui_manager"),
+    join(pyDir, "Lib", "site-packages", "comfyui_manager"),
+  ].some((p) => existsSync(p));
+  const extraArgs = useManager ? " --enable-manager" : "";
   const script = [
     "@echo off",
     "chcp 65001 >nul",
     `cd /d "${t.cwd}"`,
-    `"${t.python}" main.py --listen ${backend.host} --port ${backend.port} >> "${logFile}" 2>&1`,
+    `"${t.python}" main.py --listen ${backend.host} --port ${backend.port}${extraArgs} >> "${logFile}" 2>&1`,
     "",
   ].join("\r\n");
   // 隐藏窗口：任务若直接指向 .cmd，Windows 会开一个可见控制台（实测：任务栏多出一个 cmd 窗口）。
@@ -806,7 +815,7 @@ async function startBackendService(overridePath) {
   backendProc.lastError = null;
   saveBackendState();
   pidCache = { at: 0, pids: [] };
-  log(`请求启动 ComfyUI 服务：${t.python} main.py（cwd=${t.cwd}，日志 ${logFile}，启动器 ${useVbs ? launcherVbs : launcher}）`);
+  log(`请求启动 ComfyUI 服务：${t.python} main.py（cwd=${t.cwd}，日志 ${logFile}，启动器 ${useVbs ? launcherVbs : launcher}，manager=${useManager ? "on" : "off"}）`);
 
   // 兜底诊断：90s 后仍未就绪就把成因指向可查的两处（否则面板只会显示“不可达”，无从下手）
   setTimeout(async () => {
@@ -828,6 +837,7 @@ async function startBackendService(overridePath) {
     launcher: useVbs ? launcherVbs : launcher,
     launcherCmd: launcher,
     hidden: useVbs,
+    manager: useManager,
     logFile,
     url: `http://${backend.host}:${backend.port}`,
   };
