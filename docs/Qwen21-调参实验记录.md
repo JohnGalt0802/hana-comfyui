@@ -75,15 +75,61 @@ UNETLoader(qwen_image_2.1_bf16)
 **结论：配方不挑题材**（人像 / 产品 / 海报 / 动物四类均成立）。
 **额外发现：文字渲染准确**（`LAKESIDE` 一次成型），乃 Qwen-Image-2.1 的排印强项。
 
+## 步数对照（用含文字的复古海报重验 —— 推翻前一轮结论）
+
+提示词：`a vintage travel poster of a snowy mountain peak at dawn, the bold headline reads "NORTH RIDGE", retro print texture, muted palette`
+
+| 步数 | 耗时 | 文字 | 山体 | 评价 | 产物 |
+|---|---|---|---|---|---|
+| **12** | 24s | 米色带阴影，尚可 | **碎片/噪点感** | 快，但糙 | `qwen21_steps12_poster_00001_.png` |
+| **30** | 16s | 黑体带白边，更准 | **有岩层层次** | 明显更好 | `qwen21_steps30_poster_00001_.png` |
+| **50** | 24s | 最像印刷体 | **岩层、冰川裂缝清楚** | 最好 | `qwen21_steps50_poster_00001_.png` |
+
+### ⚠️ 结论修正
+
+**“12 步与 20/32 步肉眼相当”是错的。**
+错因：当时只用**雨林水豚**（主体大、细节要求低）做样本，掩盖了差异。
+换成**含文字的海报**，差距立刻现形。
+
+**正确结论**：
+- **12 步仅适合快速预览**（构图/大致内容）
+- **要出片、尤其带文字，30-50 步才够**（社区“2.1 需 30~50 步”的说法属实）
+- 耗时不是单调递增（12→24s、30→16s、50→24s），受缓存/冷启动影响，不能单看单次
+
+## 独立模块：提示词增强器
+
+文件：`Qwen21 提示词增强器.json`（12 节点，**纯增强，无采样/保存节点**）
+
+**为何这么做**：官方与社区的提示词增强器都是**独立跑、输出纯文本**
+（见 comfy.org 那个“QwenVL 提示词增强器”：输出可直接用于任何 T2I 节点）。
+焊在生图图里会让改采样时不得不绕开增强段。
+
+**组件**（从生图图抽出，自带 CLIPLoader）：
+
+```
+CLIPLoader(qwen3vl_8b)
+  → TextGenerate(system_prompt = skill 规则, prompt = brief)
+  → JsonExtractString → 失败判定 → 回退开关
+  → PreviewAny（输出）
+```
+
+**实测**（输入 `一只橘猫坐在窗台上`，65 秒）：
+
+> The image is a vertical realistic photograph of a ginger cat sitting on a windowsill, ... **In the upper-left corner** ... **Across the top edge** ... **In the centre of the frame** ...
+
+完全符合 skill 规则的八步框架（英文、观察者口吻、方位短语、光照独立成句）。
+
+**踩坑**：抽链时漏了给 `StringFormat` 喂宽高比的 `ResolutionSelector`（生图节点）。
+正解：增强器**本不该管画幅**，把 `StringFormat` 模板简化为 `{a}`（只吃 brief）。
+
 ## 待试（下一步）
 
-- **步数下限**：✅ 已探（12 步甜点，8 步退化）
-- **CFG**：当前 `BasicGuider` 天然 CFG off（=1）。社区有"前 8-12 步 CFG 1.5-3.5、其余 1"
-  的分段说法，需换 `CFGGuider` 才试得了
+- **CFG**：Qwen 推荐 CFG≈1，而 `BasicGuider` 天然就是该值；
+  且 `TextEncodeQwenImage21` 只吐 `positive`，要试分段 CFG 得另造负条件，成本高、收益存疑（低优先级）
 - **EasyCache 阈值**：0.5 附近找质量/速度的更好平衡（低优先级）
-- **CFG**（低优先级）：Qwen 推荐 CFG≈1，而 `BasicGuider` 天然就是该值；
-  且 `TextEncodeQwenImage21` 只吐 `positive`，要试分段 CFG 得另造负条件，成本高、收益存疑
-- **题材扩展**：✅ 已验（人像/产品/海报/动物），见上表
+- **题材扩展**：✅ 已验（人像/产品/海报/动物）
+- **步数**：✅ 已探并**修正**（12 预览 / 30-50 出片，见上表）
+- **模块化**：✅ 独立增强器已建；可继续做**两图联动**或 **subgraph**（生图图里只留一个节点）
 
 ## 附：这条链是怎么打通的（环境部分）
 
