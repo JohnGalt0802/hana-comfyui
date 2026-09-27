@@ -15,3 +15,9 @@ desktop.ini
 *.bak-*
 *.probe-hold
 
+# 工作现场 / 模板收集 / 一次性脚本（本地资产，不随仓库分发）
+_temp/
+_workflow-backups/
+qwen21-templates/
+_build_wf.py
+
