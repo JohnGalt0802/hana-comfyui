@@ -3,9 +3,12 @@
   把 Hana-ComfyUI 的画布桥（hana_bridge）部署到本机 ComfyUI 的 custom_nodes 目录。
 
 .DESCRIPTION
-  源  ：<项目>\app\bridge（__init__.py + js\hana-bridge.js）
+  源  ：<项目>\app\bridge（__init__.py + js\hana-bridge-<ddHHmmss>.js 模式的活动扩展）
   目标：<ComfyUI 源码根>\custom_nodes\hana_bridge
-  只复制源文件；.token（由 ComfyUI 侧首次加载时生成）与 __pycache__ 不参与复制/比对。
+  部署前会清空目标的 js\ 子目录，再只放入当前活动扩展 js（*.js；开发备份 *.js.bak-* 不部署）——
+  防止新旧桥文件沉积导致同一页面双载扩展（写操作会双执行，对 patch 是灾难面）。
+  清空仅限 js\ 子目录：__init__.py / .token / __pycache__ 不受影响。
+  .token（由 ComfyUI 侧首次加载时生成）与 __pycache__ 不参与复制/比对。
   部署或改动后必须重启 ComfyUI 服务才会加载（路由与前端扩展都在启动时注册）。
 
 .PARAMETER Status
@@ -91,11 +94,29 @@ if ($Status) {
   return
 }
 
+# ── 部署 ────────────────────────────────────────────────────────────────────
+# js\ 子目录：先清空，再只放当前活动扩展（*.js）——防止新旧桥文件沉积 → 同页双载扩展、
+# 写操作双执行（对 patch 是灾难面）。开发备份（*.js.bak-*）不部署。
+# 清空仅限 js\ 子目录：__init__.py / .token / __pycache__ 不受影响。
 $files = Get-SourceFiles
+$jsPrefix = (Join-Path $src "js").TrimEnd("\") + "\"
+$jsDstDir = Join-Path $dst "js"
+if (Test-Path -LiteralPath $jsDstDir) { Remove-Item -LiteralPath $jsDstDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $jsDstDir | Out-Null
+$copied = 0
 foreach ($f in $files) {
+  if ($f.FullName.StartsWith($jsPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if ($f.Extension -ne ".js") { continue } # 备份 / 非 .js 不进目标
+    $t = Join-Path $jsDstDir $f.FullName.Substring($jsPrefix.Length)
+    New-Item -ItemType Directory -Force -Path (Split-Path $t -Parent) | Out-Null
+    Copy-Item -LiteralPath $f.FullName -Destination $t -Force
+    $copied += 1
+    continue
+  }
   $rel = $f.FullName.Substring($src.Length).TrimStart("\")
   $t = Join-Path $dst $rel
   New-Item -ItemType Directory -Force -Path (Split-Path $t -Parent) | Out-Null
   Copy-Item -LiteralPath $f.FullName -Destination $t -Force
+  $copied += 1
 }
-Write-Output ("已部署 {0} 个文件（.token 保持原样，由 ComfyUI 侧生成）。重启 ComfyUI 后生效。" -f $files.Count)
+Write-Output ("已部署 {0} 个文件（js\ 已清空重建、只放活动扩展 *.js；.token 保持原样，由 ComfyUI 侧生成）。重启 ComfyUI 后生效。" -f $copied)
