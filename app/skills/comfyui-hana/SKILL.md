@@ -3,7 +3,7 @@ name: comfyui-hana
 description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端（iframe 直连 8188，自定义节点扩展可用）；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；工作区顶栏与左侧面板均可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；可自定义 ComfyUI 安装目录；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、自定义 ComfyUI 目录/ComfyUI 装在别处、自定义节点不显示/扩展脚本 403、帮我安装 ComfyUI、未检测到 ComfyUI 环境。
 ---
 
-# Hana-ComfyUI（v0.8）
+# Hana-ComfyUI（v0.9）
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。环境不存在时工作区会弹安装引导（选位置 → 让助手装 / 复制指令 / 自行安装）。
 

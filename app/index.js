@@ -28,7 +28,7 @@ const APP_ID = "comfyui-hana";
 // v0.6.0（M9）：ComfyUI 服务进程起停（中继 /_relay/backend/{start,stop,proc} + App 路由 + 工具 action=service
 //   + 左侧面板「启动服务/停止服务」）。启动走计划任务（脱离宿主沙箱 job，服务独立存活），撤下走 taskkill。
 //   面板原来那个「重试启动」正名为「重启中继」——它只重启受管 runtime，不碰 ComfyUI 服务本体。
-const APP_VERSION = "0.8.0";
+const APP_VERSION = "0.9.0";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）

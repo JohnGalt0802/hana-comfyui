@@ -1,11 +1,11 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.8
+# Hana-ComfyUI（v2 App，开发仓）· v0.9
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
 
 ## 状态（M0–M2 完成，M2.5/M2.6 收尾）
 
-- 工具 `comfyui` 全动作：status / submit / query / result / cancel / workflows / upload / service
+- 工具 `comfyui` 全动作（10）：status / submit / query / result / cancel / workflows / upload / service / update / canvas
 - 任务桥：submit → `ctx.tasks.create({callToken, delivery:"next-step"})` → 2s 轮询结算（complete/fail/cancel）
   - 能力已扩容（2026-09-21 批准并生效）：`app/tasks.manage` + `app/session.start-turn`（ledger=always）
   - **子代理会话边界**：宿主可靠投递只写桌面会话；从子代理会话发起的任务不会自动回执（工具文案会如实标注；`query` 的「投递」行可查 `published/delivered`）
@@ -66,7 +66,7 @@
     无快照或过期时改用 `op=summary` 现抓（需页面在线）。
   - 只读 op：`summary`（现抓结构摘要）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）/
     `revision`（变更序号，只问变没变）/ `events`（变更记录，可按 `since` 增量查，含按节点的 added/removed/changed）。
-  - 变更感知为 500ms 轮询签名比对（新版 LiteGraph 没有可用的变更事件），签名**不含节点位置**。
+  - 变更感知为 1.5s 轮询签名比对（新版 LiteGraph 没有可用的变更事件），签名**不含节点位置**。
   - 写入 op（均需授权）：`setWidget`（改参数）/ `addNode`（加节点）/ `removeNode`（删节点）/ `connect` / `disconnect`（连线、断线）/ `setNodeMode`（mute / bypass）/ `undo`（撤销 agent 上一步，最多 20 步）。
     撤销是**逆操作栈**（不是整图快照）：只回退 agent 那一步，不会动人在此期间的改动。
     **默认关闭**，需在设置页打开「允许 agent 修改画布」才可用；未授权时直接报错。
@@ -77,10 +77,12 @@
   - **排布与命令（2026-09-27 新增）**：`canvas` 增 `organize`（把命令递给前端扩展执行，默认 `node-organizer.organize` 自动排布，`command` 参数可换）/ `commands`（列已注册命令 id）/ `commandShape`（探命令表形状）；
     工作流“直接进画布”用 `loadWorkflowFile {file}`（读文件 + loadGraphData，自带未保存保护）；`openWorkflow` 管“打开/切换到已保存工作流”的服务层语义，两者别混（见踩坑 §18）。
     **纪律：排画布走 node-organizer 插件（先 `commands` 摸一下），不手算坐标；不要主动重排（尊重手调布局）。**
-  - 记录 `docs/M12-画布共驾-P1记录.md`；方案 `docs/画布共驾方案-20260926.md`。
+  - **语义层（P1–P4，2026-09-28 生效窗口验收通过）**：读向 `get` 投影（`select` / `fields`，只回命中节点与白名单字段）/ `check` 体检（悬空·输出未接·mute·bypass，互斥口径）/ `trace` 追踪（端口来源 / 去向）/ `outline` 大纲（功能块 + 块间连线）；写向 `patch` 意图级事务（edits + `$w` 引用 + verify + 原子回滚 + dryRun，一次 patch = 一步撤销）。
+  - **定向与健壮性（2026-09-28）**：多页面按工作流名定向（找不到明确报错、不误伤别页）；死条目 TTL 15min（过期条目不再截胡定向，全过期明确报 `no_live_page`；定向命中回包顺带刷新存活时间）。
+  - 记录 `docs/M12-画布共驾-P1记录.md`；方案 `docs/画布共驾方案-20260926.md`、`docs/画布语义层-20260927.md`；全链验收 `docs/验收记录-画布语义层-全链-20260928.md`。
   - 边界：仅**源码安装**（Git 仓库）可代为更新；便携包/手工解压会明确回报“无法代为更新”。
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
-  cancel 定向中断 10/10（M3）；静态校验 ok
+  cancel 定向中断 10/10（M3）；静态校验 ok；画布共驾 + 语义层生效窗口验收全过（2026-09-28）
 
 ## 开发流程（2026-09-26 起生效）
 
