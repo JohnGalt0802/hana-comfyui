@@ -1,7 +1,7 @@
 """Hana-ComfyUI 桥 · ComfyUI 侧（P1 只读阶段）。
 
 职责只有两件：
-  1. 让 ComfyUI 前端加载 js/hana-bridge.js（通过 WEB_DIRECTORY）；
+  1. 让 ComfyUI 前端加载 js/hana-bridge-<构建>.js（通过 WEB_DIRECTORY）；
   2. 提供本机路由，把「外部调用」转成「前端扩展执行」。
 
 链路（见 docs/画布共驾方案-20260926.md §2.2）：
@@ -62,6 +62,10 @@ try:
 except ValueError:
     CALL_TIMEOUT_SEC = 6.0
 
+# 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
+# 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
+BRIDGE_BUILD_TAG = "2026-09-28 hana-bridge-28105930"
+
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
 # 进行中的调用：reqId → asyncio.Future
@@ -74,6 +78,44 @@ _frontends = {}
 # ComfyUI 页面并不开着；缓一份在服务端，agent 就随时拿得到「手边快照」，
 # 不依赖「此刻页面在线」。
 _state = {"at": None, "ts": None, "revision": None, "summary": None, "sid": None}
+
+# ── 前端账本过期判定（TTL，2026-09-28 补缺）─────────────────────────────
+# 背景：页面关闭/冻结后不再上报，_frontends 条目不清理（无 TTL）；按 workflow 名
+# 定向时死条目（hits[0] 取最早插入）会截胡活页 → 活页收不到、误报 no_page/超时。
+# 语义：seenAt 超过 TTL 视作过期（死条目）。消费点——
+#   · canvas.pages 输出带 stale 标记（保留可观测性，不删条目）；
+#   · 按名/前缀定向只在未过期集合里取；只剩过期时明确报 no_live_page（不静默退回死条目）；
+#   · 收到定向回传 = 存活证明，顺带刷新 seenAt。
+# 默认 15 分钟（页面冻结实测 4–5 分钟失联，取裕量）。调测口：环境变量
+# HANA_BRIDGE_FRONTEND_TTL_SEC 或同目录 frontend_ttl_sec.txt（整数秒）；调用时读取。
+_FRONTEND_TTL_DEFAULT = 15 * 60.0
+
+
+def _frontend_ttl_sec():
+    raw = os.environ.get("HANA_BRIDGE_FRONTEND_TTL_SEC", "").strip()
+    if not raw:
+        try:
+            with open(os.path.join(_PKG_DIR, "frontend_ttl_sec.txt"), "r", encoding="utf-8") as fh:
+                raw = (fh.read() or "").strip()
+        except OSError:
+            raw = ""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _FRONTEND_TTL_DEFAULT
+    return val if val > 0 else _FRONTEND_TTL_DEFAULT
+
+
+def _age_sec(entry, now):
+    try:
+        seen = float((entry or {}).get("seenAt") or 0)
+    except (TypeError, ValueError):
+        seen = 0.0
+    return now - seen
+
+
+def _is_fresh(entry, now, ttl):
+    return _age_sec(entry, now) <= ttl
 
 
 def _load_token():
@@ -130,10 +172,26 @@ def _note_frontend(sid, data, kind):
     _frontend["sid"] = sid
 
 
+def _pages_brief():
+    """错误响应里的页面简表（诊断用；带 stale 标记）。"""
+    now = time.time()
+    ttl = _frontend_ttl_sec()
+    return [
+        {
+            "sid": (k or "")[:8],
+            "workflow": v.get("workflow"),
+            "stale": _age_sec(v, now) > ttl,
+        }
+        for k, v in _frontends.items()
+    ]
+
+
 def _pages_payload():
     now = time.time()
+    ttl = _frontend_ttl_sec()
     pages = []
     for s, v in _frontends.items():
+        age = round(_age_sec(v, now), 1)
         pages.append(
             {
                 "sid": (s or "")[:8],
@@ -141,13 +199,19 @@ def _pages_payload():
                 "workflow": v.get("workflow"),
                 "path": v.get("path"),
                 "modified": v.get("modified"),
-                "ageSec": round(now - (v.get("seenAt") or now), 1),
+                "ageSec": age,
                 "href": v.get("href"),
                 "kind": v.get("kind"),
+                "stale": age > ttl,  # 过期标记：消费方取活页用 not stale（路由侧已自动跳过）
             }
         )
     pages.sort(key=lambda p: p["ageSec"])
-    return {"pages": pages, "count": len(pages)}
+    return {
+        "pages": pages,
+        "count": len(pages),
+        "liveCount": sum(1 for p in pages if not p["stale"]),
+        "ttlSec": round(ttl, 1),
+    }
 
 
 def _state_age_sec():
@@ -212,35 +276,78 @@ if _ROUTES is not None:
         if op == "canvas.pages":
             return web.json_response({"ok": True, "data": _pages_payload()})
 
-        # 定向策略（2026-09-27，多页面）：
+        # 定向策略（2026-09-27，多页面；2026-09-28 加 TTL）：
         # ① 给了 workflow → 找同名页面定向；找不到就明确报错，**不退回广播**（避免误伤别的页面）
+        #    TTL：只在未过期集合里取；只剩过期条目时明确报 no_live_page（不静默退回死条目）
         # ② 没给 → 广播（向后兼容；单页面时行为不变。页面刷新/重连不会重跑 setup，
         #    而 server.py 实测 send_json(sid=None) 会发给当前所有连接，只要有一个前端在就能收到）
+        now = time.time()
+        ttl = _frontend_ttl_sec()
         want_wf = str(body.get("workflow") or "").strip()
         sid = str(body.get("sid") or "").strip() or None
         # 页面清单里给的是 8 位短 sid（便于人读），定向时允许前缀匹配；
         # 只有唯一命中才认，多个命中视为歧义、不猜。
+        # 2026-09-28（TTL）：精确 sid 保持原语义（可直指任意条目，含探死条目做诊断）；
+        # 前缀解析只认活条目；只剩过期命中时明确报 no_live_page，不静默退回死条目。
         if sid and sid not in _frontends:
             pref = [k for k in _frontends if (k or "").startswith(sid)]
-            sid = pref[0] if len(pref) == 1 else None
+            pref_live = [k for k in pref if _is_fresh(_frontends.get(k) or {}, now, ttl)]
+            if len(pref_live) == 1:
+                sid = pref_live[0]
+            elif pref and not pref_live:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "no_live_page",
+                        "detail": "sid 前缀「%s」只剩过期页面（%d 条，已跳过）" % (sid, len(pref)),
+                        "pages": _pages_brief(),
+                    },
+                    status=409,
+                )
+            else:
+                sid = None  # 无命中/歧义（多个活命中）→ 维持「不猜」语义
         routed = None
         if want_wf:
-            hits = [s for s, v in _frontends.items() if (v.get("workflow") or "") == want_wf]
-            if not hits:
+            hits_live = [
+                s
+                for s, v in _frontends.items()
+                if (v.get("workflow") or "") == want_wf and _is_fresh(v, now, ttl)
+            ]
+            hits_stale = [
+                s
+                for s, v in _frontends.items()
+                if (v.get("workflow") or "") == want_wf and not _is_fresh(v, now, ttl)
+            ]
+            if not hits_live:
+                if hits_stale:
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": "no_live_page",
+                            "detail": "「%s」的匹配页面均已过期（stale %d 条，已跳过）" % (want_wf, len(hits_stale)),
+                            "pages": _pages_brief(),
+                        },
+                        status=409,
+                    )
                 return web.json_response(
                     {
                         "ok": False,
                         "error": "no_page",
                         "detail": "没有页面正打开「%s」" % want_wf,
-                        "pages": [
-                            {"sid": (k or "")[:8], "workflow": v.get("workflow")}
-                            for k, v in _frontends.items()
-                        ],
+                        "pages": _pages_brief(),
                     },
                     status=409,
                 )
-            sid = hits[0]
-            routed = {"workflow": want_wf, "matched": len(hits)}
+            sid = hits_live[0]
+            routed = {"workflow": want_wf, "matched": len(hits_live)}
+            if hits_stale:
+                routed["staleSkipped"] = len(hits_stale)
+                LOG.info(
+                    "hana_bridge: 定向「%s」命中 %d 活页、跳过 %d 条过期条目",
+                    want_wf,
+                    len(hits_live),
+                    len(hits_stale),
+                )
 
         rid = secrets.token_hex(8)
         fut = asyncio.get_running_loop().create_future()
@@ -265,6 +372,10 @@ if _ROUTES is not None:
         except Exception as exc:  # noqa: BLE001
             _pending.pop(rid, None)
             return web.json_response({"ok": False, "error": "internal", "detail": str(exc)}, status=500)
+
+        # 收到回传 = 该页存活证明：定向命中时顺带刷新 seenAt（广播无法归属，不刷）。
+        if sid and sid in _frontends:
+            _frontends[sid]["seenAt"] = time.time()
 
         payload = {"ok": bool(res.get("ok"))}
         if "data" in res:
@@ -298,23 +409,39 @@ if _ROUTES is not None:
     @_ROUTES.get("/hana_bridge/diag")
     async def _hana_diag(request):
         """自检：把扩展挂载的真实状况报出来（只读）。
-        目的：弄清前端到底从哪里加载 hana-bridge.js。"""
+        目的：弄清前端到底从哪里加载桥 js（hana-bridge-<构建>.js）。"""
         try:
             import nodes as _nodes
             dirs = dict(getattr(_nodes, "EXTENSION_WEB_DIRS", {}) or {})
         except Exception as exc:  # noqa: BLE001
             dirs = {"__err__": str(exc)}
         here = os.path.dirname(os.path.abspath(__file__))
-        js_file = os.path.join(here, "js", "hana-bridge.js")
+        js_dir = os.path.join(here, "js")
+        # 2026-09-28：桥 js 为具名构建文件（hana-bridge-<ddHHmmss>.js，部署时清空重建）。
+        # 动态扫出当前活动文件；同目录 .bak-* 备份不参与。
+        info = {}
         try:
-            with open(js_file, "r", encoding="utf-8") as fh:
-                txt = fh.read()
-            info = {
-                "jsPath": js_file,
-                "jsBytes": len(txt.encode("utf-8")),
-                "hasDiag": "api.diag" in txt,
-                "hasBuildTag": "08:40-diag" in txt,
-            }
+            candidates = sorted(
+                f
+                for f in os.listdir(js_dir)
+                if f.startswith("hana-bridge-") and f.endswith(".js") and ".bak" not in f
+            )
+            info["jsCandidates"] = candidates
+            if not candidates:
+                info["jsErr"] = "未找到桥 js（hana-bridge-*.js）"
+            else:
+                js_file = os.path.join(js_dir, candidates[-1])
+                with open(js_file, "r", encoding="utf-8") as fh:
+                    txt = fh.read()
+                info.update(
+                    {
+                        "jsPath": js_file,
+                        "jsBytes": len(txt.encode("utf-8")),
+                        "hasDiag": "api.diag" in txt,
+                        "hasBuildTag": BRIDGE_BUILD_TAG in txt,
+                        "buildTag": BRIDGE_BUILD_TAG,
+                    }
+                )
         except Exception as exc:  # noqa: BLE001
             info = {"jsErr": str(exc)}
         return web.json_response(

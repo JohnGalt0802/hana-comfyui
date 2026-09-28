@@ -15,6 +15,10 @@ const EVT_CALL = "hana_bridge.call";
 const PATH_HELLO = "/hana_bridge/hello";
 const PATH_RESULT = "/hana_bridge/result";
 
+// 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
+// api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
+const BUILD_TAG = "2026-09-28 hana-bridge-28105930";
+
 const WIDGET_VALUE_MAX = 160;
 
 function clip(s) {
@@ -787,7 +791,7 @@ const OPS = {
 
   // 自检：一次性报出关键 API 的存在性（P0 核验用，转"推断"为"实测"）
   "api.probe": () => ({
-    bridgeBuild: "2026-09-27T08:40-diag",
+    bridgeBuild: BUILD_TAG,
     opsCount: Object.keys(OPS).length,
     opsHasDiag: typeof OPS["api.diag"] === "function",
     hasApp: !!app,
@@ -1283,6 +1287,7 @@ const OPS = {
 // 只暴露版本与计数，不做任何写操作、也不抛出内部对象。
 window.__hanaBridge = {
   version: "p4.0",
+  build: BUILD_TAG,
   ops: Object.keys(OPS),
   state: () => ({
     version: "p4.0",
