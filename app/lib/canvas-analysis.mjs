@@ -1,7 +1,8 @@
 // app/lib/canvas-analysis.mjs — 画布语义层 P2：体检 check + 追踪 trace（纯模块 · 零依赖）
 // ─────────────────────────────────────────────────────────────────────────────
 // 两个纯函数，输入都是「UI 格式 JSON」（前端 graph.toJSON() 的输出）；分析全在数据侧做，
-// 供 canvas check / trace 直接使用（参数不透传桥）。
+// 供 canvas check / trace 直接使用（参数由 app 层消费；bridgeArgs 白名单中的 nodeId/slot
+// 会随请求透传给桥，但桥端 canvas.get 忽略 args，无功能影响）。
 //
 // ① analyzeGraph(graph) —— 体检 v0（注释类节点 Note / MarkdownNote 整体跳过）：
 //    互斥口径：每节点最多一条 issue，优先级 DANGLING > OUTPUT_UNWIRED > MUTED_BYPASSED

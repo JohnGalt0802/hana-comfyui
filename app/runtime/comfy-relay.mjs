@@ -2132,11 +2132,17 @@ const server = http.createServer((req, res) => {
           }, req.method);
           return;
         }
+        // P4 修复（附加发现 A）：定向字段 workflow 藏在 args 里，而 Python 侧只读顶层 body.workflow
+        // （__init__.py 的 _hana_call）——不提升则定向丢失、退化为广播。此一处最小改。
+        const fwdArgs = (body && body.args) || {};
+        const fwd = { op, args: fwdArgs };
+        const fwdWf = fwdArgs && typeof fwdArgs === "object" ? String(fwdArgs.workflow == null ? "" : fwdArgs.workflow).trim() : "";
+        if (fwdWf) fwd.workflow = fwdWf;
         const upstream = await fetch(`http://${backend.host}:${backend.port}/api/hana_bridge/call`, {
           method: "POST",
           signal: AbortSignal.timeout(20_000),
           headers: { accept: "application/json", "content-type": "application/json", "x-hana-token": token },
-          body: JSON.stringify({ op, args: (body && body.args) || {} }),
+          body: JSON.stringify(fwd),
         });
         const text = (await upstream.text()).trim();
         let data;

@@ -213,6 +213,72 @@ test("outline：graph 非对象 → 抛 Error", () => {
   assert.throws(() => outlineGraph(), /graph 非对象/);
 });
 
+test("outline：同名组去重（AI / AI#2）——块间边方向不再丢失", () => {
+  const g = {
+    revision: 9,
+    nodes: [
+      { id: 1, type: "PrimitiveInt", title: "值1", mode: 0,
+        inputs: [{ name: "b", type: "INT", link: 31 }],
+        outputs: [{ name: "INT", type: "INT", links: [30] }],
+        widgets_values: [1], pos: [10, 10] },
+      { id: 2, type: "PrimitiveInt", title: "值2", mode: 0,
+        inputs: [{ name: "a", type: "INT", link: 30 }],
+        outputs: [{ name: "INT", type: "INT", links: [31] }],
+        widgets_values: [2], pos: [210, 10] },
+    ],
+    links: [[30, 1, 0, 2, 0, "INT"], [31, 2, 0, 1, 0, "INT"]],
+    groups: [
+      { title: "AI", bounding: [0, 0, 100, 100] },
+      { title: "AI", bounding: [200, 0, 100, 100] },
+    ],
+  };
+  const r = outlineGraph(g);
+  assert.deepStrictEqual(r.blocks.map((b) => [b.name, b.source, b.nodes]), [
+    ["AI", "group", [1]],
+    ["AI#2", "group", [2]],
+  ]);
+  // 双向两条边都在：同名不再合并成一条 [AI, AI]（方向信息不丢）
+  assert.deepStrictEqual(r.blockEdges, [["AI", "AI#2"], ["AI#2", "AI"]]);
+});
+
+test("outline：LoadImage / LoadImageMask 归「加载」（此前落「其他」）", () => {
+  const g = {
+    nodes: [
+      { id: 1, type: "LoadImage", mode: 0, inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: null }], widgets_values: ["example.png"] },
+      { id: 2, type: "LoadImageMask", mode: 0, inputs: [], outputs: [{ name: "MASK", type: "MASK", links: null }], widgets_values: ["mask.png"] },
+    ],
+  };
+  const r = outlineGraph(g);
+  assert.deepStrictEqual(r.blocks, [
+    { name: "加载", source: "role", nodes: [1, 2], summary: "#1(example.png) #2(mask.png)" },
+  ]);
+});
+
+test("outline：重名去重覆盖「组{i}」与角色块名（碰撞走 #k）", () => {
+  // a) 无标题组的「组{i}」与既有 title 碰撞 → #k
+  const a = outlineGraph({
+    nodes: [
+      { id: 1, type: "AnyType", mode: 0, inputs: [], outputs: [], pos: [10, 10] },
+      { id: 2, type: "AnyType", mode: 0, inputs: [], outputs: [], pos: [210, 10] },
+    ],
+    groups: [
+      { title: "组2", bounding: [0, 0, 100, 100] },
+      { title: "", bounding: [200, 0, 100, 100] },
+    ],
+  });
+  assert.deepStrictEqual(a.blocks.map((x) => x.name), ["组2", "组2#2"]);
+
+  // b) 组 title 与角色块名碰撞 → 角色块让位 #k
+  const b = outlineGraph({
+    nodes: [
+      { id: 1, type: "AnyType", mode: 0, inputs: [], outputs: [], pos: [10, 10] },
+      { id: 2, type: "LoadImage", mode: 0, inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: null }], widgets_values: [] },
+    ],
+    groups: [{ title: "加载", bounding: [0, 0, 100, 100] }],
+  });
+  assert.deepStrictEqual(b.blocks.map((x) => [x.name, x.source]), [["加载", "group"], ["加载#2", "role"]]);
+});
+
 console.log(`\n${pass + fail} 个用例：${pass} 通过 / ${fail} 失败`);
 if (process.argv.includes("--sample")) {
   console.log("\n── 样例（输入：本文件合成图 GRAPH_A，9 节点 / 7 连线 / 2 组）──");

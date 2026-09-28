@@ -1640,6 +1640,7 @@ export default defineApp(async (sdk) => {
     setNodeMode: { drive: "canvas.setNodeMode", desc: "mute / bypass / 恢复正常", write: true },
     save: { drive: "canvas.save", desc: "把当前图落盘为工作流文件", write: true },
     undo: { drive: "canvas.undo", desc: "撤销 agent 上一步", write: true },
+    patch: { drive: "canvas.patch", desc: "意图级写：多编辑一次提交（edits），$引用/原子回滚/verify/dryRun", write: true },
     // 排布：把命令递交给前端扩展自己执行（默认走 node-organizer 插件）
     organize: { drive: "canvas.organize", desc: "调前端扩展已注册命令（默认 node-organizer.organize 自动排布；args.command 可换）", write: true },
   };
@@ -1683,6 +1684,10 @@ export default defineApp(async (sdk) => {
     if (spec.write && !readAllowWrite()) {
       throw new Error(`「${op}」会修改你的画布，当前未授权。请在 Hana-ComfyUI 设置页打开「允许 agent 修改画布」后再试。`);
     }
+    // patch：缺 edits 提前拦住（不浪费一次桥往返；结构细节校验仍以桥侧为准）
+    if (op === "patch" && (!args || !Array.isArray(args.edits) || args.edits.length === 0)) {
+      throw new Error("patch 需要 edits（编辑数组）");
+    }
     // 写入参数原样透传给桥（桥侧做具体校验）
     const bridgeArgs = {};
     for (const k of [
@@ -1704,6 +1709,9 @@ export default defineApp(async (sdk) => {
       "force",
       "file",
       "command",
+      "edits",
+      "verify",
+      "dryRun",
     ]) {
       if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
     }
@@ -1786,6 +1794,10 @@ export default defineApp(async (sdk) => {
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     } else if (op === "outline") {
       const s = JSON.stringify(outlineGraph(payload));
+      text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
+    } else if (op === "patch") {
+      // 成功与「事务失败（已回滚）」都走这里：结果在 data 层（ok 字段）
+      const s = JSON.stringify(payload);
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     } else if (op === "running") {
       text = payload && payload.runningNodeId != null ? `当前执行节点：#${payload.runningNodeId}` : "当前没有节点在执行。";
@@ -2017,9 +2029,10 @@ export default defineApp(async (sdk) => {
               "setNodeMode",
               "save",
               "undo",
+              "patch",
             ],
             description:
-              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass）；trace=追踪端口来源/去向；outline=大纲（功能块+块间连线）；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录。写（需授权）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步。多页面时用 workflow 参数定向（不传则广播）",
+              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass）；trace=追踪端口来源/去向；outline=大纲（功能块+块间连线）；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录。写（需授权）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步；patch=意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）。多页面时用 workflow 参数定向（不传则广播）",
           },
           workflow: { type: "string", description: "多页面定向：只发给正打开这个工作流名的页面（不传则广播给所有页面）" },
           select: { type: "string", description: "投影过滤：只保留匹配节点（#8 / #8,#27 / type=PrimitiveInt / title~尺寸，逗号分隔取并集）；与 fields 搭配替代全量 get" },
@@ -2037,6 +2050,12 @@ export default defineApp(async (sdk) => {
           slot: { description: "disconnect/trace 用：槽（名字或索引）" },
           dir: { type: "string", enum: ["up", "down"], description: "trace 用：up=直接来源（默认）/ down=直接去向" },
           mode: { type: "number", enum: [0, 2, 4], description: "setNodeMode 用：0=正常 / 2=mute / 4=bypass" },
+          edits: {
+            type: "array",
+            description: "patch 用：编辑数组（顺序执行，原子回滚）。每条恰一个 key，可用：addNode / setWidget / connect / disconnect / setNodeMode / removeNode / save（save 仅限最后一条）。示例：[{\"disconnect\":{\"nodeId\":8,\"slot\":\"width\"}},{\"addNode\":{\"type\":\"PrimitiveInt\",\"title\":\"宽度\",\"as\":\"w\"}},{\"setWidget\":{\"nodeId\":\"$w\",\"name\":\"value\",\"value\":1248}},{\"connect\":{\"fromNode\":\"$w\",\"fromSlot\":\"INT\",\"toNode\":8,\"toSlot\":\"width\"}},{\"save\":{}}]",
+          },
+          verify: { type: "boolean", description: "patch 用：执行后逐条对照终态（默认 true）" },
+          dryRun: { type: "boolean", description: "patch 用：只做预检、零图变更（默认 false）；输出逐条 checks" },
         },
       },
     ];
@@ -2051,7 +2070,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队）→ 返回 prompt_id 与任务卡，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停（op=status/start/stop）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass）/ trace 追踪端口来源/去向 / outline 大纲（功能块+块间连线）/ prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / undo 撤销 agent 上一步）——写入类 op 需用户在设置页开启「允许 agent 修改画布」，且需 ComfyUI 页面在线；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass）/ trace 追踪端口来源/去向 / outline 大纲（功能块+块间连线）/ prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun））——写入类 op 需用户在设置页开启「允许 agent 修改画布」，且需 ComfyUI 页面在线；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用任务卡或 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",

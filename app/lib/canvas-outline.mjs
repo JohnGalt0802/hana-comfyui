@@ -4,9 +4,11 @@
 // 「功能块 + 块间连线」的大纲。块识别两级（group 优先，角色兜底）：
 //   ① graph.groups 非空时：节点 pos=[x,y] 落在某 group 的 bounding=[bx,by,bw,bh] 内（含边界）
 //      → 归该组（落多个组取第一个；组名 = title，空则「组{i}」——i 为该组在 groups 中的
-//      序号、从 1 起）；无 pos / 不入任何组 → 走 ②。
+//      序号、从 1 起）。块名重名去重：按 groups 顺序命名，与「已用名」冲突时追加「#k」
+//      （k 从 2 起递增直到唯一）；空标题「组{i}」与角色块名同样纳入检查——保证块名唯一、
+//      块间边不因同名合并（方向信息不丢）。无 pos / 不入任何组 → 走 ②。
 //   ② 角色兜底（first-match，不区分大小写）：
-//      /Loader/ →「加载」；/TextEncode|TextGenerate|StringFormat/ →「文本」；
+//      /Loader|LoadImage/ →「加载」；/TextEncode|TextGenerate|StringFormat/ →「文本」；
 //      /Sampler|Scheduler|Guider|Noise/ →「采样」；/^(Save|Preview)/ →「输出」；其余 →「其他」。
 //      （第三级「标题规范」本期不做；角色表按使用反馈扩展。）
 //   输出：{op:"outline", rev, total:{nodes,links}, blockCount, blocks, blockEdges, issues}
@@ -19,7 +21,7 @@
 import { analyzeGraph } from "./canvas-analysis.mjs";
 
 const ROLE_RULES = [
-  [/Loader/i, "加载"],
+  [/Loader|LoadImage/i, "加载"],
   [/TextEncode|TextGenerate|StringFormat/i, "文本"],
   [/Sampler|Scheduler|Guider|Noise/i, "采样"],
   [/^(Save|Preview)/i, "输出"],
@@ -109,14 +111,29 @@ export function outlineGraph(graph) {
     roleBuckets.get(role).push(node);
   }
 
+  // 块名分配（按 groups 顺序）+ 重名去重：冲突时追加「#k」（k 从 2 起）；
+  // 空标题组「组{i}」与角色块名同样纳入「已用名」检查——保证块名唯一、块间边不因同名合并。
+  const usedNames = new Set();
+  const dedupName = (base) => {
+    let name = base;
+    let k = 2;
+    while (usedNames.has(name)) {
+      name = `${base}#${k}`;
+      k += 1;
+    }
+    usedNames.add(name);
+    return name;
+  };
   const rawBlocks = [];
-  for (const [gi, nodes] of groupBuckets) {
+  for (let gi = 0; gi < groups.length; gi++) {
+    const nodes = groupBuckets.get(gi);
+    if (!nodes) continue;
     const g = groups[gi] || {};
     const title = typeof g.title === "string" ? g.title.trim() : "";
-    rawBlocks.push({ name: title || `组${gi + 1}`, source: "group", nodes });
+    rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", nodes });
   }
   for (const [role, nodes] of roleBuckets) {
-    rawBlocks.push({ name: role, source: "role", nodes });
+    rawBlocks.push({ name: dedupName(role), source: "role", nodes });
   }
 
   // 块排序：按块内最小 node id 升序
