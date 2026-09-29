@@ -16,6 +16,9 @@
 //   POST /_relay/fs/read           读取文本/二进制（{path, encoding, maxBytes}，上限 8 MiB）
 //   POST /_relay/upload            读取本机图片并 multipart 上传到后端 /upload/image
 //                                  （{path, subfolder?, type?, overwrite?}）
+//   POST /_relay/submit-file      读本机工作流文件（或 userdata 模板）→ UI→API 转换 → 注入 inputs
+//                                  → 提交后端 /prompt，返回 {prompt_id, source, nodeCount, applied}
+//                                  （{path | template, inputs?, front?}；需 controlKey）
 //   GET  /_relay/theme             宿主主题写入状态（跨源主题跟随，见「主题同步」区）
 //   GET  /_relay/update            ComfyUI 本体更新检查（git fetch + 比较，带 TTL 缓存）
 //   POST /_relay/update            执行更新（{op:"check"|"apply"}；apply 后台跑，需 controlKey）
@@ -48,6 +51,7 @@ import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdir
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
+import { isPlainObject, convertUiToApi, applyInputs } from "../lib/workflow-tools.mjs";
 
 // ── 退出码 ──────────────────────────────────────────────────────────────────
 const EXIT = Object.freeze({ OK: 0, INTERNAL: 1, BACKEND: 2, USAGE: 3, PORT: 7 });
@@ -65,6 +69,7 @@ const FS_READ_MAX_BYTES = 8 * 1024 * 1024;
 const GPU_CACHE_MS = 4_000;        // nvidia-smi 采集缓存（子进程开销大，别按请求频率跑）
 const CPU_SAMPLE_MS = 1_500;       // CPU 采样节拍（按间隔算 delta，与客户端无关）
 const UPLOAD_MAX_BYTES = 64 * 1024 * 1024;
+const SUBMIT_FILE_MAX_BYTES = 64 * 1024 * 1024;  // submit-file 工作流读入上限（理智保护）
 const JSON_BODY_MAX_BYTES = 256 * 1024;
 const TRACKED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
 // 逐跳头（RFC 7230）：不向下游/上游透传
@@ -1970,6 +1975,148 @@ async function handleUpload(req, res) {
   }
 }
 
+// ── submit-file：中继侧直读直提（M13）───────────────────────────────────────
+// 存在理由：宿主对「app → 受管 runtime」fetch 隧道有硬限（请求 1 MiB / 响应 4 MiB），
+// 文件/template 形态的提交若把内容拉回 app 再送回，4MiB+ 工作流必挂（群友反馈）。
+// 这里让「读文件 → UI→API 转换 → inputs 注入 → /prompt 提交」全在中继侧完成，
+// 过隧道的只有小请求（路径/模板名）与小响应（prompt_id 等）。
+async function fetchBackendJson(path, timeoutMs = 15_000) {
+  const r = await fetch(`http://${backend.host}:${backend.port}${path}`, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* 保留 null，调用方按 ok 判定 */ }
+  return { status: r.status, ok: r.ok, data, text };
+}
+
+async function readBackendText(path, timeoutMs = 15_000) {
+  const r = await fetch(`http://${backend.host}:${backend.port}${path}`, {
+    headers: { accept: "*/*" },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await r.text();
+  return { status: r.status, ok: r.ok, text };
+}
+
+// 复刻 App 侧 loadTemplate 的查找与读取（同一 userdata/workflows 语义）
+async function resolveTemplateContent(name) {
+  const list = await fetchBackendJson("/userdata?dir=workflows&recurse=true&full_info=true", 15_000);
+  const items = list.ok && Array.isArray(list.data) ? list.data : [];
+  const target = items.find((i) => i && (
+    String(i.path) === name ||
+    String(String(i.path).split("/").pop()) === name ||
+    String(i.path).toLowerCase() === name.toLowerCase()
+  ));
+  if (!target) {
+    const avail = items.slice(0, 12).map((i) => i.path).join(" / ");
+    throw new Error(`userdata 工作流里找不到「${name}」。可用：${avail || "（空——请先在 ComfyUI 里保存一个工作流，或用「导出 API 格式」的文件路径）"}`);
+  }
+  const p = String(target.path).replace(/\\/g, "/");
+  const file = p.startsWith("workflows/") ? p : `workflows/${p}`;
+  const read = await readBackendText(`/userdata/${encodeURIComponent(file)}`, 15_000);
+  if (!read.ok) throw new Error(`读取模板内容失败（HTTP ${read.status}）：${target.path}`);
+  return { content: read.text, path: target.path };
+}
+
+async function handleSubmitFile(req, res) {
+  let body;
+  try { body = await readBodyJson(req, 2 * 1024 * 1024); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+  const pathArg = typeof body.path === "string" ? body.path.trim() : "";
+  const tplArg = typeof body.template === "string" ? body.template.trim() : "";
+  if (!pathArg && !tplArg) return jsonOut(res, 400, { ok: false, error: "需要 path（本机工作流文件）或 template（userdata 工作流名）" });
+  if (!backend.reachable) return jsonOut(res, 502, { ok: false, error: "backend_unreachable", detail: `ComfyUI ${backend.host}:${backend.port} 不可达` });
+
+  // 1) 取内容（path=本机文件直读；template=userdata 代读；均不过宿主隧道）
+  let raw = "";
+  let sourceLabel = "";
+  if (pathArg) {
+    const st = safeStat(pathArg);
+    if (!st.exists || !st.isFile) return jsonOut(res, 404, { ok: false, error: `文件不存在或不是普通文件：${pathArg}`, stat: st });
+    if (st.size > SUBMIT_FILE_MAX_BYTES) return jsonOut(res, 413, { ok: false, error: `文件超过 ${Math.round(SUBMIT_FILE_MAX_BYTES / 1024 / 1024)} MiB 上限`, size: st.size });
+    try { raw = readFileSync(pathArg, "utf8"); } catch (e) { return jsonOut(res, 500, { ok: false, error: `读取文件失败：${String((e && e.message) || e)}` }); }
+    sourceLabel = `file:${pathArg}`;
+  } else {
+    try {
+      const t = await resolveTemplateContent(tplArg);
+      raw = t.content;
+      sourceLabel = `userdata:${t.path}`;
+    } catch (e) { return jsonOut(res, 502, { ok: false, error: String((e && e.message) || e) }); }
+  }
+
+  // 2) 解析
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { return jsonOut(res, 400, { ok: false, error: `工作流文件不是合法 JSON：${sourceLabel}（${String((e && e.message) || e)}）` }); }
+
+  // 3) UI→API / API 直用
+  let prompt = null;
+  let source = "";
+  try {
+    if (Array.isArray(parsed.nodes)) {
+      const oi = await fetchBackendJson("/object_info", 12_000);
+      if (!oi.ok || !oi.data || typeof oi.data !== "object") throw new Error("读取 /object_info 失败（后端不可用）");
+      prompt = convertUiToApi(parsed, oi.data);
+      source = `${sourceLabel}（UI 格式已转换）`;
+    } else if (isPlainObject(parsed)) {
+      prompt = parsed;
+      source = `${sourceLabel}（API 格式）`;
+    } else {
+      return jsonOut(res, 400, { ok: false, error: `工作流文件结构无法识别：${sourceLabel}` });
+    }
+  } catch (e) { return jsonOut(res, 422, { ok: false, error: String((e && e.message) || e) }); }
+
+  if (!isPlainObject(prompt) || Object.keys(prompt).length === 0) {
+    return jsonOut(res, 400, { ok: false, error: "工作流为空或结构无法识别（需要 API 格式：{ \"<node_id>\": { class_type, inputs } }）" });
+  }
+
+  // 4) inputs 注入
+  let applied = [];
+  try { applied = applyInputs(prompt, body.inputs); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+
+  // 5) 提交后端（client_id 与 /ws 订阅一致，见 config.clientId）
+  const promptReq = { prompt, client_id: (config && config.clientId) || "comfyui-relay" };
+  if (body.front === true) promptReq.front = true;
+  let up;
+  try {
+    up = await fetch(`http://${backend.host}:${backend.port}/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(promptReq),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (e) {
+    stats.errors += 1;
+    markBackendDown(String((e && e.code) || (e && e.message) || e));
+    return jsonOut(res, 502, { ok: false, error: `提交到后端失败：${String((e && e.message) || e)}` });
+  }
+  const upText = await up.text();
+  let upData = null;
+  try { upData = JSON.parse(upText); } catch { /* 保留原文便于报错 */ }
+  if (!up.ok || !upData || typeof upData.prompt_id !== "string") {
+    stats.errors += 1;
+    const errObj = upData && isPlainObject(upData.error) ? upData.error : null;
+    const msg = errObj ? `${errObj.type || "error"}: ${String(errObj.message || "").slice(0, 400)}` : `后端 /prompt HTTP ${up.status}`;
+    log(`submit-file 提交被拒（${key2(sourceLabel)}）：${msg}`);
+    return jsonOut(res, 502, {
+      ok: false,
+      status: up.status,
+      error: msg,
+      ...(upData && upData.node_errors && Object.keys(upData.node_errors).length ? { node_errors: upData.node_errors } : {}),
+    });
+  }
+  log(`submit-file ${key2(sourceLabel)} → prompt ${upData.prompt_id}（nodes=${Object.keys(prompt).length}${applied.length ? `，注入 ${applied.length} 项` : ""}）`);
+  return jsonOut(res, 200, {
+    ok: true,
+    prompt_id: upData.prompt_id,
+    source,
+    nodeCount: Object.keys(prompt).length,
+    applied,
+    ...(upData.number !== undefined ? { number: upData.number } : {}),
+  });
+}
+
+
 // ── 服务器 ─────────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   const pathOnly = String(req.url || "/").split("?", 1)[0];
@@ -2307,6 +2454,20 @@ const server = http.createServer((req, res) => {
       return;
     }
     void handleHistory(req, res);
+    return;
+  }
+  if (pathOnly === "/_relay/submit-file") {
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    if (!controlOk(req)) {
+      jsonOut(res, 403, { error: "comfy-relay: control key required" });
+      return;
+    }
+    void handleSubmitFile(req, res).catch((e) => {
+      try { jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }); } catch { /* 忽略 */ }
+    });
     return;
   }
   if (pathOnly === "/_relay/fs/read" || pathOnly === "/_relay/fs/stat" || pathOnly === "/_relay/upload") {

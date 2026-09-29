@@ -1,4 +1,4 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.9
+# Hana-ComfyUI（v2 App，开发仓）· v0.10
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
@@ -81,6 +81,10 @@
   - **定向与健壮性（2026-09-28）**：多页面按工作流名定向（找不到明确报错、不误伤别页）；死条目 TTL 15min（过期条目不再截胡定向，全过期明确报 `no_live_page`；定向命中回包顺带刷新存活时间）。
   - 记录 `docs/M12-画布共驾-P1记录.md`；方案 `docs/画布共驾方案-20260926.md`、`docs/画布语义层-20260927.md`；全链验收 `docs/验收记录-画布语义层-全链-20260928.md`。
   - 边界：仅**源码安装**（Git 仓库）可代为更新；便携包/手工解压会明确回报“无法代为更新”。
+- **大工作流提交（M13 新增，2026-09-29）**：文件/template 形态的 submit 改走**中继侧直读直提**（`/_relay/submit-file`）——
+  读文件 → UI→API 转换 → inputs 注入 → `/prompt` 提交全在中继完成，绕开宿主 `sdk.runtime.fetch` 隧道的
+  请求 1 MiB / 响应 4 MiB 硬限；4MiB+ 工作流可直接提交（inline 对象形态走原链路）。共享逻辑 `lib/workflow-tools.mjs`（app/中继同源）；
+  方案 `docs/大工作流提交修复-20260929.md`；测试 `tools/m13-checks/test-submit-file.mjs`（中继级 13/13 + 宿主段 E2E 通过，2026-09-29）。
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok；画布共驾 + 语义层生效窗口验收全过（2026-09-28）
 

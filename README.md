@@ -4,13 +4,14 @@
 
 ## 当前状态
 
-**M0–M12 相继完成（M2.5/M2.6 能力扩容与回执修复 → M3–M11 体验迭代 → M12 画布共驾），app 可用并已按 v0.9 发布收口**；剩余人工验收见 `docs/待办与验收清单.md`：
+**M0–M13 相继完成（M2.5/M2.6 能力扩容与回执修复 → M3–M11 体验迭代 → M12 画布共驾 → M13 大工作流提交），app 可用并已按 v0.10 发布收口**；剩余人工验收见 `docs/待办与验收清单.md`：
 
 - 界面：整页工作区（`ui/workspace.html`）嵌入 ComfyUI 官方前端——iframe **直连 `127.0.0.1:8188`**（自定义节点扩展脚本的绝对路径也走通；主题跟随宿主）
 - 能力：`comfyui` 单工具 **10 动作**——`status / submit / query / result / cancel / workflows / upload / service / update / canvas`（`canvas` = 画布共驾面：读向投影·体检·追踪·大纲，写向 patch 事务与排布命令）
 - 任务：每次提交 = 宿主正式任务（`ctx.tasks`）+ 内联任务卡（`details.card`）+ **next-step 回执**（桌面会话；子代理会话受宿主限制不会自动回执，工具文案会如实标注）
 - 服务形态：**attach 模式**——连接外部运行中的 ComfyUI；左侧面板可**一键启动 / 停止**服务（计划任务拉起，独立于 Hana 存活；不托管其自启/自愈）
 - 画布共驾（v0.9）：agent 读/改**人正在看的同一张画布**——语义层 P1–P4（`get` 投影 / `check` 体检 / `trace` 追踪 / `outline` 大纲 / `patch` 意图级事务）已过生效窗口端到端验收；多页面按工作流定向 + 死条目 TTL；排布走 node-organizer（`organize` / `commands`）
+- 大工作流提交（M13，2026-09-29）：文件/template 形态的 `submit` 改走**中继侧直读直提**（`/_relay/submit-file`），绕开宿主 fetch 隧道的 1 MiB/4 MiB 硬限——4 MiB+ 工作流可直接提交（群友反馈问题的修复；方案 `docs/大工作流提交修复-20260929.md`）
 
 ## 目录结构
 

@@ -3,7 +3,7 @@ name: comfyui-hana
 description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端（iframe 直连 8188，自定义节点扩展可用）；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；工作区顶栏与左侧面板均可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；可自定义 ComfyUI 安装目录；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、自定义 ComfyUI 目录/ComfyUI 装在别处、自定义节点不显示/扩展脚本 403、帮我安装 ComfyUI、未检测到 ComfyUI 环境。
 ---
 
-# Hana-ComfyUI（v0.9）
+# Hana-ComfyUI（v0.10）
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 Hana 的 v2 App。环境不存在时工作区会弹安装引导（选位置 → 让助手装 / 复制指令 / 自行安装）。
 
@@ -93,7 +93,7 @@ comfyui(action="...", ...)
 | action | 必填 | 语义 | 关键返回 |
 |---|---|---|---|
 | `status` | — | 服务/中继/队列/运行中任务聚合 | 文本摘要 + `details.comfyui.{phase,backend,queue,events,jobs}` |
-| `submit` | `workflow` | 提交工作流三形态（见下）；`inputs` 注入；`clientLabel`；`front` | `details.comfyui.{promptId,taskId,bridge}` + `details.card`（任务卡） |
+| `submit` | `workflow` | 提交工作流三形态（见下；文件/template 形态走**中继直读直提**，支持 4MiB+ 大文件）；`inputs` 注入；`clientLabel`；`front` | `details.comfyui.{promptId,taskId,bridge}` + `details.card`（任务卡） |
 | `query` | — | `promptId`/`taskId` 查单任务；都不给则列最近 | 状态/进度/错误摘要 |
 | `result` | — | `promptId`/`taskId` 取产物：本地路径 + 预览 URL；`stage:true` 尝试入会话文件 | 路径列表 |
 | `cancel` | — | `promptId`/`taskId` 定向取消（排队中→删除；执行中→定向中断）；`all:true` 才全清 | 模式说明 |
@@ -107,6 +107,8 @@ comfyui(action="...", ...)
 1. **API 格式 JSON 对象**：`{"3": {"class_type": "KSampler", "inputs": {...}}, ...}` —— 最稳。
 2. **文件路径字符串**：本机 `.json`；API 格式直接用；**UI 格式**（含 `nodes` 数组）会尝试自动转换（见下）。
 3. **`{"template": "名称"}`**：从 ComfyUI `userdata/workflows` 取（先 `action=workflows` 看有哪些）。
+
+**大文件说明（2026-09-29 M13 起）**：文件路径 / template 两形态由**中继侧直读直提**——读文件 → UI→API 转换 → 注入 → 提交全部在中继完成，**不受宿主通道大小限制**，4MiB+ 的 UI 格式工作流可直接提交（经典图）。仅 inline 对象形态仍走原提交链路（大对象建议落盘后传路径）。旧行为（大文件报 `Managed service response exceeds the 4 MiB limit.`）已修复。
 
 **inputs 注入**：键为 `"<node_id>.<input>"`，如 `{"3.seed": 42, "6.text": "a cat"}`。节点 id 与输入名用 `action=workflows,name=...` 的摘要定位。
 
@@ -172,6 +174,7 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
 | `后端不可达` | 先走上文「环境不存在时」三步侦察 | attach 模式：中继常驻并持续探测，恢复即可用；未装/未启动时按引导流程处理 |
 | submit 报 `node_errors` | `action=workflows` 核对节点/输入名 | ComfyUI 的节点校验错误原文在报错里 |
 | submit 报"UI→API 转换遇到不支持的构造" | 是否子图/静音节点 | 导出 API 格式再提交 |
+| submit 报 `Managed service response exceeds the 4 MiB limit.` | 宿主副本是否为 v0.10+ | 旧版行为（文件/template 拿到大文件后经宿主通道拉回，超 4MiB 被拒）；M13 起这两种形态走中继直读直提，不再受限；若仍复现，检查宿主副本是否已同步 + reload（见 `docs/大工作流提交修复-20260929.md`） |
 | 任务卡缩略图不显示 | 卡的凭据段 | 预览走 `_surface` 凭据路径；老卡或非卡环境可能 403 |
 | `result` 说"尚未完成" | 历史未落 | 等几秒重试，或先 `query` 看状态 |
 | 提交后没有自动回执 | `query` 的“投递”行 | 桌面会话：`published` = 等下一个输入点送达；子代理会话：永不自动送达，改用 query/result 主动取 |

@@ -23,12 +23,13 @@ import { join } from "node:path";
 import { projectGraph } from "./lib/canvas-project.mjs";
 import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
 import { outlineGraph } from "./lib/canvas-outline.mjs";
+import { isPlainObject, convertUiToApi, applyInputs, summarizeWorkflow } from "./lib/workflow-tools.mjs";
 
 const APP_ID = "comfyui-hana";
 // v0.6.0（M9）：ComfyUI 服务进程起停（中继 /_relay/backend/{start,stop,proc} + App 路由 + 工具 action=service
 //   + 左侧面板「启动服务/停止服务」）。启动走计划任务（脱离宿主沙箱 job，服务独立存活），撤下走 taskkill。
 //   面板原来那个「重试启动」正名为「重启中继」——它只重启受管 runtime，不碰 ComfyUI 服务本体。
-const APP_VERSION = "0.9.0";
+const APP_VERSION = "0.10.0";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
@@ -759,12 +760,8 @@ export default defineApp(async (sdk) => {
   }
 
   // ── 工作流解析（三形态 + inputs 注入）────────────────────────────────────
-  function isPlainObject(v) {
-    return v !== null && typeof v === "object" && !Array.isArray(v);
-  }
-
-  const NOTE_TYPES = new Set(["Note", "MarkdownNote"]);
-  const UNSUPPORTED_UI_TYPES = new Set(["Reroute", "PrimitiveNode", "Subgraph", "GroupNode", "SubgraphInputNode", "SubgraphOutputNode"]);
+  // isPlainObject / NOTE_TYPES / UNSUPPORTED_UI_TYPES / convertUiToApi / applyInputs / summarizeWorkflow
+  // 已移至 lib/workflow-tools.mjs（app 与中继共享，2026-09-29 M13）；见顶部 import。
 
   async function getObjectInfo() {
     const { ok, data } = await relayJson("/object_info", { timeoutMs: 30_000 });
@@ -772,68 +769,7 @@ export default defineApp(async (sdk) => {
     return data;
   }
 
-  // UI 格式（nodes/links）→ API 格式：经典图子集（子图/环绕/静音/旁路节点会明确报错）
-  function convertUiToApi(wf, objectInfo) {
-    const nodes = Array.isArray(wf.nodes) ? wf.nodes : null;
-    if (!nodes) throw new Error("不是 UI 格式工作流（缺 nodes 数组）");
-    const linkById = new Map();
-    if (Array.isArray(wf.links)) {
-      for (const l of wf.links) {
-        if (Array.isArray(l) && l.length >= 6) linkById.set(l[0], { origin: l[1], originSlot: l[2] });
-      }
-    }
-    const out = {};
-    const problems = [];
-    for (const n of nodes) {
-      if (!n || typeof n !== "object") continue;
-      const type = String(n.type || "");
-      if (NOTE_TYPES.has(type)) continue;
-      if (n.mode === 2 || n.mode === 4) { problems.push(`节点 #${n.id} ${type} 处于静音/旁路状态`); continue; }
-      if (UNSUPPORTED_UI_TYPES.has(type) || /^[0-9a-fA-F-]{20,}$/.test(type)) {
-        problems.push(`节点 #${n.id} 类型 ${type}（子图/环绕节点）`);
-        continue;
-      }
-      const info = objectInfo[type];
-      if (!info) { problems.push(`节点 #${n.id} 类型 ${type} 不在 /object_info`); continue; }
-      const declared = [
-        ...Object.keys(info.input?.required || {}),
-        ...Object.keys(info.input?.optional || {}),
-      ];
-      const nodeInputs = Array.isArray(n.inputs) ? n.inputs : [];
-      const wv = Array.isArray(n.widgets_values) ? [...n.widgets_values] : [];
-      let wvi = 0;
-      const inputs = {};
-      for (const name of declared) {
-        const slot = nodeInputs.find((s) => s && s.name === name);
-        if (slot && slot.link !== null && slot.link !== undefined) {
-          const link = linkById.get(slot.link);
-          if (!link) { problems.push(`节点 #${n.id} 输入 ${name} 的连线缺失（link ${slot.link}）`); continue; }
-          inputs[name] = [String(link.origin), link.originSlot];
-          continue;
-        }
-        const spec = (info.input?.required || {})[name] || (info.input?.optional || {})[name];
-        if (!spec) continue;
-        const t = Array.isArray(spec[0]) ? "COMBO" : String(spec[0]);
-        const isWidget = ["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"].includes(t);
-        const forceInput = !!(spec[1] && spec[1].forceInput === true);
-        if (!isWidget || forceInput) continue;
-        let val;
-        if (wvi < wv.length) val = wv[wvi++];
-        if ((name === "seed" || name === "noise_seed") && wvi < wv.length && typeof wv[wvi] === "string" &&
-            ["fixed", "increment", "decrement", "randomize"].includes(wv[wvi])) {
-          wvi += 1; // 跳过 control_after_generate 副值
-        }
-        if (isPlainObject(val) && "value" in val) val = val.value;
-        if (val !== undefined) inputs[name] = val;
-      }
-      out[String(n.id)] = { class_type: type, inputs };
-      if (typeof n.title === "string" && n.title) out[String(n.id)]._meta = { title: n.title };
-    }
-    if (problems.length) {
-      throw new Error(`UI→API 转换遇到不支持的构造：${problems.slice(0, 6).join("；")}${problems.length > 6 ? " 等" : ""}。请在 ComfyUI 里用「工作流 → 导出（API 格式）」拿到 API JSON 后再提交。`);
-    }
-    return out;
-  }
+  // convertUiToApi 已移至 lib/workflow-tools.mjs（app 与中继共享，2026-09-29 M13）
 
   async function readLocalText(path) {
     const { status, ok, data } = await relayJson("/_relay/fs/read", { method: "POST", body: JSON.stringify({ path }) });
@@ -899,39 +835,7 @@ export default defineApp(async (sdk) => {
     throw new Error("workflow 需要：API 格式 JSON 对象 / 文件路径字符串 / {template:\"名称\"}");
   }
 
-  function applyInputs(prompt, inputs) {
-    const applied = [];
-    if (!inputs) return applied;
-    if (!isPlainObject(inputs)) throw new Error("inputs 需要对象：{\"<node_id>.<input>\": value}");
-    for (const [key, value] of Object.entries(inputs)) {
-      const i = key.lastIndexOf(".");
-      if (i <= 0) throw new Error(`inputs 键格式应为 "<node_id>.<input>"：${key}`);
-      const nodeId = key.slice(0, i);
-      const inputName = key.slice(i + 1);
-      const node = prompt[nodeId];
-      if (!node || !isPlainObject(node)) {
-        throw new Error(`inputs 注入失败：节点 ${nodeId} 不存在（现有节点 id：${Object.keys(prompt).slice(0, 30).join(", ")}）`);
-      }
-      node.inputs = isPlainObject(node.inputs) ? node.inputs : {};
-      node.inputs[inputName] = value;
-      applied.push(key);
-    }
-    return applied;
-  }
-
-  function summarizeWorkflow(parsed) {
-    if (Array.isArray(parsed?.nodes)) {
-      const nodes = parsed.nodes
-        .filter((n) => n && !NOTE_TYPES.has(String(n.type)))
-        .map((n) => ({ id: n.id, type: n.type, title: n.title || undefined }));
-      return { format: "ui", nodeCount: nodes.length, nodes };
-    }
-    if (isPlainObject(parsed)) {
-      const nodes = Object.entries(parsed).map(([id, n]) => ({ id, type: n?.class_type, title: n?._meta?.title || undefined }));
-      return { format: "api", nodeCount: nodes.length, nodes };
-    }
-    return { format: "unknown", nodeCount: 0, nodes: [] };
-  }
+  // applyInputs / summarizeWorkflow 已移至 lib/workflow-tools.mjs（app 与中继共享，2026-09-29 M13）
 
   // ── 任务卡数据 ────────────────────────────────────────────────────────────
   function jobSummary(job) {
@@ -1143,26 +1047,64 @@ export default defineApp(async (sdk) => {
 
   // ── 工具动作实现 ──────────────────────────────────────────────────────────
   async function actionSubmit(args, context) {
-    const { prompt, source } = await resolveWorkflowToPrompt(args.workflow);
-    if (!isPlainObject(prompt) || Object.keys(prompt).length === 0) {
-      throw new Error("工作流为空或结构无法识别（需要 API 格式：{ \"<node_id>\": { class_type, inputs } }）");
-    }
-    const applied = applyInputs(prompt, args.inputs);
-    const label = String(args.clientLabel || "").trim().slice(0, 120) || `ComfyUI 生成（${Object.keys(prompt).length} 节点）`;
-
-    const body = { prompt, client_id: state.clientId || RELAY_CLIENT_ID_PREFIX };
-    if (args.front === true) body.front = true;
-    const { ok, status, data } = await relayJson("/prompt", { method: "POST", body: JSON.stringify(body), timeoutMs: 30_000 });
-    if (!ok) {
-      const errObj = data && isPlainObject(data.error) ? data.error : null;
-      const msg = errObj ? `${errObj.type || "error"}: ${String(errObj.message || "").slice(0, 400)}` : `HTTP ${status}`;
-      const nodeErrors = data && data.node_errors && Object.keys(data.node_errors).length
-        ? `；node_errors: ${JSON.stringify(data.node_errors).slice(0, 700)}`
+    // ── 分流（2026-09-29，M13）────────────────────────────────────────────
+    // 文件 / template 形态 → 中继侧直读直提（/_relay/submit-file）：大数据不过宿主
+    //   runtime.fetch 隧道（其请求 1 MiB / 响应 4 MiB 为宿主硬限，见 docs/大工作流提交修复-20260929.md）。
+    // inline 对象形态 → 原链路（内容已在内存，走 /prompt）。
+    const wfArg = args.workflow;
+    const wfPath = typeof wfArg === "string" ? wfArg.trim() : "";
+    const wfTemplate =
+      isPlainObject(wfArg) && typeof wfArg.template === "string" && Object.keys(wfArg).length === 1
+        ? wfArg.template.trim()
         : "";
-      throw new Error(`提交失败（${msg}）${nodeErrors}`);
+
+    let promptId = null;
+    let source = "";
+    let applied = [];
+    let nodeCount = 0;
+
+    if (wfPath || wfTemplate) {
+      const reqBody = {
+        ...(wfPath ? { path: wfPath } : { template: wfTemplate }),
+        ...(args.inputs !== undefined ? { inputs: args.inputs } : {}),
+        ...(args.front === true ? { front: true } : {}),
+      };
+      const { ok, status, data } = await relayJson("/_relay/submit-file", { method: "POST", body: JSON.stringify(reqBody), timeoutMs: 30_000 });
+      if (!ok || !data || data.ok !== true || typeof data.prompt_id !== "string") {
+        const detail = data && (data.error || data.detail) ? String(data.error || data.detail) : `HTTP ${status}`;
+        const nodeErrors = data && data.node_errors && Object.keys(data.node_errors).length
+          ? `；node_errors: ${JSON.stringify(data.node_errors).slice(0, 700)}`
+          : "";
+        throw new Error(`提交失败（${detail}）${nodeErrors}`);
+      }
+      promptId = data.prompt_id;
+      source = String(data.source || (wfPath ? `file:${wfPath}` : `userdata:${wfTemplate}`));
+      applied = Array.isArray(data.applied) ? data.applied : [];
+      nodeCount = Number(data.nodeCount) || 0;
+    } else {
+      const { prompt, source: src } = await resolveWorkflowToPrompt(wfArg);
+      if (!isPlainObject(prompt) || Object.keys(prompt).length === 0) {
+        throw new Error("工作流为空或结构无法识别（需要 API 格式：{ \"<node_id>\": { class_type, inputs } }）");
+      }
+      const appliedList = applyInputs(prompt, args.inputs);
+      const body = { prompt, client_id: state.clientId || RELAY_CLIENT_ID_PREFIX };
+      if (args.front === true) body.front = true;
+      const { ok, status, data } = await relayJson("/prompt", { method: "POST", body: JSON.stringify(body), timeoutMs: 30_000 });
+      if (!ok) {
+        const errObj = data && isPlainObject(data.error) ? data.error : null;
+        const msg = errObj ? `${errObj.type || "error"}: ${String(errObj.message || "").slice(0, 400)}` : `HTTP ${status}`;
+        const nodeErrors = data && data.node_errors && Object.keys(data.node_errors).length
+          ? `；node_errors: ${JSON.stringify(data.node_errors).slice(0, 700)}`
+          : "";
+        throw new Error(`提交失败（${msg}）${nodeErrors}`);
+      }
+      promptId = data && typeof data.prompt_id === "string" ? data.prompt_id : null;
+      if (!promptId) throw new Error(`后端未返回 prompt_id：${JSON.stringify(data).slice(0, 300)}`);
+      source = src;
+      applied = appliedList;
+      nodeCount = Object.keys(prompt).length;
     }
-    const promptId = data && typeof data.prompt_id === "string" ? data.prompt_id : null;
-    if (!promptId) throw new Error(`后端未返回 prompt_id：${JSON.stringify(data).slice(0, 300)}`);
+    const label = String(args.clientLabel || "").trim().slice(0, 120) || `ComfyUI 生成（${nodeCount} 节点）`;
 
     const job = newJob(promptId, label);
 
