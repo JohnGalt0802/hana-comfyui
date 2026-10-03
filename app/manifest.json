@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "comfyui-hana",
   "name": "Hana-ComfyUI",
-  "version": "0.10.0",
-  "description": "把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区内嵌官方前端（工作区 iframe 直连 127.0.0.1:8188，自定义节点扩展脚本的绝对路径也走通），comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）/本体更新（update）/画布共驾（canvas：读改人正在看的同一张画布——投影·体检·追踪·大纲·patch 事务·排布命令·多页面定向），生成即宿主任务（含任务卡与回执）；左侧状态面板带 GPU/CPU/内存实时图表、「释放显存」与「启动/停止 ComfyUI 服务」按钮，工作区顶栏常驻服务控制；可自定义 ComfyUI 安装目录（探测/手填），服务由计划任务拉起，独立于 Hana 存活；源码安装可检查/一键更新 ComfyUI 本体（git pull --ff-only + pip install，更新前自动停服务）；未装 ComfyUI 时提供安装引导（选位置 → 让助手装 / 复制指令 / 自行安装）。",
+  "version": "0.11.0",
+  "description": "把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区内嵌官方前端（工作区 iframe 直连 127.0.0.1:8188，自定义节点扩展脚本的绝对路径也走通），comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service：拉起前环境检查，其他模型占卡/端口残留 → 处理卡；含 wait 轮询就绪）/本体更新（update）/画布共驾（canvas：读改人正在看的同一张画布——投影·体检·追踪·大纲·patch 事务·排布命令·多页面定向），生成即宿主任务（含任务卡与回执）；左侧状态面板带 GPU/CPU/内存实时图表、「释放显存」与「启动/停止 ComfyUI 服务」按钮，工作区顶栏常驻服务控制；可自定义 ComfyUI 安装目录（探测/手填），服务由计划任务拉起，独立于 Hana 存活；源码安装可检查/一键更新 ComfyUI 本体（git pull --ff-only + pip install，更新前自动停服务）；未装 ComfyUI 时提供安装引导（选位置 → 让助手装 / 复制指令 / 自行安装）。",
   "entry": "index.js",
   "icon": "assets/icon.png",
   "minAppVersion": "0.1013.0",
@@ -68,6 +68,16 @@
         "title": "ComfyUI 任务卡",
         "description": "单次生成任务的进度卡：状态/队列位/耗时/产物缩略（数据经 /comfyui-hana/task 路由）",
         "route": "/task.html",
+        "cardForm": "flush",
+        "face": {
+          "image": "assets/cover.png"
+        }
+      },
+      {
+        "id": "envcheck",
+        "title": "ComfyUI 服务检查卡",
+        "description": "拉起前的环境检查（GPU 占用 / 8188 残留）：列出阻断进程，重试 / 清除其他进程 / 取消（数据经 /comfyui-hana/backend/* 路由）",
+        "route": "/envcheck.html",
         "cardForm": "flush",
         "face": {
           "image": "assets/cover.png"

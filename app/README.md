@@ -1,4 +1,4 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.10
+# Hana-ComfyUI（v2 App，开发仓）· v0.11
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
@@ -26,6 +26,12 @@
   会随中继退出被回收（detached 也逃不出），走计划任务才**独立于 Hana 存活**；撤下走 `taskkill /T /F`（受限令牌实测可终止）；
   中继新增 `/_relay/backend/{start,stop,proc}`，App 新增路由 `backend/start|stop|backend`；服务日志 `app-data/comfyui-hana/logs/backend.log`；
   同时把面板原「重试启动」正名为「重启中继」（它只重启受管 runtime，与 ComfyUI 服务本体是两件事）
+- 拉起服务（T2）：service 增 `envcheck` / `clear` / `wait` 三个 op——
+  环境检查（GPU 计算进程分类：自身/阻断/其他；8188 端口探测；nvidia-smi 不可用降级为警告；产出 180s 一次性快照）；
+  精准清理（只认快照，逐项复核 pid+启动时间+映像名，列表外全拒，清后 2–3s 复查不循环杀）；
+  等待就绪（单次 ≤25s 轮询，总时限 120–150s，超时只报不杀）。
+  `op=start` 前自动 envcheck：有阻断（如 llama-server 占 GPU）暂缓拉起并挂「环境检查卡」（`ui/envcheck.html`，按钮直接 POST 路由）；
+  启动去重（in-flight + state 文件 + 计划任务兜底）。中继新增 `/_relay/backend/{envcheck,clear,wait}`。
 - 工作区直连 + 服务控制 + 安装目录（v0.7 新增，M10）：
   - **工作区 iframe 直连 `127.0.0.1:8188`**（auto/direct 默认；manifest 新增 `ui.csp.frameDomains` 放行）。
     原因：自定义节点的扩展脚本习惯用**绝对路径**（`/extensions/<node>/*.js`、`/scripts/app.js`、`/scripts/ui.js`），

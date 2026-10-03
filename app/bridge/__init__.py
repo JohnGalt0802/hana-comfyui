@@ -64,7 +64,7 @@ except ValueError:
 
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
-BRIDGE_BUILD_TAG = "2026-09-28 hana-bridge-28105930"
+BRIDGE_BUILD_TAG = "2026-10-03 hana-bridge-03131827"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -77,7 +77,7 @@ _frontends = {}
 # 为何缓在服务端：人与 agent 的对话不是持续态，agent 多半在「宿主聊天页」对话、
 # ComfyUI 页面并不开着；缓一份在服务端，agent 就随时拿得到「手边快照」，
 # 不依赖「此刻页面在线」。
-_state = {"at": None, "ts": None, "revision": None, "summary": None, "sid": None}
+_state = {"at": None, "ts": None, "revision": None, "summary": None, "sid": None, "copilot": None}
 
 # ── 前端账本过期判定（TTL，2026-09-28 补缺）─────────────────────────────
 # 背景：页面关闭/冻结后不再上报，_frontends 条目不清理（无 TTL）；按 workflow 名
@@ -225,6 +225,21 @@ def _state_age_sec():
         return None
 
 
+def _copilot_brief(raw):
+    """前端上报的 copilot 状态（共驾契约 §2：{enabled, pageKey?, updatedAt}，字段名冻结）。"""
+    if not isinstance(raw, dict):
+        return None
+    page_key = raw.get("pageKey")
+    if isinstance(page_key, str):
+        page_key = page_key.strip() or None
+    else:
+        page_key = None
+    updated = raw.get("updatedAt")
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+        updated = 0
+    return {"enabled": bool(raw.get("enabled")), "pageKey": page_key, "updatedAt": updated}
+
+
 def _state_payload():
     return {
         "at": _state["at"],
@@ -233,6 +248,7 @@ def _state_payload():
         "summary": _state["summary"],
         "sid": _state["sid"],
         "hasState": _state["summary"] is not None,
+        "copilot": _state.get("copilot"),
     }
 
 
@@ -393,6 +409,9 @@ if _ROUTES is not None:
         summary = data.get("summary")
         if not isinstance(summary, dict):
             return web.json_response({"ok": False, "error": "missing_summary"}, status=400)
+        # copilot（契约 §2）：仅当本次上报携带该字段时更新（旧页面不带 = 不冲刷已有值）
+        if "copilot" in data:
+            _state["copilot"] = _copilot_brief(data.get("copilot"))
         _state.update(
             {
                 "at": data.get("at"),

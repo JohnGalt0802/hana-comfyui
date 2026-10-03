@@ -58,7 +58,14 @@ const EXIT = Object.freeze({ OK: 0, INTERNAL: 1, BACKEND: 2, USAGE: 3, PORT: 7 }
 
 // ── 常量 ────────────────────────────────────────────────────────────────────
 const PROBE_INTERVAL_MS = 5_000;   // 后端被动探测节拍
-const PROBE_TIMEOUT_MS = 3_000;
+// 探测超时（2026-09-29 修复）：3s→5s。"生图中假性不可达"事件中，后端在重负载下
+// /system_stats 迟滞为 3–9s 量级；5s 可直接吞掉 3–5s 档、配合「连续 2 次」去抖后需
+// ~10s 以上持续迟滞才翻转；连接拒绝类（真宕机）仍单次即报，不受影响。
+const PROBE_TIMEOUT_MS = 5_000;
+// 「慢」类失败（超时）连续 N 次才翻「不可达」；「死」类（拒绝/重置等）单次即翻。
+const PROBE_SLOW_FAIL_THRESHOLD = 2;
+// 近期探测耗时（ms）保留条数（供 /_relay/status 观测）。
+const PROBE_RECENT_MAX = 20;
 const QUEUE_CACHE_MS = 1_000;
 const WS_HANDSHAKE_TIMEOUT_MS = 10_000;
 const WS_RETRY_MS = 2_000;
@@ -139,6 +146,9 @@ const backend = {
   checkedAt: 0,
   lastError: null,
   system: null,
+  probeInFlight: false,   // 探测防重入（超时 5s ≥ 节拍 5s，避免叠加）
+  probeSlowStreak: 0,     // 「慢」类失败（超时）连续计数（成功清零）
+  probeRecentMs: [],      // 近期探测耗时（ms，含失败），上限 PROBE_RECENT_MAX
 };
 let queueInfo = null;
 let queueAt = 0;
@@ -367,6 +377,19 @@ function copyResponseHeaders(rawHeaders) {
 }
 
 // ── 后端探测 / 状态聚合 ────────────────────────────────────────────────────
+// 探测失败分类（2026-09-29 修复）：区分「慢」与「死」两类。
+//   "slow" = 超时（后端忙/迟滞）——允许单次误超时，连续 PROBE_SLOW_FAIL_THRESHOLD 次才翻「不可达」；
+//   "dead" = 连接拒绝/重置/其它网络错/HTTP 非 2xx——立即翻（保持原行为，真宕机不迟报）。
+function classifyProbeError(e) {
+  if (e && e.name === "TimeoutError") return "slow";
+  return "dead";
+}
+
+function recordProbeLatency(ms) {
+  backend.probeRecentMs.push(ms);
+  if (backend.probeRecentMs.length > PROBE_RECENT_MAX) backend.probeRecentMs.shift();
+}
+
 function markBackendDown(errText) {
   const was = backend.reachable;
   backend.reachable = false;
@@ -376,12 +399,16 @@ function markBackendDown(errText) {
 }
 
 async function probeBackend() {
+  if (backend.probeInFlight) return; // 防重入：上一条探测未完成时跳过本轮
+  backend.probeInFlight = true;
+  const startedMs = Date.now();
   try {
     const res = await fetch(`http://${backend.host}:${backend.port}/system_stats`, {
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       headers: { accept: "application/json" },
     });
     if (!res.ok) {
+      backend.probeSlowStreak = 0;
       markBackendDown(`/system_stats HTTP ${res.status}`);
       return;
     }
@@ -390,10 +417,26 @@ async function probeBackend() {
     backend.reachable = true;
     backend.lastError = null;
     backend.checkedAt = Date.now();
+    backend.probeSlowStreak = 0;
     backend.system = data && typeof data === "object" ? extractSystem(data) : null;
     if (!was) log(`后端 ${backend.host}:${backend.port} 可达（ComfyUI ${backend.system?.comfyui_version || "?"}）`);
+    if (backendProc.starting) { backendProc.starting = false; saveBackendState(); }
+    if (startInFlight) startInFlight = null;
   } catch (e) {
-    markBackendDown(e && e.name === "TimeoutError" ? "探测超时" : String((e && e.message) || e));
+    if (classifyProbeError(e) === "slow") {
+      backend.probeSlowStreak += 1;
+      if (backend.reachable && backend.probeSlowStreak >= PROBE_SLOW_FAIL_THRESHOLD) {
+        markBackendDown(`探测超时（连续 ${backend.probeSlowStreak} 次）`);
+      } else {
+        backend.checkedAt = Date.now(); // 未达阈值：不翻状态（单次超时属负载抖动）
+      }
+    } else {
+      backend.probeSlowStreak = 0;
+      markBackendDown(String((e && e.message) || e));
+    }
+  } finally {
+    backend.probeInFlight = false;
+    recordProbeLatency(Date.now() - startedMs);
   }
 }
 
@@ -652,9 +695,12 @@ const backendProc = {
   mainPy: null,
   launcher: null,
   logFile: null,
+  starting: false,        // 启动中标志（写入 state 文件，中继重启后可恢复）
+  lastStartResult: null,  // 最近一次启动受理结果 {at, ok, accepted|error}
   lastError: null,
   lastStop: null,
 };
+let startInFlight = null;   // 本进程内 in-flight 启动时间戳（去重用，兜底 state/计划任务）
 let pidCache = { at: 0, pids: [] };
 
 function backendStatePath() {
@@ -668,6 +714,8 @@ function loadBackendState() {
     for (const k of ["startedAt", "install", "python", "mainPy", "launcher", "logFile"]) {
       if (raw && typeof raw[k] === "string" && raw[k]) backendProc[k] = raw[k];
     }
+    if (raw && typeof raw.starting === "boolean") backendProc.starting = raw.starting;
+    if (raw && raw.lastStartResult !== undefined) backendProc.lastStartResult = raw.lastStartResult;
   } catch { /* 首次运行没有状态文件，正常 */ }
 }
 
@@ -742,10 +790,22 @@ function resolveLaunchTarget(overridePath) {
 }
 
 async function startBackendService(overridePath) {
-  if (backend.reachable) return { ok: true, already: true, reachable: true, url: `http://${backend.host}:${backend.port}` };
+  const baseUrl = `http://${backend.host}:${backend.port}`;
+  if (backend.reachable) return { ok: true, already: true, reachable: true, state: "ready", url: baseUrl };
+  // 去重（三路 start 都走本入口）：in-flight → state 文件标记 → 计划任务 Running 兜底
+  const dedup = detectStarting();
+  if (dedup.starting) {
+    return {
+      ok: true, already: true, starting: true, state: "starting",
+      detail: dedup.detail, startedAt: dedup.startedAt || backendProc.startedAt,
+      logFile: backendProc.logFile, url: baseUrl,
+    };
+  }
   const t = resolveLaunchTarget(overridePath);
   if (!t.ok) {
     backendProc.lastError = "未找到可启动的 ComfyUI 安装（缺 main.py 或缺 venv python）";
+    backendProc.starting = false;
+    backendProc.lastStartResult = { at: new Date().toISOString(), ok: false, error: backendProc.lastError };
     saveBackendState();
     return { ok: false, error: backendProc.lastError, tried: t.tried, roots: t.roots };
   }
@@ -788,6 +848,8 @@ async function startBackendService(overridePath) {
     if (useVbs) writeFileSync(launcherVbs, vbsScript, "utf8");
   } catch (e) {
     backendProc.lastError = `启动器写入失败：${(e && e.message) || e}`;
+    backendProc.starting = false;
+    backendProc.lastStartResult = { at: new Date().toISOString(), ok: false, error: backendProc.lastError };
     saveBackendState();
     return { ok: false, error: backendProc.lastError };
   }
@@ -799,6 +861,8 @@ async function startBackendService(overridePath) {
   const cr = runExe("schtasks.exe", ["/create", "/tn", BACKEND_TASK_NAME, "/tr", taskCommand, "/sc", "once", "/st", "00:00", "/f"], 20_000);
   if (cr.code !== 0) {
     backendProc.lastError = `计划任务创建失败：${cr.stderr || cr.error || `exit ${cr.code}`}`;
+    backendProc.starting = false;
+    backendProc.lastStartResult = { at: new Date().toISOString(), ok: false, error: backendProc.lastError };
     saveBackendState();
     logErr(`启动 ComfyUI 服务失败：${backendProc.lastError}`);
     return { ok: false, error: backendProc.lastError, launcher };
@@ -806,6 +870,8 @@ async function startBackendService(overridePath) {
   const rr = runExe("schtasks.exe", ["/run", "/tn", BACKEND_TASK_NAME], 20_000);
   if (rr.code !== 0) {
     backendProc.lastError = `计划任务启动失败：${rr.stderr || rr.error || `exit ${rr.code}`}`;
+    backendProc.starting = false;
+    backendProc.lastStartResult = { at: new Date().toISOString(), ok: false, error: backendProc.lastError };
     saveBackendState();
     logErr(`启动 ComfyUI 服务失败：${backendProc.lastError}`);
     return { ok: false, error: backendProc.lastError, launcher };
@@ -817,6 +883,9 @@ async function startBackendService(overridePath) {
   backendProc.mainPy = t.mainPy;
   backendProc.launcher = launcher;
   backendProc.logFile = logFile;
+  backendProc.starting = true;          // 启动中：供去重与「排除自身」窗口使用
+  backendProc.lastStartResult = { at: backendProc.startedAt, ok: true, accepted: true };
+  startInFlight = Date.now();
   backendProc.lastError = null;
   saveBackendState();
   pidCache = { at: 0, pids: [] };
@@ -859,6 +928,8 @@ async function stopBackendService() {
     else failed.push({ pid, error: r.stderr || r.error || `exit ${r.code}` });
   }
   runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000); // 顺手清理启动器任务
+  backendProc.starting = false;
+  startInFlight = null;
   await new Promise((r) => setTimeout(r, 800));
   await probeBackend();
   pidCache = { at: 0, pids: [] };
@@ -867,6 +938,347 @@ async function stopBackendService() {
   saveBackendState();
   log(`停止 ComfyUI 服务：pids=${JSON.stringify(pids)} stopped=${JSON.stringify(stopped)} 仍可达=${backend.reachable}`);
   return { ok: !backend.reachable, pids, stopped, failed, alive: backend.reachable, already: pids.length === 0 };
+}
+
+// ── 拉起服务·T1 中继层（环境检查 / 快照清理 / 去重 / 等待就绪）───────────────────
+// 入口：POST /_relay/backend/envcheck | /wait | /clear（均需 controlKey）。
+// 安全边界（方案 v2）：clear 只认 envcheck 的一次性快照；按快照复核 pid+启动时间+映像名，
+//   列表外一律拒绝；分类靠映像名+命令行而非显存数值（WDDM 下 per-proc 显存常为 N/A）。
+const START_GRACE_MS = 150_000;    // 启动窗口：此刻内不把自家 ComfyUI 判为异常
+const START_INFLIGHT_MS = 180_000; // in-flight 标志兜底过期
+const SNAPSHOT_TTL_MS = 180_000;   // 快照有效期
+const CLEAR_RECHECK_MS = 2_500;    // 清理后复查等待（2–3s）
+const envSnapshots = new Map();    // snapshotId -> {at, entries:Map<pid,{name,cmdline,startedAtMs,category,clearable}>}
+
+// 受限令牌允许子进程，但 PowerShell CIM 可能被拒；实用候选链见 queryProcessInfo。
+const PS_EXE = (() => {
+  const p = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return existsSync(p) ? p : "powershell.exe";
+})();
+
+const normPath = (s) => String(s || "").replace(/\\/g, "/");
+
+function parseJsonRows(s) {
+  const t = String(s || "").trim();
+  if (!t) return [];
+  try { const v = JSON.parse(t); return Array.isArray(v) ? v : [v]; } catch { return []; }
+}
+function epochFromCim(v) {
+  if (v === null || v === undefined) return null;
+  const m = String(v).match(/\/Date\((-?\d+)([+-]\d+)?\)\//);
+  if (m) return Number(m[1]);
+  const t = Date.parse(String(v));
+  return Number.isNaN(t) ? null : t;
+}
+
+// 取 PID 的映像名/命令行/启动时间。候选链（受限令牌下 CIM 可能被拒）：
+//   ① Win32_Process（命令行+启动时间）② Get-Process（映像名+启动时间）③ tasklist（仅映像名）
+function queryProcessInfo(pids) {
+  const ids = [...new Set((pids || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const out = new Map();
+  if (!ids.length) return out;
+  const base = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
+  const idList = ids.join(",");
+  let r = runExe(PS_EXE, [...base, `$ids=@(${idList}); Get-CimInstance Win32_Process | Where-Object { $ids -contains $_.ProcessId } | Select-Object ProcessId,Name,CreationDate,CommandLine | ConvertTo-Json -Compress`], 15_000);
+  let rows = parseJsonRows(r.stdout);
+  if (rows.length) {
+    for (const row of rows) {
+      const pid = Number(row.ProcessId);
+      if (!Number.isInteger(pid)) continue;
+      out.set(pid, { pid, name: row.Name || null, cmdline: row.CommandLine || null, startedAtMs: epochFromCim(row.CreationDate) });
+    }
+    return out;
+  }
+  r = runExe(PS_EXE, [...base, `$ids=@(${idList}); Get-Process -Id $ids -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,StartTime,Path | ConvertTo-Json -Compress`], 12_000);
+  rows = parseJsonRows(r.stdout);
+  if (rows.length) {
+    for (const row of rows) {
+      const pid = Number(row.Id);
+      if (!Number.isInteger(pid)) continue;
+      const nm = row.Path ? basename(String(row.Path)) : (row.ProcessName ? `${row.ProcessName}.exe` : null);
+      out.set(pid, { pid, name: nm, cmdline: null, startedAtMs: epochFromCim(row.StartTime) });
+    }
+    return out;
+  }
+  for (const pid of ids) {
+    const t = runExe("tasklist.exe", ["/fi", `PID eq ${pid}`, "/fo", "csv", "/nh"], 10_000);
+    const m = String(t.stdout || "").match(/^"([^"]+)","(\d+)"/m);
+    if (m) out.set(Number(m[2]), { pid: Number(m[2]), name: m[1], cmdline: null, startedAtMs: null });
+  }
+  return out;
+}
+
+// nvidia-smi 计算进程（--query-compute-apps）。失败降级：调用方只警告不阻塞。
+function smiComputeApps() {
+  const r = runExe(SMI_PATH, ["--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"], 8_000);
+  if (r.code !== 0) return { ok: false, error: r.stderr || r.error || `nvidia-smi exit ${r.code}`, rows: [] };
+  const rows = [];
+  for (const line of String(r.stdout || "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    const i = t.indexOf(",");
+    if (i < 0) continue;
+    const pid = Number(t.slice(0, i).trim());
+    const rest = t.slice(i + 1).trim();
+    const j = rest.lastIndexOf(",");
+    const name = (j >= 0 ? rest.slice(0, j) : rest).trim();
+    const used = j >= 0 ? rest.slice(j + 1).trim() : null;
+    if (Number.isInteger(pid) && pid > 0) rows.push({ pid, name, usedMemory: used });
+  }
+  return { ok: true, rows };
+}
+
+// 分类：已知推理/模型服务映像名，或 python/node 且命令行带推理指纹（含另一路 ComfyUI main.py）。
+// 注意 not 按显存数值判断（WDDM 下 used_memory 常为 [N/A]）。
+const BLOCKER_IMAGE = /^(llama-server|llama_server|llama-kvmem-server|llama-cpp-server|ollama|ollama_llama_server|koboldcpp|text-generation-launcher|vllm|whisper-server|sd-server)(\.exe)?$/i;
+function classifyCompute(name, cmdline) {
+  const base = String(name || "").split(/[\\/]/).pop().toLowerCase();
+  const cl = String(cmdline || "").toLowerCase();
+  if (BLOCKER_IMAGE.test(base)) return "blocker";
+  if (/^(python|pythonw|python3|python3\.\d+)(\.exe)?$/.test(base) || base === "node.exe") {
+    if (/(llama|vllm|ollama|kobold|text-generation|--model\b|inference|whisper)/.test(cl)) return "blocker";
+    if (/main\.py/.test(cl)) return "blocker";
+  }
+  return "other";
+}
+
+function startWindowOpen() {
+  if (startInFlight && Date.now() - startInFlight < START_GRACE_MS) return true;
+  const sa = backendProc.startedAt ? Date.parse(backendProc.startedAt) : 0;
+  return !!sa && Date.now() - sa < START_GRACE_MS;
+}
+
+// 是否「正在启动/已运行的 ComfyUI 自身」：路径匹配为主，窗口自证为兜底。
+// ③ 与 listening 解耦：启动窗口早期 8188 可能未监听，只要「main.py + 窗口开」即可自证（防自杀）。
+function isSelfProc(pid, cmdline, startedAtMs) {
+  const cl = normPath(String(cmdline || "").toLowerCase());
+  if (backendProc.mainPy && cl.includes(normPath(String(backendProc.mainPy).toLowerCase()))) return true;
+  if (backendProc.install && cl.includes(normPath(String(backendProc.install).toLowerCase())) && cl.includes("main.py")) return true;
+  if (/main\.py/.test(cl) && startWindowOpen()) return true;
+  return false;
+}
+
+// 去重判定（排在阻断逻辑之前）：in-flight → state 文件标记 → 计划任务 Running 兜底。
+function detectStarting() {
+  const now = Date.now();
+  if (startInFlight && now - startInFlight < START_INFLIGHT_MS) {
+    return { starting: true, detail: "已发起启动（in-flight，本中继进程内）", startedAt: new Date(startInFlight).toISOString() };
+  }
+  const sa = backendProc.startedAt ? Date.parse(backendProc.startedAt) : 0;
+  if (backendProc.starting && sa && now - sa < START_GRACE_MS) {
+    return { starting: true, detail: "状态文件标记启动中", startedAt: backendProc.startedAt };
+  }
+  const q = runExe("schtasks.exe", ["/query", "/tn", BACKEND_TASK_NAME, "/fo", "list"], 12_000);
+  if (q.code === 0 && /(Status:\s*Running|状态[:：]\s*正在运行|Running)/i.test(q.stdout)) {
+    return { starting: true, detail: "计划任务处于 Running（兜底判定）", startedAt: backendProc.startedAt };
+  }
+  return { starting: false };
+}
+
+function pruneSnapshots() {
+  const now = Date.now();
+  for (const [k, v] of envSnapshots) if (now - v.at > SNAPSHOT_TTL_MS) envSnapshots.delete(k);
+}
+
+// 长超时单探后端（用于 residual 前区分「忙/慢」与「真残留」）。任何 HTTP 响应都算“有响应”。
+async function probeBackendBusy(timeoutMs = 13_000) {
+  try {
+    const res = await fetch(`http://${backend.host}:${backend.port}/system_stats`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { accept: "application/json" },
+    });
+    return { responded: true, status: res.status };
+  } catch (e) {
+    return { responded: false, status: null, error: String((e && e.message) || e) };
+  }
+}
+
+async function serviceEnvCheck() {
+  const warnings = [];
+  const analyzed = new Map(); // pid -> rec（可回指快照）
+  const processes = [];
+
+  // ── 1. GPU 计算进程 + 显存水位（nvidia-smi 可用性实测；失败降级不阻塞）──
+  const smi = smiComputeApps();
+  const gpu = { available: smi.ok, error: smi.ok ? null : smi.error, name: null, memoryTotalMiB: null, memoryUsedMiB: null, memoryFreeMiB: null, utilPct: null, usedPct: null, computeAppCount: smi.ok ? smi.rows.length : null };
+  if (!smi.ok) {
+    warnings.push(`nvidia-smi 不可用，已跳过 GPU 计算进程检查（${smi.error}）`);
+  } else {
+    const gr = runExe(SMI_PATH, ["--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"], 8_000);
+    if (gr.code === 0) {
+      const p = String(gr.stdout).split(/\r?\n/)[0].split(",").map((x) => x.trim());
+      const num = (i) => { const v = parseFloat(p[i]); return Number.isNaN(v) ? null : v; };
+      gpu.name = p[0] || null;
+      gpu.memoryTotalMiB = num(1); gpu.memoryUsedMiB = num(2); gpu.memoryFreeMiB = num(3); gpu.utilPct = num(4);
+      if (gpu.memoryTotalMiB && gpu.memoryUsedMiB != null) {
+        gpu.usedPct = Math.round((gpu.memoryUsedMiB / gpu.memoryTotalMiB) * 1000) / 10;
+        if (gpu.usedPct > 85) warnings.push(`显存水位偏高：${gpu.usedPct}%（>85%，可继续）`);
+      }
+    } else {
+      warnings.push(`显存水位读取失败：${gr.stderr || gr.error || `exit ${gr.code}`}`);
+    }
+    for (const row of smi.rows) {
+      const rec = { pid: row.pid, name: basename(String(row.name || "")), cmdline: null, startedAtMs: null, usedMemory: row.usedMemory || null, category: "other", clearable: false, reason: null };
+      analyzed.set(row.pid, rec);
+      processes.push(rec);
+    }
+  }
+
+  // ── 2. 批量补齐映像名/命令行/启动时间（含 8188 监听者）──
+  const portPids = listeningPids();
+  const wantPids = [...new Set([...analyzed.keys(), ...portPids])];
+  const info = queryProcessInfo(wantPids);
+  for (const pid of wantPids) {
+    const i = info.get(pid) || {};
+    let rec = analyzed.get(pid);
+    if (!rec) {
+      rec = { pid, name: i.name || null, cmdline: i.cmdline || null, startedAtMs: i.startedAtMs ?? null, usedMemory: null, category: "other", clearable: false, reason: null };
+      analyzed.set(pid, rec); processes.push(rec);
+    } else {
+      if (i.name) rec.name = i.name;
+      if (i.cmdline) rec.cmdline = i.cmdline;
+      if (i.startedAtMs != null) rec.startedAtMs = i.startedAtMs;
+    }
+  }
+  if (!info.size && wantPids.length) warnings.push("进程详情查询失败（CIM/Get-Process/tasklist 均不可用），已按映像名降级判定");
+
+  // ── 3. 分类：先排除自身，其余按映像名+命令行（阻断项在端口探测后统一汇总）──
+  for (const rec of processes) {
+    if (rec.pid && isSelfProc(rec.pid, rec.cmdline || rec.name, rec.startedAtMs)) { rec.category = "self"; rec.reason = null; continue; }
+    if (classifyCompute(rec.name, rec.cmdline) === "blocker") {
+      rec.category = "blocker"; rec.clearable = true; rec.reason = "GPU 计算进程：疑似其他模型/推理服务";
+    }
+  }
+
+  // ── 4. 8188 端口探测（健康可达 → 无需拉起；占用不可达 → 残留分类）──
+  await probeBackend();
+  const portBlockers = [];
+  const port = { occupied: portPids.length > 0, pids: portPids, reachable: backend.reachable, owners: [], note: null };
+  if (port.occupied && backend.reachable) {
+    port.note = "8188 健康可达（无需拉起）";
+    for (const pid of portPids) { const r = analyzed.get(pid); if (r) { r.category = "self"; r.clearable = false; r.reason = null; } }
+  } else if (port.occupied && !backend.reachable) {
+    const inWindow = startWindowOpen();
+    // 标 residual 前做一次长超时（10–15s）单探：有响应 → 忙/慢，不标可清。
+    // 启动窗口内直接按自身处理，不做长探（省时且防自杀）。
+    let busy = { responded: false, status: null };
+    if (!inWindow) busy = await probeBackendBusy(13_000);
+    port.owners = portPids.map((pid) => {
+      const r = analyzed.get(pid) || {};
+      const comfy = /(^|[\\/ ])(main\.py|server\.py)(\s|$)/i.test(String(r.cmdline || "")) || isSelfProc(pid, r.cmdline, r.startedAtMs);
+      return { pid, name: r.name || null, cmdline: r.cmdline || null, comfyui: comfy, note: null };
+    });
+    const comfyOwners = port.owners.filter((o) => o.comfyui);
+    const foreign = port.owners.filter((o) => !o.comfyui);
+    const residualClearable = [];
+    for (const o of comfyOwners) {
+      const r = analyzed.get(o.pid);
+      if (inWindow) {
+        // 窗口期监听者：保 self 语义、不可清（监听期 G 红线变体）
+        if (r) { r.category = "self"; r.clearable = false; r.reason = null; }
+        o.note = "启动窗口内监听，保持自身（不清理）";
+      } else if (busy.responded) {
+        // 有响应但慢/忙：仅报告，不阻断
+        if (r) { r.category = "self"; r.clearable = false; r.reason = null; }
+        o.note = `8188 有响应（HTTP ${busy.status}）但慢/忙，等待或重试（不清理）`;
+      } else {
+        if (r) { r.category = "port-residual"; r.clearable = true; r.reason = "8188 残留（ComfyUI 监听且无响应）"; }
+        o.note = "8188 监听无响应，判定为残留，可清理";
+        residualClearable.push(o.pid);
+      }
+    }
+    for (const o of foreign) { const r = analyzed.get(o.pid); if (r) { r.category = "port-foreign"; r.clearable = false; r.reason = "8188 被无关进程占用（仅报告，不清理）"; } }
+    if (inWindow && comfyOwners.length) warnings.push("启动窗口内 8188 已有监听（自身），保持 self 不清理");
+    if (!inWindow && busy.responded && comfyOwners.length) warnings.push("8188 有监听且 /system_stats 有响应（慢/忙），未标记为可清理");
+    if (residualClearable.length) portBlockers.push({ kind: "port-residual", pids: residualClearable, reason: "8188 被监听且无响应：残留 ComfyUI，可清除后重启" });
+    if (foreign.length) portBlockers.push({ kind: "port-foreign", pids: foreign.map((o) => o.pid), reason: "8188 被监听但不可达：占用者非 ComfyUI，仅报告不清理" });
+  }
+
+  // ── 4b. 汇总阻断项（端口探测后再定，避免把可达的自身误判为阻断）──
+  const blockers = [];
+  for (const rec of processes) {
+    if (rec.category === "blocker") blockers.push({ kind: "compute", pid: rec.pid, name: rec.name, cmdline: rec.cmdline, reason: rec.reason || "GPU 计算进程：疑似其他模型/推理服务" });
+  }
+  for (const b of portBlockers) blockers.push(b);
+
+  // ── 5. 一次性快照（clear 只认它）──
+  const snapshotId = randomBytes(12).toString("hex");
+  const entries = new Map();
+  for (const rec of analyzed.values()) entries.set(rec.pid, { name: rec.name, cmdline: rec.cmdline, startedAtMs: rec.startedAtMs, category: rec.category, clearable: !!rec.clearable });
+  envSnapshots.set(snapshotId, { at: Date.now(), entries });
+  pruneSnapshots();
+
+  return { ok: blockers.length === 0, warnings, blockers, processes, gpu, port, snapshotId };
+}
+
+// 只认快照的清理：复核 pid+启动时间+映像名；列表外或不可清理项全拒；清理后复查不循环杀。
+async function confirmAndClean(snapshotId, pids) {
+  const wanted = Array.isArray(pids) ? [...new Set(pids.map(Number).filter((n) => Number.isInteger(n) && n > 0))] : [];
+  const cleared = [];
+  const refused = [];
+  const snap = envSnapshots.get(String(snapshotId || ""));
+  if (!snap) return { ok: false, cleared, refused: wanted.map((pid) => ({ pid, reason: "快照不存在或已过期（全部拒绝）" })), recheck: { ran: false, note: "无有效快照" } };
+  if (!wanted.length) return { ok: true, cleared, refused, recheck: { ran: false, note: "未指定进程" } };
+
+  const live = queryProcessInfo(wanted);
+  for (const pid of wanted) {
+    const s = snap.entries.get(pid);
+    if (!s) { refused.push({ pid, reason: "不在快照列表内（拒绝）" }); continue; }
+    if (!s.clearable) { refused.push({ pid, reason: s.category === "port-foreign" ? "8188 占用者非 ComfyUI，仅报告不清理" : "快照标记为不可清理（自身/正常进程）" }); continue; }
+    const cur = live.get(pid);
+    if (!cur) { refused.push({ pid, reason: "进程已不存在" }); continue; }
+    const sn = s.name ? basename(s.name).toLowerCase() : null;
+    const cn = cur.name ? basename(cur.name).toLowerCase() : null;
+    if (sn && cn && sn !== cn) { refused.push({ pid, reason: `映像名不匹配（快照 ${s.name} / 当前 ${cur.name}）` }); continue; }
+    if (s.startedAtMs && cur.startedAtMs && Math.abs(s.startedAtMs - cur.startedAtMs) > 2000) { refused.push({ pid, reason: "启动时间不匹配（PID 已被复用）" }); continue; }
+    const r = runExe("taskkill.exe", ["/PID", String(pid), "/T", "/F"], 20_000);
+    if (r.code === 0) cleared.push(pid);
+    else refused.push({ pid, reason: r.stderr || r.error || `taskkill exit ${r.code}` });
+  }
+
+  await new Promise((r) => setTimeout(r, CLEAR_RECHECK_MS));
+  pidCache = { at: 0, pids: [] };
+  const still = listeningPids();
+  await probeBackend();
+  const recheck = { ran: true, at: new Date().toISOString(), portPids: still, reachable: backend.reachable, note: "" };
+  if (still.length) {
+    const ri = queryProcessInfo(still);
+    recheck.owners = still.map((pid) => { const i = ri.get(pid) || {}; return { pid, name: i.name || null, cmdline: i.cmdline || null }; });
+    if (cleared.length === 0) recheck.note = "未执行清理（无通过复核的进程）";
+    else recheck.note = backend.reachable ? "清理后 8188 可达" : "清理后 8188 仍被占用（被重新拉起或未终止），未再循环清理";
+  } else {
+    recheck.note = cleared.length ? "8188 已释放" : "8188 未被占用";
+  }
+  return { ok: true, cleared, refused, recheck };
+}
+
+// 等待就绪：单次 ≤25s，只报「仍在启动」+日志路径，不杀进程。
+async function serviceWait() {
+  const budget = 25_000;
+  const t0 = Date.now();
+  await probeBackend();
+  if (backend.reachable) return waitReady(0);
+  const listening = listeningPids();
+  const dd = detectStarting();
+  if (!dd.starting && listening.length === 0 && !backendProc.starting) {
+    const err = backendProc.lastError ? `；最近错误：${backendProc.lastError}` : "";
+    return { state: "failed", detail: `未检测到启动中的服务（8188 监听进程数：${listening.length}）${err}` };
+  }
+  while (Date.now() - t0 < budget) {
+    await new Promise((r) => setTimeout(r, 2_000));
+    await probeBackend();
+    if (backend.reachable) return waitReady(Math.round(Date.now() - t0));
+  }
+  const overGrace = backendProc.startedAt && (Date.now() - Date.parse(backendProc.startedAt) >= START_GRACE_MS);
+  if (overGrace) return { state: "timeout", detail: `启动超过 ${Math.round(START_GRACE_MS / 1000)}s 仍未就绪（不杀进程）；日志：${backendProc.logFile || "未知"}`, listeningPids: listening };
+  return { state: "starting", detail: `仍在启动（本轮 ${budget}ms 未就绪）；日志：${backendProc.logFile || "未知"}`, listeningPids: listening };
+
+  function waitReady(extraMs) {
+    const readyInMs = backendProc.startedAt ? Math.max(0, Date.now() - Date.parse(backendProc.startedAt)) : extraMs;
+    if (backendProc.starting) { backendProc.starting = false; saveBackendState(); }
+    if (startInFlight) startInFlight = null;
+    return { state: "ready", readyInMs, detail: `服务就绪（ComfyUI ${(backend.system && backend.system.comfyui_version) || "?"}）` };
+  }
 }
 
 // ── 主题同步（跨源下的宿主主题跟随）─────────────────────────────────────────
@@ -1242,6 +1654,8 @@ function backendProcPayload() {
     launcher: backendProc.launcher,
     logFile: backendProc.logFile,
     pids: listeningPids(), // 始终查（5s 缓存）：启动中/未就绪时也能看到进程是否已起来
+    starting: backendProc.starting,
+    lastStartResult: backendProc.lastStartResult,
     lastError: backendProc.lastError,
     lastStop: backendProc.lastStop,
   };
@@ -1610,6 +2024,10 @@ function statusPayload() {
       lastError: backend.lastError,
       system: backend.system,
       proc: backendProcPayload(),
+      // 可观测（2026-09-29，additive）：近 N 次探测耗时与「慢」类连续计数，供分离中继/后端责任
+      probeTimeoutMs: PROBE_TIMEOUT_MS,
+      probeSlowStreak: backend.probeSlowStreak,
+      probeRecentMs: backend.probeRecentMs.slice(),
     },
     queue: queueInfo,
     events: {
@@ -2333,6 +2751,30 @@ const server = http.createServer((req, res) => {
       return;
     }
     jsonOut(res, 200, { ok: true, reachable: backend.reachable, proc: backendProcPayload() }, req.method);
+    return;
+  }
+  // 拉起服务·T1：环境检查 / 等待就绪 / 快照清理（均需 controlKey）
+  if (pathOnly === "/_relay/backend/envcheck" || pathOnly === "/_relay/backend/wait" || pathOnly === "/_relay/backend/clear") {
+    if (pathOnly === "/_relay/backend/clear") {
+      if (req.method !== "POST") { jsonOut(res, 405, { error: "method not allowed" }, req.method); return; }
+    } else if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method); return;
+    }
+    if (!controlOk(req)) { jsonOut(res, 403, { error: "comfy-relay: control key required" }); return; }
+    void (async () => {
+      try {
+        if (pathOnly === "/_relay/backend/envcheck") {
+          jsonOut(res, 200, await serviceEnvCheck(), req.method);
+        } else if (pathOnly === "/_relay/backend/wait") {
+          jsonOut(res, 200, await serviceWait(), req.method);
+        } else {
+          const body = await readBodyJson(req).catch(() => ({}));
+          jsonOut(res, 200, await confirmAndClean(body.snapshotId, body.pids), req.method);
+        }
+      } catch (e) {
+        jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }, req.method);
+      }
+    })();
     return;
   }
   // 宿主主题 → ComfyUI 服务端设置（跨源下的主题跟随；键名同 HANA_CSS_MAP / HANA_JS_MAP）

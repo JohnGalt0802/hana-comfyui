@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-09-28 hana-bridge-28105930";
+const BUILD_TAG = "2026-10-03 hana-bridge-03131827";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -153,6 +153,375 @@ function currentWorkflowInfo() {
     return { name: "(未命名)", path: null, modified: null };
   }
 }
+
+// ── D1：画布执行 + 副驾驶（canvas.queue / canvas.duplicate / canvas.visual 与开关 UI）──
+// 契约：docs/共驾接口契约-20260929.md（op 名 / 字段名 / 三动作语义冻结）；
+// 实现依据：_temp/d1-copilot-探查-20260929/ E1·E2（前端 v1.53.6 实证）。
+// 边界：只新增 op 与 UI；既有 op 行为不动。
+
+// 前端 hashUtil.ts（platform/workflow/persistence/base）的逐行等效：fnv1a → 8 位 hex。
+// 注意：本文件上方的 fnv1a() 是浮点乘法变体（与前端 Math.imul 版结果不同，仅用于本桥内部图签名）；
+// copilot 的 localStorage 键必须用下面这个精确版才能与前端惯例对齐。
+function fnv1aU32(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function hashPathKey(str) {
+  return fnv1aU32(String(str)).toString(16).padStart(8, "0");
+}
+
+// 副本工作流的独立身份 id（原生 duplicateWorkflow 用 generateUUID()；以 crypto.randomUUID 为主）
+function newUuid() {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+  } catch { /* 忽略 */ }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+// /queue 差集定位用：读出在队 / 在跑任务的 prompt_id 集合。
+// item 结构＝(number, prompt_id, …)（截 5 项）；响应＝{queue_running, queue_pending}（E1 §2-b 实锤）。
+async function queuePromptIds() {
+  const res = await api.fetchApi("/queue");
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const q = (await res.json()) || {};
+  const ids = new Set();
+  const eat = (arr) => {
+    for (const item of arr || []) {
+      if (Array.isArray(item) && item.length > 1 && item[1]) ids.add(String(item[1]));
+    }
+  };
+  eat(q.queue_running);
+  eat(q.queue_pending);
+  return ids;
+}
+
+// —— copilot 开关（按页存储；唯一写方＝本 UI；app 侧只读）——
+// localStorage 键：hana.copilot.v1:<ws>:<hashPath(pageKey)>（镜像前端 Draft.v2 的键结构）
+const COPILOT_LS_PREFIX = "hana.copilot.v1:";
+const COPILOT_TOGGLE_ID = "hana-copilot-toggle";
+const COPILOT_STYLE_ID = "hana-copilot-style";
+
+// 前端 storageKeys.ts :: getWorkspaceId 的等效（非云＝personal；云读 sessionStorage）
+function copilotWorkspaceId() {
+  try {
+    const raw = sessionStorage.getItem("Comfy.Workspace.Current");
+    if (!raw) return "personal";
+    const ws = JSON.parse(raw);
+    if (!ws || ws.type === "personal" || !ws.id) return "personal";
+    return String(ws.id);
+  } catch {
+    return "personal";
+  }
+}
+
+// pageKey = activeWorkflow.path（fallback：key → name）；取不到返回 null
+function copilotPageKey() {
+  try {
+    const wf = activeWorkflowObj();
+    if (!wf) return null;
+    const p = wf.path ? String(wf.path).trim() : "";
+    if (p) return p;
+    const k = wf.key ? String(wf.key).trim() : "";
+    if (k) return k;
+    const n = String(wf.filename || wf.name || "").trim();
+    return n || null;
+  } catch {
+    return null;
+  }
+}
+
+function copilotLsKey(pageKey) {
+  return COPILOT_LS_PREFIX + copilotWorkspaceId() + ":" + hashPathKey(pageKey);
+}
+
+// 读当前页 copilot 状态（刷新后保留：数据源即 localStorage）
+function copilotReadState() {
+  const pageKey = copilotPageKey();
+  if (!pageKey) return { enabled: false, pageKey: null, updatedAt: 0 };
+  let enabled = false;
+  let updatedAt = 0;
+  try {
+    const raw = localStorage.getItem(copilotLsKey(pageKey));
+    if (raw) {
+      const rec = JSON.parse(raw);
+      enabled = !!(rec && rec.enabled);
+      updatedAt = rec && Number.isFinite(rec.updatedAt) ? rec.updatedAt : 0;
+    }
+  } catch { /* 读不到按默认关 */ }
+  return { enabled, pageKey, updatedAt };
+}
+
+function copilotWriteState(enabled) {
+  const pageKey = copilotPageKey();
+  if (!pageKey) return { enabled: false, pageKey: null, updatedAt: 0 };
+  const rec = { enabled: !!enabled, updatedAt: Date.now() };
+  try {
+    localStorage.setItem(copilotLsKey(pageKey), JSON.stringify(rec));
+  } catch (err) {
+    console.warn(LOG_TAG, "copilot 状态写入失败", err);
+  }
+  return { enabled: rec.enabled, pageKey, updatedAt: rec.updatedAt };
+}
+
+// 上报口径（字段冻结：enabled / pageKey? / updatedAt）
+function copilotStateForPush() {
+  const cur = copilotReadState();
+  const out = { enabled: !!cur.enabled, updatedAt: Number(cur.updatedAt) || 0 };
+  if (cur.pageKey) out.pageKey = cur.pageKey;
+  return out;
+}
+
+let copilotEl = null;
+let copilotPageKeyLast; // 会话内上次页键；undefined=尚未初始化（首轮 pollGraph 落定）
+
+function copilotStyleEnsure() {
+  if (document.getElementById(COPILOT_STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = COPILOT_STYLE_ID;
+  style.textContent = `
+#${COPILOT_TOGGLE_ID} {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  margin: 0 4px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+#${COPILOT_TOGGLE_ID}:hover { background: rgba(127,127,127,.15); }
+#${COPILOT_TOGGLE_ID} .hana-copilot-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: currentColor; opacity: .35; flex: none;
+}
+#${COPILOT_TOGGLE_ID}[data-enabled="true"] {
+  border-color: rgba(255,215,0,.85);
+  background: rgba(255,215,0,.12);
+  color: #FFD700;
+}
+#${COPILOT_TOGGLE_ID}[data-enabled="true"] .hana-copilot-dot { opacity: 1; background: #FFD700; }
+`;
+  document.head.appendChild(style);
+}
+
+function copilotUiRender() {
+  if (!copilotEl) return;
+  const cur = copilotReadState();
+  copilotEl.dataset.enabled = cur.enabled ? "true" : "false";
+  copilotEl.title = cur.enabled
+    ? "小花副驾驶：开（agent 与本画布共编）— 点击关闭"
+    : "小花副驾驶：关（agent 动作先复制副本，不碰本画布）— 点击开启";
+  const label = copilotEl.querySelector(".hana-copilot-label");
+  if (label) label.textContent = cur.enabled ? "副驾驶·开" : "副驾驶·关";
+}
+
+// 切换即写即报：localStorage 写入 + UI 刷新 + 立刻推一次 state（不等防抖）
+function copilotToggle() {
+  const cur = copilotReadState();
+  copilotWriteState(!cur.enabled);
+  copilotUiRender();
+  void pushStateSnapshot();
+}
+
+// 开关 UI 挂点（方案 B · DOM 注入）：app.menu.element＝官方为 custom scripts 保留的元素槽，
+// 前端会把它搬入画布区顶栏 [data-testid="legacy-topbar-container"]（E2 §3）。
+function copilotUiEnsure() {
+  const host = app && app.menu && app.menu.element;
+  if (!host) return null;
+  copilotStyleEnsure();
+  if (!copilotEl) {
+    copilotEl = document.createElement("button");
+    copilotEl.id = COPILOT_TOGGLE_ID;
+    copilotEl.type = "button";
+    const dot = document.createElement("span");
+    dot.className = "hana-copilot-dot";
+    const label = document.createElement("span");
+    label.className = "hana-copilot-label";
+    copilotEl.append(dot, label);
+    copilotEl.addEventListener("click", (ev) => {
+      try {
+        ev.preventDefault();
+        ev.stopPropagation();
+        copilotToggle();
+      } catch (err) {
+        console.warn(LOG_TAG, "copilot 切换失败", err);
+      }
+    });
+  }
+  const dup = host.querySelector(":scope > #" + COPILOT_TOGGLE_ID);
+  if (dup && dup !== copilotEl) dup.remove();
+  if (copilotEl.parentElement !== host) host.appendChild(copilotEl);
+  copilotUiRender();
+  return copilotEl;
+}
+
+// —— 编辑可视化：lock / highlight / clear（契约 §3.2；防呆实现）——
+const COPILOT_STROKE_KEY = "hana.copilot";
+const COPILOT_GOLD = "#FFD700";
+const COPILOT_FILM_ID = "hana-copilot-film";
+
+const copilotVisual = {
+  readOnlyTouched: false, // read_only 是否被本桥改过（还原时只还原自己改的）
+  prevReadOnly: undefined, // 改动前的原值
+  markedNodeIds: [], // 已黄标的节点 id
+  markedLinks: [], // 已黄标的连线：[{ id, prevColor }]
+  markedLinkIdSet: new Set(), // 供连线渲染包裹层 O(1) 查询
+};
+let linkPatchAdapter = null; // 已被包裹的 linkRenderer 实例
+
+function filmRemove() {
+  const el = document.getElementById(COPILOT_FILM_ID);
+  if (el && el.parentElement) el.parentElement.removeChild(el);
+}
+
+// 锁膜：append 进 #graph-canvas-container（E2 §2：最后=最上；个别面板有 z-index，显式抬到 9999）。
+// pointer-events:auto 吃指针事件 → 阻断误操作；键盘挡不住（已知边界，命令层自判）。
+function filmApply(note) {
+  filmRemove();
+  const container =
+    document.getElementById("graph-canvas-container") ||
+    (app && app.canvasContainer) ||
+    null;
+  if (!container) {
+    console.warn(LOG_TAG, "找不到画布容器：lock 膜未挂上（read_only 仍已置位）");
+    return false;
+  }
+  const film = document.createElement("div");
+  film.id = COPILOT_FILM_ID;
+  film.style.cssText =
+    "position:absolute; inset:0; z-index:9999; background:rgba(0,0,0,.35);" +
+    "display:flex; flex-direction:column; align-items:center; justify-content:center;" +
+    "gap:6px; pointer-events:auto; cursor:progress;";
+  const main = document.createElement("div");
+  main.textContent = "小花正在操作…";
+  main.style.cssText =
+    "color:#FFD700; font-size:14px; font-weight:600; text-shadow:0 1px 2px rgba(0,0,0,.6);";
+  film.appendChild(main);
+  if (note) {
+    const sub = document.createElement("div");
+    sub.textContent = String(note);
+    sub.style.cssText = "color:#ddd; font-size:12px; text-shadow:0 1px 2px rgba(0,0,0,.6);";
+    film.appendChild(sub);
+  }
+  container.appendChild(film);
+  return true;
+}
+
+function visualLockReadOnly() {
+  if (copilotVisual.readOnlyTouched) return;
+  const canvas = app && app.canvas;
+  if (!canvas) return;
+  copilotVisual.prevReadOnly = canvas.read_only;
+  copilotVisual.readOnlyTouched = true;
+  canvas.read_only = true;
+}
+
+function visualRestoreReadOnly() {
+  if (!copilotVisual.readOnlyTouched) return;
+  copilotVisual.readOnlyTouched = false;
+  const canvas = app && app.canvas;
+  if (canvas) canvas.read_only = copilotVisual.prevReadOnly;
+  copilotVisual.prevReadOnly = undefined;
+}
+
+// 连线（edge）黄标：v1.53.6 的连线没有 strokeStyles 等价钩子（E2 §1 只管节点），
+// 渲染链为 LGraphCanvas.renderLink → canvas.linkRenderer.renderLinkDirect(ctx,…,color,…)。
+// 对渲染适配器做一次透明包裹：目标连线 color 覆盖为 #FFD700、线宽不低于 3。
+// 包裹层绝不抛错；标记集为空时零开销；graph 切换时适配器会重建，下一次 highlight 自动重挂。
+function ensureLinkRenderPatch() {
+  const canvas = app && app.canvas;
+  const adapter = canvas && canvas.linkRenderer;
+  if (!adapter || typeof adapter.renderLinkDirect !== "function") return false;
+  if (adapter === linkPatchAdapter) return true;
+  const orig = adapter.renderLinkDirect;
+  adapter.renderLinkDirect = function (
+    ctx, a, b, link, skip_border, flow, color, start_dir, end_dir, context, extras
+  ) {
+    try {
+      if (
+        link &&
+        copilotVisual.markedLinkIdSet.size > 0 &&
+        copilotVisual.markedLinkIdSet.has(String(link.id))
+      ) {
+        color = COPILOT_GOLD;
+        if (context && typeof context === "object" && (Number(context.connectionWidth) || 0) < 3) {
+          context = { ...context, connectionWidth: 3 };
+        }
+      }
+    } catch { /* 包裹层不抛 */ }
+    return orig.call(this, ctx, a, b, link, skip_border, flow, color, start_dir, end_dir, context, extras);
+  };
+  linkPatchAdapter = adapter;
+  return true;
+}
+
+function uninstallLinkRenderPatch() {
+  if (!linkPatchAdapter) return;
+  try {
+    delete linkPatchAdapter.renderLinkDirect; // 还原为原型方法（透明）
+  } catch { /* 忽略 */ }
+  linkPatchAdapter = null;
+}
+
+// 全撤标记（节点 strokeStyles 项 / 连线颜色 / 渲染包裹）；返回是否有实际改动（决定是否重绘）
+function visualClearMarks() {
+  let touched = false;
+  for (const id of copilotVisual.markedNodeIds) {
+    const n = findNode(id);
+    if (n && n.strokeStyles && COPILOT_STROKE_KEY in n.strokeStyles) {
+      delete n.strokeStyles[COPILOT_STROKE_KEY];
+      touched = true;
+    }
+  }
+  copilotVisual.markedNodeIds = [];
+  const lm = app.graph && app.graph.links;
+  for (const rec of copilotVisual.markedLinks) {
+    try {
+      const l = lm && typeof lm.get === "function" ? lm.get(rec.id) : null;
+      if (l) {
+        // 还原（setter 约定："" → null，即恢复「未设自定义色」）
+        l.color = rec.prevColor === undefined || rec.prevColor === null ? "" : rec.prevColor;
+        touched = true;
+      }
+    } catch { /* 忽略 */ }
+  }
+  copilotVisual.markedLinks = [];
+  copilotVisual.markedLinkIdSet = new Set();
+  uninstallLinkRenderPatch();
+  return touched;
+}
+
+// 找 from→to 的连线（任意槽位；一对节点间可能有多条）
+function linksBetween(fromId, toId) {
+  const out = [];
+  const lm = app.graph && app.graph.links;
+  if (lm && typeof lm.forEach === "function") {
+    lm.forEach((l) => {
+      if (!l) return;
+      if (String(l.origin_id) === String(fromId) && String(l.target_id) === String(toId)) out.push(l);
+    });
+  }
+  return out;
+}
+
 // agent 自己写入的 undo 栈（存 before 值）。
 // 为何需要：实测新版前端的 ChangeTracker 不记录「外部对 graph 的直接修改」
 // （graph.onBeforeChange / canvas.onBeforeChange 都不存在，Comfy.Undo 对这类改动无效），
@@ -261,6 +630,16 @@ function pollGraph() {
     if (changes.length > CHANGE_KEEP) changes = changes.slice(-CHANGE_KEEP);
     scheduleStatePush();
   }
+  // copilot：页键（工作流）变化＝切了「这块布」→ 开关 UI 与上报跟着走；
+  // 挂点晚到 / 被重建时补挂（页键未变则不额外上报）。
+  const copilotKey = copilotPageKey();
+  if (copilotKey !== copilotPageKeyLast) {
+    copilotPageKeyLast = copilotKey;
+    copilotUiEnsure();
+    scheduleStatePush();
+  } else if (!copilotEl || !copilotEl.isConnected) {
+    copilotUiEnsure();
+  }
   lastWorkflowName = wfName;
   lastSignature = sig;
   return sig;
@@ -289,6 +668,7 @@ async function pushStateSnapshot() {
       sid: api.clientId || null,
       workflow: currentWorkflowInfo(),
       summary: graphSummary(),
+      copilot: copilotStateForPush(),
     });
   } catch (err) {
     console.warn(LOG_TAG, "状态推送失败", err);
@@ -982,6 +1362,162 @@ const OPS = {
     };
   },
 
+  // ── D1：画布执行 + 可视化（需 App 侧授权开闸；契约字段冻结）──────────────
+
+  // 执行当前画布（等效点 Queue；front=true 等效 QueuePromptFront——前端以 number=-1 走 body.front）。
+  // 快返：只提交不等执行。prompt_id 优先靠猴补 api.queuePrompt 捕获（E1 §2-a），
+  // 捕获不到再用 /queue 前后差集兜底（E1 §2-b，仅取唯一新增项、不猜）。
+  "canvas.queue": async (args) => {
+    const a = args || {};
+    const front = a.front === true;
+    if (typeof app.queuePrompt !== "function") {
+      throw new Error("前端没有 app.queuePrompt（版本不支持）");
+    }
+    let beforeIds = null;
+    try {
+      beforeIds = await queuePromptIds();
+    } catch { beforeIds = null; }
+
+    const orig = api.queuePrompt;
+    let cap = null;
+    let capErr = null;
+    api.queuePrompt = async function (...callArgs) {
+      try {
+        const res = await orig.apply(this, callArgs);
+        cap = res || null;
+        return res;
+      } catch (err) {
+        capErr = err;
+        throw err;
+      }
+    };
+    try {
+      await app.queuePrompt(front ? -1 : 0, 1);
+    } finally {
+      api.queuePrompt = orig;
+    }
+    if (capErr) {
+      throw new Error("提交被拒：" + String(capErr).slice(0, 400));
+    }
+    if (cap && cap.prompt_id) {
+      return { queued: true, promptId: cap.prompt_id, number: cap.number, via: "app.queuePrompt" };
+    }
+    // 未捕获（如 processingQueue 忙时立即返回）：/queue 差集定位
+    let fallbackId = null;
+    if (beforeIds) {
+      try {
+        const afterIds = await queuePromptIds();
+        const added = [...afterIds].filter((id) => !beforeIds.has(id));
+        if (added.length === 1) fallbackId = added[0];
+      } catch { /* 兜底失败不阻断 */ }
+    }
+    const out = { queued: true, via: "app.queuePrompt" };
+    if (fallbackId) out.promptId = fallbackId;
+    return out;
+  },
+
+  // 以当前画布为基础复制为新页（E1 §1 最小等效序列；原生 duplicateWorkflow 的逐行等效）。
+  // 原布零改动：只读 activeState（含未保存改动）写进副本；副本页同步注册后立刻返回 path/key。
+  "canvas.duplicate": async () => {
+    const store = app && app.extensionManager && app.extensionManager.workflow;
+    if (!store || typeof store.createNewTemporary !== "function") {
+      throw new Error("前端没有 workflow store（app.extensionManager.workflow.createNewTemporary）");
+    }
+    const src = store.activeWorkflow;
+    if (!src) throw new Error("没有活动工作流（activeWorkflow 为空）");
+    await src.load(); // 已加载秒返
+    const state = JSON.parse(JSON.stringify(src.activeState));
+    if (!state || typeof state !== "object") {
+      throw new Error("取不到 activeState（无法读取当前画布数据）");
+    }
+    state.id = newUuid();
+    let base = String(src.filename || src.name || "").trim();
+    base = base.replace(/\.json$/i, "").replace(/\s*\(\d+\)$/, "").trim();
+    if (!base) base = "workflow";
+    const wf = store.createNewTemporary(base + " (Copy).json", state); // 同步注册，path/key 立刻可读
+    if (!wf || !wf.path) throw new Error("createNewTemporary 未返回工作流对象");
+    if (typeof app.loadGraphData !== "function") throw new Error("前端没有 app.loadGraphData");
+    await app.loadGraphData(state, true, true, wf); // 先按 await 实现（耗时见验收记录）
+    return { ok: true, page: wf.path, key: wf.key };
+  },
+
+  // 编辑可视化：lock / highlight / clear（契约 §3.2 三动作语义，防呆照做）。
+  // lock      = 撤旧高亮 → 灰膜 +「小花正在操作…」+ read_only 置位（记录原值）
+  // highlight = 先撤锁与旧高亮 → 节点 strokeStyles 黄标 + 连线黄标 → 重绘
+  // clear     = 全撤（删膜 / 只还原自己改的 read_only / 删标记 / 重绘）
+  // nodes: string[]；edges: [fromId,toId][]；无法定位的条目跳过并在返回里列出。
+  "canvas.visual": (args) => {
+    const a = args || {};
+    const action = String(a.action || "").trim();
+    if (action !== "lock" && action !== "highlight" && action !== "clear") {
+      throw new Error("action 必须是 lock / highlight / clear");
+    }
+    if (action === "lock") {
+      visualClearMarks(); // 撤旧高亮
+      filmApply(typeof a.note === "string" && a.note ? a.note : "");
+      visualLockReadOnly();
+      app.graph.setDirtyCanvas(true, true);
+      return { ok: true };
+    }
+    if (action === "clear") {
+      filmRemove();
+      visualRestoreReadOnly();
+      visualClearMarks();
+      app.graph.setDirtyCanvas(true, true);
+      return { ok: true };
+    }
+    // highlight：先撤锁与旧高亮（契约）
+    filmRemove();
+    visualRestoreReadOnly();
+    visualClearMarks();
+
+    const missedNodes = [];
+    const seenNodeIds = new Set();
+    let nodeCount = 0;
+    for (const raw of Array.isArray(a.nodes) ? a.nodes : []) {
+      const id = raw === undefined || raw === null ? "" : String(raw).trim();
+      const n = id ? findNode(id) : null;
+      if (!n) {
+        missedNodes.push(raw === undefined ? null : raw);
+        continue;
+      }
+      if (seenNodeIds.has(String(n.id))) continue;
+      seenNodeIds.add(String(n.id));
+      if (!n.strokeStyles || typeof n.strokeStyles !== "object") n.strokeStyles = {};
+      n.strokeStyles[COPILOT_STROKE_KEY] = () => ({ color: COPILOT_GOLD, lineWidth: 3, padding: 8 });
+      copilotVisual.markedNodeIds.push(n.id);
+      nodeCount += 1;
+    }
+
+    const missedEdges = [];
+    let edgeLinkCount = 0;
+    for (const pair of Array.isArray(a.edges) ? a.edges : []) {
+      if (!Array.isArray(pair) || pair.length < 2) {
+        missedEdges.push(pair === undefined ? null : pair);
+        continue;
+      }
+      const hits = linksBetween(pair[0], pair[1]);
+      if (!hits.length) {
+        missedEdges.push([pair[0], pair[1]]);
+        continue;
+      }
+      for (const l of hits) {
+        if (copilotVisual.markedLinkIdSet.has(String(l.id))) continue;
+        let prev = undefined;
+        try { prev = l.color; } catch { prev = undefined; }
+        copilotVisual.markedLinks.push({ id: l.id, prevColor: prev });
+        copilotVisual.markedLinkIdSet.add(String(l.id));
+        try { l.color = COPILOT_GOLD; } catch { /* 忽略 */ }
+        edgeLinkCount += 1;
+      }
+    }
+    if (copilotVisual.markedLinkIdSet.size > 0 && !ensureLinkRenderPatch()) {
+      console.warn(LOG_TAG, "linkRenderer 不可用：连线黄标降级（节点黄标不受影响）");
+    }
+    app.graph.setDirtyCanvas(true, true);
+    return { ok: true, nodes: nodeCount, edges: edgeLinkCount, missedNodes, missedEdges };
+  },
+
   // ── 写入（P3；需 App 侧的授权开关打开）───────────────────────────────
   // 所有改图都包在 graph.beforeChange() / afterChange() 里：这是 LiteGraph 的变更记账，
   // 人的 Ctrl+Z（app.canvas.undo()）能像撤销自己操作一样撤销 agent 的改动。
@@ -1336,6 +1872,8 @@ app.registerExtension({
       // 变更感知轮询（P2）：先建一次基线，之后定期比对签名
       pollGraph();
       setInterval(pollGraph, CHANGE_POLL_MS);
+      // copilot 开关（D1）：挂到画布区顶栏（app.menu.element）；初始态从 localStorage 恢复
+      copilotUiEnsure();
       // 页面加载后推一次基线快照（否则服务端要等到首次变化才有状态）
       void pushStateSnapshot();
       console.info(LOG_TAG + " 已挂载 clientId=" + (api.clientId || "?") + " ops=" + Object.keys(OPS).join(","));

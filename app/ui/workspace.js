@@ -26,6 +26,20 @@ let statusTimer = null;
 let frameRuntimeId = null; // 已装载 iframe 对应的 runtimeId；变化即整页重载
 let frameLoaded = false;
 
+// ── 服务不可达「去抖」与恢复「重载闸门」（2026-09-29，修「生图中假性未启动 + 进度丢失」）──
+// 背景：重负载下后端 /system_stats 迟滞数秒 → 中继探测曾单次即翻 → 覆盖层误报 +
+// 恢复时强制重载 iframe 致运行中进度丢失（docs/中继稳定性修复-20260929.md）。
+// ① 覆盖层去抖：连续 ≥OFFLINE_DEBOUNCE_TICKS 轮（轮询 3s）不可达才显示；
+// ② 重载闸门：仅「离线期间有显式启动请求」或「当前 frame 非已知可达期加载」才重载（§20 场景保留）。
+const OFFLINE_DEBOUNCE_TICKS = 3;
+let unreachableStreak = 0;   // 连续不可达轮数（可达即清零）
+let lastReachKnown = null;   // 最近一次观测到的可达性（null=尚未观测）
+let frameLoadOk = false;     // 当前 iframe 文档是否「加载于已知可达期」（或启动加载已被健康状态确认）
+let frameBootPending = false; // 启动时加载、可达性未定，等首个健康状态确认
+
+function offlineDebounced(streak) { return streak >= OFFLINE_DEBOUNCE_TICKS; }
+function frameReloadNeeded(askedStart, frameOk) { return askedStart || !frameOk; }
+
 // ── 主题 ──────────────────────────────────────────────────────────────────
 function hostThemeIsDark() {
   let snap = null;
@@ -819,6 +833,9 @@ async function tick() {
         frameIsDirect = false;
       }
       themeStaleAfterLoad = false; // 新文档会读到刚推送的色板
+      // 重载闸门记账（2026-09-29）：本次加载是否处于「已知可达」期；启动加载（未知）待首个健康状态确认
+      frameLoadOk = lastReachKnown === true;
+      frameBootPending = lastReachKnown === null;
       els.frame.src = built.url; // 含短期凭证，不落存储、不写日志
       console.log("[comfyui-hana] iframe 连接方式：", built.kind, built.note ? `（${built.note}）` : "");
     }
@@ -853,21 +870,26 @@ function stopBootPolling() {
 }
 function startStatusPolling() {
   if (statusTimer) return;
+  unreachableStreak = 0; // 新一轮状态轮询，去抖计数归零（2026-09-29）
   statusTimer = setInterval(() => { void statusTick(); }, 3000);
   void statusTick();
 }
 function stopStatusPolling() {
   if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  unreachableStreak = 0; // 退出状态轮询，去抖计数不跨段累计（2026-09-29）
   setBar(null);
 }
 
-// 服务从「不可达」恢复时，强制重载内层 iframe。
-// 原因：服务不在时 iframe 早已加载过一次（连不上，必为空白页），
-// 服务起来后它不会自动重试 —— 覆盖层一撤就是黑屏。这里带时间戳强制重载。
+// 强制重载内层 iframe（带 `_hr` 时间戳）。调用方 = statusTick 的重载闸门（2026-09-29）：
+// 仅「离线期间有显式启动请求」或「当前 frame 非已知可达期加载（如服务未起的空白页）」时调用；
+// 纯探测抖动的恢复不调用 —— 避免把运行中的进度显示重载清空。
+// （§20 场景保留：服务不在时 iframe 加载必为空白页，重载逻辑照旧生效。）
 function reloadFrameForBackend(boot) {
   const built = buildFrameUrl(boot);
   if (!built || !built.url) return;
   frameLoaded = false;
+  frameLoadOk = true;        // 重载发起于已知恢复期，新文档视为「已知可达期加载」
+  frameBootPending = false;
   els.loading.classList.add("show");
   const u = built.url + (built.url.indexOf("?") >= 0 ? "&" : "?") + "_hr=" + Date.now();
   els.frame.src = u;
@@ -884,18 +906,34 @@ async function statusTick() {
     }
     const backend = st.relay && st.relay.backend ? st.relay.backend : null;
     const reachable = !!(backend && backend.reachable);
+    lastReachKnown = reachable;
     if (!reachable) {
-      // 覆盖层承担提示（比顶栏更清楚），避免 iframe 直接渲染中继的 ECONNREFUSED JSON
-      setBar(null);
-      showOffline(st);
+      // ① 覆盖层去抖（2026-09-29）：连续 ≥OFFLINE_DEBOUNCE_TICKS 轮不可达才显示，
+      //    单次负载抖动不再误报「服务未运行」；覆盖层出现时才清 bar，避免抖动期闪没提示
+      unreachableStreak += 1;
+      if (offlineDebounced(unreachableStreak)) {
+        // 覆盖层承担提示（比顶栏更清楚），避免 iframe 直接渲染中继的 ECONNREFUSED JSON
+        setBar(null);
+        showOffline(st);
+      }
     } else {
-      if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; }
-      if (els.offline.classList.contains("show")) {
-        reloadFrameForBackend(boot); // 服务刚回来：重载内层（启动前的加载必然失败，不重载会黑屏）
-        showView("ready");
-        ensureComfySync(); // 服务刚回来，重新对齐主题
+      const wasUnreachable = unreachableStreak > 0;
+      unreachableStreak = 0;
+      // 启动期加载（可达性未知）被首个未遇离线的健康状态确认 → 记为「已知可达期加载」
+      if (frameBootPending && !wasUnreachable) { frameLoadOk = true; frameBootPending = false; }
+      if (wasUnreachable) {
+        // ② 重载闸门（2026-09-29）：仅「离线期有显式启动请求」或「frame 非已知可达期加载」重载；
+        //    纯探测抖动直接放行，不清运行中进度（§20 重载语义保留）
+        const askedStart = svcRequestedAt > 0;
+        const didReload = frameReloadNeeded(askedStart, frameLoadOk);
+        if (didReload) reloadFrameForBackend(boot);
+        if (didReload || els.offline.classList.contains("show")) {
+          showView("ready");
+          ensureComfySync(); // 服务刚回来，重新对齐主题
+        }
         setBar(null); // 清掉「已请求启动…」等操作提示
       }
+      if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; }
       // 服务运行中的常驻控制条已移除（2026-09-27）：服务控制只留左侧状态面板
       if (themeStaleAfterLoad) {
         setBar("info", "宿主主题已更新，正在刷新工作区…", []);
