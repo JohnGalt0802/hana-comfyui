@@ -3341,6 +3341,7 @@ export default defineApp(async (sdk) => {
   //       （工作区缺 → 自动拉起 → 等就绪；#38 同刻仅一壳页——自动路径不双开）。
   // 依赖：capabilities 需 app/windows.manage（扩权词，走既有「应用能力」授予，即时生效）；
   //       窗口页凭据由 ui/workspace.js 侧兜底（query 优先；缺则从 /ui/_surface/<token>/ 路径段提取并回填）。
+  // 凭据口径（2026-10-08 真机实测修正）：windows.* 一律走「无 callToken」App 级调用（详见 windowCall 注释）。
   // 注意：壳页桥为单桶（shellBridge）——窗口壳页与主工作区壳页共享心跳/队列，同刻仅一壳页。
   const CAP_WINDOWS = "app/windows.manage";
   const WORKSPACE_WINDOW_ENTRY = "/workspace.html";
@@ -3373,7 +3374,7 @@ export default defineApp(async (sdk) => {
     APP_CAPABILITY_DENIED: `宿主拒绝：未授予能力 ${CAP_WINDOWS}（设置 → 安全 →「应用能力」打开后即时生效）。`,
     APP_WINDOW_NOT_FOUND: "窗口不存在或不属于当前调用者（可能已关闭；可用 op=status 查看现状）。",
     APP_WINDOW_NOT_READY: "窗口还在打开中（opening）；稍后用 op=status 再看状态。",
-    APP_WINDOW_FORBIDDEN: "窗口调用凭据无效（callToken 不属于本 App）；请从会话内调用本工具。",
+    APP_WINDOW_FORBIDDEN: "窗口调用被宿主拒绝（凭据不属于本 App 或已回收）。现版本为 App 级窗口、不携带 callToken；若仍见该错请携带宿主日志反馈。",
     APP_WINDOW_ENTRY_INVALID: `窗口 entry 无效（应为 App ui/ 内绝对路径，如 ${WORKSPACE_WINDOW_ENTRY}）。`,
     APP_WINDOW_STALE: "本 App 实例已换代（宿主重载过）；请重试。",
   };
@@ -3385,9 +3386,16 @@ export default defineApp(async (sdk) => {
     return hint ? `${hint}（宿主：${raw}）` : raw;
   }
 
-  function windowCall(context) {
-    const callToken = context && typeof context.callToken === "string" ? context.callToken.trim() : "";
-    return callToken ? { callToken } : {};
+  // 窗口调用一律不带 callToken（App 级窗口；SDK 契约 AppWindowCall.callToken 为可选）。理由（2026-10-08 真机实测证据链）：
+  //   · 工具上下文的 callToken 是「调用期凭据」：宿主在工具 execute 返回的瞬间回收它（宿主 Sjn 包装器的 finally →
+  //     releaseCallToken 把令牌从校验账本删除）；之后再用它调 windows.* 必得 APP_WINDOW_FORBIDDEN
+  //     "App window call token does not belong to this App."——真机首测即此案（submit 自举后台段）。
+  //   · 本段同时跑同步相（op=open/close/status 直接调用）与异步相（submit 自举后台段）——异步相拿不到活凭据；
+  //   · token 有无决定窗口归属（带 → agentId=调用代理；无 → agentId=null），而 list/get/close 按
+  //     (appId, agentId, generation) 过滤——混用会出现「后台查重看不见前台窗」→ 双开，破坏 #38；
+  //   · 故全域统一为无 token（与 hana-builder 对 ownerAgentId=null 走 {} 的同款口径一致）。
+  function windowCall(_context) {
+    return {};
   }
 
   function windowLine(w) {
@@ -3398,14 +3406,11 @@ export default defineApp(async (sdk) => {
   async function openWorkspaceWindow(context) {
     const win = requireWindowsDomain();
     await requireWindowsCapability();
-    const call = windowCall(context);
-    if (!call.callToken) {
-      throw withCode("缺少宿主调用凭据 callToken（本工具需从会话内调用；窗口归属按调用者记账，缺凭据会导致后续不可见）。", "no-call-token");
-    }
+    // 不再硬要求 callToken（见 windowCall 注释：调用期凭据跨 invoke 不可用，窗口统一 App 级）。
     let snapshot;
     try {
       snapshot = await win.create({
-        ...call,
+        ...windowCall(context),
         entry: WORKSPACE_WINDOW_ENTRY,
         title: WORKSPACE_WINDOW_TITLE,
         bounds: { ...WORKSPACE_WINDOW_BOUNDS },
