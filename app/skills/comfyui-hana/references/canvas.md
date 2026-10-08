@@ -149,7 +149,7 @@ comfyui(action="canvas", op="patch", edits=[
 - agent 的改动用 `op=undo` 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。
 - 改动后拉 `get` 核对（connect 看 `input.link`、setWidget 看值），别只看桥回执。
 - 大动作先说话、小动作直接做（尺度详见 `copilot.md`）。
-- 待同步回填（D2）：canvas 类 op / 状态查询会惰性触发「backend 降级产物回填画布」；**前置＝桥可达 + 写授权 + 副驾驶总闸**——未满足时保留记录、下次再试（细节见 `submit.md`）。
+- 待同步回填（D2）：canvas 类 op / 状态查询会惰性触发「显式 backend 的未上画布产物回填画布」；**前置＝桥可达 + 写授权 + 副驾驶总闸**——未满足时保留记录、下次再试（细节见 `submit.md`）。
 
 ## 画布执行与视觉标记（D1 · 2026-10-03 实机验收）
 

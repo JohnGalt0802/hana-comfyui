@@ -68,14 +68,17 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
 
 `submit` 可用 `mode: "auto" | "canvas" | "backend"`（默认 `auto`）：
 
-- **auto 判定**：画布在线（shell alive + 扩展桥可达）**且两个授权闸都开**（「允许 agent 修改画布」＋「允许 Agent 开启画布副驾驶」）→ 画布流程；不满足（离线 / 任一授权关 / inputs 注入 / inline 对象形态等）→ backend 路径 + 待同步记账（结果注明 `degradeNote`，含原因与开启指引）。
-- **例外 · 画布忙**：画布有执行中任务 → **报错退出**（不抢占、不降级、不静默改走后端；确需后端请显式 `mode=backend`）。
+- **auto 判定**：画布在线（shell alive + 扩展桥可达）**且两个授权闸都开**（「允许 agent 修改画布」＋「允许 Agent 开启画布副驾驶」）→ 画布流程。不满足时**停下**（正常返回 + `details.comfyui.blocked: true` 含失败码 / 原因 / 选项摘要；**不静默改走后台**）：
+  - 授权缺（任一开关）→ 停下 + 选项：① 去设置页开对应开关后说「继续」；② 显式 `mode=backend` 重新提交（附风险说明）；③ 先不跑。
+  - 环境缺（服务 / 中继 / 工作区页面）→ 停下 + 指引：请启动 ComfyUI 服务 / 打开工作区（自举在后续批次升级）。
+  - 装载 / 执行失败（`canvas-unloadable` / `canvas-failed`）与其余未知错误 → 停下 + 原因。
+- **结构性豁免**：`workflow` 为 inline 对象（非 `{template}` 单键形态）或带非空 `inputs` → 形态判定前置（先于探测）、**直接走 backend**；回执注明「未上画布：inline/inputs 形态直走后台提交」。
+- **例外 · 画布忙**：画布有执行中任务 → **报错退出**（不抢占、不静默改走后端；确需后端请显式 `mode=backend`）。
 - **v2「复制工作台」五步**（2026-10-08）：`duplicate`（复制副本；原布零改动）→ `save`（副本落盘：`<原名去尾> (AgentCopy) YYYYMMDD-HHmm`，重名递增 ` (2)`）→ `canvas.copilot {enabled:true}`（开副本副驾驶）→ `loadWorkflowFile`（装载到副本）→ settle（落点断言：活动页＝副本页）→ `canvas.queue`（快返）。
   「copilot 开＝共编同页」自动分支已去除（共编同页降为「用户明确要求」的人工例外，不走本流程）；副驾驶总闸关时无法在副本上开副驾驶 → 画布路径不可走。
-- **降级**：写授权关或副驾驶总闸关 → 降级 backend（回执注明原因＋指引：去设置页开启对应开关；或显式 `mode=canvas` 直接报错）。`canvas-busy` 不降级（见上）。
-- `mode=canvas`：强制画布流程（**不降级**，前置不满足直接报错）；`mode=backend`：直接走后端（同样记待同步——"未上画布"统一口径）。
+- `mode=canvas`：强制画布流程（前置不满足直接报错）；`mode=backend`：显式后台直提（**唯一**会记待同步的路径；回执带风险说明——后端丢值先例）。
 
 ### 待同步（pending-canvas.json）与惰性回填
 
-- **记账**：backend 产出（未上画布）→ 记 `pending-canvas.json`（app 数据目录）：`{createdAt, workflowRef, promptId, note}`。
+- **记账**：仅**显式 `mode=backend`** 的产出记 `pending-canvas.json`（app 数据目录）：`{createdAt, workflowRef, promptId, note}`；auto 停下与结构豁免直提不记。
 - **惰性回填**：app 在 canvas 类 op / 状态 / shell 查询时惰性检测——画布恢复（shell alive + 桥可达）且两个授权闸都开（写授权＋副驾驶总闸）→ 复制副本 → 副本落盘（AgentCopy）→ 开副本副驾驶 → 装载该工作流 → 清标记；任一步不满足 / 失败 → 保留记录并附原因，下次触发再试。
