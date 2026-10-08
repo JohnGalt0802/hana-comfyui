@@ -13,6 +13,8 @@ comfyui(action="service", op="wait")      # 轮询就绪（单次 ≤25s，总�
 comfyui(action="service", op="status")    # 查状态（默认 op）
 ```
 
+**2026-10-08（B 主链）**：`submit`（auto）遇服务未运行会**自动复用本流程**（`envcheck` → `start` → 多轮 `wait`，总时限 150s；阻断则停下报告、不自动清障），无需用户手动先起服务。
+
 - 工作区**左侧面板**：「启动服务」/「停止服务」按钮（按当前可达性二选一显示）。
 - 工作区**顶栏**（v0.7）：服务运行中时常驻「停止服务 / 重启中继」（之前工作区内只能启动、不能关闭）。
 - 设置页（v0.7）：「Hana 启动时自动拉起 ComfyUI」开关（默认关）。
@@ -31,7 +33,7 @@ comfyui(action="service", op="status")    # 查状态（默认 op）
 
 ## 环境检查流程（blocked 之后）
 
-- 触发：`start` 的自动检查发现阻断项；或显式 `op="envcheck"`。
+- 触发：`start` 的自动检查发现阻断项；或显式 `op="envcheck"`；或 `submit`（auto）的自举链（复用同一流程，2026-10-08）。
 - 处理：回执附阻断清单与 `snapshotId`（180s 有效）→ `service clear`（带 `snapshotId+pids`）按快照清障 → `service wait` 轮询到就绪再继续。
 - 纪律：清除只按快照走（列表外一律拒绝、自身不可清；优先优雅停，防 supervisor 打地鼠）；清完 `op="wait"` 轮询到就绪再继续。
 

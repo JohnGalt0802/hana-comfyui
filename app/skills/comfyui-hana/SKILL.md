@@ -23,6 +23,8 @@ comfyui(action="service", op="start")
 comfyui(action="service", op="wait")    # 轮询就绪（单次 ≤25s，总时限 120–150s）
 ```
 
+提交时若环境缺（服务 / 中继 / 工作区），`submit`（auto）会**自动自举**：快返「环境准备中」→ 后台准备（服务拉起 / 必要时自动开工作区窗口）→ 就绪自动继续；阻断或补不上则停下报告。
+
 **生图**（提交即返回——**回合纪律：不要原地等待**；产物回执见 `references/submit.md`）：
 
 ```
@@ -57,7 +59,7 @@ comfyui(action="canvas", op="organize")   # 再排（不要主动重排——尊
 | action | 一句话 | 细节 |
 |---|---|---|
 | `status` | 服务/中继/队列/运行中任务聚合 | `references/service.md` |
-| `submit` / `query` / `result` / `cancel` | 提交工作流；查任务；取产物；定向取消（`all:true` 才全清） | `references/submit.md` |
+| `submit` / `query` / `result` / `cancel` | 提交工作流（环境缺自动自举后继续）；查任务；取产物；定向取消（`all:true` 才全清） | `references/submit.md` |
 | `workflows` / `upload` | 列/读已保存工作流；上传参考图（图生图） | `references/submit.md` |
 | `service` / `update` | 8188 服务进程起停与环境检查；本体更新（仅源码安装） | `references/service.md` |
 | `canvas` | 读/改人正在看的同一张画布（写入需授权） | `references/canvas.md` |
