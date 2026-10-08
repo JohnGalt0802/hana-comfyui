@@ -8,12 +8,12 @@
 :root {
   --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
   --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
-  --ok: #2e7d32; --bad: #c62828;
+  --ok: #2e7d32; --bad: #c62828; --gold: #b8860b;
 }
 body.t-dark {
   --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
   --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
-  --ok: #6fbf73; --bad: #e57373;
+  --ok: #6fbf73; --bad: #e57373; --gold: #d4af37;
 }
 * { box-sizing: border-box; }
 body { margin: 0; padding: 10px 12px; background: transparent; color: var(--text); font: 12px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
@@ -64,42 +64,84 @@ pre.uplog {
   white-space: pre-wrap; word-break: break-all; font-variant-numeric: tabular-nums;
 }
 pre.uplog:empty { display: none; }
+/* ── 折叠区（ComfyUI 状态 / 监视器）与本面板小部件 ── */
+details.fold { margin: 2px 0 10px; }
+details.fold > summary { list-style: none; cursor: pointer; user-select: none; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::marker { content: ""; }
+.fold-head { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; padding: 2px 0; }
+.fold-head:hover .fold-title { color: var(--accent); }
+.fold-title { font-size: 12.5px; font-weight: 700; }
+.fold-body { padding-top: 4px; }
+.arrow { margin-left: auto; color: var(--text-muted); font-size: 10px; line-height: 1; transition: transform .15s; }
+details.fold[open] > summary .arrow { transform: rotate(90deg); }
+/* 状态信号灯：灰=读取中，红=异常，绿=正常；金色 ✦=有更新 */
+.sig { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; line-height: 1; }
+.sig.ok { background: var(--ok); }
+.sig.bad { background: var(--bad); }
+.sig.update { width: auto; height: auto; background: transparent; color: var(--gold); text-shadow: 0 0 4px rgba(184,134,11,.45); font-family: "Segoe UI Symbol", "Segoe UI", sans-serif; }
+/* 监视器折叠后的一行温度（复用 v-temp 数据；展开时隐藏，图表行里已有温度） */
+.mon-temp { flex-basis: 100%; display: flex; align-items: baseline; gap: 6px; padding: 2px 0 0; }
+details.fold[open] .mon-temp { display: none; }
+/* note 区里的轻量快捷操作按钮（启动失败 → 重启中继） */
+button.mini { width: auto; padding: 3px 12px; font-size: 11px; }
 </style>
 </head>
 <body>
-  <h1>ComfyUI 状态</h1>
-  <div class="sect">
-    <div class="row"><span class="k">中继</span><span class="v" id="p-phase">读取中…</span></div>
-    <div class="row"><span class="k">服务端口</span><span class="v" id="p-port">—</span></div>
-    <div class="row"><span class="k">后端</span><span class="v" id="p-backend">—</span></div>
-    <div class="row"><span class="k">ComfyUI</span><span class="v" id="p-ver">—</span></div>
-    <div class="row"><span class="k">队列</span><span class="v" id="p-queue">—</span></div>
-  </div>
-  <div class="up-sec">
-    <div class="up-head"><span>ComfyUI 更新</span><span class="sec-spacer"></span><span class="chip" id="u-state">—</span></div>
-    <div class="row"><span class="k">版本</span><span class="v" id="u-local">—</span></div>
-    <div class="btn-row" style="margin-top:6px">
-      <button id="u-check" title="git fetch 后与远端对比 commit（不做任何改动）">检查更新</button>
-      <button id="u-apply" class="primary" title="停服务 → git pull --ff-only → pip install -r requirements.txt（后台执行）">更新</button>
+  <details class="fold" id="fold-status">
+    <summary class="fold-head">
+      <span class="sig" id="sig-dot" title="状态：读取中…"></span>
+      <span class="fold-title">ComfyUI 状态</span>
+      <span class="arrow" aria-hidden="true">▸</span>
+    </summary>
+    <div class="fold-body">
+      <div class="sect">
+        <div class="row"><span class="k">中继</span><span class="v" id="p-phase">读取中…</span></div>
+        <div class="row"><span class="k">服务端口</span><span class="v" id="p-port">—</span></div>
+        <div class="row"><span class="k">后端</span><span class="v" id="p-backend">—</span></div>
+        <div class="row"><span class="k">ComfyUI</span><span class="v" id="p-ver">—</span></div>
+        <div class="row"><span class="k">队列</span><span class="v" id="p-queue">—</span></div>
+      </div>
+      <div class="up-sec">
+        <div class="up-head"><span>ComfyUI 更新</span><span class="sec-spacer"></span><span class="chip" id="u-state">—</span></div>
+        <div class="row"><span class="k">版本</span><span class="v" id="u-local">—</span></div>
+        <div class="btn-row" style="margin-top:6px">
+          <button id="u-check" title="git fetch 后与远端对比 commit（不做任何改动）">检查更新</button>
+          <button id="u-apply" class="primary" title="停服务 → git pull --ff-only → pip install -r requirements.txt（后台执行）">更新</button>
+        </div>
+        <div class="note" id="u-note"></div>
+        <pre class="uplog" id="u-log"></pre>
+      </div>
+      <div class="note" id="p-detail"></div>
     </div>
-    <div class="note" id="u-note"></div>
-    <pre class="uplog" id="u-log"></pre>
-  </div>
-  <div class="mon-sec"><span id="m-gpu-name">GPU</span><span class="sec-spacer"></span><button class="gpu-release" id="m-release" title="让 ComfyUI 卸载全部模型、释放显存（后端 /free）">释放显存</button></div>
-  <div class="chart-row"><div class="chart-meta"><div class="chart-label">GPU 利用率</div><div class="chart-val" id="v-util">—</div></div><canvas class="chart" id="c-util"></canvas></div>
-  <div class="chart-row"><div class="chart-meta"><div class="chart-label">显存</div><div class="chart-val" id="v-vram">—</div></div><canvas class="chart" id="c-vram"></canvas></div>
-  <div class="chart-row"><div class="chart-meta"><div class="chart-label">温度</div><div class="chart-val" id="v-temp">—</div></div><canvas class="chart" id="c-temp"></canvas></div>
-  <div class="chart-row"><div class="chart-meta"><div class="chart-label">功耗</div><div class="chart-val" id="v-pwr">—</div></div><canvas class="chart" id="c-pwr"></canvas></div>
-  <div class="chart-row"><div class="chart-meta"><div class="chart-label">CPU</div><div class="chart-val" id="v-cpu">—</div></div><canvas class="chart" id="c-cpu"></canvas></div>
-  <div class="chart-row"><div class="chart-meta"><div class="chart-label">内存</div><div class="chart-val" id="v-ram">—</div></div><canvas class="chart" id="c-ram"></canvas></div>
-  <div class="note" id="m-note"></div>
+  </details>
+  <details class="fold" id="fold-mon">
+    <summary class="fold-head">
+      <span class="fold-title">监视器</span>
+      <span class="arrow" aria-hidden="true">▸</span>
+      <span class="mon-temp" id="mon-temp"><span class="chart-label">温度</span><span class="chart-val" id="mon-temp-v">—</span></span>
+    </summary>
+    <div class="fold-body">
+      <div class="mon-sec"><span id="m-gpu-name">GPU</span><span class="sec-spacer"></span><button class="gpu-release" id="m-release" title="让 ComfyUI 卸载全部模型、释放显存（后端 /free）">释放显存</button></div>
+      <div class="chart-row"><div class="chart-meta"><div class="chart-label">GPU 利用率</div><div class="chart-val" id="v-util">—</div></div><canvas class="chart" id="c-util"></canvas></div>
+      <div class="chart-row"><div class="chart-meta"><div class="chart-label">显存</div><div class="chart-val" id="v-vram">—</div></div><canvas class="chart" id="c-vram"></canvas></div>
+      <div class="chart-row"><div class="chart-meta"><div class="chart-label">温度</div><div class="chart-val" id="v-temp">—</div></div><canvas class="chart" id="c-temp"></canvas></div>
+      <div class="chart-row"><div class="chart-meta"><div class="chart-label">功耗</div><div class="chart-val" id="v-pwr">—</div></div><canvas class="chart" id="c-pwr"></canvas></div>
+      <div class="chart-row"><div class="chart-meta"><div class="chart-label">CPU</div><div class="chart-val" id="v-cpu">—</div></div><canvas class="chart" id="c-cpu"></canvas></div>
+      <div class="chart-row"><div class="chart-meta"><div class="chart-label">内存</div><div class="chart-val" id="v-ram">—</div></div><canvas class="chart" id="c-ram"></canvas></div>
+      <div class="note" id="m-note"></div>
+    </div>
+  </details>
 
   <div class="btn-row" style="margin-top:10px">
     <button id="p-start" class="primary" title="按本机探测到的安装根拉起 ComfyUI（由计划任务以当前用户身份起，独立于 Hana 存活）">启动服务</button>
     <button id="p-stop" class="danger" title="终止 8188 上的 ComfyUI 进程（正在跑的任务会中断）">停止服务</button>
   </div>
   <button id="p-retry" style="margin-top:6px" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>
-  <div class="note" id="p-note"></div>
+  <div class="note" id="p-note" style="display:none"></div>
+  <div id="p-note-actions" style="display:none;margin-top:6px">
+    <button id="p-note-retry" class="mini" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>
+  </div>
   <div class="err" id="p-err"></div>
   <script type="module" src="./assets/panel-status.js"></script>
 </body>

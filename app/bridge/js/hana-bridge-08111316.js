@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-03 hana-bridge-03131827";
+const BUILD_TAG = "2026-10-08 hana-bridge-08111316";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -110,6 +110,44 @@ let lastSignature = null;
 let lastWorkflowName = null;
 let changes = [];
 
+// ── 变更来源标记（P6，2026-10-08）─────────────────────────────────────────
+// 甲案口径：变更记录追加 source = "user"（默认：人在画布上的操作）/ "agent"（本桥写 op
+// 执行期间）/ "system"（装载 / 重配置的异步窗口内）。只增字段，不改 rev 递增语义
+// （app 侧 settle 的强证据依赖它）；工具层过滤留待后续，本期只做桥侧标记。
+let changeSource = "user";
+
+// 系统窗：从装载发起（loadGraphData）到 promise settle（或兜底超时）之前，变更记 "system"。
+// 兜底给足（大图 configure 可能远超 6s 回传口径；60s 仅防「promise 永不落地」）。
+// 单窗语义：新窗接管旧窗（旧窗 done 即失效，不会越权复位）。
+const SYSTEM_WINDOW_MAX_MS = 60_000;
+let activeSystemWindow = null;
+function beginSystemWindow() {
+  if (activeSystemWindow) activeSystemWindow.done();
+  const win = {
+    active: true,
+    timer: null,
+    done: () => {
+      if (!win.active) return;
+      win.active = false;
+      if (win.timer) { clearTimeout(win.timer); win.timer = null; }
+      if (activeSystemWindow === win) activeSystemWindow = null;
+      changeSource = "user";
+    },
+  };
+  activeSystemWindow = win;
+  changeSource = "system";
+  return win;
+}
+function armSystemWindow(win, promise) {
+  win.timer = setTimeout(win.done, SYSTEM_WINDOW_MAX_MS);
+  if (promise && typeof promise.then === "function") promise.then(win.done, win.done);
+}
+
+// P2（2026-10-08）：另存并切换链的限时预算——/call 回传上限 6s（HANA_BRIDGE_TIMEOUT
+// 可调），取 5s 留裕量；超预算返回 pending，由 app 层落定校验后报成功。
+const SAVE_CHAIN_BUDGET_MS = 5000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // 当前活动工作流对象：优先「实测存在的服务」workflowService（app.extensionManager.workflow），
 // 兼容旧版 app.workflowManager。取不到 → null。
 // 背景（2026-09-28 实测）：前端 1.53.6 已无 app.workflowManager（全包 0 命中），
@@ -126,13 +164,26 @@ function activeWorkflowObj() {
   return null;
 }
 
-// 工作流是否「已修改未保存」：isModified 实测为函数；兼容布尔 getter。
+// 工作流是否「已修改未保存」：isModified 两种形态都兼容——v1.55.14 源码核对为布尔 getter
+// （ComfyWorkflow._isModified；setter 同源）；旧版前端（2026-09-28 实测）为函数 isModified()。
 function workflowDirty(wf) {
   try {
     if (!wf) return false;
     const m = wf.isModified;
     if (typeof m === "boolean") return m;
     if (typeof m === "function") return !!wf.isModified();
+  } catch { /* 忽略 */ }
+  return false;
+}
+
+// 工作流是否为「临时页」（从未落盘、无真实文件路径）：v1.55.14 源码核对为布尔 getter
+// （UserFile.isTemporary，size===-1；saveAs 成功后才拿到真实 size）；兼容函数形式。取不到/异常 → false。
+function workflowTemporary(wf) {
+  try {
+    if (!wf) return false;
+    const t = wf.isTemporary;
+    if (typeof t === "boolean") return t;
+    if (typeof t === "function") return !!wf.isTemporary();
   } catch { /* 忽略 */ }
   return false;
 }
@@ -621,6 +672,7 @@ function pollGraph() {
     changes.push({
       rev: graphRevision,
       at: new Date().toISOString(),
+      source: changeSource, // P6（2026-10-08）：user / agent / system
       nodes: sig.nodeCount,
       links: sig.linkCount,
       deltaNodes: sig.nodeCount - lastSignature.nodeCount,
@@ -1261,7 +1313,8 @@ const OPS = {
   //   name  工作流名（不含 .json 也可）
   //   path  相对 user/default/ 的路径（如 workflows/xxx.json）
   //   force true 时即使当前图有未保存改动也切换（默认拒绝，避免静默丢掉人的编辑）
-  // 返回：{ opened, matched, activeBefore, blocked? }
+  // 返回（P1 起，2026-10-08）：完整装载快返——{ opened:true, pending:true, matched, activeBefore, activeAfter(期望), nodeCount, note }；
+  //   失败 { opened:false, blocked:"dirty"|"not_found", … }；由 app 层按 nodeCount / activeAfter 落定校验后报成功。
   // 直接按文件路径加载工作流（绕过前端工作流列表）。
   // 为何需要：前端的工作流列表在启动时加载并可能本地缓存，agent 之后新增的
   // 工作流文件不在列表里，openWorkflow 会 not_found。这条路读文件内容直接进画布。
@@ -1281,11 +1334,22 @@ const OPS = {
     const graph = await res.json();
     if (!graph || typeof graph !== "object") throw new Error("工作流文件不是合法 JSON 对象");
     if (typeof app.loadGraphData !== "function") throw new Error("前端没有 app.loadGraphData");
+    // 身份保持（2026-10-08，补验坐实后修复）：传「装载前活动页对象 aw」为 loadGraphData 第 4 参——
+    // 上游 v1.55.14：afterLoadNewGraph → activateLoadedWorkflow 对「对象」走 store.openWorkflow(aw)，
+    // 保持 aw 为活动页；对 null 则走 createNewTemporary → 活动页变「Unsaved Workflow」，submit settle
+    // 的落点断言（期待副本页名）必失败。aw 取不到时退化为旧单参行为（如实兜底）。
     // 不 await：loadGraphData 会等整图渲染完，节点多时远超前端 6s 回传上限。
     // 发起后立即回报，加载在后台继续。
-    void Promise.resolve(app.loadGraphData(graph)).catch((e) => {
+    // P6（2026-10-08）：装载窗口期间的变更记 source="system"（promise settle 或兜底超时后复位）。
+    const sysWin = beginSystemWindow();
+    const loadP = Promise.resolve(
+      aw
+        ? app.loadGraphData(graph, true, true, aw, { checkForRerouteMigration: false, deferWarnings: false })
+        : app.loadGraphData(graph),
+    ).catch((e) => {
       console.warn(LOG_TAG, "loadGraphData 失败", e);
     });
+    armSystemWindow(sysWin, loadP);
     return {
       loaded: true,
       file: rel,
@@ -1299,8 +1363,8 @@ const OPS = {
     const target = String(a.path || a.name || "").trim();
     if (!target) throw new Error("需要 name 或 path");
     const svc = app.extensionManager && app.extensionManager.workflow;
-    if (!svc || typeof svc.openWorkflow !== "function") {
-      throw new Error("前端没有 workflowService.openWorkflow（版本不支持）");
+    if (!svc) {
+      throw new Error("前端没有 workflow store（app.extensionManager.workflow 不可用，版本不支持）");
     }
     // 先刷新工作流列表：前端列表在启动时加载，agent 之后新增的文件不在其中
     for (const m of ["syncWorkflows", "loadWorkflows"]) {
@@ -1311,11 +1375,12 @@ const OPS = {
 
     const aw = svc.activeWorkflow || null;
     const before = aw ? (aw.filename || aw.path || aw.name || null) : null;
-    // 未保存保护：默认不抢掉人正在改的图
+    // 未保存保护：默认不抢掉人正在改的图。
+    // 质检①（2026-10-08）：原判定只认 function 形式；v1.55.14 的 isModified 为布尔 getter
+    // （ComfyWorkflow._isModified）→ function 判定恒 false、保护实际失效。改用 workflowDirty()
+    // （兼容 getter / 函数两种形态；loadWorkflowFile 侧同点已走 workflowDirty，不受影响）。
     let dirty = false;
-    try {
-      if (aw && typeof aw.isModified === "function") dirty = !!aw.isModified();
-    } catch { dirty = false; }
+    try { dirty = workflowDirty(aw); } catch { dirty = false; }
     if (dirty && a.force !== true) {
       return { opened: false, blocked: "dirty", activeBefore: before };
     }
@@ -1352,13 +1417,40 @@ const OPS = {
       };
     }
 
-    await svc.openWorkflow(hit);
-    const aw2 = svc.activeWorkflow || null;
+    // P1 修复（2026-10-08）：原实现只调 store 版 svc.openWorkflow(hit)——它只做「激活」
+    // （push path → load → activeWorkflow.value 赋值），从不调 app.loadGraphData 触发画布重绘，
+    // 留下「页面名 ≠ 画布内容」的半状态且无失败信号。这里改为完整装载，对齐 v1.55.14
+    // workflowService.openWorkflow 的真实序列（settingStore 打包产物核对）：
+    //   if (!hit.isLoaded) await hit.load(); → loadGraphData(clone(activeState), true, true, hit, …)
+    // 因 /call 回传上限 6s（bridge/__init__.py CALL_TIMEOUT_SEC），不等待重绘完成：
+    // 返回 pending:true + nodeCount + activeAfter（期望值），由 app 层落定校验后才报成功。
+    const wasLoaded = !!hit.isLoaded;
+    if (!wasLoaded) await hit.load();
+    // 活动页的直接写入（如 agent 写 op）可能尚未进 changeTracker：先刷齐再读 activeState，
+    // 否则 force 重载可能吞掉这批改动。非活动页为 no-op（isActiveTracker 守卫）。
+    try { hit.changeTracker?.prepareForSave?.(); } catch { /* 刷不动时不阻断（按现有 activeState 装载） */ }
+    const st = JSON.parse(JSON.stringify(hit.activeState));
+    if (!st || typeof st !== "object") throw new Error("取不到 activeState（无法装载）");
+    const nodeCount = Array.isArray(st.nodes) ? st.nodes.length : null;
+    const expectAfter = hit.filename || hit.name || hit.path || null;
+    // P6（2026-10-08）：装载窗口期间的变更记 source="system"（promise settle 或兜底超时后复位）。
+    const sysWin = beginSystemWindow();
+    const loadP = Promise.resolve(app.loadGraphData(st, true, true, hit, {
+      checkForRerouteMigration: false,
+      deferWarnings: false,
+      skipAssetScans: wasLoaded && a.force !== true, // 对齐前端：已加载且非 force 时跳过资产扫描
+    })).catch((e) => {
+      console.warn(LOG_TAG, "openWorkflow loadGraphData 失败", e);
+    });
+    armSystemWindow(sysWin, loadP);
     return {
       opened: true,
+      pending: true, // 快返：装载在页面内继续，app 层按 nodeCount / activeAfter 落定校验
       matched: (hit && (hit.path || hit.filename || hit.name)) || null,
       activeBefore: before,
-      activeAfter: aw2 ? (aw2.filename || aw2.path || aw2.name || null) : null,
+      activeAfter: expectAfter,
+      nodeCount,
+      note: "已发起完整装载（异步）：装载完成后画布刷新并激活该工作流，调用方按 nodeCount / activeAfter 落定校验确认",
     };
   },
 
@@ -1437,7 +1529,12 @@ const OPS = {
     const wf = store.createNewTemporary(base + " (Copy).json", state); // 同步注册，path/key 立刻可读
     if (!wf || !wf.path) throw new Error("createNewTemporary 未返回工作流对象");
     if (typeof app.loadGraphData !== "function") throw new Error("前端没有 app.loadGraphData");
-    await app.loadGraphData(state, true, true, wf); // 先按 await 实现（耗时见验收记录）
+    // P6（2026-10-08）：装载窗口期间的变更记 source="system"（settle 或兜底超时后复位）；
+    // await 语义保持原样（先按 await 实现，耗时见验收记录）。
+    const sysWin = beginSystemWindow();
+    const dupP = app.loadGraphData(state, true, true, wf);
+    armSystemWindow(sysWin, dupP);
+    await dupP;
     return { ok: true, page: wf.path, key: wf.key };
   },
 
@@ -1516,6 +1613,30 @@ const OPS = {
     }
     app.graph.setDirtyCanvas(true, true);
     return { ok: true, nodes: nodeCount, edges: edgeLinkCount, missedNodes, missedEdges };
+  },
+
+  // 副驾驶开关（v2，2026-10-08）：Agent 按授权开启 / 关闭「当前活动页」的副驾驶（进入 / 退出驾驶位）。
+  // 写方从「仅前端 UI」扩为「UI 与 Agent 双写方、均即时上报」（契约 §2 同批修订）。
+  // 复用 copilotWriteState（localStorage 按页写）+ copilotUiRender（顶栏按钮刷新）+
+  // pushStateSnapshot（即时上报，不等防抖）。返回 {enabled, pageKey, updatedAt}。
+  // 拦截口径：本 op 豁免于写拦截（否则鸡生蛋——未开的布永远开不了）；开启权限由 app 层
+  // 「允许 Agent 开启画布副驾驶」总闸管辖（桥读不到设置——该边界如实：桥侧对总闸无感知）。
+  "canvas.copilot": (args) => {
+    const a = args || {};
+    if (a.enabled === undefined || a.enabled === null) {
+      throw new Error("需要 enabled（true=开启 / false=关闭）");
+    }
+    const want = a.enabled === true;
+    if (!copilotPageKey()) {
+      throw new Error("没有活动工作流页（pageKey 不可得）：先在前端打开一张工作流");
+    }
+    const res = copilotWriteState(want);
+    if (res.enabled !== want) {
+      throw new Error("copilot 状态写入未生效（localStorage 不可写？）");
+    }
+    copilotUiRender();
+    void pushStateSnapshot(); // 即时上报：开关语义要即时可查（不等下一次 pollGraph 防抖）
+    return { enabled: res.enabled, pageKey: res.pageKey, updatedAt: res.updatedAt };
   },
 
   // ── 写入（P3；需 App 侧的授权开关打开）───────────────────────────────
@@ -1742,42 +1863,130 @@ const OPS = {
     };
   },
 
-  // 落盘：把当前图写成工作流文件（这样即使页面没开、或换个实例，打开就能看到改动）。
-  // 备份语义（2026-09-28 修正）：.bak.json = 「覆盖前的磁盘旧文件」——先读旧文件、写到 .bak，
-  // 再写新文件；磁盘上没有旧文件时不写 .bak（backup=null）。备份失败不阻断主写入。
+  // 落盘（P2 修复，2026-10-08）：改走前端正规保存链，目标语义＝真保存——
+  //   ① 同名保存：保留 .bak 步骤 → wf.changeTracker.prepareForSave() 刷齐 → svc.saveWorkflow(wf)
+  //      （store 版 → wf.save() 全链：写盘 + changeTracker.reset + isModified=false + 清 draft）；
+  //   ② 另存并切换（name=新名）：svc.saveAs(wf, newPath) → adopted.load() →
+  //      app.loadGraphData(clone(activeState), true, true, adopted) → svc.saveWorkflow(adopted)；
+  //      目标文件已存在先明确报错（不写任何文件）；
+  //   ③ 另存链含重绘，可能超 /call 6s 回传上限 → 限时等待（同 P1 pending 口径），
+  //      未按预算完成时返回 pending:true，由 app 层落定校验（节点数/落点/文件落盘）后报成功。
+  // 备份语义（2026-09-28；P2 保留）：.bak.json = 「覆盖前的磁盘旧文件」——先读旧文件、写到 .bak，
+  // 再走保存链；磁盘上没有旧文件时不写 .bak（backup=null）。备份失败不阻断主保存。
   "canvas.save": async (args) => {
     const a = args || {};
     const wf = activeWorkflowObj();
-    const raw = String(a.name || (wf && (wf.filename || wf.name)) || "").trim();
-    if (!raw) throw new Error("无法确定工作流名：传 {name}，或先在前端打开/保存过一张工作流");
-    const clean = raw.replace(/\.json$/i, "");
-    const json = app.graph.toJSON();
-    const body = JSON.stringify(json);
-    const put = async (file, data) => {
-      const res = await api.fetchApi(`/api/userdata/${encodeURIComponent(file)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: data,
-      });
-      if (!res.ok) throw new Error(`${file} 写入失败：HTTP ${res.status}`);
-    };
-    // 先取「覆盖前的磁盘旧文件」：有 → 写 .bak；无（404/读失败）→ 跳过 .bak
-    let backup = null;
-    let oldBody = null;
-    try {
-      // 路径要带 workflows/ 前缀：/api/userdata/<file> 的 <file> 是相对 user/default/ 的，
-      // 不带前缀会写到 user/default/ 根下（实测踩过）。
-      const old = await api.fetchApi(`/api/userdata/${encodeURIComponent(`workflows/${clean}.json`)}`, { cache: "no-store" });
-      if (old.ok) oldBody = await old.text();
-    } catch { oldBody = null; }
-    if (oldBody != null) {
-      try {
-        await put(`workflows/${clean}.bak.json`, oldBody);
-        backup = `workflows/${clean}.bak.json`;
-      } catch { /* 备份失败不阻断主写入 */ }
+    if (!wf) throw new Error("没有活动工作流：先在前端打开/保存过一张工作流");
+    const svc = app && app.extensionManager && app.extensionManager.workflow;
+    if (!svc || typeof svc.saveWorkflow !== "function" || typeof svc.saveAs !== "function") {
+      throw new Error("前端没有 workflow store（saveWorkflow / saveAs 不可用，版本不支持）");
     }
-    await put(`workflows/${clean}.json`, body);
-    return { saved: `workflows/${clean}.json`, backup, nodes: json.nodes ? json.nodes.length : null };
+    const curName = String(wf.filename || wf.name || "").trim();
+    const raw = String(a.name || curName || "").trim();
+    if (!raw) throw new Error("无法确定工作流名：传 {name}，或先在前端打开/保存过一张工作流");
+    // 质检②（2026-10-08）：临时页（Unsaved Workflow，无文件路径）且未传 name → 显式报错。
+    // 旧行为：把「Unsaved Workflow.json」当真实文件直接落盘（静默写出非预期文件；已有同名时报 409）；
+    // 若经上游服务链（saveWorkflowAs → promptSave）则是弹窗等人输入的面。统一要求显式传 name
+    // （走另存并切换链，新建 workflows/<name>.json），消除静默落盘 / 等待面。
+    if (!String(a.name || "").trim() && workflowTemporary(wf)) {
+      throw new Error(
+        `当前页是临时工作流「${wf.filename || wf.name || "Unsaved Workflow"}」（无文件路径）：保存需显式传 name=<工作流名>（将新建 workflows/<name>.json 并切换）`,
+      );
+    }
+    const clean = raw.replace(/\.json$/i, "");
+    const curClean = curName.replace(/\.json$/i, "");
+    // 读磁盘旧文件（用于 .bak 与「目标已存在」预检）；失败/不存在返回 null。
+    // 路径要带 workflows/ 前缀：/api/userdata/<file> 的 <file> 是相对 user/default/ 的，
+    // 不带前缀会写到 user/default/ 根下（实测踩过）。
+    const readOld = async (file) => {
+      try {
+        const old = await api.fetchApi(`/api/userdata/${encodeURIComponent(file)}`, { cache: "no-store" });
+        return old.ok ? await old.text() : null;
+      } catch { return null; }
+    };
+
+    if (clean !== curClean) {
+      // ── ② 另存并切换 ─────────────────────────────────────────────
+      const newPath = `workflows/${clean}.json`;
+      if ((await readOld(newPath)) != null) {
+        throw new Error(`另存目标已存在：${newPath}（请换一个名字；本次未写任何文件）`);
+      }
+      if (!wf.isLoaded) await wf.load();
+      try { wf.changeTracker?.prepareForSave?.(); } catch { /* 刷不动时按现有 activeState 继续 */ }
+      if (!wf.activeState) throw new Error("取不到当前图内容（activeState 为空），无法另存");
+      const adopted = svc.saveAs(wf, newPath);
+      if (!adopted) throw new Error("saveAs 未返回新工作流（版本不支持？）");
+      await adopted.load();
+      const st = JSON.parse(JSON.stringify(adopted.activeState));
+      if (!st || typeof st !== "object") throw new Error("另存副本取不到 activeState");
+      const nodeCount = Array.isArray(st.nodes) ? st.nodes.length : null;
+      const expectAfter = adopted.filename || adopted.name || adopted.path || null;
+      // 重绘 + 落盘（完整链）可能超过 /call 6s 回传上限 → 限时等待；未完成返回 pending，
+      // 由 app 层按 nodeCount / activeAfter 落定校验（并核对文件落盘）后再报成功（同 P1 口径）。
+      let done = false;
+      let failed = null;
+      const chain = (async () => {
+        try {
+          // P6（2026-10-08）：装载窗口期间的变更记 source="system"（settle 或兜底超时后复位）。
+          const sysWin = beginSystemWindow();
+          const loadP = app.loadGraphData(st, true, true, adopted, {
+            checkForRerouteMigration: false,
+            deferWarnings: false,
+            skipAssetScans: true, // 对齐前端：副本已加载（非 force）时跳过资产扫描
+          });
+          armSystemWindow(sysWin, loadP);
+          await loadP;
+          await svc.saveWorkflow(adopted);
+          done = true;
+        } catch (e) {
+          failed = e;
+          console.warn(LOG_TAG, "另存并切换链失败", e);
+        }
+      })();
+      await Promise.race([chain, sleep(SAVE_CHAIN_BUDGET_MS)]);
+      if (failed) throw new Error(`另存并切换失败：${(failed && failed.message) || failed}`);
+      return {
+        saved: newPath,
+        savedAs: true,
+        switched: done,
+        pending: !done,
+        nodes: nodeCount,
+        nodeCount,
+        backup: null,
+        activeBefore: curName || null,
+        activeAfter: expectAfter,
+        note: done ? "另存并切换与落盘已完成" : "另存链已发起（异步）：重绘/落盘稍后完成，按落定校验确认",
+      };
+    }
+
+    // ── ① 同名保存（前端正规保存链）─────────────────────────────
+    let backup = null;
+    {
+      const file = `workflows/${clean}.json`;
+      const oldBody = await readOld(file);
+      if (oldBody != null) {
+        try {
+          const res = await api.fetchApi(`/api/userdata/${encodeURIComponent(`workflows/${clean}.bak.json`)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: oldBody,
+          });
+          if (res.ok) backup = `workflows/${clean}.bak.json`;
+        } catch { /* 备份失败不阻断主保存 */ }
+      }
+    }
+    if (!wf.isLoaded) await wf.load();
+    try { wf.changeTracker?.prepareForSave?.(); } catch { /* 刷不动时按现有 activeState 继续 */ }
+    if (!wf.activeState) throw new Error("取不到当前图内容（activeState 为空），无法保存");
+    await svc.saveWorkflow(wf); // 全链：写盘 + changeTracker.reset + 清 dirty + 清 draft
+    const st = wf.activeState;
+    return {
+      saved: wf.path || `workflows/${clean}.json`,
+      savedAs: false,
+      backup,
+      nodes: Array.isArray(st && st.nodes) ? st.nodes.length : nodeList(app.graph).length,
+      dirtyCleared: !workflowDirty(wf),
+    };
   },
 
   // 撤销最后一步。先试官方命令（与人的 Ctrl+Z 同一条路），再按 agent 自己的逆操作栈回退。
@@ -1842,6 +2051,50 @@ async function postJson(path, body) {
   });
 }
 
+// P6（2026-10-08）：写 op 白名单（与 app/index.js CANVAS_OPS 的 write:true 项一一对应）。
+// 执行期间把变更来源标为 "agent"；装载类窗口另标 "system"（见 beginSystemWindow）。
+// v2（2026-10-08）追加 canvas.copilot（开关自身也是写类；拦截豁免见下）。
+const WRITE_OPS = new Set([
+  "canvas.loadWorkflowFile", "canvas.openWorkflow",
+  "canvas.setWidget", "canvas.addNode", "canvas.removeNode",
+  "canvas.connect", "canvas.disconnect", "canvas.setNodeMode",
+  "canvas.save", "canvas.undo", "canvas.patch", "canvas.organize",
+  "canvas.queue", "canvas.duplicate", "canvas.visual", "canvas.copilot",
+]);
+
+// ── 副驾驶写拦截（v2 硬约束，2026-10-08）─────────────────────────────
+// 写类 op 在「当前活动页副驾驶未开」时统一拒绝（{ok:false, error:"copilot_off", detail:指引}）。
+// 判定实时取当前状态：关了立即恢复受限；开了立即放行。豁免名单及理由（逐条，任务书要求）：
+//   · canvas.openWorkflow —— 「打开」（切前台看布）：无副驾驶画布上仅允许的两类动作之一。
+//   · canvas.duplicate    —— 「复制」：另一类允许动作；v2 默认工作方式就是先复制副本再干活。
+//   · canvas.save         —— 「落盘」：v2 副本流程第 2 步（复制 → 落盘 → 开副本副驾驶 → 操作，
+//                            顺序固定——落盘先于开启发生）；且落盘不注入新图变更（把已有内容
+//                            写盘），不构成侵占性修改。
+//   · canvas.copilot      —— 「开关自身」：若拦截它，未开的画布永远开不了（鸡生蛋）；
+//                            其开启权限由 app 层「允许 Agent 开启画布副驾驶」总闸管辖
+//                            （桥读不到设置——该边界如实：桥侧不检查总闸，只在 app 层生效）。
+// 另注：frame.reload（壳页腿维护 op）不在本名单（不在 WRITE_OPS 里，两名单均不含），
+// 评估结论＝维持豁免（维护性操作：重载内层 iframe，不向画布注入改动）。
+const COPILOT_WRITE_EXEMPT = new Set([
+  "canvas.openWorkflow",
+  "canvas.duplicate",
+  "canvas.save",
+  "canvas.copilot",
+]);
+
+// 判定：该 op 此刻是否应被副驾驶硬约束拒绝；拒绝时返回指引文本，放行返回 null。
+function copilotWriteBlocked(opName) {
+  if (!WRITE_OPS.has(opName)) return null;
+  if (COPILOT_WRITE_EXEMPT.has(opName)) return null;
+  const cp = copilotReadState();
+  if (cp.enabled) return null;
+  return (
+    `当前画布${cp.pageKey ? `（pageKey=${cp.pageKey}）` : ""}未开启副驾驶：写类操作已拒绝；` +
+    "Agent 仅可打开（openWorkflow）/ 复制（duplicate）/ 落盘（save）。" +
+    "开启方式：① 用户在画布顶栏点「副驾驶·开」；② 用户在设置页开启「允许 Agent 开启画布副驾驶」授权后，由 Agent 用 canvas.copilot {enabled:true} 奉命开启。"
+  );
+}
+
 // 监听中继经 ComfyUI 自带 /ws 推来的指令，执行后同源回传
 api.addEventListener(EVT_CALL, async (event) => {
   const msg = (event && event.detail) || {};
@@ -1849,7 +2102,20 @@ api.addEventListener(EVT_CALL, async (event) => {
   try {
     const fn = OPS[msg.op];
     if (!fn) throw new Error("unknown op: " + msg.op);
-    payload = { ok: true, data: await fn(msg.args || {}) };
+    const isWrite = WRITE_OPS.has(msg.op);
+    // 副驾驶硬约束（v2，2026-10-08）：写类 op 在「当前活动页未开副驾驶」时统一拒绝（豁免见上）。
+    const blockedDetail = copilotWriteBlocked(msg.op);
+    if (blockedDetail) {
+      payload = { ok: false, error: "copilot_off", detail: blockedDetail };
+    } else {
+      if (isWrite) changeSource = "agent";
+      try {
+        payload = { ok: true, data: await fn(msg.args || {}) };
+      } finally {
+        // 仅当仍在 "agent" 时复位；op 内部开了 system 窗的（装载类）由窗口自己收口复位
+        if (isWrite && changeSource === "agent") changeSource = "user";
+      }
+    }
   } catch (err) {
     payload = { ok: false, error: String((err && err.message) || err) };
   }

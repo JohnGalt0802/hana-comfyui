@@ -10,20 +10,20 @@ description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）
 ## 这是什么
 
 - **整页工作区**：内嵌官方前端，iframe **直连 `127.0.0.1:8188`**（自定义节点扩展可用）；主题跟随宿主。
-- **`comfyui` 工具**（单工具 action 分派）：经「中继」操作 8188；每次提交在宿主建一条正式任务（`next-step` 回执）并挂任务卡。
+- **`comfyui` 工具**（单工具 action 分派）：经「中继」操作 8188；每次提交在宿主建一条正式任务（`next-step` 回执）。
 - **服务独立存活**：8188 由 Windows 计划任务拉起，独立于 Hana；顶栏 / 左侧面板 / 工具均可起停。
-- 卡片：「ComfyUI 工作区」整页卡（含状态面板）、「ComfyUI 任务卡」、拉起前的「服务检查卡」。
+- 卡片：「ComfyUI 工作区」整页卡（含状态面板）。
 
 ## 快速上手（最短路径）
 
-**起服务**（别先去开终端）——自动先做环境检查；返回 `blocked` 时按随消息的「环境检查卡」处理：
+**起服务**（别先去开终端）——自动先做环境检查；返回 `blocked` 时按其指引处理（`service clear` 后重试）：
 
 ```
 comfyui(action="service", op="start")
 comfyui(action="service", op="wait")    # 轮询就绪（单次 ≤25s，总时限 120–150s）
 ```
 
-**生图**（提交即返回——**回合纪律：不要原地等待**；产物回执与任务卡见 `references/submit.md`）：
+**生图**（提交即返回——**回合纪律：不要原地等待**；产物回执见 `references/submit.md`）：
 
 ```
 comfyui(action="submit", workflow={"template":"我保存的工作流.json"}, inputs={"3.seed": 123})
@@ -44,8 +44,8 @@ comfyui(action="canvas", op="organize")   # 再排（不要主动重排——尊
 | 何时读 | 子文档 |
 |---|---|
 | 要看/改人正在看的画布：读 ops 全表、投影 get、check/trace/outline、patch 事务、排布、画布执行 / 复制 / 视觉标记 | `references/canvas.md` |
-| 生图与提交：submit 三形态、inputs 注入、任务桥与回执、任务卡状态、mode 分流（auto/canvas/backend） | `references/submit.md` |
-| 服务管理：起停、环境检查卡、就绪等待、未安装分流、本体更新 | `references/service.md` |
+| 生图与提交：submit 三形态、inputs 注入、任务桥与回执、mode 分流（auto/canvas/backend） | `references/submit.md` |
+| 服务管理：起停、环境检查、就绪等待、未安装分流、本体更新 | `references/service.md` |
 | 副驾驶（共编）与行为准则：大动作/小动作尺度、锁/高亮、开关细则 | `references/copilot.md` |
 | 排障：中继/桥/页面状态/常见坑/路由与日志位置 | `references/troubleshooting.md` |
 | 未安装 ComfyUI：完整安装流程（Windows 主线） | `INSTALL.md` |

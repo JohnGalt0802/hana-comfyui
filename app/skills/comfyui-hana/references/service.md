@@ -1,14 +1,14 @@
 # 服务管理（起停 / 环境检查 / 就绪等待 / 安装分流）
 
-> **范围**：ComfyUI 服务进程（8188）的起停、环境检查卡流程、就绪等待、未安装 / 未启动时的侦察分流、本体更新（`update`）、`status` 聚合。
+> **范围**：ComfyUI 服务进程（8188）的起停、环境检查流程、就绪等待、未安装 / 未启动时的侦察分流、本体更新（`update`）、`status` 聚合。
 > **何时读**：用户说"帮我启动/关掉 ComfyUI"、服务起不来、启动被暂缓、点按钮没反应、要装或更新 ComfyUI 时。
 
 ## 首选路径（别先去开终端）
 
-App 自己就能拉起和撤下 8188 上的 ComfyUI 本体；**拉起前会自动做环境检查**：发现其他模型占用 GPU（如 llama-server）时暂缓拉起，并给出「环境检查卡」（[重试]/[清除其他进程]/[取消]，卡内按钮直接走 App 路由）；环境干净则直接拉起：
+App 自己就能拉起和撤下 8188 上的 ComfyUI 本体；**拉起前会自动做环境检查**：发现其他模型占用 GPU（如 llama-server）时暂缓拉起，并返回阻断说明（指引 `service clear` 后重试）；环境干净则直接拉起：
 
 ```
-comfyui(action="service", op="start")     # 拉起（起始自动 envcheck；blocked → 按卡处理）
+comfyui(action="service", op="start")     # 拉起（起始自动 envcheck；blocked → 按回执指引处理）
 comfyui(action="service", op="wait")      # 轮询就绪（单次 ≤25s，总时限 120–150s，超时只报不杀）
 comfyui(action="service", op="status")    # 查状态（默认 op）
 ```
@@ -23,16 +23,16 @@ comfyui(action="service", op="status")    # 查状态（默认 op）
 | op | 语义 | 关键返回 |
 |---|---|---|
 | `status`（默认） | 聚合视图：服务 / 中继 / 队列 / 运行中任务（含监听 PID / 安装根 / 日志路径） | 文本摘要 + `details.comfyui.{phase,backend,queue,events,jobs}` |
-| `start` | 拉起服务（**起始自动 envcheck**，有阻断暂缓并挂检查卡；可带 `path` 指定安装根） | `{python,mainPy,logFile,...}` |
+| `start` | 拉起服务（**起始自动 envcheck**，有阻断暂缓并返回说明；可带 `path` 指定安装根） | `{python,mainPy,logFile,...}` |
 | `stop` | 撤下服务（taskkill 8188 上的进程） | `{already,alive,stopped,pids}` |
 | `envcheck` | 环境检查（GPU 占用 / 端口残留 → **180s 一次性快照**） | `{blockers,warnings,gpu,snapshotId}` |
 | `clear` | 按快照清理阻断进程（带 `snapshotId`+`pids`；**列表外全拒、自身不可清**） | `{cleared,refused,recheck}` |
 | `wait` | 轮询就绪（单次 ≤25s；ready / starting / timeout；**不杀进程**） | `{state,readyInMs,detail}` |
 
-## 环境检查卡流程（blocked 之后）
+## 环境检查流程（blocked 之后）
 
 - 触发：`start` 的自动检查发现阻断项；或显式 `op="envcheck"`。
-- 卡上三键：**[重试]** / **[清除其他进程]** / **[取消]**；卡随消息给出，按钮直接走 App 路由。
+- 处理：回执附阻断清单与 `snapshotId`（180s 有效）→ `service clear`（带 `snapshotId+pids`）按快照清障 → `service wait` 轮询到就绪再继续。
 - 纪律：清除只按快照走（列表外一律拒绝、自身不可清；优先优雅停，防 supervisor 打地鼠）；清完 `op="wait"` 轮询到就绪再继续。
 
 ## 机制（为什么这么绕）
@@ -45,7 +45,7 @@ comfyui(action="service", op="status")    # 查状态（默认 op）
 
 工作区提示「未检测到 ComfyUI 环境」或用户说"帮我装/启动 ComfyUI"时：
 
-**首选**：已装但没跑 → 直接 `comfyui(action="service", op="start")`（或让用户点面板按钮），不要手工开终端。若返回 `blocked`（其他模型占 GPU）→ 操作卡会随消息给出，按卡处理（清除后用 `op=wait` 轮询到就绪再继续）。
+**首选**：已装但没跑 → 直接 `comfyui(action="service", op="start")`（或让用户点面板按钮），不要手工开终端。若返回 `blocked`（其他模型占 GPU）→ 按回执指引处理（`service clear` 后用 `op=wait` 轮询到就绪再继续）。
 下面三步侦察用于**启动失败或未安装**时排查：
 1. 服务：`Invoke-RestMethod http://127.0.0.1:8188/system_stats`——失败 = 服务没跑。
 2. 安装探测（只读）——运行本技能包所在 App 的 `runtime/comfy-relay.mjs`（相对本文件：`../../../runtime/comfy-relay.mjs`）：

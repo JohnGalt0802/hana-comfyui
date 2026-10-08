@@ -7,7 +7,9 @@
 // ① analyzeGraph(graph) —— 体检 v0（注释类节点 Note / MarkdownNote 整体跳过）：
 //    互斥口径：每节点最多一条 issue，优先级 DANGLING > OUTPUT_UNWIRED > MUTED_BYPASSED
 //    DANGLING        warn：既无输入连线（inputs 全 link 空/缺）也无输出连线（outputs 全 links 空/缺）
-//    OUTPUT_UNWIRED  warn：type 匹配 /^(Save|Preview)/i，且 inputs 非空且存在未接（link=null）输入
+//    OUTPUT_UNWIRED  warn：type 匹配 /^(Save|Preview)/i，且 inputs 中存在未接（link=null 且非 widget）
+//                    输入（2026-10-08 P7 修复：新前端把「可转输入」的 widget 也序列化进 inputs，
+//                    如 {name:"filename_prefix",widget:{…},link:null}——不是「未接插座」，须排除）
 //    MUTED_BYPASSED  info：mode 2=mute / 4=bypass
 //    返回 {op:"check", rev, scanned:{nodes,links}, issueCount, issues:[…按 node id 升序]}
 //    issue 项：{level, code, node, type, title, msg}（title 缺省为 ""）
@@ -78,7 +80,7 @@ function fmtValue(vals) {
 }
 
 /**
- * 体检：悬空 / 输出未接 / mute·bypass。返回 {op:"check", rev, scanned, issueCount, issues}。
+ * 体检：悬空 / 输入未接 / mute·bypass。返回 {op:"check", rev, scanned, issueCount, issues}。
  * @param {object} graph UI 格式 JSON（graph.toJSON() 输出）
  */
 export function analyzeGraph(graph) {
@@ -107,14 +109,17 @@ export function analyzeGraph(graph) {
     const loose = [];
     if (SAVE_PREVIEW_RE.test(type)) {
       inputs.forEach((s, i) => {
-        if (s && typeof s === "object" && s.link == null) loose.push(s.name != null ? String(s.name) : `#${i}`);
+        // 2026-10-08（P7 修复）：条件追加 !s.widget——新前端把「可转输入」的 widget 也
+        // 序列化进 inputs（link 为 null 但带 widget 字段），这类不是「未接插座」，跳过；
+        // 否则 SaveImage 的 filename_prefix 会被误报 OUTPUT_UNWIRED。
+        if (s && typeof s === "object" && s.link == null && !s.widget) loose.push(s.name != null ? String(s.name) : `#${i}`);
       });
     }
 
     if (dangling) {
       issues.push({ level: "warn", code: "DANGLING", ...base, msg: "悬空：无任何连线" });
     } else if (loose.length > 0) {
-      issues.push({ level: "warn", code: "OUTPUT_UNWIRED", ...base, msg: `输出未接：${loose.join("、")}` });
+      issues.push({ level: "warn", code: "OUTPUT_UNWIRED", ...base, msg: `输入未接：${loose.join("、")}` });
     } else if (muted) {
       issues.push({
         level: "info",

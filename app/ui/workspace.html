@@ -21,7 +21,7 @@ html, body { width: 100%; height: 100%; }
 body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; overflow: hidden; }
 #ws-root { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 
-/* 顶栏：只在需要注意时出现（告警条 / 工具条） */
+/* 顶栏：告警条 / 工具条；ready 态常显「重载工作区」入口（2026-10-08） */
 #ws-bar { display: none; align-items: center; gap: 10px; padding: 4px 10px; font-size: 12px; flex-wrap: wrap; }
 #ws-bar.show { display: flex; }
 #ws-bar.warn { background: var(--warn-bg); border-bottom: 1px solid var(--warn-border); color: var(--bad); }
@@ -32,6 +32,8 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
   border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent);
 }
 #ws-bar button:hover { background: var(--accent); color: #fff; }
+/* ready 态常驻「重载工作区」：仅 ready 视图显示，由 workspace.js 控制（2026-10-08） */
+#ws-bar-reload { display: none; }
 
 #ws-body { position: relative; flex: 1; min-height: 0; }
 #ws-frame-wrap { position: absolute; inset: 0; display: none; }
@@ -61,6 +63,11 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 .panel .sub { color: var(--text-muted); font-size: 12px; margin-bottom: 14px; }
 .panel .note { margin: 10px 0 14px; line-height: 1.7; }
 .panel .meta { color: var(--text-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+/* 启动等待计时：独立于 meta 小字，accent 色 + 略大字号，一眼可见 */
+.panel .wait {
+  margin: 0 0 10px; font-size: 13.5px; font-weight: 600; letter-spacing: .01em;
+  color: var(--accent); font-variant-numeric: tabular-nums;
+}
 .panel .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .panel button {
   font-size: 12px; padding: 6px 14px; border-radius: 8px; cursor: pointer;
@@ -105,7 +112,7 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 </head>
 <body>
 <div id="ws-root">
-  <div id="ws-bar"><span id="ws-bar-text"></span><span class="spacer"></span><button id="ws-bar-action" style="display:none"></button><button id="ws-bar-action2" style="display:none"></button></div>
+  <div id="ws-bar"><span id="ws-bar-text"></span><span class="spacer"></span><button id="ws-bar-reload" title="重新加载内层 ComfyUI 页面（等价 Ctrl+R；ComfyUI 草稿默认自动恢复）">重载工作区</button><button id="ws-bar-action" style="display:none"></button><button id="ws-bar-action2" style="display:none"></button></div>
   <div id="ws-body">
     <div id="ws-loading"><span class="spinner"></span><span>正在加载 ComfyUI 前端……</span></div>
     <div id="ws-frame-wrap"><iframe id="ws-frame" title="ComfyUI"></iframe></div>
@@ -141,6 +148,7 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
           <button class="primary" id="btn-svc-guide" style="display:none">安装引导</button>
           <button id="btn-svc-reload">刷新工作区</button>
         </div>
+        <div id="off-wait" class="wait" hidden></div>
         <div class="note meta" id="off-meta"></div>
       </div>
     </div>

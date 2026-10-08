@@ -2,7 +2,7 @@
 
 > **范围**：`comfyui(action="canvas", ...)` 的全部读/写操作——操作人正在看的同一张画布（快照 / 投影 / 体检 / 追踪 / 大纲 / patch 事务 / 排布 / 直接加载）。
 > **何时读**：要看/改用户眼前那张画布时；排布画布前；画布写操作前后对账时。
-> **前置条件**：读/写走「中继 → 桥（前端扩展 hana_bridge）」到 ComfyUI 前端，**需 ComfyUI 页面在线**；**写入类 op 默认关闸**，需先在设置页开「允许 agent 修改画布」；多页面时用 `workflow` 参数定向（只发给正打开该工作流名的页面；不传则广播）。
+> **前置条件**：读/写走「中继 → 桥（前端扩展 hana_bridge）」到 ComfyUI 前端，**需 ComfyUI 页面在线**；**写入类 op 默认关闸**，需先在设置页开「允许 agent 修改画布」；且 v2 硬约束：**未开副驾驶的画布上写类 op 会被拒**（仅可打开 / 复制 / 落盘，详见下）；多页面时用 `workflow` 参数定向（只发给正打开该工作流名的页面；不传则广播）。
 
 链路参考：App → 中继 `/_relay/bridge` → ComfyUI `/api/hana_bridge/call` → 前端扩展。
 
@@ -33,7 +33,15 @@
 | `commandShape` | 探前端命令表形状（自检） |
 | `frameReload` | 强制重载工作区内的 ComfyUI iframe（扩展换文件后用） |
 
-## 写 ops（需授权；agent 的改动可用 op=undo 撤）
+### 副驾驶标注（v2，2026-10-08）
+
+读 op 的输出带副驾驶状态标注（关＝仅可读、不可写）：
+
+- `state`：快照行内「该画布副驾驶：开 / 关（仅可读、不可写）/ 未知」。
+- `pages`：**逐页**标注每页的副驾驶开关状态（每页上报时并入该页条目；“未知”＝该页尚未上报，≠ 关闭）。
+- 内容类读 op（`summary` / `get` / `check` / `trace` / `outline` / `prompt` / `running`）：输出末尾尾注一行「该画布副驾驶：…」。
+
+## 写 ops（需授权；v2 硬约束见下；agent 的改动可用 op=undo 撤）
 
 | op | 用途 | 关键参数 |
 |---|---|---|
@@ -47,13 +55,20 @@
 | `undo` | 撤销 agent 上一步 | — |
 | `patch` | 意图级写：多编辑一次提交（见下） | `edits`、`verify`、`dryRun` |
 | `loadWorkflowFile` | 按文件路径直接加载工作流（绕过前端列表；异步，画布稍后刷新） | `file`（相对 `user/default/`，如 `workflows/xxx.json`） |
-| `openWorkflow` | 打开/切到已保存工作流并推前台（不改图内容） | `name` 或 `path` |
+| `openWorkflow` | 打开/切到已保存工作流并完整装载（切前台 + 重绘；pending 落定校验；不改工作流内容） | `name` 或 `path` |
 | `organize` | 调前端扩展已注册命令（默认 node-organizer 自动排布） | `command?`（命令名） |
 | `queue` | 画布发起执行（等效点 Queue；快返） | `front?` |
 | `duplicate` | 复制画布为新页（原布零改动） | — |
 | `visual` | 编辑可视化：lock / highlight / clear | `action`、`nodes?`、`edges?`、`note?` |
+| `copilot` | 开关当前画布副驾驶（`enabled=true/false`；Agent 开启受副驾驶总闸管辖） | `enabled` |
 
 `loadWorkflowFile` / `openWorkflow` 自带未保存保护（dirty 时返回 `blocked:"dirty"`，`force:true` 可强切）。
+
+### 写拦截（v2 硬约束，2026-10-08）
+
+- **判定**：写类 op 在「当前活动页副驾驶未开」时统一拒绝，返回 `{ok:false, error:"copilot_off", detail:…}`；工具层转译为指引文案（「仅可打开 / 复制 / 落盘……① 顶栏开启 ② 授权后奉命开启」）。
+- **豁免名单**（理由）：`openWorkflow`（「打开」——无副驾驶画布上仅允许的两类动作之一）/ `duplicate`（「复制」——另一类；v2 默认先复制副本再干活）/ `save`（「落盘」——副本流程第 2 步，先落盘再开副本副驾驶，顺序要求）/ `copilot`（「开关自身」——若拦截则未开的布永远开不了，鸡生蛋）。`frameReload` 不在写名单（维护性操作），不受影响。
+- **`copilot`（开关）**：唯一门控＝设置页「允许 Agent 开启画布副驾驶」（副驾驶总闸）——不受写授权、不受目标页当前状态影响；桥读不到设置，总闸只在 app 层生效。
 
 ## 用法与示例
 
@@ -129,14 +144,16 @@ comfyui(action="canvas", op="patch", edits=[
 
 ## 写操作纪律
 
-- 写入类 op 默认关闸：设置页「允许 agent 修改画布」打开才能写；页面不在线写不了。
+- 写入类 op 默认关闸：设置页「允许 agent 修改画布」打开才能写；且目标画布须已开副驾驶（v2 硬约束，见上）；页面不在线写不了。
+- 操作对象应始终是**副本**：v2 默认流程＝复制 → 副本落盘（AgentCopy）→ 开副本副驾驶 → 操作（详见 `copilot.md`）。
 - agent 的改动用 `op=undo` 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。
 - 改动后拉 `get` 核对（connect 看 `input.link`、setWidget 看值），别只看桥回执。
 - 大动作先说话、小动作直接做（尺度详见 `copilot.md`）。
+- 待同步回填（D2）：canvas 类 op / 状态查询会惰性触发「backend 降级产物回填画布」；**前置＝桥可达 + 写授权 + 副驾驶总闸**——未满足时保留记录、下次再试（细节见 `submit.md`）。
 
 ## 画布执行与视觉标记（D1 · 2026-10-03 实机验收）
 
-三条均为写类 op（需授权、页面在线）。
+三条均为写类 op（需授权、页面在线；v2：`queue` / `visual` 还要求当前页已开副驾驶——`duplicate` 属豁免、无需副驾驶）。
 
 ### queue（画布发起执行）
 
@@ -158,7 +175,7 @@ comfyui(action="canvas", op="duplicate")   # 以当前画布复制为新页（�
 
 - 把当前活动工作流（含未保存改动）复制为**新临时页**：命名 = 原名去 `.json` / 去尾部 `(N)` 后加 `" (Copy).json"`；返回 `{ok, page, key}`（如 `page="workflows/Unsaved Workflow (Copy).json"`）。
 - **原布零改动**（实测全节点 id 对账不变）；副本是临时页，刷新即清理、无落盘影响。
-- 用途：agent 生图默认在副本上工作（copilot 关时）；红线 = 不覆写用户当前画布。
+- 用途：agent 生图默认在副本上工作（v2 固定路径：复制 → 落盘 → 开副本副驾驶 → 操作）；红线 = 不覆写用户当前画布。
 
 ### visual（编辑可视化：lock / highlight / clear）
 

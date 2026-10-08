@@ -9,7 +9,6 @@
 - 任务桥：submit → `ctx.tasks.create({callToken, delivery:"next-step"})` → 2s 轮询结算（complete/fail/cancel）
   - 能力已扩容（2026-09-21 批准并生效）：`app/tasks.manage` + `app/session.start-turn`（ledger=always）
   - **子代理会话边界**：宿主可靠投递只写桌面会话；从子代理会话发起的任务不会自动回执（工具文案会如实标注；`query` 的「投递」行可查 `published/delivered`）
-- 任务卡：`ui/task.html`（轮询 `GET /comfyui-hana/task?id=`；缩略图经 `_surface` 凭据路径）
 - 中继 v0.3：订阅 8188 `/ws` 进度事件缓存（`/_relay/prompts`）、历史摘要（`/_relay/history`）、
   `/_relay/fs/{stat,read}` + `/_relay/upload`（controlKey 保护）、日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`）
 - 环境自举（v0.3 新增）：后端不可达时中继附「本机安装探测」（`/_relay/status` 的 `env` 字段；或 `node runtime/comfy-relay.mjs --probe-env` 直看）；
@@ -30,7 +29,7 @@
   环境检查（GPU 计算进程分类：自身/阻断/其他；8188 端口探测；nvidia-smi 不可用降级为警告；产出 180s 一次性快照）；
   精准清理（只认快照，逐项复核 pid+启动时间+映像名，列表外全拒，清后 2–3s 复查不循环杀）；
   等待就绪（单次 ≤25s 轮询，总时限 120–150s，超时只报不杀）。
-  `op=start` 前自动 envcheck：有阻断（如 llama-server 占 GPU）暂缓拉起并挂「环境检查卡」（`ui/envcheck.html`，按钮直接 POST 路由）；
+  `op=start` 前自动 envcheck：有阻断（如 llama-server 占 GPU）暂缓拉起并返回阻断说明（指引 `service clear` 后重试）；
   启动去重（in-flight + state 文件 + 计划任务兜底）。中继新增 `/_relay/backend/{envcheck,clear,wait}`。
 - 工作区直连 + 服务控制 + 安装目录（v0.7 新增，M10）：
   - **工作区 iframe 直连 `127.0.0.1:8188`**（auto/direct 默认；manifest 新增 `ui.csp.frameDomains` 放行）。

@@ -116,7 +116,7 @@ test("check：互斥优先级（a 部分连接未接→OUTPUT_UNWIRED；b mute �
     links: [[2, 1, 0, 2, 0, "IMAGE"]],
   });
   assert.deepStrictEqual(a.issues, [
-    { level: "warn", code: "OUTPUT_UNWIRED", node: 2, type: "SaveImage", title: "保存", msg: "输出未接：mask" },
+    { level: "warn", code: "OUTPUT_UNWIRED", node: 2, type: "SaveImage", title: "保存", msg: "输入未接：mask" },
   ]);
   // b) mute 节点悬空 → 只报 DANGLING（不再附加 MUTED_BYPASSED）
   const b = analyzeGraph({

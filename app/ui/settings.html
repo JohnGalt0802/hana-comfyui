@@ -89,11 +89,18 @@ label.chk input { accent-color: var(--accent); }
     <h2>画布（共驾）</h2>
     <label class="chk"><input type="checkbox" id="s-allow-write"> 允许 agent 修改画布</label>
     <p class="note">
-      默认关闭。开启后，agent 才能用 canvas 工具的写入动作（setWidget 改参数 / undo 撤销）改你眼前的画布。
-      所有改动都走 LiteGraph 的变更记账，你按 Ctrl+Z 能像撤销自己操作一样撤回；关掉即立刻禁止
-      （只读的 canvas 动作不受影响）。
+      默认关闭。开启后，agent 才能用 canvas 工具的写入动作改你眼前的画布；且写操作还要求目标画布
+      已开启「副驾驶」（未开的画布上 agent 仅可打开 / 复制 / 落盘）。关掉即立刻禁止（只读的 canvas 动作不受影响）。
+      注意：agent 的改动要让 agent 用「撤销」动作撤回——新版前端的 Ctrl+Z 撤不掉外部改动。
     </p>
     <div class="msg" id="s-aw-msg"></div>
+    <label class="chk"><input type="checkbox" id="s-allow-copilot"> 允许 Agent 开启画布副驾驶</label>
+    <p class="note">
+      默认关闭。开启后，agent 在你明确下令时，可以开启指定画布的副驾驶（进入驾驶位）。
+      默认工作方式仍是先复制副本：复制 → 副本落盘 → 开副本副驾驶 → 操作（不直接碰你的原画布）。
+      关闭时 agent 无法开启任何画布副驾驶；未开副驾驶的画布上，agent 只能打开 / 复制 / 落盘。
+    </p>
+    <div class="msg" id="s-ac-msg"></div>
   </div>
 
   <div class="sec">

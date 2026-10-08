@@ -64,7 +64,7 @@ except ValueError:
 
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
-BRIDGE_BUILD_TAG = "2026-10-03 hana-bridge-03131827"
+BRIDGE_BUILD_TAG = "2026-10-08 hana-bridge-08111316"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -160,7 +160,8 @@ def _note_frontend(sid, data, kind):
     if not sid:
         return
     wf = data.get("workflow") if isinstance(data.get("workflow"), dict) else {}
-    _frontends[sid] = {
+    prev = _frontends.get(sid) or {}
+    entry = {
         "workflow": str(wf.get("name") or "").strip() or None,
         "path": wf.get("path"),
         "modified": wf.get("modified"),
@@ -169,6 +170,14 @@ def _note_frontend(sid, data, kind):
         "seenAt": time.time(),
         "kind": kind,
     }
+    # copilot（v2 续单 2026-10-08）：本次上报携带该字段才更新——/hana_bridge/state 每次上报均带；
+    # hello 不带（旧上报语义）= 不冲刷已有值（向后兼容）。形状对齐桥 js 推送：
+    # {enabled, pageKey?, updatedAt}（经 _copilot_brief 清洗）。
+    if "copilot" in data:
+        entry["copilot"] = _copilot_brief(data.get("copilot"))
+    else:
+        entry["copilot"] = prev.get("copilot")
+    _frontends[sid] = entry
     _frontend["sid"] = sid
 
 
@@ -202,6 +211,9 @@ def _pages_payload():
                 "ageSec": age,
                 "href": v.get("href"),
                 "kind": v.get("kind"),
+                # copilot（v2 续单 2026-10-08）：该页最近上报的 {enabled, pageKey?, updatedAt}；
+                # 从未上报过 = None（不猜、不借别页的值）。
+                "copilot": v.get("copilot"),
                 "stale": age > ttl,  # 过期标记：消费方取活页用 not stale（路由侧已自动跳过）
             }
         )

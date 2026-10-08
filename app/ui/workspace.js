@@ -9,12 +9,13 @@ import { hana } from "./assets/sdk.js";
 const $ = (id) => document.getElementById(id);
 const els = {
   bar: $("ws-bar"), barText: $("ws-bar-text"), barAction: $("ws-bar-action"), barAction2: $("ws-bar-action2"),
+  barReload: $("ws-bar-reload"),
   loading: $("ws-loading"), frameWrap: $("ws-frame-wrap"), frame: $("ws-frame"),
   boot: $("view-booting"), bootNote: $("boot-note"), bootMeta: $("boot-meta"),
   bootRawWrap: $("boot-raw-wrap"), bootRaw: $("boot-raw"),
   err: $("view-error"), errNote: $("err-note"), errMeta: $("err-meta"),
   errRawWrap: $("err-raw-wrap"), errRaw: $("err-raw"),
-  offline: $("view-offline"), offNote: $("off-note"), offMeta: $("off-meta"),
+  offline: $("view-offline"), offNote: $("off-note"), offWait: $("off-wait"), offMeta: $("off-meta"),
 };
 
 const MODE_KEY = "comfyui-hana.workspace.urlMode";
@@ -36,6 +37,9 @@ let unreachableStreak = 0;   // 连续不可达轮数（可达即清零）
 let lastReachKnown = null;   // 最近一次观测到的可达性（null=尚未观测）
 let frameLoadOk = false;     // 当前 iframe 文档是否「加载于已知可达期」（或启动加载已被健康状态确认）
 let frameBootPending = false; // 启动时加载、可达性未定，等首个健康状态确认
+let statusGap = false;       // fetch 失败致盲窗口（2026-10-08，P5 盲区①）：也计入「曾离线」，
+                             // 恢复时不得当作「从未离线」，否则坏帧等不到重载
+let offlineSince = 0;        // 本轮离线观测起点（2026-10-08）：判定「离线期间有无显式启动请求」用
 
 function offlineDebounced(streak) { return streak >= OFFLINE_DEBOUNCE_TICKS; }
 function frameReloadNeeded(askedStart, frameOk) { return askedStart || !frameOk; }
@@ -482,17 +486,39 @@ function stopComfySync() {
 }
 
 // ── 视图切换 ──────────────────────────────────────────────────────────────
+let currentView = "booting"; // 当前视图（顶栏「重载工作区」常显判定用；2026-10-08）
+let barHasMessage = false;   // 顶栏展示的是操作消息（true）还是 ready 常驻工具条（false）
+
+// ready 态常驻工具条（2026-10-08，P5）：空文本 + 「重载工作区」入口常显，不整条收起
+function showReadyBar() {
+  els.bar.className = "show info";
+  els.barText.textContent = "";
+  [els.barAction, els.barAction2].forEach((btn) => { btn.style.display = "none"; btn.onclick = null; });
+}
+
 function showView(name) {
+  currentView = name;
   els.boot.classList.toggle("show", name === "booting");
   els.err.classList.toggle("show", name === "error");
   els.offline.classList.toggle("show", name === "offline");
   els.frameWrap.classList.toggle("show", name === "ready");
+  // 顶栏「重载工作区」：ready 态常显，其余态收起（2026-10-08）
+  if (els.barReload) els.barReload.style.display = name === "ready" ? "inline-block" : "none";
   if (name !== "ready") { els.loading.classList.remove("show"); }
-  if (name === "ready" && !frameLoaded) els.loading.classList.add("show");
+  else if (!frameLoaded) els.loading.classList.add("show");
+  // 顶栏缺省态：ready → 常驻工具条；非 ready → 无消息则收起（有消息保留）
+  if (name === "ready") { if (!barHasMessage) showReadyBar(); }
+  else if (!barHasMessage) els.bar.classList.remove("show");
 }
 
 function setBar(kind, text, actions = []) {
-  if (!kind) { els.bar.classList.remove("show"); return; }
+  if (!kind) {
+    barHasMessage = false;
+    if (currentView === "ready") showReadyBar(); // ready 态：清为常驻工具条（含重载入口），不整条收起
+    else els.bar.classList.remove("show");
+    return;
+  }
+  barHasMessage = true;
   els.bar.className = `show ${kind}`;
   els.barText.textContent = text;
   [els.barAction, els.barAction2].forEach((btn, i) => {
@@ -736,9 +762,16 @@ function showOffline(st) {
   const bits = [];
   bits.push(hit ? `安装根 ${hit.path}` : "未检测到可启动的安装");
   if (proc && proc.startedAt) bits.push(`上次由本 App 拉起：${String(proc.startedAt).replace("T", " ").slice(0, 19)}`);
-  if (svcRequestedAt) bits.push(`已等待 ${Math.round((Date.now() - svcRequestedAt) / 1000)} 秒`);
   if (proc && proc.lastError) bits.push(`上次错误：${proc.lastError}`);
   els.offMeta.textContent = bits.join(" · ");
+  // 「已等待 XX 秒」独立成行（accent 色、13.5px，一眼可见）；无等待时隐藏
+  if (svcRequestedAt) {
+    els.offWait.textContent = `已等待 ${Math.round((Date.now() - svcRequestedAt) / 1000)} 秒`;
+    els.offWait.hidden = false;
+  } else {
+    els.offWait.hidden = true;
+    els.offWait.textContent = "";
+  }
   if (!els.offline.classList.contains("show")) {
     els.offNote.textContent = "点「启动服务」开始；首次启动约 30～90 秒（依赖导入）。";
     showView("offline");
@@ -880,19 +913,130 @@ function stopStatusPolling() {
   setBar(null);
 }
 
-// 强制重载内层 iframe（带 `_hr` 时间戳）。调用方 = statusTick 的重载闸门（2026-09-29）：
-// 仅「离线期间有显式启动请求」或「当前 frame 非已知可达期加载（如服务未起的空白页）」时调用；
-// 纯探测抖动的恢复不调用 —— 避免把运行中的进度显示重载清空。
-// （§20 场景保留：服务不在时 iframe 加载必为空白页，重载逻辑照旧生效。）
-function reloadFrameForBackend(boot) {
-  const built = buildFrameUrl(boot);
-  if (!built || !built.url) return;
+// 统一重载内层 iframe 入口（2026-10-08，P5）：三处复用 —— ① 帧健康校验的自动重载
+// （退避/收敛）；② statusTick 恢复闸门；③ 壳页桥 op frame.reload。统一记账
+// （frameLoaded/frameLoadOk/frameBootPending）：不再无条件标「已知可达期加载」
+// （2026-09-29 一次性记账的盲区③——服务不在时发起的重载会把坏帧记成健康帧，
+// 之后永远得不到自动重载）；新文档一律先记 pending，等健康状态确认（statusTick
+// 认证路径），可疑帧另由帧健康校验持续盯住。带 `_hr` 时间戳强制刷新：同一 src
+// 浏览器不会重新加载。（§20 场景保留：服务不在时 iframe 加载必为空白页。）
+function requestFrameReload(reason, url) {
+  let target = url ? String(url) : null;
+  if (!target) target = currentFrameSrc();
+  if (!target) return false;
+  let finalUrl;
+  try {
+    const u = new URL(target, location.href);
+    u.searchParams.set("_hr", String(Date.now()));
+    finalUrl = u.toString();
+  } catch {
+    finalUrl = target + (target.indexOf("?") >= 0 ? "&" : "?") + "_hr=" + Date.now();
+  }
   frameLoaded = false;
-  frameLoadOk = true;        // 重载发起于已知恢复期，新文档视为「已知可达期加载」
-  frameBootPending = false;
+  frameLoadOk = false;
+  frameBootPending = true;   // 「加载于已知可达期」待健康状态确认
+  if (frameSuspectTimer) { clearTimeout(frameSuspectTimer); frameSuspectTimer = null; } // 旧循环止步，新文档重新评估
   els.loading.classList.add("show");
-  const u = built.url + (built.url.indexOf("?") >= 0 ? "&" : "?") + "_hr=" + Date.now();
-  els.frame.src = u;
+  els.frame.src = finalUrl;  // 含短期凭证，不落存储、不写日志
+  console.log(`[comfyui-hana] 重载工作区 iframe（${reason}）`);
+  return true;
+}
+
+// ── 帧健康校验与退避重载（2026-10-08，P5：工作区冷启动/断连自愈）──────────────
+// 背景：iframe 加载失败页（chrome-error）与正常页都以 load 收场，壳页无法据此区分（跨源更不能）。
+// 校验：load 后对帧源做 no-cors 探针——跨源直连同样适用，「跨源」本身是预期结果
+// （no-cors 不会因跨源被拒），不会以跨源失败误判坏帧；再与中继观测（lastReachKnown）交叉判定。
+// 判定「可疑坏帧」：探针失败（连接被拒/超时，错误页的典型成因）＋ 帧非「已知可达期加载」
+// ＋ 中继也未看到可达（中继看到可达时探针失败不作为坏帧依据——可能是探测环境限制）。
+// 处置：退避 1s/2s/4s 自动重载（上限 3 次）；预算用尽后低频复探等待源恢复，探针翻正即
+// 收敛重载一次；探针翻正即清零。「已知可达期正常加载」的帧绝不自动重载（保留
+// 2026-09-29 闸门初衷：不轻清运行中进度）。
+const FRAME_HEALTH_SETTLE_MS = 700;                   // load 后静置（让网络错误先落定）
+const FRAME_PROBE_TIMEOUT_MS = 3000;                  // 探针超时（挂起的端口不拖死检查循环）
+const FRAME_SUSPECT_BACKOFF_MS = [1000, 2000, 4000];  // 退避重载间隔（上限 = 数组长度 3 次）
+const FRAME_SUSPECT_WATCH_MS = 4000;                  // 复探节拍（等源恢复/复核）
+let frameSuspect = false;                             // 当前文档疑似坏帧
+let frameReloadAttempts = 0;                          // 本轮可疑期的自动重载计数
+let frameHealthTimer = null;                          // load 后健康校验 one-shot
+let frameSuspectTimer = null;                         // 可疑循环计时器
+
+function frameTimersClear() {
+  if (frameHealthTimer) { clearTimeout(frameHealthTimer); frameHealthTimer = null; }
+  if (frameSuspectTimer) { clearTimeout(frameSuspectTimer); frameSuspectTimer = null; }
+}
+function frameSuspectReset() {
+  frameSuspect = false;
+  frameReloadAttempts = 0;
+}
+function currentFrameSrc() {
+  try { return els.frame && els.frame.src ? String(els.frame.src) : null; } catch { return null; }
+}
+
+// no-cors 探针：得到（不透明）响应即「源可达」；网络层失败（被拒/超时）＝「源不可达」
+async function probeFrameSrc(url) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => { try { ctl.abort(); } catch { /* 忽略 */ } }, FRAME_PROBE_TIMEOUT_MS);
+  try {
+    await fetch(url, { mode: "no-cors", cache: "no-store", signal: ctl.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function scheduleFrameHealthCheck() {
+  frameTimersClear();
+  frameHealthTimer = setTimeout(() => { frameHealthTimer = null; void frameHealthCheck(); }, FRAME_HEALTH_SETTLE_MS);
+}
+
+async function frameHealthCheck() {
+  if (!frameLoaded) return;
+  const src = currentFrameSrc();
+  if (!src) return;
+  const ok = await probeFrameSrc(src);
+  if (!frameLoaded) return; // 期间发生了重载：本次结果作废，交给新文档的校验
+  if (ok) { frameSuspectReset(); return; } // 帧源可达：当前文档视为健康
+  // 探针失败。交叉判定：中继看到「可达」时，探针失败不作为坏帧依据（可能是探针环境限制）；
+  // 「已知可达期加载」的帧同样不动——服务掉线后的恢复交给 statusTick 恢复闸门。
+  if (frameLoadOk || lastReachKnown === true) {
+    if (frameSuspect) scheduleFrameSuspectTick(FRAME_SUSPECT_WATCH_MS); // 未清的可疑保持复探
+    return;
+  }
+  // 可疑坏帧：进入退避重载循环（1s/2s/4s，上限 3 次）
+  frameSuspect = true;
+  const due = frameReloadAttempts < FRAME_SUSPECT_BACKOFF_MS.length
+    ? FRAME_SUSPECT_BACKOFF_MS[frameReloadAttempts]
+    : FRAME_SUSPECT_WATCH_MS;
+  scheduleFrameSuspectTick(due);
+}
+
+function scheduleFrameSuspectTick(delayMs) {
+  if (frameSuspectTimer) { clearTimeout(frameSuspectTimer); frameSuspectTimer = null; }
+  frameSuspectTimer = setTimeout(() => { frameSuspectTimer = null; void frameSuspectTick(); }, delayMs);
+}
+
+async function frameSuspectTick() {
+  if (!frameSuspect || !frameLoaded) return;
+  const src = currentFrameSrc();
+  if (!src) return;
+  const ok = await probeFrameSrc(src);
+  if (!frameLoaded) return; // 期间发生了重载：本次结果作废
+  if (ok) { // 源已恢复可达：收敛重载一次（与恢复闸门同语义：源确认可达才动作）
+    frameSuspectReset();
+    requestFrameReload("source-recovered");
+    return;
+  }
+  // 仍不可达：中继已见可达时不盲重载（可能是探测环境限制）；服务确不可达且预算未用尽 →
+  // 按退避重载；否则低频复探等待源恢复。
+  if (lastReachKnown !== true && frameReloadAttempts < FRAME_SUSPECT_BACKOFF_MS.length) {
+    frameReloadAttempts += 1;
+    console.warn(`[comfyui-hana] 帧健康校验：疑似坏帧，自动重载（第 ${frameReloadAttempts}/${FRAME_SUSPECT_BACKOFF_MS.length} 次）`);
+    if (!requestFrameReload(`health-check #${frameReloadAttempts}`)) scheduleFrameSuspectTick(FRAME_SUSPECT_WATCH_MS);
+    return;
+  }
+  scheduleFrameSuspectTick(FRAME_SUSPECT_WATCH_MS);
 }
 
 async function statusTick() {
@@ -911,35 +1055,55 @@ async function statusTick() {
       // ① 覆盖层去抖（2026-09-29）：连续 ≥OFFLINE_DEBOUNCE_TICKS 轮不可达才显示，
       //    单次负载抖动不再误报「服务未运行」；覆盖层出现时才清 bar，避免抖动期闪没提示
       unreachableStreak += 1;
+      if (!offlineSince) offlineSince = Date.now(); // 本轮离线窗口起点（2026-10-08）
       if (offlineDebounced(unreachableStreak)) {
         // 覆盖层承担提示（比顶栏更清楚），避免 iframe 直接渲染中继的 ECONNREFUSED JSON
         setBar(null);
         showOffline(st);
       }
     } else {
-      const wasUnreachable = unreachableStreak > 0;
+      const wasGap = statusGap; // fetch 失败窗口（2026-10-08，盲区①）
+      statusGap = false;
+      const wasUnreachable = unreachableStreak > 0 || wasGap; // 失败窗口不得当「从未离线」
       unreachableStreak = 0;
-      // 启动期加载（可达性未知）被首个未遇离线的健康状态确认 → 记为「已知可达期加载」
-      if (frameBootPending && !wasUnreachable) { frameLoadOk = true; frameBootPending = false; }
+      // 启动期加载（可达性未知）被首个未遇离线的健康状态确认 → 记为「已知可达期加载」；
+      // 疑似坏帧（frameSuspect）不予确认（2026-10-08）
+      if (frameBootPending && !wasUnreachable && !frameSuspect) { frameLoadOk = true; frameBootPending = false; }
       if (wasUnreachable) {
-        // ② 重载闸门（2026-09-29）：仅「离线期有显式启动请求」或「frame 非已知可达期加载」重载；
-        //    纯探测抖动直接放行，不清运行中进度（§20 重载语义保留）
-        const askedStart = svcRequestedAt > 0;
+        // ② 重载闸门（2026-10-08 修订）：「frame 非已知可达期加载」或「离线期有显式启动请求」重载；
+        //    显式启动请求 = 本页 svcRequestedAt ∪ 服务端权威字段（proc.starting / 离线期内的
+        //    lastStartResult.ok）——覆盖「从左侧面板启动不置位 svcRequestedAt」的盲区②；
+        //    纯探测抖动直接放行，不清运行中进度（§20 重载语义保留）。
+        const proc = backend && backend.proc ? backend.proc : null;
+        const lr = proc && proc.lastStartResult ? proc.lastStartResult : null;
+        const lrAt = lr && lr.at ? Date.parse(lr.at) : NaN;
+        const askedStart = svcRequestedAt > 0
+          || !!(proc && proc.starting === true)
+          || !!(lr && lr.ok === true && Number.isFinite(lrAt) && lrAt >= (offlineSince || 0) - 5000);
         const didReload = frameReloadNeeded(askedStart, frameLoadOk);
-        if (didReload) reloadFrameForBackend(boot);
+        if (didReload) {
+          const built = buildFrameUrl(boot);
+          requestFrameReload("status-recovery", built && built.url ? built.url : null);
+        }
         if (didReload || els.offline.classList.contains("show")) {
           showView("ready");
           ensureComfySync(); // 服务刚回来，重新对齐主题
         }
         setBar(null); // 清掉「已请求启动…」等操作提示
+        offlineSince = 0; // 本轮离线窗口关闭
       }
-      if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; }
+      if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; els.offWait.hidden = true; }
       // 服务运行中的常驻控制条已移除（2026-09-27）：服务控制只留左侧状态面板
       if (themeStaleAfterLoad) {
         setBar("info", "宿主主题已更新，正在刷新工作区…", []);
       }
     }
-  } catch { /* 状态读取失败不打扰界面 */ }
+  } catch {
+    // fetch 失败窗口（2026-10-08，盲区①）：参与「曾离线」判定——恢复时照常走闸门，
+    // 不得当作「从未离线」；界面提示由覆盖层/左侧面板承担，此处静默。
+    statusGap = true;
+    if (!offlineSince) offlineSince = Date.now();
+  }
 }
 
 // ── 交互绑定 ──────────────────────────────────────────────────────────────
@@ -971,10 +1135,12 @@ $("btn-svc-start").addEventListener("click", () => { void startBackend(); });
 $("btn-svc-guide").addEventListener("click", () => { guideShow(1); });
 $("btn-svc-reload").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
 $("btn-reload2").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
+$("ws-bar-reload").addEventListener("click", () => { requestFrameReload("manual"); }); // ready 常驻重载入口（2026-10-08）
 els.frame.addEventListener("load", () => {
   frameLoaded = true;
   els.loading.classList.remove("show");
   ensureComfySync(); // 内层文档（重）载入 → 重新对齐基座色板与主题色
+  scheduleFrameHealthCheck(); // 帧健康校验（2026-10-08，P5）：load 区分不了正常页与错误页，探针复核
 });
 
 // ── 启动 ──────────────────────────────────────────────────────────────────
@@ -1041,15 +1207,13 @@ async function shellOp(op, args) {
 
   // 内层重载：壳页能重设 iframe.src，是唯一能穿透套娃的手。
   // 用途：扩展换了新文件后，已开页面不会自动重载 js，这里强制重载一次。
+  // 2026-10-08（P5 盲区③）：改走 requestFrameReload 统一记账——此前旁路重设 src 不记账，
+  // 服务不在时落下的坏帧会被当成「已知可达期加载」，之后永远得不到自动重载。
   if (op === "frame.reload") {
-    try {
-      const u = new URL(els.frame.src, location.href);
-      u.searchParams.set("_hr", String(Date.now()));
-      els.frame.src = u.toString();
-      return { reloaded: true, src: els.frame.src };
-    } catch (e) {
-      return { reloaded: false, error: String((e && e.message) || e) };
-    }
+    const ok = requestFrameReload("bridge-op");
+    return ok
+      ? { reloaded: true, src: els.frame.src }
+      : { reloaded: false, error: "工作区 iframe 尚未装载，无帧可重载" };
   }
 
   // 诊断类：不要求 app 就绪，否则"够不到 app"这种问题永远查不出来
@@ -1087,6 +1251,29 @@ async function shellOp(op, args) {
     };
   }
 
+  // P1 落定数据链（2026-10-08，v2 批）：壳页腿补两个读 op——app 层 waitCanvasTargetArrive /
+  // waitCanvasLoadSettled 需要「活动页 + 节点数」读数；扩展腿不可达时（代理模式）由壳页腿供数。
+  if (op === "exec.running") {
+    const svc = app.extensionManager && app.extensionManager.workflow;
+    const wf = svc ? svc.activeWorkflow : null;
+    return {
+      runningNodeId: typeof app.runningNodeId === "number" ? app.runningNodeId : null,
+      activeWorkflow: wf ? String(wf.filename || wf.name || "").trim() || null : null,
+    };
+  }
+
+  if (op === "canvas.revision") {
+    // 壳页侧没有桥的变更序号机制（pollGraph 在扩展腿）：不给 revision（调用方按 null 处理）；
+    // 只报规模读数；settle 判定退化为「节点数稳定」路径（与桥侧缺字段时同口径）。
+    // 拿不到的字段给 undefined（JSON 序列化时被丢弃 → 远端读作 null，避免 null→0 的误读）。
+    const g = app.graph;
+    return {
+      nodes: g && Array.isArray(g._nodes) ? g._nodes.length : undefined,
+      links: g && g.links ? Object.keys(g.links).length : undefined,
+      lastChangeAt: null,
+    };
+  }
+
   if (op === "shell.diag") {
     return shellDiag();
   }
@@ -1100,9 +1287,13 @@ async function shellOp(op, args) {
     }
     const aw0 = svc.activeWorkflow || null;
     const before = aw0 ? (aw0.filename || aw0.path || aw0.name || null) : null;
+    // 脏判定双形态（2026-10-08，v2 批；对齐补丁批 workflowDirty）：v1.55.14 isModified 为布尔 getter
+    // （ComfyWorkflow._isModified），旧版为函数——原判定只认 function，getter 形态下未保存保护实际失效。
     let dirty = false;
     try {
-      if (aw0 && typeof aw0.isModified === "function") dirty = !!aw0.isModified();
+      const m = aw0 ? aw0.isModified : null;
+      if (typeof m === "boolean") dirty = m;
+      else if (typeof m === "function") dirty = !!aw0.isModified();
     } catch { dirty = false; }
     if (dirty && a.force !== true) {
       return { opened: false, blocked: "dirty", activeBefore: before };
@@ -1126,14 +1317,33 @@ async function shellOp(op, args) {
         candidates: list.slice(0, 40).map((w) => w && (w.path || w.filename || w.name)).filter(Boolean),
       };
     }
-    await svc.openWorkflow(hit);
-    const aw1 = svc.activeWorkflow || null;
+    // P1 对齐（2026-10-08，v2 批）：原实现调 store 版 svc.openWorkflow(hit)——它只做「激活」
+    // （push path → load → activeWorkflow.value 赋值），从不触发画布重绘（半状态、无失败信号；
+    // 「只激活不重绘」经 v1.55.14 打包产物核对坐实）。这里对齐桥侧 P1「完整装载」序列：
+    //   load → prepareForSave（刷齐 tracker）→ clone activeState → app.loadGraphData(st,true,true,hit,{…})
+    // 快返（不等重绘），返回 pending:true + nodeCount + activeAfter（期望值），由 app 层
+    //（waitCanvasTargetArrive）按「活动页到达 + 节点数」落定校验后才算成功。
+    const wasLoaded = !!hit.isLoaded;
+    if (!wasLoaded) await hit.load();
+    try { hit.changeTracker?.prepareForSave?.(); } catch { /* 刷不动时按现有 activeState 装载 */ }
+    const st = JSON.parse(JSON.stringify(hit.activeState));
+    if (!st || typeof st !== "object") throw new Error("取不到 activeState（无法装载）");
+    const nodeCount = Array.isArray(st.nodes) ? st.nodes.length : null;
+    const expectAfter = hit.filename || hit.name || hit.path || null;
+    void Promise.resolve(app.loadGraphData(st, true, true, hit, {
+      checkForRerouteMigration: false,
+      deferWarnings: false,
+      skipAssetScans: wasLoaded && a.force !== true, // 对齐前端：已加载且非 force 时跳过资产扫描
+    })).catch((e) => console.warn("[comfyui-hana] openWorkflow loadGraphData 失败", e));
     return {
       opened: true,
+      pending: true, // 快返：装载在页面内继续，app 层按 nodeCount / activeAfter 落定校验
       via: "shell",
       matched: (hit && (hit.path || hit.filename || hit.name)) || null,
       activeBefore: before,
-      activeAfter: aw1 ? (aw1.filename || aw1.path || aw1.name || null) : null,
+      activeAfter: expectAfter,
+      nodeCount,
+      note: "已发起完整装载（异步）：装载完成后画布刷新并激活该工作流，调用方按 nodeCount / activeAfter 落定校验确认",
     };
   }
 

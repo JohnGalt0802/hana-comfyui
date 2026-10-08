@@ -151,6 +151,65 @@ $("s-auto-start").addEventListener("change", async () => {
   }
 });
 
+// ── 画布授权开关（2026-10-08：补齐 allow-write 链 + 新增副驾驶总闸）────────────────
+// 说明：M12-P3 引入「允许 agent 修改画布」时只加了 HTML 与 main() 调用，JS 实现漏了
+// （loadAllowWrite 未定义 → main() 在此抛 ReferenceError、轮询注册被中断）。本批一并修复。
+async function loadAllowWrite() {
+  try {
+    const { data } = await apiJson("/comfyui-hana/allow-write");
+    $("s-allow-write").checked = !!(data && data.enabled);
+  } catch { /* 忽略 */ }
+}
+
+$("s-allow-write").addEventListener("change", async () => {
+  const want = $("s-allow-write").checked;
+  setMsg("s-aw-msg", "保存中…", "");
+  try {
+    const { data } = await apiJson("/comfyui-hana/allow-write", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: want }),
+    });
+    if (!data || !data.ok) {
+      $("s-allow-write").checked = !want;
+      setMsg("s-aw-msg", `保存失败：${(data && data.error) || "未知原因"}`, "bad");
+    } else {
+      setMsg("s-aw-msg", want ? "已开启（即时生效）" : "已关闭", "ok");
+    }
+  } catch (e) {
+    $("s-allow-write").checked = !want;
+    setMsg("s-aw-msg", `保存失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
+async function loadAllowCopilot() {
+  try {
+    const { data } = await apiJson("/comfyui-hana/allow-copilot");
+    $("s-allow-copilot").checked = !!(data && data.enabled);
+  } catch { /* 忽略 */ }
+}
+
+$("s-allow-copilot").addEventListener("change", async () => {
+  const want = $("s-allow-copilot").checked;
+  setMsg("s-ac-msg", "保存中…", "");
+  try {
+    const { data } = await apiJson("/comfyui-hana/allow-copilot", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: want }),
+    });
+    if (!data || !data.ok) {
+      $("s-allow-copilot").checked = !want;
+      setMsg("s-ac-msg", `保存失败：${(data && data.error) || "未知原因"}`, "bad");
+    } else {
+      setMsg("s-ac-msg", want ? "已开启（即时生效）" : "已关闭", "ok");
+    }
+  } catch (e) {
+    $("s-allow-copilot").checked = !want;
+    setMsg("s-ac-msg", `保存失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
 // ── 启动 ──────────────────────────────────────────────────────────────────
 async function main() {
   syncTheme();
@@ -160,6 +219,7 @@ async function main() {
   void loadInstall();
   void loadAutoStart();
   void loadAllowWrite();
+  void loadAllowCopilot();
   setInterval(() => { void poll(); }, 3000);
   setInterval(() => { void loadInstall(); }, 20000);
 }

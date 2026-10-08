@@ -12,7 +12,6 @@
 | submit 报 `node_errors` | `action=workflows` 核对节点/输入名 | ComfyUI 的节点校验错误原文在报错里 |
 | submit 报"UI→API 转换遇到不支持的构造" | 是否子图/静音节点 | 导出 API 格式再提交 |
 | submit 报 `Managed service response exceeds the 4 MiB limit.` | 宿主副本是否为 v0.10+ | 旧版行为（文件/template 拿到大文件后经宿主通道拉回，超 4MiB 被拒）；M13 起这两种形态走中继直读直提，不再受限；若仍复现，检查宿主副本是否已同步 + reload（见 `docs/大工作流提交修复-20260929.md`） |
-| 任务卡缩略图不显示 | 卡的凭据段 | 预览走 `_surface` 凭据路径；老卡或非卡环境可能 403 |
 | `result` 说"尚未完成" | 历史未落 | 等几秒重试，或先 `query` 看状态 |
 | 提交后没有自动回执 | `query` 的"投递"行 | 桌面会话：`published` = 等下一个输入点送达；子代理会话：永不自动送达，改用 query/result 主动取 |
 | 点了「启动服务」没反应 | `comfyui(action="service", op="status")` 的 `lastError` + `logs/backend.log` | 常见：无 venv python / 计划任务创建失败（启动器路径含空格必须带引号，已在代码里处理）/ 端口 8188 被别的进程占 |
@@ -39,14 +38,14 @@ ComfyUI 的自定义色板（`Comfy.CustomColorPalettes.hana`，键名与壳页 
 
 ## 中继与桥
 
-- **中继**：本 App 的受管 runtime（`runtime/comfy-relay.mjs`，随 Hana 生命周期）——给 8188 提供 HTTP/WS 通道 + 工具/任务/卡片面。**未就绪**时等 1-3s，或 `POST /comfyui-hana/relay/start`（自动拉起，失败自动退避重试）。
+- **中继**：本 App 的受管 runtime（`runtime/comfy-relay.mjs`，随 Hana 生命周期）——给 8188 提供 HTTP/WS 通道 + 工具/任务面。**未就绪**时等 1-3s，或 `POST /comfyui-hana/relay/start`（自动拉起，失败自动退避重试）。
 - **中继增强**：订阅 8188 `/ws` 做进度事件缓存；`/_relay/history` 裁剪历史；日志落盘（见下"数据、日志与配置文件"）。
 - **画布桥两条腿**（壳页 / 前端扩展）互补：直连模式下壳页跨源够不到 app；代理模式下扩展脚本可能加载不了——app 先试壳页，失败自动回退扩展；两条腿都不可达时报"工作区壳页未在超时内回传"类错误。
 - **桥自检**：`comfyui(action="canvas", op="probe")`（关键 API 存在性）。
 
 ## 路由面速查（v0.7-0.9）
 
-`boot-state` / `status` / `health` / `task` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start` / `theme` / `update` / `update/status`（均在 `/comfyui-hana/` 下）。
+`boot-state` / `status` / `health` / `relay/start` / `backend/start` / `backend/stop` / `backend` / `install-targets` / `install-target` / `auto-start` / `theme` / `update` / `update/status`（均在 `/comfyui-hana/` 下）。
 
 ## 数据、日志与配置文件
 
