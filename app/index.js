@@ -3231,6 +3231,161 @@ export default defineApp(async (sdk) => {
     throw new Error(`op 必须是 status / start / stop / envcheck / clear / wait（收到 "${op}"）`);
   }
 
+  // ── 工作区自开（B 前置原型：宿主原生窗装工作区）──────────────────────────
+  // 定位：落地「开一个宿主原生窗、装入 /workspace.html」的最小通路（B 包先行使，乙案）。
+  // 边界：原型形态（工具入口 action=window · op=open|close|status）；不做 task 化/自举链/探测自愈，
+  //       B 阶段按产品形态收敛/并入自举链。
+  // 依赖：capabilities 需 app/windows.manage（扩权词，走既有「应用能力」授予，即时生效）；
+  //       窗口页凭据由 ui/workspace.js 侧兜底（query 优先；缺则从 /ui/_surface/<token>/ 路径段提取并回填）。
+  // 注意：壳页桥为单桶（shellBridge）——窗口壳页与主工作区壳页共享心跳/队列，同刻仅一壳页。
+  const CAP_WINDOWS = "app/windows.manage";
+  const WORKSPACE_WINDOW_ENTRY = "/workspace.html";
+  const WORKSPACE_WINDOW_TITLE = "ComfyUI 工作区";
+  const WORKSPACE_WINDOW_BOUNDS = Object.freeze({ width: 1180, height: 820 });
+  let lastWorkspaceWindowId = null; // 原型口径：最近一次 op=open 打开的窗口（close 的缺省目标）
+
+  function windowsDomain() {
+    return sdk.windows && typeof sdk.windows.create === "function" ? sdk.windows : null;
+  }
+
+  function requireWindowsDomain() {
+    const win = windowsDomain();
+    if (win) return win;
+    throw withCode("宿主未提供 App 原生窗口支持（ctx.windows 缺失；需支持 app/windows.manage 的宿主版本）。", "unsupported");
+  }
+
+  async function requireWindowsCapability() {
+    const caps = await capabilitiesMap(true); // 强制刷新：授权刚变更时不误判
+    if (!caps) return; // 账本不可查时放行——让宿主实际调用当裁判（缺权会带 APP_CAPABILITY_DENIED 回来）
+    const st = caps[CAP_WINDOWS] || "not_asked";
+    if (st === "always" || st === "session") return;
+    throw withCode(
+      `未授予能力 ${CAP_WINDOWS}（账本：${st}）：到 设置 → 安全 →「应用能力」为本 App 打开该词（即时生效）；列表里没有该词 = 当前部署版本尚未声明（需先同步新版）。`,
+      "capability-denied",
+    );
+  }
+
+  const WINDOW_ERROR_HINTS = {
+    APP_CAPABILITY_DENIED: `宿主拒绝：未授予能力 ${CAP_WINDOWS}（设置 → 安全 →「应用能力」打开后即时生效）。`,
+    APP_WINDOW_NOT_FOUND: "窗口不存在或不属于当前调用者（可能已关闭；可用 op=status 查看现状）。",
+    APP_WINDOW_NOT_READY: "窗口还在打开中（opening）；稍后用 op=status 再看状态。",
+    APP_WINDOW_FORBIDDEN: "窗口调用凭据无效（callToken 不属于本 App）；请从会话内调用本工具。",
+    APP_WINDOW_ENTRY_INVALID: `窗口 entry 无效（应为 App ui/ 内绝对路径，如 ${WORKSPACE_WINDOW_ENTRY}）。`,
+    APP_WINDOW_STALE: "本 App 实例已换代（宿主重载过）；请重试。",
+  };
+
+  function windowErrText(e) {
+    const code = e && typeof e.code === "string" ? e.code : "";
+    const hint = WINDOW_ERROR_HINTS[code];
+    const raw = msgOf(e);
+    return hint ? `${hint}（宿主：${raw}）` : raw;
+  }
+
+  function windowCall(context) {
+    const callToken = context && typeof context.callToken === "string" ? context.callToken.trim() : "";
+    return callToken ? { callToken } : {};
+  }
+
+  function windowLine(w) {
+    const b = w && w.bounds && Number.isFinite(w.bounds.width) ? `${w.bounds.width}×${w.bounds.height}` : "?";
+    return `${w && w.windowId ? w.windowId : "?"}（${(w && w.state) || "?"}；${(w && w.title) || "?"}；${b}）`;
+  }
+
+  async function openWorkspaceWindow(context) {
+    const win = requireWindowsDomain();
+    await requireWindowsCapability();
+    const call = windowCall(context);
+    if (!call.callToken) {
+      throw withCode("缺少宿主调用凭据 callToken（本工具需从会话内调用；窗口归属按调用者记账，缺凭据会导致后续不可见）。", "no-call-token");
+    }
+    let snapshot;
+    try {
+      snapshot = await win.create({
+        ...call,
+        entry: WORKSPACE_WINDOW_ENTRY,
+        title: WORKSPACE_WINDOW_TITLE,
+        bounds: { ...WORKSPACE_WINDOW_BOUNDS },
+        chrome: "native", // 自绘/主题坑规避：workspace.html 不自绘 chrome，取壳原生框（对照 builder 的 custom 是因其页自绘标题栏）
+        data: { role: "workspace" },
+      });
+    } catch (e) {
+      throw withCode(windowErrText(e), (e && e.code) || "window-open-failed");
+    }
+    lastWorkspaceWindowId = snapshot && typeof snapshot.windowId === "string" ? snapshot.windowId : null;
+    log(`工作区窗口已打开：windowId=${lastWorkspaceWindowId || "?"}（entry=${WORKSPACE_WINDOW_ENTRY}）`);
+    return snapshot;
+  }
+
+  async function closeWorkspaceWindow(args, context) {
+    const win = requireWindowsDomain();
+    await requireWindowsCapability();
+    const explicit = typeof args.windowId === "string" ? args.windowId.trim() : "";
+    const targetId = explicit || lastWorkspaceWindowId || "";
+    if (!targetId) {
+      throw withCode("没有可关闭的窗口：未记录到已开的工作区窗；如窗口仍在，先 op=status 取 windowId 再 close。", "no-window");
+    }
+    let snapshot;
+    try {
+      snapshot = await win.close({ ...windowCall(context), windowId: targetId });
+    } catch (e) {
+      throw withCode(windowErrText(e), (e && e.code) || "window-close-failed");
+    }
+    if (targetId === lastWorkspaceWindowId) lastWorkspaceWindowId = null;
+    log(`工作区窗口已关闭：windowId=${targetId}`);
+    return snapshot;
+  }
+
+  async function workspaceWindowStatus(context) {
+    const win = requireWindowsDomain();
+    await requireWindowsCapability();
+    let windows = [];
+    try {
+      const list = await win.list(windowCall(context));
+      windows = Array.isArray(list) ? list : [];
+    } catch (e) {
+      throw withCode(windowErrText(e), (e && e.code) || "window-list-failed");
+    }
+    // last 指向的窗口若不在 list（列表按调用者过滤后不可见等），单独 get 一次补状态
+    let last = null;
+    if (lastWorkspaceWindowId && !windows.some((w) => w && w.windowId === lastWorkspaceWindowId)) {
+      try {
+        last = await win.get({ ...windowCall(context), windowId: lastWorkspaceWindowId });
+      } catch (e) {
+        last = { windowId: lastWorkspaceWindowId, error: windowErrText(e) };
+      }
+    }
+    return { windows, last };
+  }
+
+  async function actionWindow(args, context) {
+    const op = String(args.op || "status").trim().toLowerCase();
+    if (op === "open") {
+      const snapshot = await openWorkspaceWindow(context);
+      const text = [
+        `工作区窗口已打开：${windowLine(snapshot)}`,
+        `- entry=${WORKSPACE_WINDOW_ENTRY} · chrome=native · bounds=${snapshot && snapshot.bounds ? `${snapshot.bounds.width}×${snapshot.bounds.height}` : "?"}`,
+        "窗口页自取 surface 凭据（query 优先；缺则从路径段提取并回填 URL）。",
+        "注意：壳页桥为单桶——同刻仅一壳页（窗口页与卡/面板页并存会互抢画布 op）。",
+      ].join("\n");
+      return { content: [{ type: "text", text }], details: { comfyui: { action: "window", op, ok: true, window: snapshot } } };
+    }
+    if (op === "close") {
+      const snapshot = await closeWorkspaceWindow(args, context);
+      const text = `已关闭工作区窗口：${windowLine(snapshot)}`;
+      return { content: [{ type: "text", text }], details: { comfyui: { action: "window", op, ok: true, window: snapshot } } };
+    }
+    if (op === "status") {
+      const { windows, last } = await workspaceWindowStatus(context);
+      const lines = windows.length
+        ? windows.map((w) => `- ${windowLine(w)}`)
+        : ["（当前没有本 App 的已开窗口）"];
+      if (last) lines.push(`- last 补查：${last.error ? `${last.windowId}（get 失败：${last.error}）` : windowLine(last)}`);
+      const text = [`工作区窗口：${windows.length} 个`, ...lines, "op=open 打开；op=close 关闭。"].join("\n");
+      return { content: [{ type: "text", text }], details: { comfyui: { action: "window", op, ok: true, windows, last } } };
+    }
+    throw new Error(`window 的 op 必须是 open / close / status（收到 "${op}"）`);
+  }
+
   // ── 工具注册 ──────────────────────────────────────────────────────────────
   function actionBranches() {
     return [
@@ -3390,6 +3545,14 @@ export default defineApp(async (sdk) => {
           enabled: { type: "boolean", description: "copilot 用：true=开启当前画布副驾驶 / false=关闭（Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）" },
         },
       },
+      {
+        command: "window",
+        required: [],
+        fields: {
+          op: { type: "string", enum: ["open", "close", "status"], description: "open=打开宿主原生窗装载工作区（/workspace.html；需能力 app/windows.manage；壳页桥单桶，同刻仅一壳页）；close=关闭窗口（默认关最近一次 open 的；可传 windowId）；status=列出本 App 已开窗口（默认）" },
+          windowId: { type: "string", description: "close 用：目标窗口 id（aw_*，来自 op=status / op=open 返回；省略则关最近一次打开的工作区窗）" },
+        },
+      },
     ];
   }
 
@@ -3403,6 +3566,7 @@ export default defineApp(async (sdk) => {
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停与环境检查（op=status/start/stop/envcheck/clear/wait：start 自动先 envcheck，异常时返回阻断说明；envcheck=检查 GPU 占用/端口残留；clear=按快照清理进程（snapshotId+pids）；wait=轮询就绪，单次≤25s）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
         "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass）/ trace 追踪端口来源/去向 / outline 大纲（功能块+块间连线）/ prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖））——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "window=工作区原生窗（B 前置原型）：op=open 打开宿主原生窗装载工作区（/workspace.html；需能力 app/windows.manage；窗口页自取 surface 凭据；壳页桥为单桶——同刻仅一壳页，开窗前建议先关掉其它工作区壳页）/ op=status 列出本 App 已开窗口（默认）/ op=close 关闭窗口（默认关最近一次打开的，可传 windowId）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
         type: "object",
@@ -3463,9 +3627,10 @@ export default defineApp(async (sdk) => {
             case "service": return await actionService(args, context);
             case "update": return await actionUpdate(args, context);
             case "canvas": return await actionCanvas(args, context);
+            case "window": return await actionWindow(args, context);
             case "upload": return await actionUpload(args);
             default:
-              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update / canvas（收到 "${action}"）`);
+              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update / canvas / window（收到 "${action}"）`);
           }
         } catch (e) {
           const text = `comfyui(${action || "?"}) 失败：${msgOf(e)}`;

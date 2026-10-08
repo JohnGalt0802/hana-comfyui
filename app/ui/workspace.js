@@ -785,8 +785,32 @@ function showOffline(st) {
 //   前端相对寻址基于所在目录，结果与根路径一致）。
 //   若 SDK 分支不可用（无 surface session 等），auto 会先回落"手工凭据路径"
 //   （proxyPrefix + _surface/<appSurfaceSession>/，与宿主/SDK 同款形态），最后才回落到无凭据 raw。
+// 凭据读取（B 前置 · 窗口入口兜底，2026-10-08）：
+//   query 优先；原生窗 entry 无 query（宿主只构造 /ui/_surface/<token>/ 路径段），故缺 query 时从路径段提取，
+//   并把凭据回填进当前 URL（history.replaceState）——SDK（hana.api.fetch / hana.api.url）只认 query，
+//   回填后窗口页与 iframe 场景行为一致；回填幂等；两处都取不到时给可读提示（console.warn，仅一次）。
+let surfaceSessionWarned = false;
 function readSurfaceSession() {
-  try { return new URLSearchParams(location.search).get("appSurfaceSession") || null; } catch { return null; }
+  try {
+    const fromQuery = new URLSearchParams(location.search).get("appSurfaceSession");
+    if (fromQuery) return fromQuery;
+    const m = /\/ui\/_surface\/([^/]+)\//.exec(location.pathname || "");
+    if (m) {
+      let token = m[1];
+      try { token = decodeURIComponent(token) || token; } catch { /* 原样使用 */ }
+      try {
+        const u = new URL(location.href);
+        u.searchParams.set("appSurfaceSession", token);
+        history.replaceState(null, "", `${u.pathname}${u.search}${u.hash}`);
+      } catch { /* 回填失败不挡本次取用 */ }
+      return token;
+    }
+    if (!surfaceSessionWarned) {
+      surfaceSessionWarned = true;
+      console.warn("[comfyui-hana] 未取得 App surface 会话凭据（URL 无 appSurfaceSession、路径无 /ui/_surface/<token>/ 段）：请从卡中心 / 工作区入口重新打开本页。");
+    }
+    return null;
+  } catch { return null; }
 }
 
 function buildFrameUrl(boot) {
@@ -1379,6 +1403,7 @@ async function shellTick() {
 }
 
 async function main() {
+  readSurfaceSession(); // 窗口 entry 兜底：先把路径段凭据回填进 URL（幂等），再进入任何 hana.api.fetch
   syncTheme();
   // 宿主主题钩子：回调直接给主题快照（theme/cssUrl/appearance/palettes），比自己嗅 CSS 可靠
   try {

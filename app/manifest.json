@@ -25,7 +25,8 @@
     "app/resources.read",
     "app/tools.expose-to-model",
     "app/tasks.manage",
-    "app/session.start-turn"
+    "app/session.start-turn",
+    "app/windows.manage"
   ],
   "ui": {
     "csp": {
