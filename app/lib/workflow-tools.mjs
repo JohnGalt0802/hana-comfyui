@@ -1,6 +1,7 @@
 // lib/workflow-tools.mjs — 工作流解析/转换/注入（app 与中继共享）
 // 2026-09-29（M13）：从 index.js 抽出，供 app(index.js) 与中继(runtime/comfy-relay.mjs) 同源使用。
 // 中继侧直提（/_relay/submit-file）需要同一份 UI→API 转换与 inputs 注入逻辑，避免双实现漂移。
+// 2026-10-08（R1）：补 named↔位置值交叉校验（fail-loud），防「过期 named 被静默采用」的值分叉类事故。
 
 export function isPlainObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -12,6 +13,24 @@ export const UNSUPPORTED_UI_TYPES = new Set(["Reroute", "PrimitiveNode", "Subgra
 // UI 格式（nodes/links）→ API 格式：经典图子集（子图/环绕/静音/旁路节点会明确报错）
 const WIDGET_SPEC_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3"]);
 const SEED_CONTROL_VALUES = new Set(["fixed", "increment", "decrement", "randomize"]);
+
+// R1 防线（2026-10-08）：named↔位置值交叉校验——防静默采用过期 named。
+// 背景：前端保存走 serialiseWidgetValues 双写（named 与位置同源），正常文件两字段一致；
+// 但当文件被「只改 widgets_values、不动 widgets_values_named」的外部批处理脚本改写后，
+// named 会停留在旧值——转换器 named 优先，会把「用户现值」静默换成「旧值」（04/少女事故同型）。
+// 范围：下列类型的 named 主键恒在 widgets_values[0]（全语料核验：一致文件 0 误报）；分歧即拒绝。
+// 新增类型前先核验「主键 ↔ wv 下标」对位语义（含 autogrow/控制副值等特殊形态不在列）。
+const NAMED_WV_CHECK = new Map([
+  ["PrimitiveStringMultiline", "value"],
+  ["PrimitiveBoolean", "value"],
+  ["PrimitiveInt", "value"],
+  ["PrimitiveFloat", "value"],
+  ["ComfySwitchNode", "switch"],
+  ["LoadImage", "image"],
+  ["LoadImageOutput", "image"],
+  ["CLIPLoader", "clip_name"],
+]);
+const cutValue = (v) => { const s = typeof v === "string" ? v : JSON.stringify(v); return s == null ? String(s) : s.length > 36 ? s.slice(0, 36) + "…" : s; };
 
 export function convertUiToApi(wf, objectInfo) {
   const nodes = Array.isArray(wf.nodes) ? wf.nodes : null;
@@ -62,6 +81,7 @@ export function convertUiToApi(wf, objectInfo) {
 
     // ② widget 值：优先 widgets_values_named 按名取值（被连线 widget 亦占位，按名读天然免疫错位）；
     //    无 named 的位置回退：widget 位（含被连线覆盖者）消耗 wvi 一格；非 widget 类型 / forceInput 不消耗。
+    //    R1（2026-10-08）：双字段皆存时先做 named↔位置交叉校验，分歧即拒绝（附分歧清单），见 ③。
     if (named) {
       for (const name of declared) {
         if (Object.prototype.hasOwnProperty.call(inputs, name)) continue; // 已被连线覆盖
@@ -101,6 +121,21 @@ export function convertUiToApi(wf, objectInfo) {
         if (Object.prototype.hasOwnProperty.call(inputs, name)) continue; // 被连线覆盖：已占位，不覆盖连线
         if (isPlainObject(val) && "value" in val) val = val.value;
         if (val !== undefined) inputs[name] = val;
+      }
+    }
+
+    // ③ R1 校验（2026-10-08）：双字段皆存 → named 主键 vs 位置值交叉核对；分歧 → problems（最终 throw）。
+    //    只覆盖 NAMED_WV_CHECK 内类型（对位语义已核验）；分歧清单含节点号 / 类型 / 两侧值。
+    if (named && wv.length > 0) {
+      const checkKey = NAMED_WV_CHECK.get(type);
+      if (checkKey && Object.prototype.hasOwnProperty.call(named, checkKey)) {
+        let namedVal = named[checkKey];
+        if (isPlainObject(namedVal) && "value" in namedVal) namedVal = namedVal.value;
+        if (JSON.stringify(namedVal) !== JSON.stringify(wv[0])) {
+          problems.push(
+            `节点 #${n.id} ${type}.${checkKey} 的 widgets_values_named 与 widgets_values 位置值分歧（named=${cutValue(namedVal)} ≠ wv[0]=${cutValue(wv[0])}）——疑似过期 named（外部脚本只改位置值的产物），已拒绝（防静默采用旧值）`,
+          );
+        }
       }
     }
 
