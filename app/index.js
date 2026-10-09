@@ -18,11 +18,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { defineApp } from "./sdk/app-contract/server-client.js";
 import { randomInt, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { projectGraph } from "./lib/canvas-project.mjs";
 import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
 import { outlineGraph } from "./lib/canvas-outline.mjs";
+import { resolveWorkflowPath, loadUiWorkflow, fileGet, fileCheck, fileTrace, fileOutline, fileSummary, fileDiff, runFilePatch } from "./workflow-file.mjs";
 import { isPlainObject, convertUiToApi, applyInputs, summarizeWorkflow } from "./lib/workflow-tools.mjs";
 
 const APP_ID = "comfyui-hana";
@@ -801,6 +802,28 @@ export default defineApp(async (sdk) => {
     return data;
   }
 
+  // T2 接线（2026-10-09）：check 的 object_info best-effort——进程内缓存（TTL 10 分钟）；
+  // 仅当 rules 含 missing_required / all 时按需拉取；拉取失败不报硬错（调用方传 undefined，
+  // lib 走降级路径并在 warnings 如实标注）。
+  const OBJECT_INFO_TTL_MS = 10 * 60_000;
+  const objectInfoCache = { at: 0, data: null };
+  async function getObjectInfoCached() {
+    const now = Date.now();
+    if (objectInfoCache.data && now - objectInfoCache.at < OBJECT_INFO_TTL_MS) return objectInfoCache.data;
+    const data = await getObjectInfo();
+    objectInfoCache.at = now;
+    objectInfoCache.data = data;
+    return data;
+  }
+  function rulesNeedObjectInfo(rules) {
+    if (rules === undefined || rules === null) return false;
+    const list = Array.isArray(rules) ? rules : String(rules).split(",");
+    return list.some((x) => {
+      const s = String(x).trim().toLowerCase();
+      return s === "missing_required" || s === "all";
+    });
+  }
+
   // convertUiToApi 已移至 lib/workflow-tools.mjs（app 与中继共享，2026-09-29 M13）
 
   async function readLocalText(path) {
@@ -809,6 +832,20 @@ export default defineApp(async (sdk) => {
       throw new Error(`读取文件失败（${status}）：${data?.error || "未知错误"} —— ${path}`);
     }
     return data.text;
+  }
+
+  // T-fs 修复（2026-10-09）：工作流文件写盘的「中继后端」——app 进程受宿主 --permission 沙箱限制
+  // （fs 白名单不含 ComfyUI 安装目录），落盘统一由中继代做（/_relay/fs/write，原子写）。
+  async function writeWorkflowFileViaRelay(path, text) {
+    const { status, ok, data } = await relayJson("/_relay/fs/write", {
+      method: "POST",
+      body: JSON.stringify({ path, text }),
+      timeoutMs: 30_000,
+    });
+    if (!ok || !data || data.ok !== true) {
+      throw new Error(`写入文件失败（${status}）：${(data && data.error) || "未知错误"} —— ${path}`);
+    }
+    return data;
   }
 
   async function loadTemplate(name) {
@@ -1967,6 +2004,8 @@ export default defineApp(async (sdk) => {
     duplicate: { drive: "canvas.duplicate", desc: "以当前画布复制为新页（原布零改动；返回新页 path/key）", write: true },
     visual: { drive: "canvas.visual", desc: "画布视觉标记：lock 置锁 / highlight 黄标 / clear 全撤", write: true },
     copilot: { drive: "canvas.copilot", desc: "开关当前画布副驾驶（enabled=true/false；Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）", write: true },
+    // T2 接线：语义 diff（两份工作流 JSON）——目前仅 source="file"（live 对 file 列为后续）。
+    diff: { drive: "canvas.diff", desc: "语义 diff：两份工作流 JSON 的节点/连线/组差异（source=file；path=基准、pathB=目标）" },
   };
 
   // 壳页桥：工作区壳页与 iframe 同源，直接够得到 iframe.contentWindow.app。
@@ -2402,6 +2441,8 @@ export default defineApp(async (sdk) => {
 
   // ComfyUI user/default 候选目录：优先 main.py 同级的 user/default；再兜安装根直接子路径。
   // 用于把「用户目录内的绝对路径」相对化成桥要求的装载路径（相对 user/default）。
+  // T-fs 修复（2026-10-09）：不再用 app 进程 existsSync 探测存在性/排序——宿主 --permission
+  // 沙箱下裸 fs 探测会抛英文受限错误；存在性判断由调用方经中继 stat 完成（resolveCanvasWorkflowsDir）。
   function comfyUserDirCandidates() {
     const env = state.snapshot && state.snapshot.relay ? state.snapshot.relay.env : null;
     const hit = env && Array.isArray(env.installs) ? env.installs[0] : null;
@@ -2412,9 +2453,7 @@ export default defineApp(async (sdk) => {
       cands.push(join(hit.path, "user", "default"));
       cands.push(join(hit.path, "ComfyUI", "user", "default"));
     }
-    const uniq = [...new Set(cands.filter(Boolean))];
-    uniq.sort((a, b) => (existsSync(b) ? 1 : 0) - (existsSync(a) ? 1 : 0));
-    return uniq;
+    return [...new Set(cands.filter(Boolean))];
   }
 
   // 绝对路径 → user/default 相对路径（仅用户目录内可相对化）；已是相对路径则原样（桥按 user/default 解析）。
@@ -2727,6 +2766,17 @@ export default defineApp(async (sdk) => {
     const op = Object.keys(CANVAS_OPS).find((k) => k.toLowerCase() === opRaw.toLowerCase()) || "";
     const spec = op ? CANVAS_OPS[op] : null;
     if (!spec) throw new Error(`op 必须是 ${Object.keys(CANVAS_OPS).join(" / ")}（收到 "${opRaw}"）`);
+    // T1（2026-10-09）文件源通道：source="file" 时不走桥——读类 op（get/check/outline/trace/summary）
+    // 读 path 指定的工作流 JSON 文件（免闸门），patch 走文件版事务（沿用「允许 agent 修改画布」闸门）。
+    // source 缺省 "live" 时以下全部行为与现状完全一致（本分叉之外一行未动）。
+    const sourceRaw = args && args.source != null ? String(args.source).trim().toLowerCase() : "live";
+    if (sourceRaw !== "live" && sourceRaw !== "file") {
+      throw new Error(`source 只支持 "live"（默认，人眼前画布）或 "file"（工作流 JSON 文件，需 path）（收到 "${String(args.source)}"）`);
+    }
+    if (sourceRaw === "file") return await actionCanvasFile(args, op, opRaw);
+    if (op === "diff") {
+      throw new Error('「diff」目前仅支持 source="file"（对两份工作流 JSON 文件做语义 diff：path=基准、pathB=目标）；live 对 file 的比较列为后续');
+    }
     // 写入类 op 需显式授权（默认关）；v2（2026-10-08）：副驾驶开关（copilot）改走总闸特判——
     // 只受「允许 Agent 开启画布副驾驶」管辖，不受写授权、不受目标页当前状态影响（否则鸡生蛋）。
     if (spec.write) {
@@ -3007,7 +3057,11 @@ export default defineApp(async (sdk) => {
       const s = JSON.stringify(projectGraph(payload, { select: projSelect, fields: projFields }));
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     } else if (op === "check") {
-      const s = JSON.stringify(analyzeGraph(payload));
+      // T2 接线：rules 原样透传；object_info best-effort（仅 rules 需要时拉，带缓存；拉不到走 lib 降级）
+      const wantOI = rulesNeedObjectInfo(args && args.rules);
+      let checkOI;
+      if (wantOI) { try { checkOI = await getObjectInfoCached(); } catch { checkOI = undefined; } }
+      const s = JSON.stringify(analyzeGraph(payload, { rules: args && args.rules, objectInfo: checkOI }));
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     } else if (op === "trace") {
       // trace：nodeId/slot/dir 从 args 直读（不透传给桥）；缺参给明确报错
@@ -3015,10 +3069,11 @@ export default defineApp(async (sdk) => {
       const slot = args && args.slot;
       if (nodeId == null || String(nodeId).trim() === "") throw new Error("trace 需要 nodeId（目标节点 id）");
       if (slot == null || String(slot).trim() === "") throw new Error("trace 需要 slot（名字或索引）");
-      const s = JSON.stringify(traceGraph(payload, { node: nodeId, slot, dir: args && args.dir }));
+      const s = JSON.stringify(traceGraph(payload, { node: nodeId, slot, dir: args && args.dir, multi: args && args.multi, depth: args && args.depth }));
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     } else if (op === "outline") {
-      const s = JSON.stringify(outlineGraph(payload));
+      // T2 接线：detail（blocks|nodes）+ block（块选择 → lib 的 select）
+      const s = JSON.stringify(outlineGraph(payload, { detail: args && args.detail, select: args && args.block }));
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     } else if (op === "patch") {
       // 成功与「事务失败（已回滚）」都走这里：结果在 data 层（ok 字段）
@@ -3157,6 +3212,138 @@ export default defineApp(async (sdk) => {
       },
     };
     return { content: [{ type: "text", text }], details };
+  }
+
+  // ── 文件源通道（T1，2026-10-09）：source="file" 的读 op 与文件版 patch ─────────
+  // 与 live 的关系：读类 op 走 app/lib 同一批纯函数（输出同构；来源标记由文本尾注 + details 承载）；
+  // patch 走 workflow-file 的文件版事务（内存全应用 → 全成才写盘 → .bak → 主文件；dryRun/verify 同族）。
+  // 路径：绝对路径，或相对 ComfyUI 工作流目录（user/default/workflows）解析；目录外拒绝。
+  // 闸门：文件读免闸门；文件写（patch）沿用「允许 agent 修改画布」授权（allow-write.json，同先例）。
+  const CANVAS_FILE_READ_OPS = new Set(["get", "check", "outline", "trace", "summary"]);
+
+  // T-fs 修复（2026-10-09）：目录存在性改经中继 /_relay/fs/stat 判断（app 进程不碰 fs）；
+  // 全部候选不可用时返回首候选，由后续 read/write 给出可读错误（不抛英文沙箱文案）。
+  async function relayStatPath(p) {
+    const { ok, data } = await relayJson("/_relay/fs/stat", { method: "POST", body: JSON.stringify({ path: p }), timeoutMs: 8_000 });
+    if (!ok || !data || typeof data !== "object") return null;
+    return data.stat || null;
+  }
+
+  async function resolveCanvasWorkflowsDir() {
+    const cands = comfyUserDirCandidates().map((d) => join(d, "workflows"));
+    for (const c of cands) {
+      try {
+        const st = await relayStatPath(c);
+        if (st && st.exists && st.isDirectory) return c;
+      } catch { /* 中继不可用或查询失败：试下一个候选 */ }
+    }
+    return cands[0] || null;
+  }
+
+  async function actionCanvasFile(args, op, opRaw) {
+    const pathRaw = args && args.path != null ? String(args.path) : "";
+    const clipJson = (v) => {
+      const s = JSON.stringify(v);
+      return s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
+    };
+
+    // ── 读类（免闸门；免画布/免页面）──
+    if (CANVAS_FILE_READ_OPS.has(op)) {
+      const workflowsDir = await resolveCanvasWorkflowsDir();
+      const { abs } = resolveWorkflowPath(pathRaw, workflowsDir);
+      const { parsed } = await loadUiWorkflow(abs, { readText: readLocalText });
+      let text;
+      let payload = null;
+      if (op === "get") {
+        const projSelect = args && typeof args.select === "string" ? args.select : "";
+        const projFields = args && typeof args.fields === "string" ? args.fields : "";
+        payload = fileGet(parsed, { select: projSelect, fields: projFields });
+        text = clipJson(payload);
+      } else if (op === "check") {
+        // T2 接线：rules 原样透传；object_info best-effort（仅 rules 需要时拉，带缓存；拉不到走 lib 降级）
+        const wantOI = rulesNeedObjectInfo(args && args.rules);
+        let checkOI;
+        if (wantOI) { try { checkOI = await getObjectInfoCached(); } catch { checkOI = undefined; } }
+        payload = fileCheck(parsed, { rules: args && args.rules, objectInfo: checkOI });
+        text = clipJson(payload);
+      } else if (op === "trace") {
+        payload = fileTrace(parsed, { node: args && args.nodeId, slot: args && args.slot, dir: args && args.dir, multi: args && args.multi, depth: args && args.depth });
+        text = clipJson(payload);
+      } else if (op === "outline") {
+        payload = fileOutline(parsed, { detail: args && args.detail, block: args && args.block });
+        text = clipJson(payload);
+      } else { // summary（与 live 的文本形态同构；首行注明来源是文件）
+        payload = fileSummary(parsed);
+        const rows = (payload.nodes || []).map((n) => `  #${n.id} ${n.type}${n.title && n.title !== n.type ? ` （${n.title}）` : ""}`);
+        text = [`文件：${payload.nodeCount} 个节点 / ${payload.linkCount} 条连线`, ...rows].join("\n");
+      }
+      text = `${text}\n（source=file：${abs}）`;
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          comfyui: {
+            action: "canvas", op, ok: true, source: "file", file: abs,
+            ...(op === "summary" && payload ? { nodeCount: payload.nodeCount, linkCount: payload.linkCount } : {}),
+          },
+        },
+      };
+    }
+
+    // ── 读类附加：diff（两份工作流 JSON 的语义 diff；免闸门）──
+    if (op === "diff") {
+      const workflowsDir = await resolveCanvasWorkflowsDir();
+      const pathB = args && args.pathB != null ? String(args.pathB) : "";
+      if (!pathB.trim()) throw new Error("diff 需要 pathB（目标文件；path=基准、pathB=目标）");
+      const { abs: baseAbs } = resolveWorkflowPath(pathRaw, workflowsDir);
+      const { abs: nextAbs } = resolveWorkflowPath(pathB, workflowsDir);
+      const { parsed: baseParsed } = await loadUiWorkflow(baseAbs, { readText: readLocalText });
+      const { parsed: nextParsed } = await loadUiWorkflow(nextAbs, { readText: readLocalText });
+      const d = fileDiff(baseParsed, nextParsed);
+      const text = `${clipJson(d)}\n（diff：${d.summary}）\n（source=file：基准 ${baseAbs} ↔ 目标 ${nextAbs}）`;
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          comfyui: {
+            action: "canvas", op, ok: true, source: "file",
+            base: baseAbs, next: nextAbs, clean: d.clean, summary: d.summary,
+          },
+        },
+      };
+    }
+
+    // ── 写类：文件版 patch（沿用「允许 agent 修改画布」闸门；同 allow-write.json 先例）──
+    if (op === "patch") {
+      if (!readAllowWrite()) {
+        throw new Error("「patch（source=file）」会修改工作流文件，当前未授权。请在 Hana-ComfyUI 设置页打开「允许 agent 修改画布」后再试（文件通道沿用该开关）。");
+      }
+      if (!args || !Array.isArray(args.edits) || args.edits.length === 0) {
+        throw new Error("patch 需要 edits（编辑数组）");
+      }
+      const workflowsDir = await resolveCanvasWorkflowsDir();
+      const { abs } = resolveWorkflowPath(pathRaw, workflowsDir);
+      const { text: oldText, parsed } = await loadUiWorkflow(abs, { readText: readLocalText });
+      const report = await runFilePatch({
+        abs, text: oldText, parsed,
+        edits: args.edits,
+        verify: args.verify,
+        dryRun: args.dryRun,
+        verifyCheck: args.verifyCheck,
+        getObjectInfo,
+        writeText: writeWorkflowFileViaRelay,
+      });
+      return {
+        content: [{ type: "text", text: clipJson(report) }],
+        details: {
+          comfyui: {
+            action: "canvas", op, ok: report.ok === true, source: "file", file: abs,
+            written: report.written === true,
+            ...(report.written === true ? { backup: report.backup || null } : {}),
+          },
+        },
+      };
+    }
+
+    throw new Error(`source=file 只支持 op：get / check / outline / trace / summary / diff / patch（收到 "${opRaw}"）`);
   }
 
   // ── 服务环境检查 / 清理 / 等待（T2 · 拉起服务）────────────────────────────
@@ -3965,6 +4152,7 @@ export default defineApp(async (sdk) => {
               "check",
               "trace",
               "outline",
+              "diff",
               "prompt",
               "running",
               "probe",
@@ -3991,10 +4179,10 @@ export default defineApp(async (sdk) => {
               "copilot",
             ],
             description:
-              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass）；trace=追踪端口来源/去向；outline=大纲（功能块+块间连线）；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录；commands=列前端已注册命令 id；commandShape=命令表形状（自检）；frameReload=重载内层 iframe（扩展换文件后用）。写（需授权；v2 硬约束：未开副驾驶的画布上仅可打开 / 复制 / 落盘）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步；patch=意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）；loadWorkflowFile=按路径装载工作流（绕过前端列表）；openWorkflow=打开已保存工作流并完整装载（切前台+重绘，pending 落定校验；自带未保存保护，需授权）；organize=调前端已注册命令（默认自动排布）；queue=执行当前画布（等效点 Queue，快返；front 插队首）；duplicate=复制当前画布为新页（原布零改动，返回新页 page/key）；visual=锁与高亮（visualAction=lock/highlight/clear）；copilot=开关当前画布副驾驶（enabled=true/false；Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）。多页面时用 workflow 参数定向（不传则广播）",
+              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）；trace=追踪端口来源/去向（multi 多级链）；outline=大纲（功能块+块间连线；detail=nodes 可下钻）；diff=两文件语义 diff（source=file；path=基准、pathB=目标）；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录；commands=列前端已注册命令 id；commandShape=命令表形状（自检）；frameReload=重载内层 iframe（扩展换文件后用）。写（需授权；v2 硬约束：未开副驾驶的画布上仅可打开 / 复制 / 落盘）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步；patch=意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）；loadWorkflowFile=按路径装载工作流（绕过前端列表）；openWorkflow=打开已保存工作流并完整装载（切前台+重绘，pending 落定校验；自带未保存保护，需授权）；organize=调前端已注册命令（默认自动排布）；queue=执行当前画布（等效点 Queue，快返；front 插队首）；duplicate=复制当前画布为新页（原布零改动，返回新页 page/key）；visual=锁与高亮（visualAction=lock/highlight/clear）；copilot=开关当前画布副驾驶（enabled=true/false；Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）。source=file=对工作流 JSON 文件操作（path：绝对路径或相对工作流目录 user/default/workflows；读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak、dryRun/verify〕；其余 op 不支持）。多页面时用 workflow 参数定向（不传则广播）",
           },
           workflow: { type: "string", description: "多页面定向：只发给正打开这个工作流名的页面（不传则广播给所有页面）" },
-          select: { type: "string", description: "投影过滤：只保留匹配节点（#8 / #8,#27 / type=PrimitiveInt / title~尺寸，逗号分隔取并集）；与 fields 搭配替代全量 get" },
+          select: { type: "string", description: "投影过滤：只保留匹配节点（#8 / #8,#27 / type=PrimitiveInt / title~尺寸 / 邻接 #8/up、#8/down〔≤跳数，含自身，#8/up:2 限 2 跳〕，逗号分隔取并集）；与 fields 搭配替代全量 get" },
           fields: { type: "string", description: "投影过滤：节点字段白名单（title,type,mode,inputs,outputs,widgets_values,pos,size，逗号分隔）；id 始终保留" },
           nodeId: { type: "string", description: "目标节点 id（canvas get/state/summary 里的 \"#<id>\"，setWidget/removeNode/connect/trace 等用）" },
           name: { type: "string", description: "setWidget 用参数名；save 用工作流名（省略则用当前工作流）" },
@@ -4011,10 +4199,10 @@ export default defineApp(async (sdk) => {
           mode: { type: "number", enum: [0, 2, 4], description: "setNodeMode 用：0=正常 / 2=mute / 4=bypass" },
           edits: {
             type: "array",
-            description: "patch 用：编辑数组（顺序执行，原子回滚）。每条恰一个 key，可用：addNode / setWidget / connect / disconnect / setNodeMode / removeNode / save（save 仅限最后一条）。示例：[{\"disconnect\":{\"nodeId\":8,\"slot\":\"width\"}},{\"addNode\":{\"type\":\"PrimitiveInt\",\"title\":\"宽度\",\"as\":\"w\"}},{\"setWidget\":{\"nodeId\":\"$w\",\"name\":\"value\",\"value\":1248}},{\"connect\":{\"fromNode\":\"$w\",\"fromSlot\":\"INT\",\"toNode\":8,\"toSlot\":\"width\"}},{\"save\":{}}]",
+            description: "patch 用：编辑数组（顺序执行，原子回滚）。每条恰一个 key，可用：addNode / setWidget / connect / disconnect / setNodeMode / removeNode / save（save 仅限最后一条）。source=file 时另支持：addGroup{title,nodeIds?,bounds?} / setGroup{index|title,(title|nodeIds)} / removeGroup{index|title} / cloneNodes{nodeIds,offset?|position?}；save=写盘（仅末条、缺省自动）。示例：[{\"disconnect\":{\"nodeId\":8,\"slot\":\"width\"}},{\"addNode\":{\"type\":\"PrimitiveInt\",\"title\":\"宽度\",\"as\":\"w\"}},{\"setWidget\":{\"nodeId\":\"$w\",\"name\":\"value\",\"value\":1248}},{\"connect\":{\"fromNode\":\"$w\",\"fromSlot\":\"INT\",\"toNode\":8,\"toSlot\":\"width\"}},{\"save\":{}}]",
           },
-          verify: { type: "boolean", description: "patch 用：执行后逐条对照终态（默认 true）" },
-          dryRun: { type: "boolean", description: "patch 用：只做预检、零图变更（默认 false）；输出逐条 checks" },
+          verify: { type: "boolean", description: "patch 用：执行后逐条对照终态（默认 true）；source=file 时＝应用后结构自检（+默认复跑 check 对比新增 issue）" },
+          dryRun: { type: "boolean", description: "patch 用：只做预检、零图变更（默认 false）；输出逐条 checks；source=file 时＝内存模拟全批校验、不落盘" },
           page: { type: "string", description: "目标页定向（页 path/key；部分 op 支持，如 loadWorkflowFile 装载到指定页）" },
           front: { type: "boolean", description: "queue 用：true 插队首（默认队尾）" },
           visualAction: { type: "string", enum: ["lock", "highlight", "clear"], description: "visual 用：lock=置锁变灰 / highlight=黄标（撤锁后标 nodes）/ clear=全撤" },
@@ -4022,6 +4210,15 @@ export default defineApp(async (sdk) => {
           edges: { type: "array", items: { type: "array", items: { type: "string" } }, description: "visual highlight 用：要黄标的连线 [fromNodeId, toNodeId] 列表" },
           note: { type: "string", description: "visual 用：备注（显示在锁提示里）" },
           enabled: { type: "boolean", description: "copilot 用：true=开启当前画布副驾驶 / false=关闭（Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）" },
+          source: { type: "string", enum: ["live", "file"], description: "数据来源：live=人眼前画布（默认，行为不变）；file=工作流 JSON 文件（读类 op：get/check/outline/trace/summary 免画布免授权；patch=文件版事务：内存全应用→写盘+自动 .bak，dryRun/verify 同族；其余 op 不支持）。配合 path 使用" },
+          path: { type: "string", description: "source=file 用：工作流 JSON 文件路径——绝对路径，或相对 ComfyUI 工作流目录（user/default/workflows）解析；目录外路径拒绝。写回保持原文件格式；写盘前自动生成 <名>.bak.json（旧内容）" },
+          verifyCheck: { type: "boolean", description: "source=file patch 用：verify 时复跑 check 并把新增 issue 放进 verify.check（默认 true；只报告、不判败）" },
+          rules: { description: "check 用（可选）：规则集——逗号分隔字符串或字符串数组。可用 id：dangling / output_unwired / missing_required / muted_bypassed / domain_div16 / domain_steps_range / domain_save_name / domain_denoise_range；组记号：core（核心三码，缺省）/ domain / all。含 missing_required 或 all 时会尽力自动拉取 object_info（拉不到自动降级并在 warnings 标注）" },
+          detail: { type: "string", enum: ["blocks", "nodes"], description: "outline 用：blocks=块级大纲（缺省）/ nodes=块下钻（配合 block，节点级视图）" },
+          block: { type: "string", description: "outline 用（detail=nodes 时）：块选择——块名或 #<n>（1 基序号，按 blocks 顺序），逗号分隔取并集；缺省=全部块" },
+          multi: { type: "boolean", description: "trace 用：true=返回多级完整链（path[]）；缺省单步（与旧版一致）" },
+          depth: { type: "number", description: "trace 用：多级链深度上限（1..1000 整数，缺省 10；给出即启用多级）" },
+          pathB: { type: "string", description: "diff 用（source=file）：目标文件路径（path=基准、pathB=目标；相对工作流目录或绝对路径）" },
         },
       },
       {
@@ -4044,7 +4241,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合（含四态环境诊断）；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队；mode=auto|canvas|backend 选执行位置——默认 auto：画布在线且已授权时复制副本-装载-画布执行（canvas.queue）；环境缺（中继/服务/工作区）自动自举：快返「环境准备中」→ 后台准备（服务拉起/必要时自动拉起工作区窗口）→ 就绪自动继续；阻断/补不上/授权缺停下（blocked：原因+选项，不自动改走后台）；inline 对象/带 inputs 结构豁免直走后台并注明）→ 返回 prompt_id，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停与环境检查（op=status/start/stop/envcheck/clear/wait：start 自动先 envcheck，异常时返回阻断说明；envcheck=检查 GPU 占用/端口残留；clear=按快照清理进程（snapshotId+pids）；wait=轮询就绪，单次≤25s）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass）/ trace 追踪端口来源/去向 / outline 大纲（功能块+块间连线）/ prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖））——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）/ trace 追踪端口来源/去向（multi 多级链）/ outline 大纲（功能块+块间连线；detail 下钻）/ diff 两文件语义 diff（source=file；path 基准/pathB 目标）/ prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖）；source=file 对工作流 JSON 文件操作：读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak；path 相对工作流目录 user/default/workflows 或绝对路径〕）——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "window=工作区原生窗：op=open 打开宿主原生窗装载工作区（/workspace.html；需能力 app/windows.manage；窗口页自取 surface 凭据；壳页桥为单桶——同刻仅一壳页，开窗前建议先关掉其它工作区壳页）/ op=status 列出本 App 已开窗口（默认）/ op=close 关闭窗口（默认关最近一次打开的，可传 windowId）。提交环境缺时自举链也会自动拉起该窗（同刻仅一壳页；无需手动）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {

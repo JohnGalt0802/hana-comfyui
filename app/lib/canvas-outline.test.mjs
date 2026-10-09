@@ -190,7 +190,7 @@ test("outline：issues 复用 analyzeGraph（悬空节点）", () => {
   const a = analyzeGraph(GRAPH_A);
   assert.deepStrictEqual(r.issues, a.issues);
   assert.deepStrictEqual(r.issues, [
-    { level: "warn", code: "DANGLING", node: 30, type: "EmptyLatentImage", title: "悬空尺寸", msg: "悬空：无任何连线" },
+    { level: "warn", code: "DANGLING", node: 30, type: "EmptyLatentImage", title: "悬空尺寸", msg: "悬空：无任何连线", symbol: '#30 EmptyLatentImage "悬空尺寸" = [512,512,1]' },
   ]);
 });
 
@@ -277,6 +277,75 @@ test("outline：重名去重覆盖「组{i}」与角色块名（碰撞走 #k）"
     groups: [{ title: "加载", bounding: [0, 0, 100, 100] }],
   });
   assert.deepStrictEqual(b.blocks.map((x) => [x.name, x.source]), [["加载", "group"], ["加载#2", "role"]]);
+});
+
+// ── T2：下钻（detail:"nodes" + select） ─────────────────────────────────────
+
+test("outline T2：detail=nodes——按块名下钻（节点行 id/type/title/value/symbol）", () => {
+  const r = outlineGraph(GRAPH_A, { detail: "nodes", select: "尺寸组" });
+  assert.strictEqual(r.op, "outline");
+  assert.strictEqual(r.semanticRev, "s1");
+  assert.strictEqual(r.detail, "nodes");
+  assert.deepStrictEqual(r.total, { nodes: 9, links: 7 });
+  assert.strictEqual(r.blockCount, 6);
+  assert.strictEqual(r.select, "尺寸组");
+  assert.deepStrictEqual(r.blocks, [
+    {
+      index: 3, name: "尺寸组", source: "group", nodeCount: 3,
+      nodes: [
+        { id: 8, type: "SizeApply", title: "尺寸", value: null, symbol: '#8 SizeApply "尺寸"' },
+        { id: 27, type: "PrimitiveInt", title: "尺寸·宽", value: 1248, symbol: '#27 PrimitiveInt "尺寸·宽" = 1248' },
+        { id: 28, type: "PrimitiveInt", title: "尺寸·高", value: 832, symbol: '#28 PrimitiveInt "尺寸·高" = 832' },
+      ],
+    },
+  ]);
+  assert.ok(!("blockEdges" in r) && !("issues" in r));
+});
+
+test("outline T2：detail=nodes——索引 #1 / 并集排序 / #0 抛错", () => {
+  const r = outlineGraph(GRAPH_A, { detail: "nodes", select: "#1" });
+  assert.deepStrictEqual(r.blocks, [
+    { index: 1, name: "加载", source: "role", nodeCount: 1, nodes: [
+      { id: 2, type: "CheckpointLoaderSimple", title: "Checkpoint 加载", value: "model.safetensors", symbol: '#2 CheckpointLoaderSimple "Checkpoint 加载" = "model.safetensors"' },
+    ] },
+  ]);
+  const u = outlineGraph(GRAPH_A, { detail: "nodes", select: "文本,#1" });
+  assert.deepStrictEqual(u.blocks.map((b) => [b.index, b.name]), [[1, "加载"], [2, "文本"]]);
+  assert.throws(() => outlineGraph(GRAPH_A, { detail: "nodes", select: "#0" }), /块索引从 #1 起/);
+});
+
+test("outline T2：detail=nodes——未命中→空结果+note；部分未命中记 note；缺省=全部块；大小写不敏感", () => {
+  const r = outlineGraph(GRAPH_A, { detail: "nodes", select: "不存在" });
+  assert.deepStrictEqual(r.blocks, []);
+  assert.strictEqual(r.note, '未命中任何块："不存在"；可选块：#1 加载、#2 文本、#3 尺寸组、#4 组2、#5 其他、#6 输出');
+  const p = outlineGraph(GRAPH_A, { detail: "nodes", select: "尺寸组,zzz" });
+  assert.deepStrictEqual(p.blocks.map((b) => [b.index, b.name]), [[3, "尺寸组"]]);
+  assert.strictEqual(p.note, '部分未命中："zzz"；可选块：#1 加载、#2 文本、#3 尺寸组、#4 组2、#5 其他、#6 输出');
+  const all = outlineGraph(GRAPH_A, { detail: "nodes" });
+  assert.deepStrictEqual(all.blocks.map((b) => b.index), [1, 2, 3, 4, 5, 6]);
+  assert.ok(!("select" in all));
+  const ci = outlineGraph({
+    nodes: [
+      { id: 1, type: "AnyType", mode: 0, inputs: [], outputs: [], pos: [10, 10] },
+      { id: 2, type: "LoadImage", mode: 0, inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: null }], widgets_values: ["x.png"] },
+    ],
+    groups: [{ title: "Panel", bounding: [0, 0, 100, 100] }],
+  }, { detail: "nodes", select: "panel" });
+  assert.deepStrictEqual(ci.blocks.map((b) => [b.index, b.name]), [[1, "Panel"]]);
+});
+
+test("outline T2：detail/select 校验——blocks+select 抛错 / 非法 detail 抛错 / select 非字符串抛错", () => {
+  assert.throws(() => outlineGraph(GRAPH_A, { select: "尺寸组" }), /select 仅在 detail:"nodes"（下钻）时可用/);
+  assert.throws(() => outlineGraph(GRAPH_A, { detail: "blocks", select: "x" }), /select 仅在 detail:"nodes"/);
+  assert.throws(() => outlineGraph(GRAPH_A, { detail: "xx" }), /detail 只支持 "blocks" 或 "nodes"/);
+  assert.throws(() => outlineGraph(GRAPH_A, { detail: "nodes", select: 42 }), /select 必须是字符串/);
+  const r = outlineGraph(GRAPH_A, { detail: "nodes", select: "  " }); // 空 = 未给出
+  assert.strictEqual(r.blocks.length, 6);
+});
+
+test("outline T2：semanticRev = s1（blocks 与 nodes 两模式）", () => {
+  assert.strictEqual(outlineGraph(GRAPH_A).semanticRev, "s1");
+  assert.strictEqual(outlineGraph(GRAPH_A, { detail: "nodes" }).semanticRev, "s1");
 });
 
 console.log(`\n${pass + fail} 个用例：${pass} 通过 / ${fail} 失败`);

@@ -188,6 +188,57 @@ test("结果可 JSON 序列化（round-trip 深等）", () => {
   assert.deepStrictEqual(JSON.parse(JSON.stringify(r)), r);
 });
 
+// ── T2：邻接选择器 / semanticRev ─────────────────────────────────────────────
+
+test("T2 邻接：#8/up 与 #8/down（含锚点自身，缺省 1 跳）；方向大小写不敏感", () => {
+  const up = projectGraph(GRAPH, { select: "#8/up" });
+  assert.deepStrictEqual(up.matched.ids, [8, 27, 28]);
+  const down = projectGraph(GRAPH, { select: "#8/down" });
+  assert.deepStrictEqual(down.matched.ids, [8, 12]);
+  assert.deepStrictEqual(projectGraph(GRAPH, { select: "#8/UP" }).matched.ids, [8, 27, 28]);
+  // 端点为叶：#27/up 仅自身
+  assert.deepStrictEqual(projectGraph(GRAPH, { select: "#27/up" }).matched.ids, [27]);
+});
+
+test("T2 邻接：深度（#27/down:2 追两跳；#12/up:2 汇合链；#12/up 缺省 1 跳）", () => {
+  const d2 = projectGraph(GRAPH, { select: "#27/down:2" });
+  assert.deepStrictEqual(d2.matched.ids, [8, 12, 27]);
+  const u2 = projectGraph(GRAPH, { select: "#12/up:2" });
+  assert.deepStrictEqual(u2.matched.ids, [2, 6, 8, 12, 27, 28]);
+  assert.deepStrictEqual(u2.links.map((l) => l[0]), [38, 39, 40, 41, 42]); // 与命中集一致的 links 过滤
+  const one = projectGraph(GRAPH, { select: "#12/up" });
+  assert.deepStrictEqual(one.matched.ids, [2, 6, 8, 12]);
+  const same = projectGraph(GRAPH, { select: "#8/down:2" }); // #12 无更下游
+  assert.deepStrictEqual(same.matched.ids, [8, 12]);
+});
+
+test("T2 邻接：并集语义 / 缺失锚点空匹配 / 两端不全的连线不计入", () => {
+  const u = projectGraph(GRAPH, { select: "#6,#8/up" });
+  assert.deepStrictEqual(u.matched.ids, [6, 8, 27, 28]);
+  const missing = projectGraph(GRAPH, { select: "#999/up" });
+  assert.deepStrictEqual(missing.matched, { count: 0, ids: [] });
+  const g = {
+    nodes: [
+      { id: 1, type: "A", inputs: [], outputs: [] },
+      { id: 2, type: "B", inputs: [{ name: "in", link: 5 }], outputs: [] },
+    ],
+    links: [[5, 99, 0, 2, 0, "X"]], // 源 99 不在 nodes
+  };
+  assert.deepStrictEqual(projectGraph(g, { select: "#2/up" }).matched.ids, [2]); // 99 不进邻域
+});
+
+test("T2 邻接：非法语法/深度抛错（不动现有 #id 报错文案）", () => {
+  assert.throws(() => projectGraph(GRAPH, { select: "#8/up:0" }), /邻接 depth 需要 ≥1 的整数/);
+  assert.throws(() => projectGraph(GRAPH, { select: "#8/up:abc" }), /邻接语法不支持/);
+  assert.throws(() => projectGraph(GRAPH, { select: "#8/side" }), /邻接语法不支持/);
+  assert.throws(() => projectGraph(GRAPH, { select: "#abc" }), /select 语法不支持："#abc"/);
+});
+
+test("T2 semanticRev：project 输出附加 s1", () => {
+  assert.strictEqual(projectGraph(GRAPH, { select: "#8" }).semanticRev, "s1");
+  assert.strictEqual(projectGraph(GRAPH).semanticRev, "s1");
+});
+
 console.log(`\n${pass + fail} 个用例：${pass} 通过 / ${fail} 失败`);
 if (process.argv.includes("--sample")) {
   const out = projectGraph(GRAPH, { select: "#27,#8", fields: "inputs,widgets_values,title" });

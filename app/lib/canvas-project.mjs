@@ -8,19 +8,23 @@
 //     #8                按节点 id 精确匹配（解析数字）
 //     type=PrimitiveInt 按类型匹配（不区分大小写）
 //     title~尺寸        按标题子串包含（不区分大小写）
+//     #8/up  #8/down    邻接（T2 新增）：#8 及其 ≤depth 跳的上游/下游节点（含 #8 自身；
+//                       与其它 term 同样取并集）；可带深度：#8/up:2 / #8/down:3，缺省 1；
+//                       仅统计两端都存在于 nodes 的连线；锚点不在图中 → 空匹配。
 //     空 / 缺省 = 不过滤（全部节点）；无法识别的 term 抛 Error。
 //   fields —— 逗号分隔的字段白名单（title,type,mode,inputs,outputs,widgets_values,pos,size）：
 //     空 / 缺省 = ["title","type","mode","inputs","outputs","widgets_values"]；id 始终保留；
 //     未知字段名抛 Error。
 //
 //   返回普通可序列化对象：
-//   { op:"get", projected:true, rev,
+//   { op:"get", semanticRev, projected:true, rev,
 //     total:{nodes,links}, matched:{count,ids},
 //     nodes:[{id, …白名单字段（节点上存在才带）}…按 id 升序],
 //     links:[fromNode 或 toNode 命中即保留的链接行（原结构）] }
 //
 //   纯数据变换：不依赖宿主 / 前端 / 网络；可直接对历史快照跑。
 // ─────────────────────────────────────────────────────────────────────────────
+import { SEMANTIC_REV } from "./canvas-symbol.mjs";
 
 const ALLOWED_FIELDS = ["title", "type", "mode", "inputs", "outputs", "widgets_values", "pos", "size"];
 const DEFAULT_FIELDS = ["title", "type", "mode", "inputs", "outputs", "widgets_values"];
@@ -64,14 +68,78 @@ function resolveFields(fields) {
   return out;
 }
 
-function resolveMatchers(select) {
+// 邻接（#8/up、#8/down）：建一次前/后向邻接表（仅两端都存在于 nodes 的连线）
+function buildAdjacency(graph) {
+  const rawNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const rawLinks = Array.isArray(graph.links) ? graph.links : [];
+  const known = new Set(rawNodes.filter((n) => n && typeof n === "object").map((n) => idKey(n.id)));
+  const up = new Map();
+  const down = new Map();
+  const add = (m, a, b) => {
+    if (!m.has(a)) m.set(a, new Set());
+    m.get(a).add(b);
+  };
+  for (const row of rawLinks) {
+    if (!Array.isArray(row) || row.length < 4) continue;
+    const f = idKey(row[1]);
+    const t = idKey(row[3]);
+    if (!known.has(f) || !known.has(t)) continue;
+    add(down, f, t);
+    add(up, t, f);
+  }
+  return { up, down, known };
+}
+
+// 从锚点出发的 ≤depth 跳邻域（含锚点自身）；锚点不在图中 → 空集
+function neighborhood(adj, dirWord, anchor, depth) {
+  const start = idKey(anchor);
+  if (!adj.known.has(start)) return new Set();
+  const map = dirWord === "up" ? adj.up : adj.down;
+  const seen = new Set([start]);
+  let frontier = [start];
+  for (let d = 0; d < depth && frontier.length; d++) {
+    const next = [];
+    for (const k of frontier) {
+      for (const nb of map.get(k) || []) {
+        if (!seen.has(nb)) {
+          seen.add(nb);
+          next.push(nb);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return seen;
+}
+
+function resolveMatchers(select, graph) {
   if (select === undefined || select === null) return null;
   if (typeof select !== "string") throw new Error(`select 必须是逗号分隔的字符串（收到 ${typeof select}）`);
   const terms = select.split(",").map((s) => s.trim()).filter(Boolean);
   if (!terms.length) return null;
   const matchers = [];
+  let adj = null; // 邻接表懒建（仅出现邻接 term 时）
   for (const term of terms) {
     if (term.startsWith("#")) {
+      const adjM = /^#(\d+)\/(up|down)(?::(\d+))?$/i.exec(term);
+      if (adjM) {
+        const anchor = Number(adjM[1]);
+        const dirWord = adjM[2].toLowerCase();
+        let depth = 1;
+        if (adjM[3] !== undefined) {
+          depth = Number(adjM[3]);
+          if (!Number.isInteger(depth) || depth < 1) {
+            throw new Error(`select 邻接 depth 需要 ≥1 的整数："${term}"（正确格式：#8/up 或 #8/up:2）`);
+          }
+        }
+        if (!adj) adj = buildAdjacency(graph);
+        const set = neighborhood(adj, dirWord, anchor, depth);
+        matchers.push((node) => set.has(idKey(node.id)));
+        continue;
+      }
+      if (term.includes("/")) {
+        throw new Error(`select 邻接语法不支持："${term}"（正确格式：#<id>/up 或 #<id>/down，可带 :depth，如 #8/up:2）`);
+      }
       const m = /^#(\d+)$/.exec(term);
       if (!m) throw new Error(`select 语法不支持："${term}"（#<id> 后应为数字，如 #8）`);
       const want = Number(m[1]);
@@ -90,7 +158,7 @@ function resolveMatchers(select) {
       matchers.push((node) => String(node.title ?? "").toLowerCase().includes(want));
       continue;
     }
-    throw new Error(`select 语法不支持："${term}"（可用：#<id> 或 type=<类型> 或 title~<子串>，逗号分隔取并集）`);
+    throw new Error(`select 语法不支持："${term}"（可用：#<id>、#<id>/up[:n]、#<id>/down[:n]、type=<类型> 或 title~<子串>，逗号分隔取并集）`);
   }
   return matchers;
 }
@@ -105,7 +173,7 @@ export function projectGraph(graph, { select, fields } = {}) {
     throw new Error(`projectGraph: graph 非对象（收到 ${graph === null ? "null" : typeof graph}），需要 UI 格式 JSON（graph.toJSON() 输出）`);
   }
   const fieldList = resolveFields(fields);
-  const matchers = resolveMatchers(select);
+  const matchers = resolveMatchers(select, graph);
 
   const rawNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
   const matchedNodes = rawNodes.filter(
@@ -127,6 +195,7 @@ export function projectGraph(graph, { select, fields } = {}) {
 
   return {
     op: "get",
+    semanticRev: SEMANTIC_REV,
     projected: true,
     rev: graph.revision ?? null,
     total: { nodes: rawNodes.length, links: rawLinks.length },

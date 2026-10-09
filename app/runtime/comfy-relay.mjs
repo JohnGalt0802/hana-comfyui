@@ -14,6 +14,7 @@
 //   GET/POST /_relay/custom-roots  App 推送的自定义安装位置（POST 需 controlKey）
 //   POST /_relay/fs/stat           文件 stat（本机路径；{path}）
 //   POST /_relay/fs/read           读取文本/二进制（{path, encoding, maxBytes}，上限 8 MiB）
+//   POST /_relay/fs/write          写入文本（{path, text}，上限 16 MiB；原子写 .tmp→rename；app 沙箱外的落盘代做）
 //   POST /_relay/upload            读取本机图片并 multipart 上传到后端 /upload/image
 //                                  （{path, subfolder?, type?, overwrite?}）
 //   POST /_relay/submit-file      读本机工作流文件（或 userdata 模板）→ UI→API 转换 → 注入 inputs
@@ -52,6 +53,7 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { isPlainObject, convertUiToApi, applyInputs } from "../lib/workflow-tools.mjs";
+import { writeFileAtomic } from "../workflow-file.mjs"; // 原子写共享实现（T-fs 修复：中继代 app 落盘）
 
 // ── 退出码 ──────────────────────────────────────────────────────────────────
 const EXIT = Object.freeze({ OK: 0, INTERNAL: 1, BACKEND: 2, USAGE: 3, PORT: 7 });
@@ -73,6 +75,7 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const PROMPT_MAX_RECORDS = 300;    // 事件缓存上限（条）
 const PROMPT_KEEP_TERMINAL_MS = 30 * 60 * 1000;
 const FS_READ_MAX_BYTES = 8 * 1024 * 1024;
+const FS_WRITE_MAX_BYTES = 16 * 1024 * 1024; // fs/write 内容上限（工作流文件通常 <200KB；防呆）
 const GPU_CACHE_MS = 4_000;        // nvidia-smi 采集缓存（子进程开销大，别按请求频率跑）
 const CPU_SAMPLE_MS = 1_500;       // CPU 采样节拍（按间隔算 delta，与客户端无关）
 const UPLOAD_MAX_BYTES = 64 * 1024 * 1024;
@@ -2335,7 +2338,7 @@ async function handleFsRead(req, res) {
   if (!p) return jsonOut(res, 400, { ok: false, error: "需要 path" });
   const st = safeStat(p);
   if (!st.exists || !st.isFile) return jsonOut(res, 404, { ok: false, error: `文件不存在或不是普通文件：${p}`, stat: st });
-  if (st.size > FS_READ_MAX_BYTES) return jsonOut(res, 413, { ok: false, error: `文件超过 ${FS_READ_MAX_BYTES} 字节上限`, size: st.size });
+  if (st.size > FS_READ_MAX_BYTES) return jsonOut(res, 413, { ok: false, error: `文件超过 ${Math.round(FS_READ_MAX_BYTES / 1024 / 1024)} MiB 上限（${FS_READ_MAX_BYTES} 字节；工作流文件通常 <200KB）`, size: st.size });
   try {
     const buf = readFileSync(p);
     const encoding = body.encoding === "base64" ? "base64" : "utf8";
@@ -2345,6 +2348,34 @@ async function handleFsRead(req, res) {
   } catch (e) {
     return jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });
   }
+}
+
+// ── fs/write：写入文本（T-fs 修复 2026-10-09）─────────────────────────────
+// 动机：app 进程受宿主 --permission 沙箱限制（fs 白名单不含 ComfyUI 安装目录），
+// 工作流文件的落盘由中继（local-machine，fs 全通）代做；与 fs/read 对称。
+// body: {path, text}；原子写：写 <path>.tmp → rename 覆盖（防半写损坏）。
+async function handleFsWrite(req, res) {
+  let body;
+  try { body = await readBodyJson(req, 40 * 1024 * 1024); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+  const p = typeof body.path === "string" ? body.path.trim() : "";
+  if (!p) return jsonOut(res, 400, { ok: false, error: "需要 path" });
+  if (typeof body.text !== "string") return jsonOut(res, 400, { ok: false, error: "需要 text（字符串内容）" });
+  const bytes = Buffer.byteLength(body.text, "utf8");
+  if (bytes > FS_WRITE_MAX_BYTES) {
+    return jsonOut(res, 413, {
+      ok: false,
+      error: `内容超过 ${Math.round(FS_WRITE_MAX_BYTES / 1024 / 1024)} MiB 上限（${bytes} 字节；工作流文件通常 <200KB）`,
+      size: bytes,
+    });
+  }
+  try {
+    writeFileAtomic(p, body.text);
+  } catch (e) {
+    log(`fs/write 失败 ${key2(p)}：${String((e && e.message) || e)}`);
+    return jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });
+  }
+  log(`fs/write ${key2(p)}（${bytes} B）`);
+  return jsonOut(res, 200, { ok: true, path: p, size: bytes });
 }
 
 async function handleFsStat(req, res) {
@@ -2912,7 +2943,7 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  if (pathOnly === "/_relay/fs/read" || pathOnly === "/_relay/fs/stat" || pathOnly === "/_relay/upload") {
+  if (pathOnly === "/_relay/fs/read" || pathOnly === "/_relay/fs/stat" || pathOnly === "/_relay/fs/write" || pathOnly === "/_relay/upload") {
     if (req.method !== "POST") {
       jsonOut(res, 405, { error: "method not allowed" }, req.method);
       return;
@@ -2921,7 +2952,7 @@ const server = http.createServer((req, res) => {
       jsonOut(res, 403, { error: "comfy-relay: control key required" });
       return;
     }
-    const handler = pathOnly === "/_relay/fs/read" ? handleFsRead : pathOnly === "/_relay/fs/stat" ? handleFsStat : handleUpload;
+    const handler = pathOnly === "/_relay/fs/read" ? handleFsRead : pathOnly === "/_relay/fs/stat" ? handleFsStat : pathOnly === "/_relay/fs/write" ? handleFsWrite : handleUpload;
     void handler(req, res).catch((e) => {
       try { jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }); } catch { /* 忽略 */ }
     });

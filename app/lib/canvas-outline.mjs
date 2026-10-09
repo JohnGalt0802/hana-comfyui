@@ -1,6 +1,6 @@
 // app/lib/canvas-outline.mjs — 画布语义层 P3：大纲 outline（纯模块 · 零依赖）
 // ─────────────────────────────────────────────────────────────────────────────
-// outlineGraph(graph)：把「UI 格式 JSON」（前端 graph.toJSON() 输出）压成
+// outlineGraph(graph, { detail, select })：把「UI 格式 JSON」（前端 graph.toJSON() 输出）压成
 // 「功能块 + 块间连线」的大纲。块识别两级（group 优先，角色兜底）：
 //   ① graph.groups 非空时：节点 pos=[x,y] 落在某 group 的 bounding=[bx,by,bw,bh] 内（含边界）
 //      → 归该组（落多个组取第一个；组名 = title，空则「组{i}」——i 为该组在 groups 中的
@@ -11,14 +11,22 @@
 //      /Loader|LoadImage/ →「加载」；/TextEncode|TextGenerate|StringFormat/ →「文本」；
 //      /Sampler|Scheduler|Guider|Noise/ →「采样」；/^(Save|Preview)/ →「输出」；其余 →「其他」。
 //      （第三级「标题规范」本期不做；角色表按使用反馈扩展。）
-//   输出：{op:"outline", rev, total:{nodes,links}, blockCount, blocks, blockEdges, issues}
+//   detail —— "blocks"（缺省，旧版行为：块级大纲）| "nodes"（T2 下钻：某块节点级视图）：
+//     detail="nodes" + select（按块名/索引选择；逗号分隔取并集，缺省=全部块）：
+//       块名（精确优先，不中回退大小写不敏感）或 #<n>（块序号，从 1 起，按 blocks 顺序）。
+//     每节点一行：{id, type, title, value（关键值：单值/多值数组/无则 null）, symbol（符号行）}。
+//     语法合法但未命中 → 空结果 + note（含可选块清单）；select 在 detail="blocks" 时给出 → 抛错。
+//   输出：{op:"outline", semanticRev, rev, total:{nodes,links}, blockCount, blocks, blockEdges, issues}
 //   - blocks 按块内最小 node id 升序；块内 nodes 升序
 //   - summary：一句短摘要（单值参数进括号提示；块内链路按「出边节点… → 其余节点…」）
 //   - blockEdges：跨块连线按 [fromName,toName] 去重（同块自环不算），按 [from 块最小 id, to 块最小 id] 排序
 //   - issues：直接复用 analyzeGraph(graph).issues（不重写）
+//   - detail="nodes" 时：合并 detail 字段；blocks 换成被选块的 {index,name,source,nodeCount,nodes[]}
+//     行视图（自带 symbol），不含 blockEdges/issues；select 原样回显；未命中项进入 note。
 //   空图合法（全空输出）；graph 非对象 → 抛 Error。
 // ─────────────────────────────────────────────────────────────────────────────
 import { analyzeGraph } from "./canvas-analysis.mjs";
+import { SEMANTIC_REV, formatNodeSymbol } from "./canvas-symbol.mjs";
 
 const ROLE_RULES = [
   [/Loader|LoadImage/i, "加载"],
@@ -58,12 +66,25 @@ function minIdOf(ids) {
 }
 
 /**
- * 大纲：功能块 + 块间连线。返回 {op:"outline", rev, total, blockCount, blocks, blockEdges, issues}。
+ * 大纲：功能块 + 块间连线（缺省）｜ 块下钻（detail:"nodes"）。
  * @param {object} graph UI 格式 JSON（graph.toJSON() 输出）
+ * @param {{detail?: "blocks"|"nodes", select?: string}} [options]
  */
-export function outlineGraph(graph) {
+export function outlineGraph(graph, options = {}) {
   if (graph === null || typeof graph !== "object") {
     throw new Error(`outlineGraph: graph 非对象（收到 ${graph === null ? "null" : typeof graph}），需要 UI 格式 JSON（graph.toJSON() 输出）`);
+  }
+  const { detail, select } = options || {};
+  const detailNorm = detail === undefined || detail === null ? "blocks" : String(detail).trim().toLowerCase();
+  if (detailNorm !== "blocks" && detailNorm !== "nodes") {
+    throw new Error(`outlineGraph: detail 只支持 "blocks" 或 "nodes"（收到 ${JSON.stringify(String(detail))}）`);
+  }
+  if (select !== undefined && select !== null && typeof select !== "string") {
+    throw new Error(`outlineGraph: select 必须是字符串（收到 ${typeof select}）`);
+  }
+  const selectStr = (select ?? "").trim();
+  if (detailNorm === "blocks" && selectStr !== "") {
+    throw new Error('outlineGraph: select 仅在 detail:"nodes"（下钻）时可用');
   }
   const rawNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
   const rawLinks = Array.isArray(graph.links) ? graph.links : [];
@@ -195,13 +216,91 @@ export function outlineGraph(graph) {
   });
   const blockEdges = kept.map((e) => [blocks[e.fi].name, blocks[e.ti].name]);
 
-  return {
+  const issues = analyzeGraph(graph).issues;
+
+  if (detailNorm === "blocks") {
+    return {
+      op: "outline",
+      semanticRev: SEMANTIC_REV,
+      rev: graph.revision ?? null,
+      total: { nodes: rawNodes.length, links: rawLinks.length },
+      blockCount: blocks.length,
+      blocks,
+      blockEdges,
+      issues,
+    };
+  }
+
+  // detail === "nodes"：块下钻（每节点一行：id/type/title/关键值/符号行）
+  const nodeByKey = new Map();
+  for (const node of rawNodes) {
+    if (node && typeof node === "object") nodeByKey.set(keyOf(node.id), node);
+  }
+  const rowOf = (n) => {
+    const wv = Array.isArray(n.widgets_values) ? n.widgets_values : [];
+    const value = wv.length === 0 ? null : wv.length === 1 ? wv[0] : wv.slice();
+    return {
+      id: n.id,
+      type: String(n.type ?? ""),
+      title: typeof n.title === "string" ? n.title : "",
+      value,
+      symbol: formatNodeSymbol(n),
+    };
+  };
+
+  let matched;
+  const unmatched = [];
+  if (selectStr === "") {
+    matched = blocks.map((b, i) => ({ index: i + 1, block: b })); // 缺省 = 全部块
+  } else {
+    const terms = selectStr.split(",").map((s) => s.trim()).filter(Boolean);
+    const picked = new Set();
+    for (const term of terms) {
+      const m = /^#(\d+)$/.exec(term);
+      if (m) {
+        const n = Number(m[1]);
+        if (n < 1) throw new Error(`outlineGraph: 块索引从 #1 起（收到 ${JSON.stringify(term)}）`);
+        if (n <= blocks.length) picked.add(n);
+        else unmatched.push(term);
+        continue;
+      }
+      let hitIdx = [];
+      blocks.forEach((b, i) => {
+        if (b.name === term) hitIdx.push(i + 1);
+      });
+      if (!hitIdx.length) {
+        const lower = term.toLowerCase();
+        blocks.forEach((b, i) => {
+          if (b.name.toLowerCase() === lower) hitIdx.push(i + 1);
+        });
+      }
+      if (hitIdx.length) hitIdx.forEach((i) => picked.add(i));
+      else unmatched.push(term);
+    }
+    matched = [...picked].sort((a, b) => a - b).map((i) => ({ index: i, block: blocks[i - 1] }));
+  }
+
+  const outBlocks = matched.map(({ index, block }) => ({
+    index,
+    name: block.name,
+    source: block.source,
+    nodeCount: block.nodes.length,
+    nodes: block.nodes.map((id) => nodeByKey.get(keyOf(id))).filter(Boolean).map(rowOf),
+  }));
+
+  const result = {
     op: "outline",
+    semanticRev: SEMANTIC_REV,
+    detail: "nodes",
     rev: graph.revision ?? null,
     total: { nodes: rawNodes.length, links: rawLinks.length },
     blockCount: blocks.length,
-    blocks,
-    blockEdges,
-    issues: analyzeGraph(graph).issues,
+    blocks: outBlocks,
   };
+  if (selectStr !== "") result.select = selectStr;
+  if (unmatched.length) {
+    const what = outBlocks.length === 0 ? "未命中任何块" : "部分未命中";
+    result.note = `${what}：${unmatched.map((t) => JSON.stringify(t)).join("、")}；可选块：${blocks.map((b, i) => `#${i + 1} ${b.name}`).join("、")}`;
+  }
+  return result;
 }
