@@ -1,4 +1,4 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.11
+# Hana-ComfyUI（v2 App，开发仓）· v0.12
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
@@ -90,6 +90,11 @@
   读文件 → UI→API 转换 → inputs 注入 → `/prompt` 提交全在中继完成，绕开宿主 `sdk.runtime.fetch` 隧道的
   请求 1 MiB / 响应 4 MiB 硬限；4MiB+ 工作流可直接提交（inline 对象形态走原链路）。共享逻辑 `lib/workflow-tools.mjs`（app/中继同源）；
   方案 `docs/大工作流提交修复-20260929.md`；测试 `tools/m13-checks/test-submit-file.mjs`（中继级 13/13 + 宿主段 E2E 通过，2026-09-29）。
+- **语义层完善批（v0.12 新增，2026-10-09）**：
+  - **source=file 文件源通道**：读（`get`/`check`/`outline`/`trace`/`summary`/`diff`）与写（`patch` 事务：全成/零写盘/自动 `.bak`/`dryRun`/`verify`；组操作 `addGroup`/`setGroup`/`removeGroup`；`cloneNodes` 克隆子图）均支持文件路径；
+  - **lib 补强**：`check` 扩容（`MISSING_REQUIRED` + `DOMAIN_DIV16`/`STEPS_RANGE`/`SAVE_NAME`/`DENOISE_RANGE`，rules 可裁剪）、`outline` `detail=nodes` 下钻、`trace` `multi` 多级链、邻接选择器（`#id/down`、`#id/up:N`）、符号行 + `semanticRev`、`diff` 两文件语义图 diff；
+  - **修复**：文件源读/写改走中继（`/_relay/fs/write` 原子写），解决宿主 fs 白名单限制；
+  - **UI**：工作区「重载工作区」按钮自顶栏移至右上角悬浮（ready 态常显横条取消）。
 - 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
   cancel 定向中断 10/10（M3）；静态校验 ok；画布共驾 + 语义层生效窗口验收全过（2026-09-28）
 
