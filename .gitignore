@@ -19,5 +19,7 @@ desktop.ini
 _temp/
 _workflow-backups/
 qwen21-templates/
+comfyui-skills/
+comfyui-skill-bundle/
 _build_wf.py
 
