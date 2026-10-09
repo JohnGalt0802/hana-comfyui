@@ -486,36 +486,27 @@ function stopComfySync() {
 }
 
 // ── 视图切换 ──────────────────────────────────────────────────────────────
-let currentView = "booting"; // 当前视图（顶栏「重载工作区」常显判定用；2026-10-08）
-let barHasMessage = false;   // 顶栏展示的是操作消息（true）还是 ready 常驻工具条（false）
-
-// ready 态常驻工具条（2026-10-08，P5）：空文本 + 「重载工作区」入口常显，不整条收起
-function showReadyBar() {
-  els.bar.className = "show info";
-  els.barText.textContent = "";
-  [els.barAction, els.barAction2].forEach((btn) => { btn.style.display = "none"; btn.onclick = null; });
-}
+// 2026-10-09：「重载工作区」自顶栏移出为 #ws-body 右上角悬浮按钮；ready 态不再常显工具条
+// （无操作消息即收起，与其余态一致），原 showReadyBar / currentView 随之移除。
+let barHasMessage = false;   // 顶栏当前展示的是否为操作消息（顶栏只在有消息时显示）
 
 function showView(name) {
-  currentView = name;
   els.boot.classList.toggle("show", name === "booting");
   els.err.classList.toggle("show", name === "error");
   els.offline.classList.toggle("show", name === "offline");
   els.frameWrap.classList.toggle("show", name === "ready");
-  // 顶栏「重载工作区」：ready 态常显，其余态收起（2026-10-08）
+  // 「重载工作区」悬浮按钮：仅 ready 态显示（2026-10-09 自顶栏移出）
   if (els.barReload) els.barReload.style.display = name === "ready" ? "inline-block" : "none";
   if (name !== "ready") { els.loading.classList.remove("show"); }
   else if (!frameLoaded) els.loading.classList.add("show");
-  // 顶栏缺省态：ready → 常驻工具条；非 ready → 无消息则收起（有消息保留）
-  if (name === "ready") { if (!barHasMessage) showReadyBar(); }
-  else if (!barHasMessage) els.bar.classList.remove("show");
+  // 顶栏缺省态：无操作消息则收起（有消息保留）；ready 态不再常显工具条（2026-10-09）
+  if (!barHasMessage) els.bar.classList.remove("show");
 }
 
 function setBar(kind, text, actions = []) {
   if (!kind) {
     barHasMessage = false;
-    if (currentView === "ready") showReadyBar(); // ready 态：清为常驻工具条（含重载入口），不整条收起
-    else els.bar.classList.remove("show");
+    els.bar.classList.remove("show"); // 消息清除 → 收起顶栏（ready 态不再回落到常驻工具条，2026-10-09）
     return;
   }
   barHasMessage = true;
@@ -1159,7 +1150,7 @@ $("btn-svc-start").addEventListener("click", () => { void startBackend(); });
 $("btn-svc-guide").addEventListener("click", () => { guideShow(1); });
 $("btn-svc-reload").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
 $("btn-reload2").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
-$("ws-bar-reload").addEventListener("click", () => { requestFrameReload("manual"); }); // ready 常驻重载入口（2026-10-08）
+$("ws-bar-reload").addEventListener("click", () => { requestFrameReload("manual"); }); // 悬浮重载按钮（ready 态右上角）：走统一重载入口 requestFrameReload（2026-10-08 P5）
 els.frame.addEventListener("load", () => {
   frameLoaded = true;
   els.loading.classList.remove("show");
