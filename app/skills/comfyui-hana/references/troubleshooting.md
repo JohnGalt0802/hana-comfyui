@@ -21,6 +21,34 @@
 | 工作区能开但**节点面板/扩展缺块**，控制台报 `/scripts/app.js`、`/extensions/...` 403 | 工作区「连接方式」下拉 | 自定义节点扩展用绝对路径，代理前缀下会打到宿主根被 403；选 `direct`（默认）或 `auto` 直连 8188 即可（v0.7） |
 | 探测不到已装的 ComfyUI | 设置页「ComfyUI 安装目录」/ `install-targets` | 手填安装根（含 `main.py` 的那层或其外层），保存即生效 |
 
+## 避坑与处置（agent 操作高频坑）
+
+> 与上面「排错表」互补：这里收 agent 操作链路上最高频、最易误判的几个坑（现象 → 处置）。成色见 `docs/复盘-agent操作hui-卡点-20261010.md`。
+
+**1. reload 断工具 RPC**（报 `RPC peer closed; cannot call callback.tools.execute`）
+- 现象：App reload 换新代码后**当轮**工具 RPC 断，工具全失灵（等一会/再 reload 均不恢复，实测需重启宿主）。
+- 处置阶梯：① 先别动，走**路由级调用**继续干活（`POST /api/apps/comfyui-hana/routes/comfyui-hana/<action>`；`window open` 等 SDK 动作仍须工具面）→ ② 等 1~2 个用户回合再试工具 → ③ 仍未恢复则**重启宿主**（终解）→ ④ **禁止反复 reload**。预防：生效动作集中做、别穿插验收。
+
+**2. `submit` 带非空 `inputs` 或 inline 对象 → 直走 backend**（值可能错、假成功）
+- 现象：`workflow` 为 inline 对象（非 `{template}` 单键）或带非空 `inputs` 时，形态判定前置、**直接走 backend 不经画布**；后端 UI→API 转换对原语节点丢值、`LoadImageOutput` 回卷 → 出图“看着成了其实没成”。
+- 处置：要**值正确**就用 `canvas.queue`（画布路径），别用 `inputs`/inline 提交需精确值的工作流。
+
+**3. `save` 另存换名 → 副驾驶按页失配**
+- 现象：副驾驶按 localStorage × 活动页 path 记录；`save` 产生新文件名（新 pageKey），装载后活动页已变 → 状态读为“关/未知”，随后 `queue`（写类 op）被 `copilot_off` 拒。
+- 处置：副本流程装载到新页后**重开一次副本副驾驶**再 queue。
+
+**4. `openWorkflow` 半成功**（`opened:true` 但未装载、留 dirty）
+- 现象：返回 `opened:true`、`activeAfter` 已切换，但 `summary`/`events` 仍是旧图；页面被置 dirty 并卡住后续 `loadWorkflowFile`。
+- 处置：以 `summary`/`events` 复核是否真装载，**别只看 `opened`**；要“进画布”用 `loadWorkflowFile`。
+
+**5. `LoadImageOutput` 取图目录是 `input/`**（不是 output）
+- 现象：`LoadImageOutput` 取的是 `<ComfyUI>/input/` 下的文件，垫图放 `output/` 取不到。
+- 处置：垫图放 `<ComfyUI>/input/`。
+
+**6. 宿主重启后“未找到工具：comfyui”**（≠ RPC 断）
+- 现象：宿主重启后会话恢复早于 app 加载数秒，工具目录暂缺 app 工具，报“未找到工具”；等待 / disable-enable / reload 均无效。
+- 处置：**切到另一对话再切回**（约 10 秒恢复）。先看回执字样分三态（RPC 断 / 目录缺工具 / 就绪），别误按 reload / 重启处理。
+
 ## 页面状态：工作区为什么直连 8188（v0.7，2026-09-25 实测定位）
 
 ComfyUI 官方前端的资源引用是**相对路径**，经代理前缀能正常加载；但**自定义节点的扩展脚本**习惯写**绝对路径**

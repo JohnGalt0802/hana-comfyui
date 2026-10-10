@@ -69,7 +69,7 @@
   - 默认 op `state`：读**服务端缓存**的最近一次画布快照（零往返，**ComfyUI 页面没开着也能拿到**）。
     快照由前端在画布变化后主动推（debounce 1.5s）缓在 ComfyUI 侧，带 `ageSec` 时间戳；
     无快照或过期时改用 `op=summary` 现抓（需页面在线）。
-  - 只读 op：`summary`（现抓结构摘要）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `probe`（自检）/
+  - 只读 op：`summary`（现抓结构摘要）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `progress`（执行进度聚合，只读）/ `probe`（自检）/
     `revision`（变更序号，只问变没变）/ `events`（变更记录，可按 `since` 增量查，含按节点的 added/removed/changed）。
   - 变更感知为 1.5s 轮询签名比对（新版 LiteGraph 没有可用的变更事件），签名**不含节点位置**。
   - 写入 op（均需授权）：`setWidget`（改参数）/ `addNode`（加节点）/ `removeNode`（删节点）/ `connect` / `disconnect`（连线、断线）/ `setNodeMode`（mute / bypass）/ `undo`（撤销 agent 上一步，最多 20 步）。

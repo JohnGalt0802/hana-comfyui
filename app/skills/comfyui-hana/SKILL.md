@@ -10,6 +10,7 @@ description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）
 ## 这是什么
 
 - **整页工作区**：内嵌官方前端，iframe **直连 `127.0.0.1:8188`**（自定义节点扩展可用）；主题跟随宿主。
+- **工作区原生窗**（`comfyui(action="window", op=...)`）：`open` 自开宿主原生窗装载工作区 / `status` / `close`；壳页桥单桶，同刻仅一壳页。
 - **`comfyui` 工具**（单工具 action 分派）：经「中继」操作 8188；每次提交在宿主建一条正式任务（`next-step` 回执）。
 - **服务独立存活**：8188 由 Windows 计划任务拉起，独立于 Hana；顶栏 / 左侧面板 / 工具均可起停。
 - 卡片：「ComfyUI 工作区」整页卡（含状态面板）。
@@ -40,6 +41,14 @@ comfyui(action="canvas", op="organize")   # 再排（不要主动重排——尊
 ```
 
 未装 / 未启动 ComfyUI → `references/service.md`（三步侦察与 `INSTALL.md` 分工）。
+
+## 使用 hui 的三种工作状态
+
+1. **宿主工作区页已开**：直接用宿主页干活（submit `mode=auto` 走画布执行 `canvas.queue`），不拉窗。
+2. **宿主页未开 + 需要前端（画布）生图**：agent 拉**独立原生窗**装载工作区，在窗内跑画布（submit 自举链会自动拉窗，或手动 `comfyui(action="window", op="open")`）。
+3. **后端生图**（不需画布）：直接后端执行（submit `mode=backend`；内联结构等自动走后端），不碰画布。
+
+说明：宿主工作区页**由用户手动开启**；宿主不提供由 agent 程序化打开它的入口（已实测），agent 不尝试越界拉起。
 
 ## 主题索引（何时读哪份）
 

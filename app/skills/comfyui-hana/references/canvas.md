@@ -21,6 +21,7 @@
 | `outline` | 大纲：功能块 + 块间连线（见下） | — | blocks / blockEdges / issues |
 | `prompt` | 可提交形态（现抓 prompt 对象） | — | 节点数（已就绪） |
 | `running` | 当前执行到哪个节点 | — | runningNodeId |
+| `progress` | 执行进度聚合（只读；执行中可查） | — | running / runningNodeId / nodeCount / queueRemaining / promptId |
 | `revision` | 画布变更序号（只问变没变，轻量） | — | revision / 计数 / 规模 |
 | `events` | 画布变更记录（最近若干条） | — | rev / 时间 / 增删节点连线 |
 
@@ -39,7 +40,7 @@
 
 - `state`：快照行内「该画布副驾驶：开 / 关（仅可读、不可写）/ 未知」。
 - `pages`：**逐页**标注每页的副驾驶开关状态（每页上报时并入该页条目；“未知”＝该页尚未上报，≠ 关闭）。
-- 内容类读 op（`summary` / `get` / `check` / `trace` / `outline` / `prompt` / `running`）：输出末尾尾注一行「该画布副驾驶：…」。
+- 内容类读 op（`summary` / `get` / `check` / `trace` / `outline` / `prompt` / `running` / `progress`）：输出末尾尾注一行「该画布副驾驶：…」。
 
 ## 写 ops（需授权；v2 硬约束见下；agent 的改动可用 op=undo 撤）
 
@@ -163,6 +164,7 @@ comfyui(action="canvas", op="queue", front=true)   # 插队首（等效 Queue Pr
 ```
 
 - **快返**：只提交、不等执行（实测 95ms）；执行进度以画布原生 UI 为准。
+- **接宿主任务卡**（对齐 `submit`）：捕获到 `promptId` 时同 `submit` 姿势登记一个宿主任务（`app/tasks.manage` + `delivery:"next-step"`）并在回执里出卡；完成/失败/中断经后台轮询结算，按 next-step 通道投递回执（子代理会话不自动送达，见 `troubleshooting.md`）。无 `callToken`（按钮通道）或未捕获到 `promptId` 时如实降级说明，不假造。执行中的进度可用 `op="progress"` 查（见上「读 ops」）。
 - 返回 `{queued, promptId?, number?, via}`（`via` 恒为 `app.queuePrompt`）：promptId 优先经猴补捕获；捕获不到时用 /queue 前后差集反查（仅取唯一新增项，不猜）；仍拿不到就**如实返回不带 `promptId`**（≠ 未提交）。
 - **空图**（无输出节点）：提交会被服务端校验拒绝（`prompt_no_outputs`："Prompt has no outputs"），op 如实报"提交被拒：…"——不静默假成功。
 - **画布忙**：op 层不拦——有任务执行中也可照常入队（等效再点一次 Queue）；前端处理循环忙时立即返回、项已入队（由在跑的循环消化），promptId 可能缺失（差集兜底）。（`submit` 流程层的"画布忙不抢占"是另一层纪律，见 `submit.md`）

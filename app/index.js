@@ -9,7 +9,7 @@
 //   3. 任务桥：submit → ctx.tasks.create({callToken, delivery:"next-step"}) → 轮询结算
 //      （complete/fail/cancel）—— 需要能力词 app/tasks.manage + app/session.start-turn，
 //      未授权时自动降级为「仅内存跟踪」（工具返回值里说明原因）
-//   4. 路由：/comfyui-hana/boot-state | status | health | relay/start | backend/start | backend/stop | backend
+//   4. 路由：/comfyui-hana/boot-state | status | health | relay/start | backend/start | backend/stop | backend | backend/{envcheck,clear,wait} | task
 //      （relay/start 只重启「中继」；backend/* 管 8188 上的 ComfyUI 本体，由计划任务拉起，独立于 Hana 存活）
 //   5. 每 1.5s 轮询中继 /_relay/status（ctx.runtime.fetch 优先）；每 2s 结算任务
 //
@@ -17,22 +17,26 @@
 // 负责（停用/卸载时回收其受管进程组与服务连接）。
 // ─────────────────────────────────────────────────────────────────────────────
 import { defineApp } from "./sdk/app-contract/server-client.js";
-import { randomInt, randomBytes } from "node:crypto";
+import { createHash, randomInt, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { projectGraph } from "./lib/canvas-project.mjs";
 import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
 import { outlineGraph } from "./lib/canvas-outline.mjs";
-import { resolveWorkflowPath, loadUiWorkflow, fileGet, fileCheck, fileTrace, fileOutline, fileSummary, fileDiff, runFilePatch } from "./workflow-file.mjs";
+import { resolveWorkflowPath, loadUiWorkflow, fileGet, fileCheck, fileTrace, fileOutline, fileSummary, fileDiff, runFilePatch, writeFileAtomic } from "./workflow-file.mjs";
 import { isPlainObject, convertUiToApi, applyInputs, summarizeWorkflow } from "./lib/workflow-tools.mjs";
+// T3-1 / T3-3（2026-10-10）：openWorkflow 链路的落定判定与路由失败文案（纯函数，见其 test.mjs）。
+import { nameMatchesTarget, openWorkflowLoadVerdict, openWorkflowRouteError, toIntOrNull } from "./lib/canvas-open-workflow.mjs";
 
 const APP_ID = "comfyui-hana";
 // v0.6.0（M9）：ComfyUI 服务进程起停（中继 /_relay/backend/{start,stop,proc} + App 路由 + 工具 action=service
 //   + 左侧面板「启动服务/停止服务」）。启动走计划任务（脱离宿主沙箱 job，服务独立存活），撤下走 taskkill。
 //   面板原来那个「重试启动」正名为「重启中继」——它只重启受管 runtime，不碰 ComfyUI 服务本体。
 // （拉起服务 T2）：service 增 envcheck/clear/wait op；start 前自动 envcheck，阻断时暂缓拉起并返回阻断说明。
-//   2026-10-08：环境检查卡（envcheck.html）与卡按钮路由（/comfyui-hana/backend/{envcheck,clear,wait}）已移除。
-const APP_VERSION = "0.11.1";
+//   2026-10-09：卡片功能恢复——任务卡（task.html，submit/queue 回执 details.card）与环境检查卡
+//     （envcheck.html，卡按钮路由 /comfyui-hana/backend/{envcheck,clear,wait} 一并恢复）；
+//     流内卡走工具回执通道，不注册 contributes.cards（卡片中心零新增）。
+const APP_VERSION = "0.12.0";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
@@ -49,6 +53,7 @@ const TERMINAL_JOB = new Set(["completed", "error", "interrupted", "canceled", "
 const CAP_TASKS = "app/tasks.manage";
 const CAP_START_TURN = "app/session.start-turn";
 const CAP_STAGE_FILE = "app/session.stage-file";
+const KEEPALIVE_PROBE = true; // TODO 踹探针实验（临时代码，验证完按结论处理）
 
 const USER_TEXT = Object.freeze({
   "port-busy": "中继端口被占用或无法监听（已自动换随机端口重试，仍失败请检查本机回环端口占用与安全软件拦截）。",
@@ -983,6 +988,56 @@ export default defineApp(async (sdk) => {
     return null;
   }
 
+  // ── 流内任务卡（卡片功能恢复，2026-10-09）──────────────────────────────
+  // 通道：工具回执 details.card（+ details.bridgedTool）——宿主投影为内联卡，挂在工具调用块下方；
+  // 不注册 contributes.cards（卡片中心零新增；与下载器「妥善解决」同姿势）。
+  // 卡页 route 静态（/task.html / /envcheck.html），身份经宿主 surface 上下文的 cardInstanceId 反查。
+  function stableCardId(key) {
+    return "a_" + createHash("sha256").update(`${APP_ID}:${key}`).digest("hex").slice(0, 20);
+  }
+
+  // 卡实例 id → 任务：遍历内存任务表（promptId → stableCardId 重算比对）。先验词法形状；
+  // 记忆外（>50 条清理 / 进程重启）如实返回 null（卡页给「未找到」说明）。
+  async function findJobByCardId(cardId) {
+    if (!/^a_[0-9a-f]{20}$/.test(String(cardId || ""))) return null;
+    for (const job of state.jobs.values()) {
+      if (stableCardId(job.promptId) === cardId) return job;
+    }
+    return null;
+  }
+
+  // 任务卡 ref（backend submit / canvas submit / canvas queue 三路共用；route 静态、id 稳定）。
+  function taskCardRef(promptId, label, description) {
+    return {
+      pluginId: APP_ID,
+      cardId: "task",
+      cardInstanceId: stableCardId(promptId),
+      route: "/task.html",
+      title: `ComfyUI 生成 · ${label}`,
+      description,
+      aspectRatio: "16:9",
+      cardForm: "flush",
+      preferredWidthPx: 460,
+      titlebar: null,
+    };
+  }
+
+  // 环境检查卡 ref（service envcheck / service start 两路共用；卡自带按钮流程，数据由卡页自拉）。
+  function envcheckCardRef(snapshotId, blockerCount, sessionPath) {
+    return {
+      pluginId: APP_ID,
+      cardId: "envcheck",
+      cardInstanceId: stableCardId(`envcheck:${typeof sessionPath === "string" && sessionPath ? sessionPath : "any"}`),
+      route: "/envcheck.html",
+      title: "检测到其他模型占用 GPU",
+      description: `发现 ${blockerCount} 个阻断项 · 快照 ${String(snapshotId || "").slice(0, 8)}…`,
+      aspectRatio: "16:9",
+      cardForm: "flush",
+      preferredWidthPx: 460,
+      titlebar: null,
+    };
+  }
+
   // ── 状态出口 ──────────────────────────────────────────────────────────────
   function proxyPrefix() {
     if (state.phase !== "ready" || !state.runtimeId) return null;
@@ -1208,6 +1263,7 @@ export default defineApp(async (sdk) => {
     }
     const mode = modeRaw || "auto";
     let degradeNote = "";
+    let structuralExempt = false; // T1-2：auto 下「inline/inputs 形态直走后台」的结构豁免标记
     if (mode === "canvas") {
       return await submitCanvasFlow(args, context);
     }
@@ -1221,6 +1277,7 @@ export default defineApp(async (sdk) => {
         !(typeof args.inputs === "object" && Object.keys(args.inputs || {}).length === 0);
       if (isInlineObject || inputsNonEmpty) {
         degradeNote = "inline/inputs 形态直走后台提交";
+        structuralExempt = true;
       } else {
         // B 主链：四态诊断（中继/服务，轻读）→ 通过再探页面态（#49 两腿判定）→ 全过直走现状；
         // 有缺 → 自举链（快返「环境准备中」+ 后台准备 + 就绪自动继续）。
@@ -1353,11 +1410,18 @@ export default defineApp(async (sdk) => {
 
     startStatusPolling();
     // A 批（2026-10-08）：未上画布注记——显式 backend 保留「已记待同步」；结构豁免直提如实注明（未记）。
-    const notOnCanvasLine = !degradeNote
-      ? ""
+    // T1-2（2026-10-10）：结构豁免（inline/inputs 直提后端）回执升级为显著「警示」措辞，并带 backendDirect
+    //   标记（程序可判定）——把「未经画布的直提」这条假成功高发路径讲清楚。
+    const backendDirect = structuralExempt || mode === "backend";
+    const notOnCanvasLine = structuralExempt
+      ? [
+          `- ⚠️ 警示：本次未经画布，直提后端（${degradeNote}）。`,
+          "- ⚠️ 风险：后端 UI→API 转换对原语节点会丢值、LoadImageOutput 等受控下拉可能回卷，出图内容可能与画布所见不一致（假成功）。",
+          "- ➜ 要值正确 / 要人机共驾：请走画布路径（去掉 inputs，用 canvas.queue 提交）。",
+        ].join("\n")
       : mode === "backend"
         ? `- 未上画布：${degradeNote}；已记待同步（画布恢复且获授权后可回填）`
-        : `- 未上画布：${degradeNote}`;
+        : "";
     const text = [
       `已提交 ComfyUI 工作流：${label}`,
       `- prompt_id: ${promptId}`,
@@ -1381,6 +1445,7 @@ export default defineApp(async (sdk) => {
       content: [{ type: "text", text }],
       details: {
         bridgedTool: { name: "comfyui", server: APP_ID },
+        card: taskCardRef(promptId, label, `prompt ${promptId.slice(0, 8)}… · ${source}${applied.length ? ` · 注入 ${applied.length} 项` : ""}`),
         comfyui: {
           action: "submit",
           mode: "backend",
@@ -1395,6 +1460,8 @@ export default defineApp(async (sdk) => {
           originSession: sessionPath ? (subagentOrigin ? "subagent" : "desktop") : "unknown",
           deliverySupported: job.taskId ? !subagentOrigin : null,
           degradeNote: degradeNote || null,
+          backendDirect,
+          backendDirectReason: structuralExempt ? "inline/inputs" : mode === "backend" ? "explicit" : null,
         },
       },
     };
@@ -1583,6 +1650,7 @@ export default defineApp(async (sdk) => {
       content: [{ type: "text", text }],
       details: {
         bridgedTool: { name: "comfyui", server: APP_ID },
+        card: taskCardRef(promptId, label, `prompt ${promptId.slice(0, 8)}… · ${ref.source} · 画布执行`),
         comfyui: {
           action: "submit",
           mode: "canvas",
@@ -1979,6 +2047,7 @@ export default defineApp(async (sdk) => {
     outline: { drive: "canvas.get", desc: "大纲：功能块与块间连线（app 层分析）" },
     prompt: { drive: "canvas.prompt", desc: "可提交形态（prompt 对象）" },
     running: { drive: "exec.running", desc: "当前执行到哪个节点" },
+    progress: { drive: "exec.running", desc: "执行进度聚合（只读）：执行中？/ 当前节点 / 画布节点数 / 队列剩余 / promptId" },
     probe: { drive: "api.probe", desc: "桥自检（关键 API 存在性）" },
     revision: { drive: "canvas.revision", desc: "画布变更序号（只问变没变，轻量）" },
     events: { drive: "canvas.events", desc: "画布变更记录（最近若干条）" },
@@ -2051,24 +2120,28 @@ export default defineApp(async (sdk) => {
   // 画布桥调用助手（双腿）：壳页活着先试壳页；壳页不支持/失败回退扩展腿。
   // 返回 { ok, status, via, payload, error, detail }；不抛错，由调用方决定行为。
   // 与 actionCanvas 的原有派发行为一致（actionCanvas 也改走这里，单一来源）。
-  async function canvasBridgeInvoke(drive, args, timeoutMs = 30_000) {
+  async function canvasBridgeInvoke(drive, args, timeoutMs) {
+    // L6（2026-10-10）：timeoutMs 现同时透传两腿（此前只作用于扩展腿，壳页腿恒用自身 20s 默认）——
+    // 调用方显式给才覆盖：显式值两腿一致；缺省则各守自身默认（壳页腿 20s / 扩展腿 30s）。
+    const extMs = timeoutMs === undefined ? 30_000 : timeoutMs;
+    const legMs = timeoutMs === undefined ? undefined : timeoutMs;
     let via = "bridge";
     let res;
     if (shellAlive()) {
       try {
-        const r = await shellCall(drive, args || {});
+        const r = await shellCall(drive, args || {}, legMs);
         if (r.ok) {
           via = "shell";
           res = { ok: true, status: 200, data: { ok: true, data: r.data } };
         } else {
           // 壳页活着但执行失败（直连模式跨源够不到 / 壳页桥未支持）→ 回退扩展
-          res = await bridgeCallExt(drive, args, timeoutMs);
+          res = await bridgeCallExt(drive, args, extMs);
         }
       } catch {
-        res = await bridgeCallExt(drive, args, timeoutMs);
+        res = await bridgeCallExt(drive, args, extMs);
       }
     } else {
-      res = await bridgeCallExt(drive, args, timeoutMs);
+      res = await bridgeCallExt(drive, args, extMs);
     }
     const { ok, status, data } = res;
     const d = data && typeof data === "object" ? data : {};
@@ -2230,19 +2303,9 @@ export default defineApp(async (sdk) => {
 
   // 目标页匹配（落点断言）：duplicate 返回 {page,key}（E1 口径）；exec.running.activeWorkflow
   // 是 filename||name。两侧统一「反斜杠归一 + 去 .json + 小写」后比全串或基名（容忍前缀/扩展名差异）。
-  function canvasPageMatches(active, candidates) {
-    if (!active) return false;
-    const norm = (s) => String(s || "").replace(/\\/g, "/").trim().toLowerCase().replace(/\.json$/, "");
-    const a = norm(active);
-    if (!a) return false;
-    const aBase = a.split("/").pop();
-    for (const c of candidates || []) {
-      const n = norm(c);
-      if (!n) continue;
-      if (a === n || aBase === n.split("/").pop()) return true;
-    }
-    return false;
-  }
+  // L5（2026-10-10）：实现复用 lib 纯函数 nameMatchesTarget（单一来源——单测覆盖的就是运行时在跑的），
+  // 不再本地重复实现（旧实现与之同口径：全串或基名相等）。保留本名作内部调用别名。
+  const canvasPageMatches = (active, candidates) => nameMatchesTarget(active, candidates);
 
   // settle（修复 3）：装载后等画布安定，再放行 queue。
   // 依据（v1.53.6 实证）：loadGraphData 在 configure 前至少 3 处 await（扩展钩子 ×2、
@@ -2303,6 +2366,39 @@ export default defineApp(async (sdk) => {
         throw e;
       }
     }
+  }
+
+  // T3-1（2026-10-10）：openWorkflow 未落定时的现况取证（只读，供「如实报」用）。
+  // 取：活动页名 / 该页 modified（dirty，来自 canvas.pages 服务端账本）/ 最近一条 events。
+  async function openWorkflowUnsettledDiag({ expectedNames }) {
+    const out = { active: null, pageModified: null, pageNodeCount: null, lastChange: null };
+    try {
+      const run = await canvasBridgeInvoke("exec.running", {});
+      if (run.ok && run.payload && typeof run.payload === "object") out.active = run.payload.activeWorkflow || null;
+    } catch { /* 取不到如实留空（上层文案按「未知」渲染） */ }
+    try {
+      const pgs = await canvasBridgeInvoke("canvas.pages", {});
+      const pages = pgs.ok && pgs.payload && Array.isArray(pgs.payload.pages) ? pgs.payload.pages : null;
+      if (pages) {
+        // 优先认「当前活动页」（exec.running 给的），其次认目标页；都没有再退化为任一活页。
+        const hit = pages.find((p) => p && !p.stale && canvasPageMatches(p.workflow, out.active ? [out.active] : []))
+          || pages.find((p) => p && !p.stale && canvasPageMatches(p.workflow, expectedNames))
+          || pages.find((p) => p && !p.stale);
+        if (hit) {
+          out.pageModified = hit.modified === true ? true : (hit.modified === false ? false : null);
+          out.pageNodeCount = Number.isFinite(Number(hit.nodeCount)) ? Number(hit.nodeCount) : null;
+        }
+      }
+    } catch { /* 同上 */ }
+    try {
+      const ev = await canvasBridgeInvoke("canvas.events", {});
+      const ch = ev.ok && ev.payload && Array.isArray(ev.payload.changes) ? ev.payload.changes : null;
+      if (ch && ch.length) {
+        const last = ch[ch.length - 1] || {};
+        out.lastChange = { at: last.at || null, source: last.source || null };
+      }
+    } catch { /* 同上 */ }
+    return out;
   }
 
   // 等待「目标页到达 + 装载落定」（P1 P2 快返类 op 专用，2026-10-08）。
@@ -2373,26 +2469,38 @@ export default defineApp(async (sdk) => {
     return "该画布副驾驶：关（仅可读、不可写）";
   }
 
-  // 其他内容类读 op 的尾注：取 state 服务端缓存（零画布往返）；拿不到返回 null（不阻断读 op）。
-  async function copilotAnnotationLine() {
+  // 其他内容类读 op 的尾注数据源：取 state 服务端缓存（零画布往返）。
+  // 返回 copilot 对象（可为 null＝尚未上报）；桥不可达返回 undefined（调用方不给行、不给字段）。
+  async function fetchCanvasCopilot() {
     try {
       const st = await canvasBridgeInvoke("canvas.state", {});
       if (st.ok && st.payload && typeof st.payload === "object") {
-        return copilotLineText(st.payload.copilot);
+        return st.payload.copilot || null;
       }
-    } catch { /* 拿不到不给行 */ }
-    return null;
+    } catch { /* 拿不到 */ }
+    return undefined;
   }
 
   // v2 副本落盘命名：<原名去尾> (AgentCopy) YYYYMMDD-HHmm；重名递增「 (2)」「 (3)」…。
-  // 「原名去尾」= 从 duplicate 产物页名派生（去 .json、去尾部「 (N)」副本递增与「 (Copy)」副本后缀
-  // ——与桥侧 duplicate 的清洗口径同源）。重名探测：读 workflows/<name>.json 是否存在
-  // （与桥侧「另存并切换」的目标已存在预检同口径）；探测失败按「不存在」处理（save 侧仍有预检兜底）。
+  // 「原名去尾」= 从 duplicate 产物页名派生（去 .json、去尾部「 (N)」副本递增、「 (Copy)」副本后缀，
+  // 以及 T3-2 补上的「 (AgentCopy) YYYYMMDD-HHmm」历史副本段——与桥侧 duplicate 的清洗口径同源）。
+  // 重名探测：读 workflows/<name>.json 是否存在（与桥侧「另存并切换」的目标已存在预检同口径）；
+  // 探测失败按「不存在」处理（save 侧仍有预检兜底）。
   function agentCopyBaseName(srcPage) {
     let base = String(srcPage || "").split("/").pop() || "";
     base = base.replace(/\.json$/i, "");
-    base = base.replace(/\s*\(\d+\)$/, "");
-    base = base.replace(/\s*\(Copy\)$/i, "");
+    // T3-2（2026-10-10）：循环剥离叠加尾巴，直到不再变化，只留原始名——
+    //   ·「 (N)」副本递增（如「 (2)」）；·「 (AgentCopy) YYYYMMDD-HHmm」历史副本段
+    //   （可多层叠加，正则一次清干净）；·「 (Copy)」副本后缀。
+    //   修复前漏了 AgentCopy 段自身，导致每复制一轮净增一层，最终撞 400 超长。
+    for (let guard = 0; guard < 50; guard++) {
+      const next = base
+        .replace(/\s*\(\d+\)$/, "")
+        .replace(/(?:\s*\(AgentCopy\)\s*\d{8}-\d{4})+$/i, "")
+        .replace(/\s*\(Copy\)$/i, "");
+      if (next === base) break;
+      base = next;
+    }
     base = base.trim() || "workflow";
     return base;
   }
@@ -2757,6 +2865,91 @@ export default defineApp(async (sdk) => {
     } catch { /* 检测本身不打扰调用方 */ }
   }
 
+  // T4-2（2026-10-10）：只读进度聚合（执行中可查）。四源并行、能取就取、取不到省略并在 notes 如实标注
+  //   （不假造、不触发任何执行/写入）：
+  //   ① 桥 exec.running —— 当前执行节点（runningNodeId）+ 活动工作流（画布不在线则缺）
+  //   ② 桥 canvas.summary —— 画布节点数（nodeCount）
+  //   ③ 中继 /queue —— 后端队列（运行中 / 排队），运行中队首的 promptId
+  //   ④ 中继 /_relay/prompts —— /ws 事件聚合（活跃 prompt 的 currentNode / 细粒度 progress + 队列剩余）
+  // 返回 { running, canvasOnline, runningNodeId?, nodeCount?, queueRunning?, queueRemaining?, promptId?, progress?, activeWorkflow?, notes[] }
+  async function collectCanvasProgress() {
+    const notes = [];
+    const [run, sum, qs, pr] = await Promise.all([
+      canvasBridgeInvoke("exec.running", {}, 8_000).catch((e) => ({ ok: false, error: msgOf(e) })),
+      canvasBridgeInvoke("canvas.summary", {}, 8_000).catch((e) => ({ ok: false, error: msgOf(e) })),
+      relayJson("/queue", { timeoutMs: 8_000 }).catch(() => null),
+      relayJson("/_relay/prompts", { timeoutMs: 8_000 }).catch(() => null),
+    ]);
+    const out = { notes };
+    // ① 桥：当前执行节点 + 活动工作流
+    let canvasOnline = false;
+    if (run && run.ok) {
+      canvasOnline = true;
+      const rp = run.payload && typeof run.payload === "object" ? run.payload : {};
+      if (typeof rp.runningNodeId === "number") out.runningNodeId = rp.runningNodeId;
+      if (rp.activeWorkflow) out.activeWorkflow = String(rp.activeWorkflow);
+    } else {
+      notes.push(`画布不可达（exec.running：${(run && run.error) || "未知"}）`);
+    }
+    out.canvasOnline = canvasOnline;
+    // ② 桥：画布节点数
+    if (sum && sum.ok && sum.payload && typeof sum.payload === "object" && Number.isFinite(Number(sum.payload.nodeCount))) {
+      out.nodeCount = Number(sum.payload.nodeCount);
+    } else if (canvasOnline) {
+      notes.push("画布节点数取不到（canvas.summary 无 nodeCount）");
+    }
+    // ③ 中继 /queue：后端队列
+    let queueRunning = null;
+    let queueRemaining = null;
+    let queueReachable = false;
+    if (qs && qs.ok && qs.data && typeof qs.data === "object") {
+      queueReachable = true;
+      const rl = Array.isArray(qs.data.queue_running) ? qs.data.queue_running : [];
+      const pl = Array.isArray(qs.data.queue_pending) ? qs.data.queue_pending : [];
+      queueRunning = rl.length;
+      queueRemaining = pl.length;
+      out.queueRunning = queueRunning;
+      out.queueRemaining = queueRemaining;
+      const head = rl.find((it) => Array.isArray(it) && typeof it[1] === "string");
+      if (head) out.promptId = head[1];
+    } else {
+      notes.push("后端 /queue 不可达（队列剩余未知）");
+    }
+    // ④ 中继 /_relay/prompts：/ws 事件聚合（补 promptId / 当前节点 / 细粒度进度 / 队列剩余）
+    if (pr && pr.ok && pr.data && typeof pr.data === "object") {
+      const d = pr.data;
+      const act = Array.isArray(d.active) ? d.active : [];
+      const cur = act.find((r) => r && r.state === "running") || act[0] || null;
+      if (queueRemaining === null && d.ws && typeof d.ws.queueRemaining === "number") {
+        out.queueRemaining = d.ws.queueRemaining;
+        out.queueRemainingSource = "ws";
+      }
+      if (cur) {
+        if (!out.promptId && cur.promptId) out.promptId = cur.promptId;
+        if (out.runningNodeId == null && cur.currentNode != null) {
+          out.runningNodeId = cur.currentNode;
+          out.runningNodeIdSource = "ws";
+        }
+        if (cur.progress && typeof cur.progress === "object" && typeof cur.progress.value === "number" && typeof cur.progress.max === "number") {
+          out.progress = { value: cur.progress.value, max: cur.progress.max, node: cur.progress.node ?? null };
+        }
+        out.activePrompts = act.length;
+      }
+    } else {
+      notes.push("/ws 事件聚合不可达（细粒度进度缺失）");
+    }
+    // 执行中判定（M2，2026-10-10）：改三态——有任一「运行态源」可达才给布尔；
+    // 画布（exec.running）与后端 /queue 全不可达时 = 未知（out.running=null + notes），绝不报「空闲」。
+    const runningSourceReachable = canvasOnline || queueReachable;
+    if (runningSourceReachable) {
+      out.running = out.runningNodeId != null || (queueRunning != null && queueRunning > 0);
+    } else {
+      out.running = null;
+      notes.push("执行状态未知：画布与后端队列均不可达");
+    }
+    return out;
+  }
+
   // P8（2026-10-08）：签名补 context（queue 走宿主任务桥需要 callToken）；路由调用点传 null 保留降级。
   async function actionCanvas(args, context) {
     // 默认 state：对话开始时最常用——读服务端缓存的「手边快照」，零往返
@@ -2864,6 +3057,34 @@ export default defineApp(async (sdk) => {
         details: { comfyui: { action: "canvas", op, ok: true, payload: legs } },
       };
     }
+    // T4-2（2026-10-10）：progress——只读进度聚合（执行中可查；多源并行，取不到如实标注、省略字段）。
+    if (op === "progress") {
+      const prog = await collectCanvasProgress();
+      // M2（2026-10-10）：running 三态——true 执行中 / false 空闲 / null 未知（全源不可达，不谎报空闲）。
+      const stateText = prog.running === true ? "执行中" : (prog.running === false ? "空闲" : "未知");
+      const lines = [`画布执行进度：${stateText}`];
+      if (prog.runningNodeId != null) {
+        lines.push(`- 当前节点：#${prog.runningNodeId}${prog.nodeCount != null ? `（画布共 ${prog.nodeCount} 节点）` : ""}`);
+      } else if (prog.nodeCount != null) {
+        lines.push(`- 画布节点：${prog.nodeCount} 个`);
+      }
+      if (prog.queueRunning != null || prog.queueRemaining != null) {
+        lines.push(`- 队列：运行中 ${prog.queueRunning != null ? prog.queueRunning : "?"} · 排队 ${prog.queueRemaining != null ? prog.queueRemaining : "?"}`);
+      }
+      if (prog.promptId) {
+        lines.push(`- prompt: ${String(prog.promptId).slice(0, 8)}…${prog.progress ? `（当前节点进度 ${prog.progress.value}/${prog.progress.max}）` : ""}`);
+      }
+      if (prog.activeWorkflow) lines.push(`- 活动工作流：${prog.activeWorkflow}`);
+      if (prog.notes.length) lines.push(`- 说明：${prog.notes.join("；")}`);
+      let text = lines.join("\n");
+      const annot = await fetchCanvasCopilot();
+      if (annot !== undefined) text += `\n${copilotLineText(annot)}`;
+      maybeBackfillPendingCanvas(`canvas:${op}`);
+      return {
+        content: [{ type: "text", text }],
+        details: { comfyui: { action: "canvas", op, ok: true, progress: prog, ...(annot !== undefined ? { copilot: annot } : {}) } },
+      };
+    }
     // P1/P2（2026-10-08）：openWorkflow / save 为「快返 + 落定」语义——先取装载前变更序号（settle 参照）。
     let settleRevBefore = null;
     if (op === "openWorkflow" || op === "save") {
@@ -2882,6 +3103,20 @@ export default defineApp(async (sdk) => {
         const why = inv.error || `HTTP ${inv.status}`;
         // v2：写拦截（copilot_off）——转译为友好文案＋如何开启的指引（任务书口径：工具层友好面）。
         if (inv.error === "copilot_off") throw copilotOffError(op, inv);
+        // T3-3（2026-10-10）：openWorkflow 的路由失败（无匹配页 no_page/no_live_page、有页未响应 timeout）
+        // → 专用错误码与文案，不混进通用「读画布失败」（旧文案「可能没有打开的页面」与实况矛盾）。
+        if (op === "openWorkflow") {
+          const routeErr = openWorkflowRouteError({
+            error: inv.error,
+            wantWf: String((bridgeArgs && bridgeArgs.workflow) || "").trim(),
+          });
+          if (routeErr) {
+            const pagesBrief = onlinePagesBrief(inv.pages);
+            const e = new Error(`${routeErr.text}${pagesBrief ? `\n- 在线页面：${pagesBrief}` : ""}`);
+            e.code = routeErr.code;
+            throw e;
+          }
+        }
         // A1c（2026-10-08）：路由类错误（no_page / no_live_page）的 py 回执自带在线页面简表——
         // 补进报错文案（数据 = canvasBridgeInvoke 保留的 pages 透传，原被丢弃）。
         const pagesBrief = onlinePagesBrief(inv.pages);
@@ -2912,6 +3147,10 @@ export default defineApp(async (sdk) => {
             }
             payload = {
               opened: true,
+              // M1（2026-10-10）：文件回退成功路径必为「已装载」——补 loaded:true，
+              // 与 details「loaded: payload.loaded === true」及文本「已打开并装载…」对齐；
+              //（失败路径在此前已 throw，仍如实不落 loaded）。
+              loaded: true,
               fallback: "file",
               name: target,
               file: fb.ref.file,
@@ -2958,15 +3197,45 @@ export default defineApp(async (sdk) => {
     // ── P1/P2/P8（2026-10-08）：快返类 op 的落定 / 任务桥处理 ────────────────
     // P1：openWorkflow 快返（pending）→ 落定校验（到达 activeAfter + 节点数）通过后才报成功，超时/落点不符显式报错。
     if (op === "openWorkflow" && payload && typeof payload === "object" && payload.opened === true && payload.pending === true) {
+      // T3-1（2026-10-10）契约收紧：把「打开了（切换已发起）」与「装上了（装载已落定）」分开如实报。
       // 到达语义：装载在途期间活动页尚未切换，不能即时报「落点不符」；
-      // 等「活动页到达 activeAfter + 节点数 == nodeCount」才算落定，超时显式报错。
-      const arr = await waitCanvasTargetArrive({
-        expectedNodes: Number.isFinite(Number(payload.nodeCount)) ? Number(payload.nodeCount) : null,
-        candidates: payload.activeAfter ? [payload.activeAfter] : (payload.matched ? [payload.matched] : null),
-        revBefore: settleRevBefore ? settleRevBefore.revision : null,
-      });
-      payload.settled = true;
-      payload.settlePolls = arr && arr.polls;
+      // 等「活动页到达 activeAfter + 节点数 == nodeCount」才算第一证据，超时不为成功。
+      const expectedNodes = toIntOrNull(payload.nodeCount);
+      const candidates = payload.activeAfter ? [payload.activeAfter] : (payload.matched ? [payload.matched] : null);
+      let arrived = false;
+      let settleInfo = null;
+      try {
+        settleInfo = await waitCanvasTargetArrive({
+          expectedNodes,
+          candidates,
+          revBefore: settleRevBefore ? settleRevBefore.revision : null,
+        });
+        arrived = true;
+      } catch (e) {
+        payload.settleError = msgOf(e);
+      }
+      // 第二证据（可观测）：现抓 summary 的节点数——与期望冲突则判未落定（取不到则以第一证据为准）。
+      let summaryNodes = null;
+      try {
+        const sm = await canvasBridgeInvoke("canvas.summary", {});
+        if (sm.ok && sm.payload && typeof sm.payload === "object" && sm.payload.nodeCount != null) {
+          summaryNodes = Number(sm.payload.nodeCount);
+        }
+      } catch { /* 第二证据取不到：由 verdict 退化为「以到达为准」 */ }
+      const verdict = openWorkflowLoadVerdict({ arrived, expectedNodes, summaryNodeCount: summaryNodes });
+      payload.opened = true;
+      payload.loaded = verdict.loaded;
+      payload.settled = verdict.loaded;
+      payload.settleReason = verdict.reason;
+      if (verdict.loaded) {
+        payload.settlePolls = settleInfo && settleInfo.polls;
+      } else {
+        // 校验不过：如实标「未落定」——不回退成功语义、不静默；附现况证据（含 dirty 提示）。
+        payload.pending = false;
+        payload.unsettled = true;
+        const diag = await openWorkflowUnsettledDiag({ expectedNames: candidates });
+        payload.diagnostics = { ...diag, summaryNodes };
+      }
     }
     // P2：另存并切换（savedAs）pending 时同口径落定（到达 adopted 页）；再核对目标文件确实落盘。
     // （2026-10-08 批：实现抽为 settleSaveAsPending，与 submitCanvasFlow / 回填共用。）
@@ -2985,9 +3254,10 @@ export default defineApp(async (sdk) => {
           if (fresh.length === 1) { promptId = fresh[0]; promptIdVia = "queue-diff"; }
         } catch { /* 反查失败不阻断；结果如实标注未捕获 */ }
       }
-      queueTask = { promptId, promptIdVia, taskId: null, taskNote: null, subagentOrigin: false };
+      queueTask = { promptId, promptIdVia, label: null, taskId: null, taskNote: null, subagentOrigin: false };
       if (promptId) {
         const label = `画布执行（${promptId.slice(0, 8)}…）`;
+        queueTask.label = label; // 卡 ref 与文本行共用同一 label（卡片功能恢复）
         const { job, subagentOrigin } = await attachHostTask(promptId, {
           label,
           context,
@@ -3022,15 +3292,32 @@ export default defineApp(async (sdk) => {
       }
       const rows = (payload.pages || []).map((p) => {
         const cpText = p.copilot && typeof p.copilot === "object"
-          ? (p.copilot.enabled ? "副驾驶：开" : "副驾驶：关")
+          ? (p.copilot.enabled
+              ? `副驾驶：开${p.copilot.pageKey ? `（pageKey=${p.copilot.pageKey}）` : ""}`
+              : "副驾驶：关")
           : "副驾驶：未知";
-        return `  ${p.sid}… 「${p.workflow || "(未命名)"}」 ${p.ageSec}s 前活跃${p.modified ? "（有未保存改动）" : ""}｜${cpText}`;
+        // T3-4（2026-10-10）：页身份——owner（agent 副本页 / 用户页，未知则省略）+ empty（空图，未知则省略）。
+        const tags = [];
+        if (p.owner === "agent") tags.push("agent 副本页");
+        else if (p.owner === "user") tags.push("用户页");
+        if (p.empty === true) tags.push("空图");
+        const tagText = tags.length ? `｜${tags.join("｜")}` : "";
+        return `  ${p.sid}… 「${p.workflow || "(未命名)"}」 ${p.ageSec}s 前活跃${p.modified ? "（有未保存改动）" : ""}${tagText}｜${cpText}`;
       });
       text = [`在线页面：${payload.count} 个`, ...rows].join("\n");
       if (!rows.length) text = "在线页面：0 个（没有开着的 ComfyUI 页面）";
-      if ((payload.pages || []).some((p) => !p.copilot)) {
-        text += "\n注：「副驾驶：未知」= 该页尚未上报状态（未知 ≠ 关闭）。";
+      const pageList = payload.pages || [];
+      const notes = [];
+      if (pageList.some((p) => !p.copilot)) {
+        notes.push("「副驾驶：未知」= 该页尚未上报状态（未知 ≠ 关闭）");
       }
+      if (pageList.some((p) => p.empty === true)) {
+        notes.push("「空图」= 该页当前无节点");
+      }
+      if (pageList.some((p) => !("owner" in p))) {
+        notes.push("页身份未标注 = 该页归属未知");
+      }
+      if (notes.length) text += `\n注：${notes.join("；")}。`;
     } else if (op === "state" && payload) {
       if (!payload.hasState) {
         text =
@@ -3118,7 +3405,22 @@ export default defineApp(async (sdk) => {
     } else if (op === "setNodeMode" && payload) {
       text = `#${payload.nodeId} 已设为 ${payload.label}（mode=${payload.mode}，原 ${payload.before}）`;
     } else if (op === "openWorkflow" && payload && typeof payload === "object") {
-      if (payload.fallback === "file") {
+      if (payload.unsettled === true) {
+        // T3-1（2026-10-10）：未落定如实报——「已切换但未装载/未落定」，并说明复核口径。
+        const name = payload.activeAfter || payload.matched || "?";
+        const d = payload.diagnostics || {};
+        const lines = [
+          `openWorkflow 未落定：请求已发起（opened=true，目标「${name}」${payload.nodeCount != null ? `，${payload.nodeCount} 节点` : ""}），但装载未确认落定（loaded=false）。`,
+          `- 现况：活动页「${d.active || "(未知)"}」；summary 节点数 ${d.summaryNodes == null ? "未知" : d.summaryNodes}（预期 ${payload.nodeCount == null ? "未知" : payload.nodeCount}）；判据=${payload.settleReason || "未落定"}${payload.settleError ? `；等待详情：${payload.settleError}` : ""}`,
+          "- 复核以 summary / events 为准，别只看 opened（opened 仅表示切换请求已发起，不等于画布已装载）。",
+        ];
+        if (d.pageModified === true) lines.push('- ⚠️ 该页现为 dirty（有未保存改动）：后续 loadWorkflowFile 会被 blocked:"dirty" 拦，需 force:true，或先在画布上处理掉未保存改动。');
+        else if (d.pageModified === false) lines.push("- 该页当前未标记未保存改动（dirty=false）。");
+        else lines.push("- 该页 dirty 状态未知（页面尚未上报）。");
+        if (d.lastChange && d.lastChange.at) lines.push(`- 最近一次画布变更：${new Date(d.lastChange.at).toLocaleString()}（source=${d.lastChange.source || "?"}）。`);
+        lines.push("建议：改用 loadWorkflowFile（path=…）按文件直接装载；或排查该页装载失败原因后重试。");
+        text = lines.join("\n");
+      } else if (payload.fallback === "file") {
         // A1b（2026-10-08）：name 未命中 → 文件回退装载的回执注明。
         text = `已打开并装载：name 未命中，已按文件回退装载（${payload.file}）${payload.nodeCount != null ? `，${payload.nodeCount} 节点` : ""}`;
       } else {
@@ -3185,19 +3487,33 @@ export default defineApp(async (sdk) => {
       text = s && s.length > 60_000 ? s.slice(0, 60_000) + `\n…（已截断，原文 ${s.length} 字符）` : String(s);
     }
     // v2 读侧标注（2026-10-08）：内容类读 op 尾注副驾驶状态行（state 内嵌、pages 逐页已单独标注，不重复）。
+    let annotCopilot;
     const COPILOT_ANNOTATED_OPS = new Set(["summary", "get", "check", "trace", "outline", "prompt", "running"]);
     if (COPILOT_ANNOTATED_OPS.has(op)) {
-      const line = await copilotAnnotationLine();
-      if (line) text = `${text}\n${line}`;
+      annotCopilot = await fetchCanvasCopilot();
+      if (annotCopilot !== undefined) text = `${text}\n${copilotLineText(annotCopilot)}`;
     }
     // 惰性回填触发点之一（契约 §3.3）：canvas 类 op 完成后检测画布是否恢复
     maybeBackfillPendingCanvas(`canvas:${op}`);
+    // T3-1（2026-10-10）：openWorkflow 未落定 → ok:false + blocked:"unsettled"（如实上报，不谎报成功）。
+    const openWorkflowUnsettled = op === "openWorkflow" && payload && payload.unsettled === true;
     const details = {
       comfyui: {
         action: "canvas",
         op,
-        ok: true,
+        ok: !openWorkflowUnsettled,
         ...(op === "summary" && payload ? { nodeCount: payload.nodeCount, linkCount: payload.linkCount } : {}),
+        // T3-1（2026-10-10）：openWorkflow 把「打开了(opened)」与「装上了(loaded)」分开如实报。
+        ...(op === "openWorkflow" && payload && typeof payload === "object"
+          ? {
+              opened: payload.opened === true,
+              loaded: payload.loaded === true,
+              ...(payload.unsettled ? { blocked: "unsettled", settleReason: payload.settleReason || null, diagnostics: payload.diagnostics || null } : {}),
+            }
+          : {}),
+        // T2-1（2026-10-10）：读 op 暴露副驾驶状态（结构化）；「未知」＝null（尚未上报），不并同「关」。
+        ...(op === "state" && payload ? { copilot: payload.copilot || null } : {}),
+        ...(op === "summary" && annotCopilot !== undefined ? { copilot: annotCopilot } : {}),
         ...(op === "probe" || op === "running" || op === "revision" ? { payload } : {}),
         ...(op === "events" ? { changeCount: payload && payload.total } : {}),
         // A1b（2026-10-08）：openWorkflow name 未命中 → 文件回退装载的结构化注明（与文本同步）。
@@ -3211,6 +3527,12 @@ export default defineApp(async (sdk) => {
           : {}),
       },
     };
+    // 流内任务卡（卡片功能恢复，2026-10-09）：queue 捕获到 promptId 时同 submit 姿势出卡
+    //（旧版 queue op 无卡，按恢复单补齐——机制与 submit 卡一致，卡页按 cardInstanceId 反查）。
+    if (op === "queue" && queueTask && queueTask.promptId) {
+      details.bridgedTool = { name: "comfyui", server: APP_ID };
+      details.card = taskCardRef(queueTask.promptId, queueTask.label || `画布执行（${queueTask.promptId.slice(0, 8)}…）`, `prompt ${queueTask.promptId.slice(0, 8)}… · 画布执行`);
+    }
     return { content: [{ type: "text", text }], details };
   }
 
@@ -3400,7 +3722,7 @@ export default defineApp(async (sdk) => {
             ...formatBlockerLines(blockers),
             `- ${gpuLine}`,
             `快照 snapshotId=${d.snapshotId}（约 180s 内有效；clear 需带上它）。`,
-            "处理方式：service clear（需 snapshotId+pids）后再 start。",
+            "处理方式：随消息的操作卡（重试 / 清除其他进程 / 取消），或 service clear 后再 start。",
           ]
         : [`环境检查通过：未发现阻断项，可以 service start 拉起。`, `- ${gpuLine}`];
       if (warnings.length) lines.push(...warnings.map((w) => `- 警告：${w}`));
@@ -3408,6 +3730,11 @@ export default defineApp(async (sdk) => {
         content: [{ type: "text", text: lines.join("\n") }],
         details: { comfyui: { action: "service", op, ok: blockers.length === 0, blockerCount: blockers.length, snapshotId: d.snapshotId, warnings } },
       };
+      // 环境检查卡（卡片功能恢复，2026-10-09）：阻断时随回执出卡（route 静态 /envcheck.html；卡自拉数据）。
+      if (blockers.length) {
+        out.details.bridgedTool = { name: "comfyui", server: APP_ID };
+        out.details.card = envcheckCardRef(d.snapshotId, blockers.length, context && context.sessionPath);
+      }
       return out;
     }
     if (op === "wait") {
@@ -3471,12 +3798,15 @@ export default defineApp(async (sdk) => {
           `环境检查未通过：发现 ${envBlockers.length} 个阻断项，已暂缓拉起。`,
           ...formatBlockerLines(envBlockers),
           `快照 snapshotId=${envD.snapshotId}（约 180s 内有效）。`,
-          "处理：service envcheck → clear → start（按快照清理后重试）。",
+          "操作卡随消息给出（重试 / 清除其他进程 / 取消）；也可 service envcheck → clear → start。",
         ].join("\n");
         return {
           content: [{ type: "text", text }],
           details: {
             comfyui: { action: "service", op, blocked: true, blockerCount: envBlockers.length, snapshotId: envD.snapshotId, warnings: envD.warnings || [] },
+            // 环境检查卡（卡片功能恢复，2026-10-09）：start 前自动检查阻断时同 envcheck op 出卡
+            bridgedTool: { name: "comfyui", server: APP_ID },
+            card: envcheckCardRef(envD.snapshotId, envBlockers.length, context && context.sessionPath),
           },
         };
       }
@@ -3590,6 +3920,106 @@ export default defineApp(async (sdk) => {
     return `${w && w.windowId ? w.windowId : "?"}（${(w && w.state) || "?"}；${(w && w.title) || "?"}；${b}）`;
   }
 
+  // ── TODO 踹探针实验（临时代码，验证完按结论处理）──────────────────────────
+  // 目的：验证「App 主进程定时 ctx.windows.request() 踹窗口页 → 窗口页 hana.window.onRequest
+  // 应答」的 IPC 消息能否穿透 Chromium 后台节流（intensive throttling）。主进程 setInterval
+  // 不受页面节流：每 10s 踹一发 poke（Promise.race 10s 超时；超时不阻塞下一发，防积压）；窗口页
+  // 同步应答 { seq, t1, visibility }。每条结果 JSONL 双路追加落盘（POKE_DIR 与 APP_POKE_DIR，同名 poke-<窗开时间戳>.jsonl），
+  // 一行一条 {"seq","sentAt","recvAt","deltaMs","pageT1","pageVisibility","state"}
+  //（state: ok|timeout|error）。全链路容错、故障可见（脉搏日志 + 落盘告警），探针失败绝不影响正常业务。
+  // 摘除指引：① 顶部 KEEPALIVE_PROBE；② 本块；③ openWorkspaceWindow 内启动调用；
+  //（应答端在 app/ui/workspace.js 的 setupKeepalivePokeListener）。
+  const POKE_INTERVAL_MS = 10_000; // 踹周期
+  const POKE_TIMEOUT_MS = 10_000;  // 单发超时（超时记 state="timeout"，recvAt/deltaMs 记 null）
+  const POKE_DIR = "D:/HanakoWorks/ComfyUI/_temp/keepalive-probe"; // 实验产物目录（目录不存在则创建）
+  const APP_POKE_DIR = join(dataDir, "keepalive-probe"); // 落盘双路保底：app-data 侧目录（同名 basename 文件）
+  const keepaliveProbes = new Map(); // windowId → { timer, seq, reg }；防守：同一窗口仅一个循环（防重复叠加）
+
+  function pokeAppendLine(file, row) { // 2026-10-10 可观测化：双路落盘（原 POKE_DIR + app-data 侧）；任一路失败即告警
+    const line = JSON.stringify(row) + "\n";
+    const base = String(file).replace(/^.*[\\/]/, ""); // 双路同名 basename
+    let dOk = false, dErr = "";
+    try { // 路由 ①：原实验目录
+      mkdirSync(POKE_DIR, { recursive: true });
+      writeFileSync(file, line, { flag: "a" });
+      dOk = true;
+    } catch (e) { dErr = msgOf(e); }
+    let aOk = false, aErr = "";
+    try { // 路由 ②：app-data 侧（join(dataDir, "keepalive-probe") + 同名 basename 文件）
+      mkdirSync(APP_POKE_DIR, { recursive: true });
+      writeFileSync(join(APP_POKE_DIR, base), line, { flag: "a" });
+      aOk = true;
+    } catch (e) { aErr = msgOf(e); }
+    if (!dOk || !aOk) warn(`[keepalive-probe] 落盘 d=${dOk ? "ok" : dErr} appdata=${aOk ? "ok" : aErr}`); // 两路都成则静默
+  }
+
+  async function pokeOnce(win, windowId, seq, file) {
+    const sentAt = Date.now();
+    let timer = null;
+    const raced = await Promise.race([
+      Promise.resolve()
+        .then(() => win.request({ windowId, message: { type: "poke", seq, sentAt } }))
+        .then((resp) => ({ kind: "ok", resp }), (e) => ({ kind: "error", err: e })), // 超时后的迟到拒绝一并吞掉（保留错误文本供脉搏），不炸链
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ kind: "timeout" }), POKE_TIMEOUT_MS); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (raced.kind === "ok") {
+      const resp = raced.resp && typeof raced.resp === "object" ? raced.resp : {};
+      const recvAt = Date.now();
+      pokeAppendLine(file, {
+        seq, sentAt, recvAt, deltaMs: recvAt - sentAt,
+        pageT1: typeof resp.t1 === "number" ? resp.t1 : null,
+        pageVisibility: typeof resp.visibility === "string" ? resp.visibility : null,
+        state: "ok",
+      });
+      log(`[keepalive-probe] seq=${seq} state=ok deltaMs=${recvAt - sentAt}`); // 脉搏：每发一行
+      return;
+    }
+    pokeAppendLine(file, { // timeout：10s 未回；error：请求被拒/异常（二者 recvAt/deltaMs 记 null）
+      seq, sentAt, recvAt: null, deltaMs: null,
+      pageT1: null, pageVisibility: null,
+      state: raced.kind,
+    });
+    const errText = raced.err ? ` err=${msgOf(raced.err)}` : ""; // error：附加错误文本（若有）
+    log(`[keepalive-probe] seq=${seq} state=${raced.kind} deltaMs=null${errText}`); // 脉搏：每发一行
+  }
+
+  function startKeepaliveProbe(windowId) {
+    if (!windowId || keepaliveProbes.has(windowId)) return; // 防守：同一窗口只启动一个循环
+    const win = sdk.windows;
+    if (!win || typeof win.request !== "function") return; // 宿主未提供 request：静默跳过
+    const file = join(POKE_DIR, `poke-${Date.now()}.jsonl`); // 文件名＝窗开时间戳
+    const entry = { timer: null, seq: 0, reg: null };
+    keepaliveProbes.set(windowId, entry);
+    entry.timer = setInterval(() => {
+      try { pokeOnce(win, windowId, ++entry.seq, file).catch(() => { /* 静默 */ }); } catch { /* 静默 */ }
+    }, POKE_INTERVAL_MS);
+    entry.timer.unref?.(); // 探针不阻碍进程退出
+    // 窗口关闭（ctx.windows.onEvent 的 closed）→ 清循环 + 摘监听（防遗留叠加）
+    if (typeof win.onEvent === "function") {
+      Promise.resolve()
+        .then(() => win.onEvent({ windowId }, (event) => {
+          if (event && event.type === "closed") stopKeepaliveProbe(windowId);
+        }))
+        .then((reg) => {
+          entry.reg = reg || null;
+          if (!keepaliveProbes.has(windowId)) { try { reg?.dispose?.(); } catch { /* 忽略 */ } } // 竞态兜底：注册迟到于已停
+        })
+        .catch(() => { /* 静默：监听注册失败不影响循环本体 */ });
+    }
+    log(`[keepalive-probe] 踹循环已启动：windowId=${windowId} → ${file}（dataDir=${dataDir}）`);
+  }
+
+  function stopKeepaliveProbe(windowId) {
+    const entry = keepaliveProbes.get(windowId);
+    if (!entry) return;
+    keepaliveProbes.delete(windowId);
+    try { clearInterval(entry.timer); } catch { /* 忽略 */ }
+    try { entry.reg?.dispose?.(); } catch { /* 忽略 */ }
+    log(`[keepalive-probe] 踹循环已停止：windowId=${windowId}`);
+  }
+  // ── TODO 踹探针实验块结束 ─────────────────────────────────────────────────
+
   async function openWorkspaceWindow(context) {
     const win = requireWindowsDomain();
     await requireWindowsCapability();
@@ -3601,7 +4031,7 @@ export default defineApp(async (sdk) => {
         entry: WORKSPACE_WINDOW_ENTRY,
         title: WORKSPACE_WINDOW_TITLE,
         bounds: { ...WORKSPACE_WINDOW_BOUNDS },
-        chrome: "native", // 自绘/主题坑规避：workspace.html 不自绘 chrome，取壳原生框（对照 builder 的 custom 是因其页自绘标题栏）
+        chrome: "custom", // 页面自绘标题栏（拖动 + 三键），故声明 custom（win32 下 BrowserWindow 选项不变）
         data: { role: "workspace" },
       });
     } catch (e) {
@@ -3609,6 +4039,10 @@ export default defineApp(async (sdk) => {
     }
     lastWorkspaceWindowId = snapshot && typeof snapshot.windowId === "string" ? snapshot.windowId : null;
     log(`工作区窗口已打开：windowId=${lastWorkspaceWindowId || "?"}（entry=${WORKSPACE_WINDOW_ENTRY}）`);
+    // TODO 踹探针实验（临时代码，验证完按结论处理）：窗口创建成功 → 为该窗口启动踹循环
+    if (KEEPALIVE_PROBE) {
+      try { startKeepaliveProbe(lastWorkspaceWindowId); } catch { /* 静默：探针失败绝不影响开窗业务 */ }
+    }
     return snapshot;
   }
 
@@ -3659,7 +4093,7 @@ export default defineApp(async (sdk) => {
       const snapshot = await openWorkspaceWindow(context);
       const text = [
         `工作区窗口已打开：${windowLine(snapshot)}`,
-        `- entry=${WORKSPACE_WINDOW_ENTRY} · chrome=native · bounds=${snapshot && snapshot.bounds ? `${snapshot.bounds.width}×${snapshot.bounds.height}` : "?"}`,
+        `- entry=${WORKSPACE_WINDOW_ENTRY} · chrome=custom · bounds=${snapshot && snapshot.bounds ? `${snapshot.bounds.width}×${snapshot.bounds.height}` : "?"}`,
         "窗口页自取 surface 凭据（query 优先；缺则从路径段提取并回填 URL）。",
         "注意：壳页桥为单桶——同刻仅一壳页（窗口页与卡/面板页并存会互抢画布 op）。",
       ].join("\n");
@@ -3676,10 +4110,176 @@ export default defineApp(async (sdk) => {
         ? windows.map((w) => `- ${windowLine(w)}`)
         : ["（当前没有本 App 的已开窗口）"];
       if (last) lines.push(`- last 补查：${last.error ? `${last.windowId}（get 失败：${last.error}）` : windowLine(last)}`);
-      const text = [`工作区窗口：${windows.length} 个`, ...lines, "op=open 打开；op=close 关闭。"].join("\n");
+      const text = [`工作区窗口：${windows.length} 个`, ...lines, "op=open 打开窗口；op=close 关闭。"].join("\n");
       return { content: [{ type: "text", text }], details: { comfyui: { action: "window", op, ok: true, windows, last } } };
     }
     throw new Error(`window 的 op 必须是 open / close / status（收到 "${op}"）`);
+  }
+
+  // ── 画布移交（2026-10-09 首版；2026-10-09 晚修订 1：非破坏加入 + 任意次序接管）──────────
+  // 方案：docs/画布移交-外开窗口到主工作区-20261009.md（含「⚠ 修订 1」节）。单桶壳页桥（shellBridge）
+  // 下不做实时接力，本移交 = 一次性状态转移：
+  //   · op=write（窗口侧）：取全量画布（canvas.get，读类不需授权）→ 落盘
+  //     user/default/workflows/_handoff-<ts>.json（中继 /_relay/fs/write 原子写）→ 写标记 handoff.json（app-data）；
+  //   · op=peek / op=clear（卡侧/测试）：查 / 清标记；
+  //   · op=take（卡侧）：查标记 → 桥 canvas.loadWorkflowNewPage【新开页装载】（快照开为一张
+  //     【新】画布页，不触碰当前活动页——内容/dirty 无关，故无 dirty 分支）→ 成功清标记。
+  //     口径＝「用户主动移交」（用户点「放入」+ 开卡接住），不走 agent 写闸门；桥侧该 op 不登记
+  //     WRITE_OPS（不含 copilot 写拦截）。防重入：本函数内 take 互斥（同一时刻一次）+ 桥侧同文件去重
+  //     （回执超时后的重试不重复开页）。触发侧（短窗轮询/活跃重查）见 app/ui/workspace.js。
+  //   · 修订 1.2：write 落盘写标记后，若「卡实例记录」新鲜 → 立即定向直发同一「新开页装载」
+  //     （按精确 sid 单发给卡实例；在线场景秒级进入 hui），成功即清标记；失败/无目标才落到卡侧
+  //     兜底（短窗/低频巡检/take）。直发与卡侧 take 并发时由桥侧同文件去重兜底（不产生第二页）。
+  //   · op=close-window：复用「工作区自开」的 close 通道（窗口页优先用宿主窗口 API 自关，失败再走这里）。
+  const HANDOFF_FILE = join(dataDir, "handoff.json");
+  const HANDOFF_PREFIX = "_handoff-";
+
+  function readHandoffMarker() {
+    try {
+      const j = JSON.parse(readFileSync(HANDOFF_FILE, "utf8"));
+      if (j && typeof j.file === "string" && j.file.trim()) return j;
+    } catch { /* 无标记 / 损坏：按无标记处理 */ }
+    return null;
+  }
+  function writeHandoffMarker(marker) {
+    writeFileAtomic(HANDOFF_FILE, JSON.stringify(marker, null, 2)); // 原子写（.tmp → rename）
+  }
+  function clearHandoffMarker() {
+    try { rmSync(HANDOFF_FILE, { force: true }); return true; } catch { return false; }
+  }
+  let takeInFlight = false; // take 防重入（修订 1）：同一时刻只允许一次在途；并发/重入请求回报 inFlight
+  // ── 修订 1.2：定向直发（在线场景「点击直发」）──────────────────────────────
+  // 卡壳页随 handoff/peek 上报「本壳 iframe 实例的 sid」（经桥 postMessage 宣告获得），记于此；
+  // write 时若记录新鲜，把「新开页装载」按精确 sid 单发给该实例（不走壳页队列、不广播）。
+  let handoffCardSid = null; // { sid, at }
+  const HANDOFF_CARD_TTL_MS = 150_000; // 新鲜窗口：巡检 60s 拍 ×2 余量（短窗期 2.5s 拍，更鲜）
+  function rememberCardSid(raw) {
+    const s = typeof raw === "string" ? raw.trim() : "";
+    if (!s || s.length > 128) return; // 形状校验（clientId 为 uuid 级字符串；超长/空直接忽略）
+    handoffCardSid = { sid: s, at: Date.now() };
+  }
+  function freshCardSid() {
+    if (handoffCardSid && Date.now() - handoffCardSid.at < HANDOFF_CARD_TTL_MS) return handoffCardSid.sid;
+    return null;
+  }
+
+  // 定向直发：把「新开页装载」单发给在线的 hui 实例（不含窗实例）。链路——
+  //   app → /_relay/bridge（relay 提升 args.sid 到顶层）→ py _hana_call 定向 send_sync（单发）
+  //   → 目标实例的桥执行 canvas.loadWorkflowNewPage → 同源回传 → py → relay → 本函数回执。
+  // 返回 { ok, reason, page? }；ok=true 时标记已清（接住即完成）。任一步失败 → 保留标记走卡侧离线兜底。
+  async function tryDirectDeliver(marker) {
+    const sid = freshCardSid();
+    if (!sid) return { ok: false, reason: "no-card" }; // 无新鲜卡记录：hui 离线（或壳页身份通道未就绪）→ 兜底
+    try {
+      // 前置校验（防「定向退化广播」）：py 的 _hana_call 在「sid 不在账本」时会退化为广播
+      //（误伤其他实例）；先确认该 sid 存在于活页清单。仅存在性判定、不要求未过期——账本条目只标
+      // stale、不删；「是否真活」以投递回执为准（stale 只是「久未上报」，活实例照常可达；
+      // 真断了则无回执→超时→兜底）。检查通过后即使目标瞬断也不会退化为广播。
+      const pages = await relayJson("/_relay/bridge", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ op: "canvas.pages", args: {} }),
+        timeoutMs: 5_000,
+      });
+      const list = pages && pages.ok && pages.data && pages.data.ok && pages.data.data && Array.isArray(pages.data.data.pages)
+        ? pages.data.data.pages : null;
+      if (!list || !list.some((p) => p && p.sidFull === sid)) {
+        return { ok: false, reason: "card-not-live" };
+      }
+      // 定向投递（单发；不走壳页桥队列，也不广播）
+      const del = await relayJson("/_relay/bridge", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ op: "canvas.loadWorkflowNewPage", args: { file: marker.file, sid } }),
+        timeoutMs: 8_000, // > py CALL_TIMEOUT_SEC(6s)：让 py 的超时回执先到，拿明确失败语义
+      });
+      const d = del && del.data;
+      if (d && d.ok === true && d.data && d.data.newPage === true) {
+        clearHandoffMarker();
+        log(`画布移交：定向直发成功（sid=${sid.slice(0, 8)}…，新开页 ${d.data.page || "?"}${d.data.dedup ? "，幂等去重" : ""}）`);
+        return { ok: true, reason: "delivered", page: d.data.page || null };
+      }
+      log(`画布移交：定向直发未完成（${(d && (d.error || d.detail)) || `HTTP ${del && del.status}`}）——保留标记走离线兜底`);
+      return { ok: false, reason: "deliver-failed" };
+    } catch (e) {
+      log(`画布移交：定向直发异常（${msgOf(e)}）——保留标记走离线兜底`);
+      return { ok: false, reason: "deliver-error" };
+    }
+  }
+
+  async function actionHandoff(op, args) {
+    if (op === "write") {
+      if (!relayReady()) return { ok: false, error: "relay-not-ready" };
+      const got = await canvasBridgeInvoke("canvas.get", {});
+      if (!got.ok) return { ok: false, error: got.error || "取画布失败", detail: got.detail || null, pages: got.pages || null };
+      const graph = got.payload;
+      if (!graph || typeof graph !== "object") return { ok: false, error: "画布全量为空（页面未就绪？）" };
+      const workflowsDir = await resolveCanvasWorkflowsDir();
+      if (!workflowsDir) return { ok: false, error: "找不到 ComfyUI 工作流目录（user/default/workflows）" };
+      const name = `${HANDOFF_PREFIX}${Date.now()}.json`;
+      const abs = join(workflowsDir, name);
+      const written = await writeWorkflowFileViaRelay(abs, JSON.stringify(graph)); // 与 ComfyUI 自身保存同为紧凑 JSON
+      const marker = {
+        file: `workflows/${name}`, // 桥 loadWorkflowFile 要求「相对 user/default」的路径
+        abs,
+        ts: new Date().toISOString(),
+        from: String((args && args.from) || "window"),
+        nodes: Array.isArray(graph.nodes) ? graph.nodes.length : null,
+      };
+      writeHandoffMarker(marker);
+      log(`画布移交：已落盘 ${name}（来源 ${marker.from}${written && written.size != null ? `，${written.size} B` : ""}）`);
+      // 修订 1.2：在线场景「定向直发」——按精确 sid 单发给在线的 hui 实例（秒级、拿回执）；
+      // 失败/无目标 → 保留标记，走卡侧离线兜底（短窗 / 低频巡检）。回执驱动窗口文案与谢幕。
+      const del = await tryDirectDeliver(marker);
+      return {
+        ok: true, file: marker.file, abs, ts: marker.ts, nodes: marker.nodes,
+        delivered: del.ok === true, reason: del.reason || null, page: del.page || null,
+      };
+    }
+    if (op === "peek") {
+      rememberCardSid(args && args.cardSid); // 修订 1.2：卡壳页顺带上报本壳实例 sid（定向直发目标记录）
+      const m = readHandoffMarker();
+      return m ? { ok: true, has: true, ...m } : { ok: true, has: false };
+    }
+    if (op === "clear") return { ok: true, cleared: clearHandoffMarker() };
+    if (op === "take") {
+      if (!relayReady()) return { ok: false, error: "relay-not-ready" };
+      const m = readHandoffMarker();
+      if (!m) return { ok: true, taken: false, absent: true };
+      // 防重入（第一道；第二道=桥侧同文件去重）：短窗轮询 / 活跃重查 / 并发来源同一时刻只放一次 in-flight。
+      if (takeInFlight) return { ok: true, taken: false, inFlight: true };
+      takeInFlight = true;
+      try {
+        // 修订 1：接住动作 = 桥「新开页装载」（快照开为一张【新】画布页；不触碰当前活动页，
+        // 故无 dirty 分支）。口径＝「用户主动移交」，不走 agent 写闸门（桥侧该 op 不在 WRITE_OPS）。
+        const r = await canvasBridgeInvoke("canvas.loadWorkflowNewPage", { file: m.file });
+        if (!r.ok) return { ok: false, error: r.error || "装载失败", detail: r.detail || null, pages: r.pages || null };
+        const p = r.payload && typeof r.payload === "object" ? r.payload : {};
+        if (p.newPage === true) {
+          clearHandoffMarker();
+          log(`画布移交：已接住 ${m.file}（新开页${p.page ? ` ${p.page}` : ""}${p.dedup ? "，幂等去重" : ""}，via ${r.via}）`);
+          return {
+            ok: true, taken: true, file: m.file,
+            page: p.page || null,
+            nodeCount: p.nodeCount != null ? p.nodeCount : null,
+            dedup: p.dedup === true,
+            via: r.via, ts: m.ts,
+          };
+        }
+        return { ok: false, error: "装载返回未知形态", detail: p };
+      } finally {
+        takeInFlight = false;
+      }
+    }
+    if (op === "close-window") {
+      try {
+        const snapshot = await closeWorkspaceWindow({}, null);
+        return { ok: true, closed: true, window: snapshot || null };
+      } catch (e) {
+        return { ok: false, closed: false, error: msgOf(e) };
+      }
+    }
+    return { ok: false, error: `handoff op 必须是 write / peek / clear / take / close-window（收到 "${op}"）` };
   }
 
   // ── 环境自举（B 主链，2026-10-08）：单一互斥 + 服务/页面自举段 + submit 准备链 ──
@@ -4155,6 +4755,7 @@ export default defineApp(async (sdk) => {
               "diff",
               "prompt",
               "running",
+              "progress",
               "probe",
               "revision",
               "events",
@@ -4179,7 +4780,7 @@ export default defineApp(async (sdk) => {
               "copilot",
             ],
             description:
-              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）；trace=追踪端口来源/去向（multi 多级链）；outline=大纲（功能块+块间连线；detail=nodes 可下钻）；diff=两文件语义 diff（source=file；path=基准、pathB=目标）；prompt=可提交形态；running=当前执行节点；probe=桥自检；revision=变更序号；events=变更记录；commands=列前端已注册命令 id；commandShape=命令表形状（自检）；frameReload=重载内层 iframe（扩展换文件后用）。写（需授权；v2 硬约束：未开副驾驶的画布上仅可打开 / 复制 / 落盘）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步；patch=意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）；loadWorkflowFile=按路径装载工作流（绕过前端列表）；openWorkflow=打开已保存工作流并完整装载（切前台+重绘，pending 落定校验；自带未保存保护，需授权）；organize=调前端已注册命令（默认自动排布）；queue=执行当前画布（等效点 Queue，快返；front 插队首）；duplicate=复制当前画布为新页（原布零改动，返回新页 page/key）；visual=锁与高亮（visualAction=lock/highlight/clear）；copilot=开关当前画布副驾驶（enabled=true/false；Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）。source=file=对工作流 JSON 文件操作（path：绝对路径或相对工作流目录 user/default/workflows；读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak、dryRun/verify〕；其余 op 不支持）。多页面时用 workflow 参数定向（不传则广播）",
+              "读/改人正在看的同一张画布。读：pages=在线页面清单（各自开的哪个工作流）；state=最近快照（默认，零往返）；summary=现抓摘要；get=全量 UI JSON（select/fields 投影裁剪）；check=体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）；trace=追踪端口来源/去向（multi 多级链）；outline=大纲（功能块+块间连线；detail=nodes 可下钻）；diff=两文件语义 diff（source=file；path=基准、pathB=目标）；prompt=可提交形态；running=当前执行节点；progress=执行进度聚合（只读：执行中？/当前节点/画布节点数/队列剩余/promptId）；probe=桥自检；revision=变更序号；events=变更记录；commands=列前端已注册命令 id；commandShape=命令表形状（自检）；frameReload=重载内层 iframe（扩展换文件后用）。写（需授权；v2 硬约束：未开副驾驶的画布上仅可打开 / 复制 / 落盘）：setWidget=改参数；addNode=加节点；removeNode=删节点；connect=连线；disconnect=断线；setNodeMode=mute/bypass；save=落盘为工作流文件；undo=撤销 agent 上一步；patch=意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）；loadWorkflowFile=按路径装载工作流（绕过前端列表）；openWorkflow=打开已保存工作流并完整装载（切前台+重绘，pending 落定校验；自带未保存保护，需授权）；organize=调前端已注册命令（默认自动排布）；queue=执行当前画布（等效点 Queue，快返；front 插队首）；duplicate=复制当前画布为新页（原布零改动，返回新页 page/key）；visual=锁与高亮（visualAction=lock/highlight/clear）；copilot=开关当前画布副驾驶（enabled=true/false；Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）。source=file=对工作流 JSON 文件操作（path：绝对路径或相对工作流目录 user/default/workflows；读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak、dryRun/verify〕；其余 op 不支持）。多页面时用 workflow 参数定向（不传则广播）",
           },
           workflow: { type: "string", description: "多页面定向：只发给正打开这个工作流名的页面（不传则广播给所有页面）" },
           select: { type: "string", description: "投影过滤：只保留匹配节点（#8 / #8,#27 / type=PrimitiveInt / title~尺寸 / 邻接 #8/up、#8/down〔≤跳数，含自身，#8/up:2 限 2 跳〕，逗号分隔取并集）；与 fields 搭配替代全量 get" },
@@ -4241,7 +4842,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合（含四态环境诊断）；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队；mode=auto|canvas|backend 选执行位置——默认 auto：画布在线且已授权时复制副本-装载-画布执行（canvas.queue）；环境缺（中继/服务/工作区）自动自举：快返「环境准备中」→ 后台准备（服务拉起/必要时自动拉起工作区窗口）→ 就绪自动继续；阻断/补不上/授权缺停下（blocked：原因+选项，不自动改走后台）；inline 对象/带 inputs 结构豁免直走后台并注明）→ 返回 prompt_id，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停与环境检查（op=status/start/stop/envcheck/clear/wait：start 自动先 envcheck，异常时返回阻断说明；envcheck=检查 GPU 占用/端口残留；clear=按快照清理进程（snapshotId+pids）；wait=轮询就绪，单次≤25s）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）/ trace 追踪端口来源/去向（multi 多级链）/ outline 大纲（功能块+块间连线；detail 下钻）/ diff 两文件语义 diff（source=file；path 基准/pathB 目标）/ prompt 可提交形态 / running 当前执行节点 / probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖）；source=file 对工作流 JSON 文件操作：读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak；path 相对工作流目录 user/default/workflows 或绝对路径〕）——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）/ trace 追踪端口来源/去向（multi 多级链）/ outline 大纲（功能块+块间连线；detail 下钻）/ diff 两文件语义 diff（source=file；path 基准/pathB 目标）/ prompt 可提交形态 / running 当前执行节点 / progress 执行进度聚合（只读：执行中？/当前节点/画布节点数/队列剩余/promptId）/ probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖）；source=file 对工作流 JSON 文件操作：读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak；path 相对工作流目录 user/default/workflows 或绝对路径〕）——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "window=工作区原生窗：op=open 打开宿主原生窗装载工作区（/workspace.html；需能力 app/windows.manage；窗口页自取 surface 凭据；壳页桥为单桶——同刻仅一壳页，开窗前建议先关掉其它工作区壳页）/ op=status 列出本 App 已开窗口（默认）/ op=close 关闭窗口（默认关最近一次打开的，可传 windowId）。提交环境缺时自举链也会自动拉起该窗（同刻仅一壳页；无需手动）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
@@ -4336,6 +4937,29 @@ export default defineApp(async (sdk) => {
       });
 
       app.get("/comfyui-hana/health", (c) => c.json({ ok: true, app: { id: APP_ID, version: APP_VERSION }, ts: new Date().toISOString() }));
+
+      // ── TODO 节流探针实验（临时代码，验证完按结论处理）────────────────────────
+      // 「网络直采」通道（hui 页 → 后端报数，数据必达）：页面每 10s POST {t, n, vis}
+      //（页面侧见 app/ui/workspace.js 的 setupThrottleProbe 网络直采段），本路由把一行 JSON
+      // append 到 join(dataDir, "keepalive-probe", "hui-page-pulse.jsonl")（目录不存在则建）。
+      // 不依赖 state 通道读回：页面被 Chromium 节流时落盘节奏会直接变稀/停摆，读该文件即可判定。
+      // 摘除：删除本路由 + 页面侧上报段（setupThrottleProbe）。
+      app.post("/comfyui-hana/keepalive-probe-ping", async (c) => {
+        let t = null, n = null, vis = null; // TODO 实验：容错解析——缺字段/畸形 body 一律记 null
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const src = body && typeof body === "object" ? body : {};
+          if (typeof src.t === "number" && Number.isFinite(src.t)) t = src.t;
+          if (typeof src.n === "number" && Number.isFinite(src.n)) n = src.n;
+          if (typeof src.vis === "string") vis = src.vis;
+        } catch { /* 忽略：按 null 落盘 */ }
+        try { // TODO 实验：append 落盘（目录不存在则建）；写失败不影响响应
+          const dir = join(dataDir, "keepalive-probe");
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, "hui-page-pulse.jsonl"), JSON.stringify({ t, n, vis }) + "\n", { flag: "a" });
+        } catch { /* 忽略 */ }
+        return c.json({ ok: true });
+      });
 
       // 主机指标（GPU / CPU / 内存）：中继侧采集（nvidia-smi + os 模块），面板图表数据源
       app.get("/comfyui-hana/metrics", async (c) => {
@@ -4506,6 +5130,22 @@ export default defineApp(async (sdk) => {
       app.get("/comfyui-hana/canvas", canvasRoute);
       app.post("/comfyui-hana/canvas", canvasRoute);
 
+      // 画布移交（2026-10-09）：外开窗口 → 主工作区。op=write / peek / clear / take / close-window。
+      // 只服务本 App 壳页（窗口页/卡页直连本路由；非工具面动作，不进 comfyui 工具）。
+      const handoffHttp = async (c) => {
+        try {
+          let body = {};
+          try { body = await c.req.json(); } catch { body = {}; }
+          if (!body || typeof body !== "object") body = {};
+          const op = String(c.req.query("op") || body.op || "peek").trim();
+          return c.json(await actionHandoff(op, body));
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      };
+      app.get("/comfyui-hana/handoff", handoffHttp);
+      app.post("/comfyui-hana/handoff", handoffHttp);
+
       // 画布写入授权开关（默认关）：agent 改画布前必须先得到明确允许
       app.get("/comfyui-hana/allow-write", (c) => {
         try { return c.json({ ok: true, enabled: readAllowWrite() }); } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
@@ -4588,6 +5228,60 @@ export default defineApp(async (sdk) => {
         }
       });
 
+      // 环境检查 / 快照清理 / 等待就绪（卡片功能恢复，2026-10-09）：环境检查卡的按钮直接 POST 的入口。
+      // 语义同工具 service 的 envcheck/clear/wait op；转发到中继 /_relay/backend/{envcheck,clear,wait}，
+      // 经 relayJson → x-comfy-relay-key（controlKey）管理；宿主侧由 surface 凭据（app_route）保护。
+      app.post("/comfyui-hana/backend/envcheck", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/backend/envcheck", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+            timeoutMs: 30_000,
+          });
+          return c.json(ok && data && typeof data === "object" ? data : { ok: false, error: (data && data.error) || `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.post("/comfyui-hana/backend/clear", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const snapshotId = typeof body.snapshotId === "string" ? body.snapshotId.trim() : "";
+          const pids = Array.isArray(body.pids) ? body.pids.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0) : [];
+          if (!snapshotId || !pids.length) return c.json({ ok: false, error: "需要 {snapshotId, pids[]}（快照来自 envcheck；列表外/不可清理项会被中继拒绝）" }, 400);
+          const { ok, status, data } = await relayJson("/_relay/backend/clear", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ snapshotId, pids }),
+            timeoutMs: 30_000,
+          });
+          if (ok) void refreshSnapshot();
+          return c.json(ok && data && typeof data === "object" ? data : { ok: false, error: (data && data.error) || `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.post("/comfyui-hana/backend/wait", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/backend/wait", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+            timeoutMs: 30_000,
+          });
+          if (ok) void refreshSnapshot();
+          return c.json(ok && data && typeof data === "object" ? data : { ok: false, error: (data && data.error) || `relay HTTP ${status}` }, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
       app.get("/comfyui-hana/backend", async (c) => {
         if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
         try {
@@ -4596,6 +5290,27 @@ export default defineApp(async (sdk) => {
           return c.json(out, ok ? 200 : 502);
         } catch (e) {
           return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      // 任务卡数据源（卡片功能恢复，2026-10-09）：按 cardId（宿主铸造的卡实例 id，卡页 surface 上下文）
+      // 或 id（promptId/taskId，调试/兼容）查任务；卡片 route 静态（/task.html），身份经 cardId 反查。
+      app.get("/comfyui-hana/task", async (c) => {
+        try {
+          const cardId = String(c.req.query("cardId") || "").trim();
+          const id = String(c.req.query("id") || "").trim();
+          if (!cardId && !id) return c.json({ ok: false, error: "需要 ?cardId=<卡片实例 id> 或 ?id=<promptId 或 taskId>" }, 400);
+          const job = cardId ? await findJobByCardId(cardId) : await findJobById(id);
+          if (!job) return c.json({ ok: true, found: false, id: cardId || id, proxyPrefix: proxyPrefix() });
+          return c.json({
+            ok: true,
+            found: true,
+            proxyPrefix: proxyPrefix(),
+            task: jobSummary(job),
+            relayEvents: state.snapshot?.relay?.events || null,
+          });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
         }
       });
 
