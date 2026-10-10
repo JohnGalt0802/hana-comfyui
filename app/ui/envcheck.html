@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ComfyUI 服务检查</title>
+<style>
+:root {
+  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
+  --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --ok: #2e7d32; --bad: #c62828; --warn: #b07a1e;
+}
+body.t-dark {
+  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
+  --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --ok: #6fbf73; --bad: #e57373; --warn: #d9a94e;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 10px 12px; background: transparent; color: var(--text); font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+.ec-hdr { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.ec-title { font-size: 14px; font-weight: 700; }
+.chip { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); white-space: nowrap; }
+.chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
+.chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
+.chip.warn { background: rgba(176,122,30,.18); color: var(--warn); }
+.ec-sub { color: var(--text-muted); font-size: 11.5px; margin: 2px 0 6px; }
+.ec-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.ec-row { display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px; border: 0.5px solid var(--border); border-radius: 8px; background: var(--bg-card); }
+.ec-row input { margin-top: 3px; flex: none; }
+.ec-row .nm { font-weight: 600; font-size: 12.5px; word-break: break-all; }
+.ec-row .meta { color: var(--text-muted); font-size: 11px; margin-top: 1px; word-break: break-all; }
+.ec-row .tag { font-size: 10px; color: var(--warn); border: 0.5px solid var(--border); border-radius: 6px; padding: 0 6px; flex: none; }
+.ec-note { color: var(--warn); font-size: 11.5px; margin: 6px 0; }
+.ec-warn { color: var(--text-muted); font-size: 11px; margin: 2px 0; }
+.ec-warn div { margin: 1px 0; }
+.ec-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.ec-btn { appearance: none; border: 0.5px solid var(--border); background: var(--bg-card); color: var(--text); font: 12px system-ui, sans-serif; padding: 5px 12px; border-radius: 8px; cursor: pointer; }
+.ec-btn:hover { border-color: var(--accent); }
+.ec-btn.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.ec-btn:disabled { opacity: .5; cursor: default; }
+.ec-status { margin-top: 8px; font-size: 11.5px; color: var(--text-muted); white-space: pre-wrap; word-break: break-all; }
+.ec-status.err { color: var(--bad); }
+.ec-foot { margin-top: 8px; color: var(--text-muted); font-size: 10.5px; }
+</style>
+</head>
+<body>
+  <div id="ec-root">
+    <div class="ec-hdr"><span class="ec-title">ComfyUI 服务检查</span><span class="chip" id="ec-chip">读取中…</span></div>
+    <div class="ec-sub">正在检查环境…</div>
+  </div>
+  <script type="module" src="./assets/envcheck.js"></script>
+</body>
+</html>

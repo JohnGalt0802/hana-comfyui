@@ -25,6 +25,7 @@
 import asyncio
 import logging
 import os
+import re
 import secrets
 import time
 
@@ -64,7 +65,8 @@ except ValueError:
 
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
-BRIDGE_BUILD_TAG = "2026-10-08 hana-bridge-08111316"
+# 2026-10-09 修订 1.2：对齐新活动桥 hana-bridge-09205624（diag 呈现待下次 ComfyUI 重启转正）。
+BRIDGE_BUILD_TAG = "2026-10-09 hana-bridge-09205624"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -177,6 +179,16 @@ def _note_frontend(sid, data, kind):
         entry["copilot"] = _copilot_brief(data.get("copilot"))
     else:
         entry["copilot"] = prev.get("copilot")
+    # nodeCount（T3-4 2026-10-10）：快照带 summary 时记该页最近节点数，供 canvas.pages 判「空图」；
+    # hello / 旧上报不带 summary ＝ 沿用上次值（不冲刷）。取不到 = None（消费侧如实省略，不乱标）。
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else None
+    if summary is not None and summary.get("nodeCount") is not None:
+        try:
+            entry["nodeCount"] = int(summary.get("nodeCount"))
+        except (TypeError, ValueError):
+            entry["nodeCount"] = prev.get("nodeCount")
+    else:
+        entry["nodeCount"] = prev.get("nodeCount")
     _frontends[sid] = entry
     _frontend["sid"] = sid
 
@@ -195,28 +207,58 @@ def _pages_brief():
     ]
 
 
+# T3-4（2026-10-10）：页身份判定（读侧可辨；判不准则省略，绝不乱标）。
+# · agent 生成的副本页命名＝「<原名> (AgentCopy) YYYYMMDD-HHmm」→ owner=agent。
+# L4（2026-10-10）：锚到完整形态（(AgentCopy) + 空格 + YYYYMMDD-HHmm 时间戳，大小写敏感），
+# 与 app 侧 agentCopyBaseName 的 `(?:\(\s*AgentCopy\)\s*\d{8}-\d{4})+$` 同源——避免用户页被误标 agent。
+_AGENT_COPY_RE = re.compile(r"\(AgentCopy\)\s*\d{8}-\d{4}")
+
+
+def _page_owner(name):
+    """页归属：命名含「(AgentCopy)」＝agent 生成的副本页；有名字的其余＝user；无名字＝None（未知，省略）。"""
+    if not isinstance(name, str):
+        return None
+    n = name.strip()
+    if not n:
+        return None
+    return "agent" if _AGENT_COPY_RE.search(n) else "user"
+
+
+def _page_empty(node_count):
+    """该页是否空图（无节点）：节点数已知＝bool；未知（从未上报过 summary）＝None（省略，不乱标）。"""
+    if isinstance(node_count, bool) or not isinstance(node_count, int):
+        return None
+    return node_count <= 0
+
+
 def _pages_payload():
     now = time.time()
     ttl = _frontend_ttl_sec()
     pages = []
     for s, v in _frontends.items():
         age = round(_age_sec(v, now), 1)
-        pages.append(
-            {
-                "sid": (s or "")[:8],
-                "sidFull": s,
-                "workflow": v.get("workflow"),
-                "path": v.get("path"),
-                "modified": v.get("modified"),
-                "ageSec": age,
-                "href": v.get("href"),
-                "kind": v.get("kind"),
-                # copilot（v2 续单 2026-10-08）：该页最近上报的 {enabled, pageKey?, updatedAt}；
-                # 从未上报过 = None（不猜、不借别页的值）。
-                "copilot": v.get("copilot"),
-                "stale": age > ttl,  # 过期标记：消费方取活页用 not stale（路由侧已自动跳过）
-            }
-        )
+        page = {
+            "sid": (s or "")[:8],
+            "sidFull": s,
+            "workflow": v.get("workflow"),
+            "path": v.get("path"),
+            "modified": v.get("modified"),
+            "ageSec": age,
+            "href": v.get("href"),
+            "kind": v.get("kind"),
+            # copilot（v2 续单 2026-10-08）：该页最近上报的 {enabled, pageKey?, updatedAt}；
+            # 从未上报过 = None（不猜、不借别页的值）。
+            "copilot": v.get("copilot"),
+            "stale": age > ttl,  # 过期标记：消费方取活页用 not stale（路由侧已自动跳过）
+        }
+        # T3-4（2026-10-10）：页身份标记——已知的给精确值，判不出的键直接省略（不塞 None）。
+        owner = _page_owner(v.get("workflow"))
+        if owner is not None:
+            page["owner"] = owner
+        empty = _page_empty(v.get("nodeCount"))
+        if empty is not None:
+            page["empty"] = empty
+        pages.append(page)
     pages.sort(key=lambda p: p["ageSec"])
     return {
         "pages": pages,

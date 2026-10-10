@@ -21,6 +21,26 @@ html, body { width: 100%; height: 100%; }
 body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; overflow: hidden; }
 #ws-root { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 
+/* 自绘标题栏（2026-10-09）：仅 App 原生窗口态显示（.on 由 workspace.js 控制；卡/iframe 不显示）。
+   整栏拖动（-webkit-app-region: drag）；三键 no-drag（否则点不到）。高 36px，为 #ws-root 首子元素，
+   #ws-body 顺延（悬浮按钮相对 #ws-body 定位，不受影响）。 */
+#ws-titlebar {
+  display: none; align-items: center; height: 36px; flex: none; gap: 2px; padding: 0 6px 0 12px;
+  background: var(--bg-card); border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag; user-select: none;
+}
+#ws-titlebar.on { display: flex; }
+#ws-titlebar .tb-title { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+#ws-titlebar .tb-spacer { flex: 1; align-self: stretch; }
+#ws-titlebar button {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 38px; height: 26px; padding: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text-muted); cursor: pointer;
+  -webkit-app-region: no-drag; /* 必须：三键需可点击（拖动区会吞指针事件） */
+}
+#ws-titlebar button:hover { background: var(--border); color: var(--text); }
+#ws-titlebar #ws-tb-close:hover { background: var(--bad); color: #fff; } /* Windows 惯例：关闭键 hover 红底 */
+
 /* 顶栏：告警条 / 工具条（无操作消息时收起）；ready 态不再常显（2026-10-09，「重载工作区」移出为悬浮按钮） */
 #ws-bar { display: none; align-items: center; gap: 10px; padding: 4px 10px; font-size: 12px; flex-wrap: wrap; }
 #ws-bar.show { display: flex; }
@@ -32,15 +52,18 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
   border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent);
 }
 #ws-bar button:hover { background: var(--accent); color: #fff; }
-/* 「重载工作区」悬浮按钮（2026-10-09 自顶栏移出）：贴 #ws-body 右上角，仅 ready 视图显示（workspace.js 控制）。
+/* 悬浮小按钮（贴 #ws-body 右上角；显示由 workspace.js 控制）：
+   「重载工作区」（ready 态）·「放入 hui 画布」（仅窗口态，2026-10-09 画布移交）。
    z-index:3 —— 高于 iframe 与 #ws-loading(z:2)；不高于 #view-offline(z:3，ready 态不显示，无叠层冲突)。 */
-#ws-bar-reload {
-  display: none; position: absolute; top: 8px; right: 10px; z-index: 3;
+#ws-bar-reload, #ws-handoff {
+  display: none; position: absolute; right: 10px; z-index: 3;
   font-size: 11.5px; padding: 2px 10px; border-radius: 6px; cursor: pointer;
   border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent);
   opacity: .5; transition: opacity .15s ease;
 }
-#ws-bar-reload:hover, #ws-bar-reload:focus { opacity: 1; background: var(--accent); color: #fff; }
+#ws-bar-reload { top: 8px; }
+#ws-handoff { top: 34px; }
+#ws-bar-reload:hover, #ws-bar-reload:focus, #ws-handoff:hover, #ws-handoff:focus { opacity: 1; background: var(--accent); color: #fff; }
 
 #ws-body { position: relative; flex: 1; min-height: 0; }
 #ws-frame-wrap { position: absolute; inset: 0; display: none; }
@@ -119,11 +142,21 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 </head>
 <body>
 <div id="ws-root">
+  <!-- 自绘标题栏（2026-10-09）：仅 App 原生窗口态显示（workspace.js 加 .on）；拖动区 + 最小化/最大化/关闭 -->
+  <div id="ws-titlebar">
+    <span class="tb-title">ComfyUI 工作区</span>
+    <span class="tb-spacer"></span>
+    <button id="ws-tb-min" type="button" title="最小化" aria-label="最小化"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><path d="M1.5 5h7"/></svg></button>
+    <button id="ws-tb-max" type="button" title="最大化" aria-label="最大化"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><rect x="1.6" y="1.6" width="6.8" height="6.8" rx="0.8"/></svg></button>
+    <button id="ws-tb-close" type="button" title="关闭窗口" aria-label="关闭窗口"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6"/></svg></button>
+  </div>
   <div id="ws-bar"><span id="ws-bar-text"></span><span class="spacer"></span><button id="ws-bar-action" style="display:none"></button><button id="ws-bar-action2" style="display:none"></button></div>
   <div id="ws-body">
     <div id="ws-loading"><span class="spinner"></span><span>正在加载 ComfyUI 前端……</span></div>
     <!-- 「重载工作区」悬浮按钮：2026-10-09 自顶栏移出；仅 ready 态由 workspace.js 显示 -->
     <button id="ws-bar-reload" title="重新加载内层 ComfyUI 页面（等价 Ctrl+R；ComfyUI 草稿默认自动恢复）">重载工作区</button>
+    <!-- 「放入 hui 画布」悬浮按钮：仅窗口态（外开窗口）ready 时由 workspace.js 显示（2026-10-09 画布移交） -->
+    <button id="ws-handoff" title="把当前画布保存并移交到 Hana 主工作区（工作区卡自动接住）">放入 hui 画布</button>
     <div id="ws-frame-wrap"><iframe id="ws-frame" title="ComfyUI"></iframe></div>
 
     <div class="view show" id="view-booting">

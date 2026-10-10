@@ -2730,10 +2730,14 @@ const server = http.createServer((req, res) => {
         }
         // P4 修复（附加发现 A）：定向字段 workflow 藏在 args 里，而 Python 侧只读顶层 body.workflow
         // （__init__.py 的 _hana_call）——不提升则定向丢失、退化为广播。此一处最小改。
+        // 修订 1.2（2026-10-09）：同名提升 args.sid（「放入 hui 画布」定向直发按精确 sid 单发；
+        // Python 侧同样只读顶层 body.sid）。
         const fwdArgs = (body && body.args) || {};
         const fwd = { op, args: fwdArgs };
         const fwdWf = fwdArgs && typeof fwdArgs === "object" ? String(fwdArgs.workflow == null ? "" : fwdArgs.workflow).trim() : "";
         if (fwdWf) fwd.workflow = fwdWf;
+        const fwdSid = fwdArgs && typeof fwdArgs === "object" ? String(fwdArgs.sid == null ? "" : fwdArgs.sid).trim() : "";
+        if (fwdSid) fwd.sid = fwdSid;
         const upstream = await fetch(`http://${backend.host}:${backend.port}/api/hana_bridge/call`, {
           method: "POST",
           signal: AbortSignal.timeout(20_000),

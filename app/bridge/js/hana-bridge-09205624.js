@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-08 hana-bridge-08111316";
+const BUILD_TAG = "2026-10-09 hana-bridge-09205624";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -1149,6 +1149,23 @@ function runPatchDryRun(list) {
   return { ok: true, dryRun: true, checks, valid };
 }
 
+// ── handoff「新开页装载」支撑（修订 1，2026-10-09）──────────────────────────
+// 用户主动移交（外开窗口「放入 hui 画布」）的接住动作 = 把移交快照装载为一张【新】页，
+// 不触碰当前活动页（无 dirty 检查、不覆盖任何现有画布）。机制 = duplicate 新页序列的同款复用
+// （读文件 → createNewTemporary → loadGraphData(state, true, true, wf)），但不复制当前画布。
+//
+// 为什么独立 op（canvas.loadWorkflowNewPage）而非 loadWorkflowFile + newPage:true（任务书候选 A 评估结论）：
+//   · 旧版桥对不认识的参数是「静默忽略」→ 老路径（覆盖当前页）照走，形成「新 app + 未刷新页面」
+//     组合下的破坏性降级；独立 op 名在旧桥侧 = unknown op → 干净失败（零副作用），对部署次序天然安全。
+//   · 独立 op 不登记 WRITE_OPS：本动作口径＝「用户主动移交」（按钮 + 开卡），不走 agent 写闸门
+//     （含 copilot 写拦截的豁免，逐条说明见下方 WRITE_OPS 注释块旁）。
+//
+// 幂等（「同一移交只接一次」的第二道闸；第一道 = app 侧 take 互斥 + 标记清除）：
+//   回执超时（>6s 前端回传上限）或网络抖动会引发 app 侧重试；同一文件在去重窗口内的重复请求
+//   直接复用首开的页身份，不重建第二页。
+const NEW_PAGE_DEDUP_MS = 600_000; // 10 分钟：远大于卡侧 60s 短窗轮询 + 重试窗口
+let lastNewPageLoad = null; // { file, at, page, key, nodeCount, failed }
+
 const OPS = {
   // 全量 UI 格式（等价 Ctrl+S 写出的结构）
   "canvas.get": () => app.graph.toJSON(),
@@ -1355,6 +1372,62 @@ const OPS = {
       file: rel,
       nodeCount: Array.isArray(graph.nodes) ? graph.nodes.length : null,
       note: "已发起加载（异步），画布稍后刷新",
+    };
+  },
+
+  // 移交快照的「新开页装载」（修订 1，2026-10-09；用户主动移交专用，机制/口径说明见 OPS 表前注释块）。
+  // 入参：{ file }（相对 user/default/ 的路径，如 workflows/_handoff-<ts>.json）
+  // 回执：{ loaded:true, newPage:true, page, key, nodeCount }；去重命中时追加 dedup:true。
+  // await 语义：与 duplicate 一致，等 loadGraphData 完成（新页就绪/激活）才回执——「接住」即落定；
+  //   超大图超过前端 6s 回传上限时由 app 侧重试 + 上方去重窗口兜底（重试不重建第二页）。
+  "canvas.loadWorkflowNewPage": async (args) => {
+    const a = args || {};
+    const file = String(a.file || a.path || "").trim();
+    if (!file) throw new Error("需要 file（相对 user/default/ 的路径，如 workflows/_handoff-<ts>.json）");
+    const rel = file.replace(/^\\+/, "").replace(/\\\\/g, "/");
+    // ① 幂等去重：同文件的近期重复请求（回执超时后的重试）不重建页
+    const prev = lastNewPageLoad;
+    if (prev && prev.file === rel && !prev.failed && Date.now() - prev.at < NEW_PAGE_DEDUP_MS) {
+      return {
+        loaded: true, newPage: true, dedup: true, file: rel,
+        page: prev.page || null, key: prev.key || null, nodeCount: prev.nodeCount != null ? prev.nodeCount : null,
+        note: "同一移交近期已开页装载，未重复开页（幂等）",
+      };
+    }
+    // ② 读文件（与 canvas.loadWorkflowFile 同源的 userdata 读链）
+    const res = await api.fetchApi("/api/userdata/" + encodeURIComponent(rel), { cache: "no-store" });
+    if (!res.ok) throw new Error("读取工作流文件失败：HTTP " + res.status + "（" + rel + "）");
+    const graph = await res.json();
+    if (!graph || typeof graph !== "object") throw new Error("工作流文件不是合法 JSON 对象");
+    if (typeof app.loadGraphData !== "function") throw new Error("前端没有 app.loadGraphData");
+    const store = app && app.extensionManager && app.extensionManager.workflow;
+    if (!store || typeof store.createNewTemporary !== "function") {
+      throw new Error("前端没有 workflow store（app.extensionManager.workflow.createNewTemporary）");
+    }
+    // ③ 新开页（duplicate 同机制）：独立身份 id + 原文件名注册临时页（size=-1，未落盘；用户可在画布内自行另存）
+    const state = JSON.parse(JSON.stringify(graph));
+    state.id = newUuid(); // 独立身份（对齐原生 duplicateWorkflow；避免与来源页 id 关联歧义）
+    const base = rel.split("/").pop().replace(/\.json$/i, "").trim() || "workflow";
+    const wf = store.createNewTemporary(base + ".json", state); // 同步注册，path/key 立刻可读
+    if (!wf || !wf.path) throw new Error("createNewTemporary 未返回工作流对象");
+    const nodeCount = Array.isArray(state.nodes) ? state.nodes.length : null;
+    // ④ 落账先于装载：回执超时后的重试据此去重（页已建才需要去重；未建成的错误路径不落账）
+    const rec = { file: rel, at: Date.now(), page: wf.path, key: wf.key || null, nodeCount, failed: false };
+    lastNewPageLoad = rec;
+    // ⑤ 装载并激活新页（第 4 参传新页对象 wf → 活动页切为新页；装载期变更记 "system"）
+    const sysWin = beginSystemWindow();
+    const loadP = Promise.resolve(
+      app.loadGraphData(state, true, true, wf, { checkForRerouteMigration: false, deferWarnings: false }),
+    ).catch((e) => {
+      rec.failed = true;
+      console.warn(LOG_TAG, "新开页装载 loadGraphData 失败", e);
+    });
+    armSystemWindow(sysWin, loadP);
+    await loadP;
+    return {
+      loaded: true, newPage: true, file: rel,
+      page: wf.path, key: wf.key || null, nodeCount,
+      note: "已新开一页并装载（不触碰原活动页）",
     };
   },
 
@@ -2028,6 +2101,35 @@ const OPS = {
   },
 };
 
+// ── 壳页协同（修订 1.2，2026-10-09）：向 parent 壳页宣告本实例身份 ─────────────
+// 背景：验收环境 iframe 为跨源直连（auto 首选 direct；http://127.0.0.1:8188），壳页读不到
+// iframe 内容（comfyWin() 属性读取被跨源拦），而「放入 hui 画布」的定向直发需要知道
+// 「本壳 iframe 里这个实例的 clientId」。postMessage 是该跨源条件下唯一可用通道。
+// 用途：壳页把 clientId 随 handoff/peek 上报给 App 服务端（定向目标记录）；同时供诊断。
+// 数据仅 {clientId, href, build}（非敏感）；targetOrigin="*" 系跨源必要设定（壳页 origin
+// 不可预知：宿主代理路径或 127.0.0.1:8188 直连）；壳页侧按 event.source===自家 iframe 校验。
+function announceToShell() {
+  try {
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(
+        { type: "hana.bridge.announce", clientId: api.clientId || null, href: location.href, build: BUILD_TAG },
+        "*",
+      );
+    }
+  } catch (err) { console.warn(LOG_TAG, "壳页宣告失败", err); }
+}
+
+// 壳页可按需主动问询（自愈：壳页 reload/缓存丢失时不必等下一次自动宣告）。
+// 只响应「来自 parent」的查询，回推与自动宣告同形的消息。
+window.addEventListener("message", (e) => {
+  try {
+    const d = e && e.data;
+    if (!d || typeof d !== "object" || d.type !== "hana.bridge.whoami") return;
+    if (!window.parent || window.parent === window || e.source !== window.parent) return;
+    announceToShell();
+  } catch { /* 响应失败静默 */ }
+});
+
 // 诊断出口（只读）：用于确认“当前页面加载的是哪一版脚本、当前 revision 多少”。
 // 只暴露版本与计数，不做任何写操作、也不抛出内部对象。
 window.__hanaBridge = {
@@ -2075,6 +2177,9 @@ const WRITE_OPS = new Set([
 //                            （桥读不到设置——该边界如实：桥侧不检查总闸，只在 app 层生效）。
 // 另注：frame.reload（壳页腿维护 op）不在本名单（不在 WRITE_OPS 里，两名单均不含），
 // 评估结论＝维持豁免（维护性操作：重载内层 iframe，不向画布注入改动）。
+// 另注（修订 1，2026-10-09）：canvas.loadWorkflowNewPage（移交快照「新开页装载」）两名单均不含——
+// 口径＝「用户主动移交」（用户点「放入」+ 开卡接住，非 agent 代理写），不设副驾驶门槛、
+// 也不标 agent 变更来源；装载窗口的变更由 beginSystemWindow 记 "system"（与 loadWorkflowFile 同）。
 const COPILOT_WRITE_EXEMPT = new Set([
   "canvas.openWorkflow",
   "canvas.duplicate",
@@ -2129,6 +2234,9 @@ api.addEventListener(EVT_CALL, async (event) => {
 app.registerExtension({
   name: "hana.bridge",
   async setup() {
+    // 壳页协同（修订 1.2）：把本实例身份推给 parent 壳页（定向直发用；与后端无关，先行；
+    // 后端未就绪/hello 失败也不影响宣告——见上方 announceToShell 注释块）。
+    announceToShell();
     try {
       await postJson(PATH_HELLO, {
         clientId: api.clientId || null,
