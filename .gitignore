@@ -1,10 +1,18 @@
 # 本地构建物与临时产物（不进版本库）
 _build/
 dist/
+node_modules/
+__pycache__/
+*.pyc
 
 # 测试运行日志/输出（可重跑再生成；规范化证据在 docs/m0-results、docs/m2-results）
 tools/**/logs/
 tools/**/*.log
+
+# 运行时物（凭据 / 交付暂存，不进版本库）
+.token
+*.token
+_delivery/
 
 # 系统杂物
 .DS_Store
@@ -12,6 +20,7 @@ Thumbs.db
 desktop.ini
 
 # 开发期备份（不许进仓库）
+*.bak
 *.bak-*
 *.probe-hold
 
