@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-11 hana-bridge-11235537";
+const BUILD_TAG = "2026-10-11 hana-bridge-12000952";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -2584,6 +2584,12 @@ function historyBarStyleEnsure() {
 #${HISTORY_BAR_ID} .hhb-tick[data-kind="save"] { background: transparent; border: 2px solid var(--hhb-c, #5aa0d8); box-shadow: none; }
 #${HISTORY_BAR_ID} .hhb-tick:hover { filter: brightness(1.28); }
 #${HISTORY_BAR_ID} .hhb-tick-sel { box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
+/* P7（2026-10-12）框视角：历史旧数据刻度（blockNames === null，无法细分到框）——淡化 + 右上小点 */
+#${HISTORY_BAR_ID} .hhb-tick[data-legacy] { opacity: .55; }
+#${HISTORY_BAR_ID} .hhb-tick[data-legacy]::after {
+  content: ""; position: absolute; top: -3px; right: -3px;
+  width: 4px; height: 4px; border-radius: 50%; background: #e8c268;
+}
 #${HISTORY_BAR_ID} .hhb-times { display:flex; justify-content:space-between; gap:12px; margin-top:3px; color:#8fa3b8; font-size:11px; }
 #${HISTORY_BAR_ID} .hhb-times span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 /* 悬停气泡（锚在刻度上方；越界落到刻度下方）。pointer-events:none → 不挡刻度 hover */
@@ -2594,6 +2600,7 @@ function historyBarStyleEnsure() {
   box-shadow:0 6px 20px rgba(0,0,0,.5); padding:5px 8px; font-size:11px; line-height:1.45;
 }
 #${HISTORY_BAR_ID} .hhb-bub-time { color:#9fb3c8; }
+#${HISTORY_BAR_ID} .hhb-bub-legacy { color:#9aa0a8; font-size:10px; }
 /* 单击刻度的缩略图浮层（默认隐藏；移开自动关） */
 #${HISTORY_BAR_ID} .hhb-shots { display:none; }
 #${HISTORY_BAR_ID} .hhb-shots-on { display:block; margin-top:6px; }
@@ -2792,6 +2799,84 @@ function historyGroupName(group) {
   return s || "分组";
 }
 
+// ── P7（2026-10-12）框视角：按「碰过当前框」过滤提交刻度 ──────────────────────
+// 旧数据判据：entry.blockNames 不是数组（null / 字段缺失 / 异常值）→ 无法判定归属 → 视为旧数据（保留 + 标注）。
+function historyTickIsLegacy(ent) {
+  return !(ent && Array.isArray(ent.blockNames));
+}
+
+// 取「当前框」在 graphBlocks 块名口径下的名字（供框视角过滤比对）。
+// 与 graphBlocks 同源：只对「bounding 内有自己首个归属节点」的 group 命名（空 group 不成块；节点落多组取第一个），
+// 名 = title.trim() || `组{i+1}`（i 为 graph.groups 序号、从 1 起），重名按出现序 `#2`/`#3` 递增去重。
+// 角色块名在 group 名之后才进池（后进者改名），故 group 名不受角色名影响 —— 此处无需模拟角色桶。
+// 返回 null = 无法判定（无 graph / 框不在图里 / 该框不成块 / 活图与序列化组数或标题对不上）
+// → 调用方退化为「不过滤」（宁多勿漏），并 console.warn。
+function historyBlockNameOf(group) {
+  if (!group) return null;
+  let liveGroups = null;
+  let json = null;
+  try {
+    const g = app && app.graph ? app.graph : null;
+    liveGroups = g && Array.isArray(g._groups) ? g._groups : null;
+    if (g && typeof g.toJSON === "function") json = g.toJSON();
+  } catch (err) {
+    console.warn(LOG_TAG, "提交历史框视角：读取活图失败，退化为不过滤", err);
+    return null;
+  }
+  if (!liveGroups || !liveGroups.length || !json) return null;
+  const idx = liveGroups.indexOf(group);
+  if (idx < 0) return null; // 框不在活图分组里 → 判不了
+  const groups = Array.isArray(json.groups) ? json.groups : [];
+  const rawNodes = Array.isArray(json.nodes) ? json.nodes : [];
+  if (groups.length !== liveGroups.length) return null; // 组数对不上：口径不同源
+  // 组数一致再对一次标题（两边都有 title 才比），对不上同样退化 —— 防序列化顺序错位
+  const lt = group && typeof group.title === "string" ? group.title.trim() : "";
+  const jt = groups[idx] && typeof groups[idx].title === "string" ? groups[idx].title.trim() : "";
+  if (lt && jt && lt !== jt) return null;
+  // 归属：同 graphBlocks（节点 pos 落在 bounding 内、含边界；落多组取第一个）
+  const owner = new Map(); // node → group index（首个命中）
+  for (const node of rawNodes) {
+    if (!node || typeof node !== "object") continue;
+    const pos = node.pos;
+    if (!Array.isArray(pos) || typeof pos[0] !== "number" || typeof pos[1] !== "number") continue;
+    for (let gi = 0; gi < groups.length; gi++) {
+      const b = groups[gi] && Array.isArray(groups[gi].bounding) ? groups[gi].bounding : null;
+      if (!b || b.length < 4 || b.slice(0, 4).some((v) => typeof v !== "number")) continue;
+      if (pos[0] >= b[0] && pos[0] <= b[0] + b[2] && pos[1] >= b[1] && pos[1] <= b[1] + b[3]) {
+        owner.set(node, gi);
+        break;
+      }
+    }
+  }
+  // 命名：只对「有归属节点」的组命名，按组序进池去重（同 graphBlocks）
+  const used = new Set();
+  let name = null;
+  for (let gi = 0; gi < groups.length; gi++) {
+    let has = false;
+    for (const gi2 of owner.values()) {
+      if (gi2 === gi) {
+        has = true;
+        break;
+      }
+    }
+    if (!has) continue; // 空 group 不成块（不占名）
+    const g = groups[gi] || {};
+    const base = typeof g.title === "string" && g.title.trim() ? g.title.trim() : `组${gi + 1}`;
+    let cur = base;
+    let k = 2;
+    while (used.has(cur)) {
+      cur = `${base}#${k}`;
+      k += 1;
+    }
+    used.add(cur);
+    if (gi === idx) {
+      name = cur;
+      break;
+    }
+  }
+  return name;
+}
+
 // 构建号短串（契约 §2.4）：BUILD_TAG 尾部数字串，如 "2026-10-11 hana-bridge-11225527" → "11225527"。
 function historyBuildShort() {
   const m = String(BUILD_TAG || "").match(/(\d{5,})\s*$/);
@@ -2982,6 +3067,8 @@ function historyBarTickMake(reqId, ent, ctx) {
   tick.style.setProperty("--hhb-c", historyTickColor(src));
   tick.dataset.src = src;
   tick.dataset.kind = kind;
+  // P7：旧数据（无法细分到框）→ 打标记（淡化 + 右上小点；样式见 .hhb-tick[data-legacy]）
+  if (historyTickIsLegacy(ent)) tick.dataset.legacy = "1";
   tick.title = ""; // 用自绘气泡，不用原生 tooltip
   tick.addEventListener("mouseenter", () => historyBarBubbleShow(tick, ent));
   tick.addEventListener("mouseleave", () => historyBarBubbleHide());
@@ -3037,6 +3124,13 @@ function historyBarBubbleShow(tick, ent) {
   names.className = "hhb-bub-names";
   names.textContent = historyTickChangedNames(ent).join("、");
   b.append(t, names);
+  // P7：旧数据（blockNames === null / 字段缺失）→ 气泡里加一行小字
+  if (historyTickIsLegacy(ent)) {
+    const lg = document.createElement("div");
+    lg.className = "hhb-bub-legacy";
+    lg.textContent = "历史旧数据（无法细分到框）";
+    b.appendChild(lg);
+  }
   // 先隐藏挂入：需要其 offsetWidth 才能算定位
   b.style.visibility = "hidden";
   b.style.left = "0px";
@@ -3210,25 +3304,41 @@ async function historyBarLoad(reqId, ctx, countEl) {
     if (reqId !== historyBarRequestId) return; // 已切/已收起：作废
     const entries = Array.isArray(data.entries) ? data.entries : [];
     historyBarLatestEntry = entries.length ? entries[entries.length - 1] : null; // P3-G1：索引末条＝最近提交（比对基线）
-    if (countEl) countEl.textContent = entries.length + " 次提交";
+    // P7（2026-10-12）框视角：只渲染「碰过当前框」的提交。
+    // 口径：blockNames 为 null（旧数据，无法判定）→ 保留（不参与筛选）；为数组 → 保留当且仅当含当前框名。
+    // 当前框名取不到（框不在图里 / 该框不成块 / 命名口径对不上）→ 退化为不过滤（宁多勿漏），console.warn。
+    // 只影响渲染：不改 entries、不改 historyBarLatestEntry（比对基线）、不改选中态机制。
+    const curBlock = historyBlockNameOf(historyBarGroup);
+    if (historyBarGroup && !curBlock) {
+      console.warn(LOG_TAG, "提交历史框视角：当前框名未能判定，退化为不过滤（宁多勿漏）");
+    }
+    const shown = curBlock
+      ? entries.filter((ent) => {
+          const bn = ent && ent.blockNames;
+          if (bn === null || bn === undefined) return true; // 旧数据：不参与筛选
+          if (!Array.isArray(bn)) return true; // 异常字段：不参与筛选
+          return bn.includes(curBlock);
+        })
+      : entries;
+    if (countEl) countEl.textContent = shown.length + " 次提交";
     if (!axis) return;
     axis.textContent = "";
     if (times) times.textContent = "";
-    if (!entries.length) {
+    if (!shown.length) {
       const empty = document.createElement("div");
       empty.className = "hhb-empty";
-      empty.textContent = "这个工作流还没有提交记录";
+      empty.textContent = curBlock ? "这个块没有提交记录" : "这个工作流还没有提交记录";
       axis.appendChild(empty);
       return;
     }
     // 刻度左旧右新：按 entries 原序（索引本身按 seq/时间递增）直接 append
-    for (const ent of entries) axis.appendChild(historyBarTickMake(reqId, ent, ctx));
+    for (const ent of shown) axis.appendChild(historyBarTickMake(reqId, ent, ctx));
     // 轴下：左端最早时间 / 右端最新时间（historyFmtTime）
     if (times) {
       const first = document.createElement("span");
-      first.textContent = historyFmtTime(entries[0] && entries[0].at);
+      first.textContent = historyFmtTime(shown[0] && shown[0].at);
       const last = document.createElement("span");
-      last.textContent = historyFmtTime(entries[entries.length - 1] && entries[entries.length - 1].at);
+      last.textContent = historyFmtTime(shown[shown.length - 1] && shown[shown.length - 1].at);
       times.append(first, last);
     }
   } catch (err) {

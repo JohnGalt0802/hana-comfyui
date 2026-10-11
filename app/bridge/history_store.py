@@ -889,6 +889,48 @@ def save_commit(body, user_dir):
     )
 
 
+# ── 10.5 框视角：一条提交 → 碰过的框（P6，只读计算，不落盘）────────────────
+def _block_names_for_entry(entry):
+    """一条 entry「碰过」的框名列表（只读计算，不改索引磁盘内容）。
+
+    判定：一条提交碰过框 B ⟺ delta 的 changed/added/removed 里任一节点 id ∈ B.nodeIds。
+    三种返回值（blockNames 字段语义）：
+      · None     —— **无法判定**：旧数据（delta 非 dict），或 blocks 非 list，
+                    或 blocks 里任一项缺 nodeIds / nodeIds 非数组；
+      · []       —— 有数据但没碰任何框（delta + blocks 完整，无一命中）；
+      · [名字…]  —— 命中的框名列表（按 blocks 顺序，name 缺省补 ""）。
+    id 一律 str 后比较（索引里 nodeIds 是 number，delta 里可能 number/string，统一避类型坑）。
+    """
+    e = entry if isinstance(entry, dict) else {}
+    delta = e.get("delta")
+    if not isinstance(delta, dict):
+        return None
+    blocks = e.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+    hit_ids = set()
+    for k in ("changed", "added", "removed"):
+        items = delta.get(k)
+        if not isinstance(items, list):
+            continue
+        for x in items:
+            if not isinstance(x, dict):
+                continue
+            nid = x.get("id")
+            if nid is not None:
+                hit_ids.add(str(nid))
+    names = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            return None  # 块形态不可读 → 无法判定
+        ids = b.get("nodeIds")
+        if not isinstance(ids, list):
+            return None  # 有块但无 nodeIds = 旧数据（无法判定）
+        if any(str(i) in hit_ids for i in ids):
+            names.append("" if b.get("name") is None else str(b.get("name")))
+    return names
+
+
 # ── 11. 查询 ────────────────────────────────────────────────────────────────
 def list_commits(workflow, user_dir):
     """读某工作流的索引。目录不存在 → 空 entries（ok=True）；索引坏行只计数不抛异常。
@@ -898,6 +940,7 @@ def list_commits(workflow, user_dir):
       · runs   —— 该节点的全部 run（主行 promptId + 各 mergeInto 行的 promptId +
                   sidecar 里其余 run），去重排序；每 run 的 images 由 sidecar 提供
       · images —— runs 里所有 images 的扁平合并
+      · blockNames —— P6 框视角：该提交碰过的框名列表（null=无法判定；[]=没碰任何框）
     mergeInto 行**不单独成 entry**（其 promptId 并入目标节点的 runs）。
     """
     if not isinstance(user_dir, str) or not user_dir.strip():
@@ -929,6 +972,7 @@ def list_commits(workflow, user_dir):
         if e.get("mergeInto") is not None:
             continue  # 折叠：不单独成 entry
         norm = normalize_entry(e)
+        norm["blockNames"] = _block_names_for_entry(e)
         snapshot_file = _entry_snapshot_file(e)
         sidecar_runs = _read_sidecar_runs(dir_path, snapshot_file) if snapshot_file else []
         seq_key = _to_int(e.get("seq"), None)

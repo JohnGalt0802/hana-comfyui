@@ -1047,5 +1047,210 @@ class TestAttachImages(TempRootTestCase):
         self.assertTrue(os.path.isdir(os.path.join(self.root, "workflows", ".history", "wf")))
 
 
+class TestBlockNames(TempRootTestCase):
+    """P6 框视角：list_commits 每条 entry 的 blockNames（null / [] / 名字列表）。
+
+    判定：一条提交碰过框 B ⟺ delta 的 changed/added/removed 里任一节点 id ∈ B.nodeIds。
+    索引行直接手写以精确控制 delta / blocks 形态；全部落 tempfile，不碰真实 .history。
+    """
+
+    WF = "wf"
+
+    def write_index(self, entries):
+        path = os.path.join(self.root, "workflows", ".history", self.WF, hs.INDEX_FILE_NAME)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n")
+        return path
+
+    def block_names(self, entries):
+        self.write_index(entries)
+        listed = hs.list_commits(self.WF, self.root)
+        self.assertTrue(listed["ok"])
+        return [e.get("blockNames") for e in listed["entries"]]
+
+    @staticmethod
+    def base_entry(seq=1, **extra):
+        e = {
+            "seq": seq,
+            "file": "%04d-p%d.json" % (seq, seq),
+            "promptId": "p%d" % seq,
+            "at": "2026-10-11T00:00:00.000Z",
+            "source": "user",
+            "kind": "run",
+            "blocks": [],
+            "delta": None,
+        }
+        e.update(extra)
+        return e
+
+    def test_hits_one_block(self):
+        # 实测口径：delta.changed=[{id:16}] → 精确命中 3 号框，其余不命中
+        entries = [self.base_entry(
+            blocks=[
+                {"name": "1. Load", "source": "group", "nodeIds": [1, 2]},
+                {"name": "2. Sampler", "source": "group", "nodeIds": [14, 15]},
+                {"name": "3. Prompt enhancer (optional)", "source": "group", "nodeIds": [16, 17]},
+            ],
+            delta={"changed": [{"id": 16, "title": "x", "fields": ["steps"]}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [["3. Prompt enhancer (optional)"]])
+
+    def test_hits_multiple_blocks(self):
+        entries = [self.base_entry(
+            blocks=[
+                {"name": "A", "source": "group", "nodeIds": [1]},
+                {"name": "B", "source": "group", "nodeIds": [2, 3]},
+                {"name": "C", "source": "group", "nodeIds": [4]},
+            ],
+            delta={
+                "changed": [{"id": 1}],
+                "added": [{"id": 3}],
+                "removed": [{"id": 4}],
+            },
+        )]
+        # 按 blocks 顺序；三个类别的 id 各自命中一个框
+        self.assertEqual(self.block_names(entries), [["A", "B", "C"]])
+
+    def test_changed_added_removed_all_counted(self):
+        entries = [self.base_entry(
+            blocks=[{"name": "OnlyAdded", "source": "group", "nodeIds": [9]}],
+            delta={"changed": [], "added": [{"id": 9, "title": "n"}], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [["OnlyAdded"]])
+        entries = [self.base_entry(
+            blocks=[{"name": "OnlyRemoved", "source": "group", "nodeIds": [9]}],
+            delta={"changed": [], "added": [], "removed": [{"id": 9, "title": "n"}]},
+        )]
+        self.assertEqual(self.block_names(entries), [["OnlyRemoved"]])
+
+    def test_no_hit_returns_empty_list(self):
+        # 有完整 delta + blocks，但没碰任何框 → [] （区别于 null）
+        entries = [self.base_entry(
+            blocks=[
+                {"name": "A", "source": "group", "nodeIds": [1, 2]},
+                {"name": "B", "source": "group", "nodeIds": [3]},
+            ],
+            delta={"changed": [{"id": 99}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [[]])
+
+    def test_no_blocks_at_all_with_delta_returns_empty(self):
+        entries = [self.base_entry(
+            blocks=[],
+            delta={"changed": [{"id": 1}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [[]])
+
+    def test_legacy_no_delta_returns_null(self):
+        # 旧数据：无 delta（索引行缺该字段 / delta 非 dict）→ null
+        old = {"seq": 1, "file": "0001-p1.json", "promptId": "p1", "at": "2026-01-01T00:00:00.000Z",
+               "source": "user", "blocks": [{"name": "A", "source": "group", "nodeIds": [1]}]}
+        self.assertEqual(self.block_names([old]), [None])
+        for bad in ([], "x", 3, None):
+            self.assertEqual(self.block_names([self.base_entry(delta=bad, blocks=[{"name": "A", "nodeIds": [1]}])]), [None])
+
+    def test_legacy_blocks_without_node_ids_returns_null(self):
+        # blocks 有但项里缺 nodeIds（P5a 前的旧数据：{name,nodeCount}）→ null
+        entries = [self.base_entry(
+            blocks=[{"name": "A", "nodeCount": 3}],
+            delta={"changed": [{"id": 1}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [None])
+        # nodeIds 非数组 → null
+        for bad in ("1,2", 5, None, {}):
+            self.assertEqual(
+                self.block_names([self.base_entry(blocks=[{"name": "A", "nodeIds": bad}],
+                                                   delta={"changed": [{"id": 1}], "added": [], "removed": []})]),
+                [None],
+            )
+
+    def test_blocks_not_list_returns_null(self):
+        for bad in (None, "x", {}, 3):
+            entries = [self.base_entry(
+                blocks=bad,
+                delta={"changed": [{"id": 1}], "added": [], "removed": []},
+            )]
+            # normalize_entry 把非 list blocks 读成 []，但 _block_names_for_entry 判原始形态 → null
+            self.assertEqual(self.block_names(entries), [None])
+
+    def test_any_block_missing_node_ids_makes_entry_null(self):
+        # 只要有一个块缺 nodeIds，整条 entry 无法判定 → null（不是部分命中）
+        entries = [self.base_entry(
+            blocks=[
+                {"name": "A", "source": "group", "nodeIds": [1]},
+                {"name": "Legacy", "nodeCount": 2},
+            ],
+            delta={"changed": [{"id": 1}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [None])
+
+    def test_id_type_mixed_number_and_string_still_match(self):
+        # nodeIds 里是 number，delta 里是 string（反之亦然）→ str 比较仍命中
+        entries = [self.base_entry(
+            blocks=[{"name": "A", "source": "group", "nodeIds": [16, "21"]}],
+            delta={"changed": [{"id": "16"}], "added": [{"id": 21}], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [["A"]])
+        entries = [self.base_entry(
+            blocks=[{"name": "A", "source": "group", "nodeIds": ["16"]}],
+            delta={"changed": [{"id": 16}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [["A"]])
+
+    def test_id_none_ignored(self):
+        # delta 项 id 为 None → 不参与命中；无命中 → []
+        entries = [self.base_entry(
+            blocks=[{"name": "A", "nodeIds": [1]}],
+            delta={"changed": [{"id": None}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [[]])
+
+    def test_block_name_missing_yields_empty_string(self):
+        entries = [self.base_entry(
+            blocks=[{"source": "group", "nodeIds": [5]}],
+            delta={"changed": [{"id": 5}], "added": [], "removed": []},
+        )]
+        self.assertEqual(self.block_names(entries), [[""]])
+
+    def test_merge_into_rows_not_separate_entries(self):
+        # mergeInto 行折叠：blockNames 只出现在主行 entry（数量与 entries 对齐）
+        main = self.base_entry(
+            seq=1,
+            blocks=[{"name": "A", "source": "group", "nodeIds": [1]}],
+            delta={"changed": [{"id": 1}], "added": [], "removed": []},
+        )
+        merged = {"seq": 2, "mergeInto": 1, "promptId": "p2", "at": "2026-10-11T00:00:01.000Z",
+                  "kind": "run", "source": "user"}
+        self.assertEqual(self.block_names([main, merged]), [["A"]])
+
+    def test_real_commit_flow_block_names(self):
+        # 端到端：真实 commit（带 blocks）→ list_commits 的 blockNames 命中
+        g1 = {"nodes": [{"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 20}}, {"id": 2}], "links": []}
+        g2 = {"nodes": [{"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 30}}, {"id": 2}], "links": []}
+        blocks = [{"name": "采样", "source": "group", "nodeIds": [1]}, {"name": "加载", "source": "group", "nodeIds": [2]}]
+        self.commit({"workflow": "wf", "graph": g1, "promptId": "p1", "blocks": blocks})
+        self.commit({"workflow": "wf", "graph": g2, "promptId": "p2", "blocks": blocks})
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(len(listed["entries"]), 2)
+        # 第 1 条无 head → delta None → 无法判定
+        self.assertIsNone(listed["entries"][0]["blockNames"])
+        # 第 2 条 delta.changed=[{id:1}] → 命中「采样」
+        self.assertEqual(listed["entries"][1]["blockNames"], ["采样"])
+
+    def test_index_on_disk_untouched(self):
+        # 只读计算：list_commits 不改索引磁盘内容
+        path = self.write_index([self.base_entry(
+            blocks=[{"name": "A", "source": "group", "nodeIds": [1]}],
+            delta={"changed": [{"id": 1}], "added": [], "removed": []},
+        )])
+        with open(path, encoding="utf-8") as fh:
+            before = fh.read()
+        hs.list_commits("wf", self.root)
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertNotIn("blockNames", before)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
