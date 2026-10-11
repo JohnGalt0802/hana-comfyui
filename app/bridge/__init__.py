@@ -32,6 +32,22 @@ import time
 from aiohttp import web
 
 try:
+    import folder_paths
+
+    _folder_paths_err = None
+except Exception as _exc:  # 脱离 ComfyUI 环境单独 import 时的保护（P1-C1）
+    folder_paths = None
+    _folder_paths_err = _exc
+
+try:
+    from app.user_manager import default_user as _default_user
+
+    _user_manager = type("_UM", (), {"default_user": _default_user})  # 轻量载体，只取常量
+except Exception as _exc:
+    _user_manager = None
+    _user_manager_err = _exc
+
+try:
     from server import PromptServer
 
     _ROUTES = PromptServer.instance.routes
@@ -41,6 +57,18 @@ except Exception as _exc:  # 例如脱离 ComfyUI 环境单独 import 时的保�
     _IMPORT_ERR = _exc
 else:
     _IMPORT_ERR = None
+
+try:
+    from .history_store import commit as _history_commit
+    from .history_store import list_commits as _history_list_commits
+    from .history_store import read_snapshot as _history_read_snapshot
+except Exception as _exc:  # P1-C1：history_store 纯标准库，正常不会失败；防御性保护
+    _history_commit = None
+    _history_list_commits = None
+    _history_read_snapshot = None
+    _HISTORY_IMPORT_ERR = _exc
+else:
+    _HISTORY_IMPORT_ERR = None
 
 WEB_DIRECTORY = "./js"
 
@@ -65,8 +93,8 @@ except ValueError:
 
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
-# 2026-10-09 修订 1.2：对齐新活动桥 hana-bridge-09205624（diag 呈现待下次 ComfyUI 重启转正）。
-BRIDGE_BUILD_TAG = "2026-10-09 hana-bridge-09205624"
+# 2026-10-11（P3-H1）：对齐新活动桥 hana-bridge-1011095446（P2-F1/F2 + P3-G1 转正；diag 呈现待下次 ComfyUI 重启转正）。
+BRIDGE_BUILD_TAG = "2026-10-11 hana-bridge-1011095446"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -541,8 +569,101 @@ if _ROUTES is not None:
             }
         )
 
+    # ── P1-C1：画布提交历史（落盘与查询）─────────────────────────────────
+    # 方案甲：Python 在 ComfyUI 进程内直接写盘（桥前端经 8188 同源直连，不走中继。
+    # 背景：iframe 首选 direct，桥页面够不到中继的 /_relay/history/commit → 404，见
+    # docs/调研-画布提交历史-落盘通道.md）。逻辑全在 history_store.py（纯模块，可单测）；
+    # 此处只做鉴权/读体/取目录/拆状态码。
+    # USER_DIR：folder_paths.get_user_directory()（D:\ComfyUI\ComfyUI\folder_paths.py L146-147，
+    #   返回模块级 user_directory，即 <base_path>/user，L72 赋值、L149-151 可被 set_user_directory 改）；
+    #   default 用户再拼一层：user_manager.default_user = "default"（app/user_manager.py L17，
+    #   get_request_user_id L59-70 的缺省分支）。单用户部署实际目录 = user/default。
+    #   注意：这两处 import 依赖 ComfyUI 运行环境；import 失败时落盘不可用（与 _ROUTES
+    #   同一支架），由 _hana_history_deps_ready() 判定并在端点内明确报 500，不猜路径。
+
+    def _history_user_dir():
+        """解析 user/default 绝对路径；任一依赖缺失抛 RuntimeError（不猜路径拼死值）。"""
+        if _ROUTES is None or _history_commit is None or folder_paths is None or _user_manager is None:
+            missing = [
+                name
+                for name, ok in (
+                    ("routes", _ROUTES is not None),
+                    ("history_store", _history_commit is not None),
+                    ("folder_paths", folder_paths is not None),
+                    ("user_manager", _user_manager is not None),
+                )
+                if not ok
+            ]
+            raise RuntimeError(
+                "USER_DIR 依赖不可用（%s）：routes=%s history_store=%s folder_paths=%s user_manager=%s"
+                % (
+                    ", ".join(missing),
+                    _IMPORT_ERR,
+                    _HISTORY_IMPORT_ERR,
+                    _folder_paths_err,
+                    _user_manager_err,
+                )
+            )
+        return os.path.join(folder_paths.get_user_directory(), _user_manager.default_user)
+
+    # P1-D1（2026-10-11）：不再校验 token —— 对齐 /hello、/state 的信任模型：调用方是
+    # 8188 同源页面（桥 js），只落盘/只读、不转发；本机 8188 绑 127.0.0.1。
+    # 而 /call 校验 token 是因为它是中继→外部的入口，桥 js 拿不到 token（全仓无 token 引用）。
+    @_ROUTES.post("/hana_bridge/history-commit")
+    async def _hana_history_commit(request):
+        """提交一次画布快照落盘。请求体: { workflow, promptId?, graph, at?, source? }"""
+        try:
+            user_dir = _history_user_dir()
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        body = await _json(request)
+        out = _history_commit(body, user_dir)
+        status = out.pop("status", 200 if out.get("ok") else 500)
+        return web.json_response(out, status=status)
+
+    @_ROUTES.get("/hana_bridge/history-list")
+    async def _hana_history_list(request):
+        """查某工作流的提交索引。query: ?workflow=<名>；缺参数 400。
+        信任模型同 history-commit（P1-D1）：8188 同源、本机-only，不校验 token。"""
+        try:
+            user_dir = _history_user_dir()
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        workflow = str(request.query.get("workflow") or "").strip()
+        if not workflow:
+            return web.json_response({"ok": False, "error": "missing_workflow"}, status=400)
+        out = _history_list_commits(workflow, user_dir)
+        status = out.pop("status", 200 if out.get("ok") else 500)
+        return web.json_response(out, status=status)
+
+    @_ROUTES.get("/hana_bridge/history-snapshot")
+    async def _hana_history_snapshot(request):
+        """P3-G1：读某条提交快照的完整 JSON（含 graph 本体，回跳用）。
+        query: ?workflow=<名>&seq=<n> 或 ?workflow=<名>&file=<文件名>（file 优先）。
+        信任模型同 history-list / history-commit（P1-D1）：8188 同源、本机-only，不校验 token。"""
+        try:
+            user_dir = _history_user_dir()
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        workflow = str(request.query.get("workflow") or "").strip()
+        if not workflow:
+            return web.json_response({"ok": False, "error": "missing_workflow"}, status=400)
+        seq_raw = str(request.query.get("seq") or "").strip()
+        file_raw = str(request.query.get("file") or "").strip()
+        if not seq_raw and not file_raw:
+            return web.json_response({"ok": False, "error": "missing_seq_or_file"}, status=400)
+        out = _history_read_snapshot(
+            workflow,
+            user_dir,
+            seq=(int(seq_raw) if seq_raw.isdigit() else seq_raw),
+            file_name=(file_raw or None),
+        )
+        status = out.pop("status", 200 if out.get("ok") else 500)
+        return web.json_response(out, status=status)
+
     LOG.info(
-        "hana_bridge: 路由已注册（call / hello / result / ping），token 就绪，超时 %gs",
+        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-list / history-snapshot），"
+        "token 就绪，超时 %gs",
         CALL_TIMEOUT_SEC,
     )
 else:

@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-09 hana-bridge-09205624";
+const BUILD_TAG = "2026-10-11 hana-bridge-1011095446";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -1250,6 +1250,7 @@ const OPS = {
     hasLiteGraph: typeof window.LiteGraph !== "undefined" || typeof LiteGraph !== "undefined",
     hasClientId: !!api.clientId,
     hasExtensionManager: !!(app && app.extensionManager),
+    hasQueuePromptCapture: queuePromptCaptureInstalled,
     nodeCount: nodeList(app && app.graph).length,
     href: location.href,
   }),
@@ -2153,6 +2154,779 @@ async function postJson(path, body) {
   });
 }
 
+// ── P1-A2（2026-10-11）：api.queuePrompt 常驻包装（画布提交历史 · 捕获点）────────
+// 旧口径只在 canvas.queue op 内「临时」替换 api.queuePrompt（第 1546 行存原函数、第 1549 行替换、
+// 第 1562 行还原），用完即还 → 只有 agent 触发那一次能捕获，用户点「运行」/Ctrl+Enter 抓不到。
+// 本包装改在扩展 setup() 里安装一次、不再还原，覆盖任何经前端 api.queuePrompt 的提交
+// （按钮 onClick → 命令 Comfy.QueuePrompt → app.queuePrompt → api.queuePrompt → POST /prompt，
+//  代码确证：全部前端来源都汇于此，且前端不会重写该方法）。
+// 边界（硬性）：只读包装 —— 不改返回值、不改调用时机；上报失败绝不影响原生提交（整段吞掉 + console.warn）。
+// P1-C2（2026-10-11）：上报目标改道桥 Python 后端（同源可达，随 8188 相对路径走）。
+// 端点 /hana_bridge/history-commit 由 P1-C1 并行实现（Python 端直接落盘）；未就绪时静默失败。
+const HISTORY_COMMIT_PATH = "/hana_bridge/history-commit";
+let queuePromptCaptureInstalled = false;
+
+// 安装常驻包装（幂等）。在 setup() 里调用一次。
+function installQueuePromptCapture() {
+  if (queuePromptCaptureInstalled) return;
+  if (typeof api.queuePrompt !== "function") {
+    console.warn(LOG_TAG, "常驻提交捕获跳过：api.queuePrompt 不存在（前端版本不支持）");
+    return;
+  }
+  const orig = api.queuePrompt;
+  api.queuePrompt = async function (...callArgs) {
+    // 抓图：调用原函数「之前」，抓当前画布 UI 格式 JSON。
+    // 复用桥里已有的序列化路径 —— canvas.get op 就是 app.graph.toJSON()（第 1171 行），不另写一套。
+    let graph = null;
+    try {
+      if (app && app.graph && typeof app.graph.toJSON === "function") {
+        graph = app.graph.toJSON();
+      }
+    } catch (err) {
+      console.warn(LOG_TAG, "提交前抓画布失败（不影响提交）", err);
+    }
+    // 只读：原样透传返回值与抛错时机。
+    const r = await orig.apply(this, callArgs);
+    // 上报在原生提交之后、fire-and-forget；任何失败都不回抛（否则会污染原生提交链路）。
+    try {
+      const promptId = r && r.prompt_id ? r.prompt_id : null;
+      // 口径修正（P1-C2）：抓图失败时不上报 —— graph 为 null/undefined/无 nodes 的空对象一律跳过
+      // （空快照无意义，还白占一个 seq）。
+      const hasGraph = graph && graph.nodes && Object.keys(graph.nodes).length > 0;
+      if (promptId && hasGraph) {
+        // P2-F2：抓图后、上报前算「块归属」（每个 group 含哪些节点）；计算失败只降级
+        // （blocks=null → 上报不带该字段），绝不影响原生提交链路。
+        let blocks = null;
+        try {
+          blocks = graphBlocks(graph);
+        } catch (err) {
+          console.warn(LOG_TAG, "提交快照块归属计算失败（不影响上报）", err);
+        }
+        void reportHistoryCommit({ graph, promptId, blocks });
+      }
+    } catch (err) {
+      console.warn(LOG_TAG, "提交历史上报失败（不影响提交）", err);
+    }
+    return r;
+  };
+  queuePromptCaptureInstalled = true;
+}
+
+// 上报一次提交（契约字段冻结，勿改字段名）：POST /hana_bridge/history-commit
+// ⚠️ P1-C2：目标改道桥 Python 后端（同源）；端点由 P1-C1 并行实现，未就绪时静默失败。
+// source 恒为 "user"（前端通道都是人在点；agent 若经此通道也先记 user，后续批次再细分）。
+async function reportHistoryCommit({ graph, promptId, blocks }) {
+  try {
+    let workflow = null;
+    try {
+      workflow = currentWorkflowInfo().name;
+    } catch {
+      workflow = null;
+    }
+    const body = {
+      workflow,
+      promptId,
+      graph: graph || {},
+      at: new Date().toISOString(),
+      source: "user",
+    };
+    // P2-F2：块归属（[{name, source:"group"|"role", nodeIds:[…]}]）随快照上报；
+    // 仅在算出数组时携带 —— null / 计算失败 → 不带字段（Python 端快照同样省略，读回 null）。
+    if (Array.isArray(blocks)) body.blocks = blocks;
+    await postJson(HISTORY_COMMIT_PATH, body);
+  } catch (err) {
+    // 端点由 P1-C1 实现，未就绪时静默失败。
+    console.warn(LOG_TAG, "提交历史上报失败（端点由 P1-C1 实现，未就绪时静默失败）", err);
+  }
+}
+
+// ── P2-F2（2026-10-11）：提交快照的块归属 blocks ──────────────────────────────
+// graphBlocks(graph)：对「UI 格式 JSON」算块归属 → [{name, source:"group"|"role", nodeIds:[…]}]。
+// 归组口径移植自 app/lib/canvas-outline.mjs（group 优先 + 角色兜底两级），纯函数零依赖 ——
+// CSP 'self' 下桥全局脚本不能 import ESM，只能复制而非引用；**改动需同步两侧**。
+// 口径：① graph.groups 非空时，节点 pos=[x,y] 落在某 group.bounding=[x,y,w,h] 内（含边界）
+// → 归该组，落多个组取第一个；无 pos / 不入任何组 → ② 角色兜底（first-match、不区分大小写）：
+// /Loader|LoadImage/→加载、/TextEncode|TextGenerate|StringFormat/→文本、
+// /Sampler|Scheduler|Guider|Noise/→采样、/^(Save|Preview)/→输出、其余→其他。
+// 块名去重沿用同款：重名加 #2 递增直到唯一；空 title 用「组{i}」（i 为 groups 序号、从 1 起），
+// 与角色块名同池查重。与 outline 的差异：不产 summary/blockEdges/issues；块排序与 outline
+// 一致（按块内最小 node id 升序，nodeIds 亦升序）。
+// 边界：graph 非对象/null → 返回 null（调用方整字段省略，Python 快照读回 null）；
+//       空 groups → 全部节点走角色兜底；空节点图 → []（合法零块；但提交通道有 hasGraph
+//       拦截，空节点图本就不上报，[] 只会出现在直连 Python 的请求里）。
+//       空 group（bounding 内无节点）不成块，同 outline。
+function graphBlocks(graph) {
+  if (graph === null || typeof graph !== "object") return null;
+  const rawNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const groups = Array.isArray(graph.groups) ? graph.groups : [];
+  const ROLE_RULES = [
+    [/Loader|LoadImage/i, "加载"],
+    [/TextEncode|TextGenerate|StringFormat/i, "文本"],
+    [/Sampler|Scheduler|Guider|Noise/i, "采样"],
+    [/^(Save|Preview)/i, "输出"],
+  ];
+  const ROLE_FALLBACK = "其他";
+  // ① group 归属：pos 点在 bounding 内（含边界）；命中即 break（落多组取第一个）
+  const groupOfNode = new Map(); // node obj → group index
+  if (groups.length) {
+    for (const node of rawNodes) {
+      if (!node || typeof node !== "object") continue;
+      const pos = node.pos;
+      if (!Array.isArray(pos) || typeof pos[0] !== "number" || typeof pos[1] !== "number") continue;
+      for (let gi = 0; gi < groups.length; gi++) {
+        const g = groups[gi];
+        const b = g && Array.isArray(g.bounding) ? g.bounding : null;
+        if (!b || b.length < 4 || b.slice(0, 4).some((v) => typeof v !== "number")) continue;
+        if (pos[0] >= b[0] && pos[0] <= b[0] + b[2] && pos[1] >= b[1] && pos[1] <= b[1] + b[3]) {
+          groupOfNode.set(node, gi);
+          break;
+        }
+      }
+    }
+  }
+  // 分桶：group 优先；未归组 → ② 角色兜底（first-match）
+  const groupBuckets = new Map(); // group index → node[]
+  const roleBuckets = new Map(); // role name → node[]
+  for (const node of rawNodes) {
+    if (!node || typeof node !== "object") continue;
+    const gi = groupOfNode.get(node);
+    if (gi !== undefined) {
+      if (!groupBuckets.has(gi)) groupBuckets.set(gi, []);
+      groupBuckets.get(gi).push(node);
+      continue;
+    }
+    const type = String(node.type ?? "");
+    let role = ROLE_FALLBACK;
+    for (const [re, name] of ROLE_RULES) {
+      if (re.test(type)) {
+        role = name;
+        break;
+      }
+    }
+    if (!roleBuckets.has(role)) roleBuckets.set(role, []);
+    roleBuckets.get(role).push(node);
+  }
+  // 块名分配（groups 顺序）+ 重名去重「#k」（k 从 2 起；空标题组名与角色名同池检查）
+  const usedNames = new Set();
+  const dedupName = (base) => {
+    let name = base;
+    let k = 2;
+    while (usedNames.has(name)) {
+      name = `${base}#${k}`;
+      k += 1;
+    }
+    usedNames.add(name);
+    return name;
+  };
+  const rawBlocks = [];
+  for (let gi = 0; gi < groups.length; gi++) {
+    const nodes = groupBuckets.get(gi);
+    if (!nodes) continue; // 空 group 不成块（同 outline）
+    const g = groups[gi] || {};
+    const title = typeof g.title === "string" ? g.title.trim() : "";
+    rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", nodes });
+  }
+  for (const [role, nodes] of roleBuckets) {
+    rawBlocks.push({ name: dedupName(role), source: "role", nodes });
+  }
+  // 排序对齐 outline：块按块内最小 node id 升序
+  const idNum = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const cmpIds = (a, b) => {
+    const an = idNum(a);
+    const bn = idNum(b);
+    if (an !== null && bn !== null) return an - bn;
+    const as = String(a);
+    const bs = String(b);
+    return as < bs ? -1 : as > bs ? 1 : 0;
+  };
+  const minId = (ids) => ids.reduce((m, id) => (cmpIds(id, m) < 0 ? id : m), ids[0]);
+  rawBlocks.sort((a, b) => cmpIds(minId(a.nodes.map((n) => (n && typeof n === "object" ? n.id : null))), minId(b.nodes.map((n) => (n && typeof n === "object" ? n.id : null)))));
+  return rawBlocks.map((b) => ({
+    name: b.name,
+    source: b.source,
+    nodeIds: b.nodes.map((n) => (n && typeof n === "object" ? n.id : null)).sort(cmpIds),
+  }));
+}
+
+// ── P2-F1（2026-10-11）：画布提交历史 · 点击 group 弹出提交历史工具栏（UI 层）──────
+// 落点依据：docs/调研-画布提交历史-P2落点.md（结论＝并入主桥单文件，不建新 js，双载红线）。
+// 做法：包裹 LGraphCanvas.prototype.processMouseDown（rgthree 同款先例），点击时
+// convertEventToCanvasOffset 反算画布坐标 → getGroupOnPos 命中 group → 弹出；点空白/✕ 收起。
+// 边界（硬性）：
+//  · 包裹只读透传：不改原生行为、不改返回值/抛错时机/this；钩子自身异常只 warn；
+//  · 幂等安装：哨兵防 setup() 重跑重复包裹（同名扩展生命周期可能跑两遍）；
+//  · 数据只在弹层打开时 fetch 一次（不缓存不轮询）；失败弹层内显错行，不抛异常；
+//  · 弹层 z-index 10001（> 锁膜 filmApply 的 9999）；本体 pointer-events:auto，不做 inset
+//    全屏遮罩（避免吞画布交互，同锁膜经验）；坐标全程 CSS px（getBoundingClientRect 与
+//    convertOffsetToCanvas 同单位），不乘 DPR。
+// 明确不做（待商榷，勿实现）：按块归属过滤、浅色主题、设置开关。（回滚已由 P3-G1 落地，见下方专块。）
+const HISTORY_LIST_PATH = "/hana_bridge/history-list"; // fetchApi 自动加 /api 前缀 → /api/hana_bridge/history-list（已实测等价）
+const HISTORY_BAR_ID = "hana-history-bar";
+const HISTORY_BAR_STYLE_ID = "hana-history-bar-style";
+
+let historyBarEl = null; // 弹层单例：null=收起
+let historyBarRequestId = 0; // 竞态哨兵：切换/收起后递增，在途旧响应作废
+let historyGroupClickInstalled = false; // processMouseDown 包裹幂等哨兵
+// P3-G1：回跳态（卡片点选 / 最近提交基线 / 二次确认状态机）
+let historyBarSelection = null; // 卡片点选的提交 {file, seq}（file 为空时按 seq 定位）
+let historyBarLatestEntry = null; // 最近一次提交条目（未提交比对基线；historyBarLoad 渲染时回填）
+let historyRollback = { armed: false, timer: null, busy: false };
+
+function historyBarStyleEnsure() {
+  if (document.getElementById(HISTORY_BAR_STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = HISTORY_BAR_STYLE_ID;
+  style.textContent = `
+#${HISTORY_BAR_ID} {
+  position: fixed; z-index: 10001;
+  background: rgba(28,32,39,.96); color: #fff;
+  border: 1px solid rgba(255,255,255,.2); border-radius: 11px;
+  box-shadow: 0 10px 32px rgba(0,0,0,.45);
+  padding: 8px 10px; font-size: 12px; line-height: 1.4;
+  pointer-events: auto; user-select: none;
+  max-width: min(640px, calc(100vw - 16px));
+}
+#${HISTORY_BAR_ID} .hhb-title { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+#${HISTORY_BAR_ID} .hhb-wf { font-weight:600; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#${HISTORY_BAR_ID} .hhb-count { color:#9fb3c8; }
+#${HISTORY_BAR_ID} .hhb-x { margin-left:auto; background:transparent; border:0; color:#cfd8e3; font-size:14px; cursor:pointer; padding:0 4px; line-height:1; }
+#${HISTORY_BAR_ID} .hhb-x:hover { color:#fff; }
+#${HISTORY_BAR_ID} .hhb-cards { display:flex; gap:8px; overflow-x:auto; padding-bottom:2px; }
+#${HISTORY_BAR_ID} .hhb-card { flex:none; display:flex; gap:6px; align-items:center; padding:5px 7px; border:1px solid rgba(255,255,255,.14); border-radius:8px; background:rgba(255,255,255,.04); cursor:pointer; }
+#${HISTORY_BAR_ID} .hhb-card:hover { border-color:rgba(255,255,255,.35); }
+#${HISTORY_BAR_ID} .hhb-card-sel { border-color:rgba(127,178,217,.9); background:rgba(127,178,217,.16); }
+#${HISTORY_BAR_ID} .hhb-thumb { width:48px; height:48px; flex:none; border-radius:6px; background:#3a414b; color:#aab4c0; display:flex; align-items:center; justify-content:center; font-size:12px; }
+#${HISTORY_BAR_ID} .hhb-seq { font-weight:600; }
+#${HISTORY_BAR_ID} .hhb-row { display:flex; align-items:center; gap:4px; color:#9fb3c8; font-size:11px; }
+#${HISTORY_BAR_ID} .hhb-dot { width:7px; height:7px; border-radius:50%; flex:none; background:#9aa0a8; }
+#${HISTORY_BAR_ID} .hhb-dot[data-src="user"] { background:#7fb2d9; }
+#${HISTORY_BAR_ID} .hhb-dot[data-src="agent"] { background:#c9a0e8; }
+#${HISTORY_BAR_ID} .hhb-foot { display:flex; align-items:center; gap:8px; margin-top:7px; }
+#${HISTORY_BAR_ID} .hhb-roll { background:rgba(127,178,217,.15); border:1px solid rgba(127,178,217,.5); color:#cfe4f5; border-radius:7px; padding:3px 10px; cursor:pointer; font-size:12px; }
+#${HISTORY_BAR_ID} .hhb-roll:hover { background:rgba(127,178,217,.28); }
+#${HISTORY_BAR_ID} .hhb-roll-armed { background:rgba(232,160,160,.18); border-color:rgba(232,160,160,.75); color:#f3c6c6; }
+#${HISTORY_BAR_ID} .hhb-topmsg { color:#b8e0a0; font-size:12px; margin-bottom:6px; }
+#${HISTORY_BAR_ID} .hhb-msg { color:#e8c268; font-size:11px; }
+#${HISTORY_BAR_ID} .hhb-empty, #${HISTORY_BAR_ID} .hhb-err { color:#9fb3c8; padding:6px 2px; }
+#${HISTORY_BAR_ID} .hhb-err { color:#e8a0a0; }
+`;
+  document.head.appendChild(style);
+}
+
+// 收起弹层（幂等）：递增竞态哨兵作废在途 fetch 响应
+function historyBarClose() {
+  historyBarRequestId++;
+  historyRollbackStateReset(); // P3-G1：收起 → 二次确认状态复位（规格 4）
+  historyBarSelection = null;
+  historyBarLatestEntry = null;
+  if (historyBarEl && historyBarEl.parentElement) {
+    historyBarEl.parentElement.removeChild(historyBarEl);
+  }
+  historyBarEl = null;
+}
+
+// 弹层内提示行（替代 alert）
+function historyBarTip(msg, isError) {
+  if (!historyBarEl) return;
+  const tip = historyBarEl.querySelector(".hhb-msg");
+  if (tip) {
+    tip.textContent = msg;
+    tip.style.color = isError ? "#e8a0a0" : "#e8c268";
+  }
+}
+
+// 时间显示：ISO UTC → 本地 MM-DD HH:mm；解析失败原样显示
+function historyFmtTime(at) {
+  const t = Date.parse(at);
+  if (!isFinite(t)) return String(at || "");
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// group 几何中心 → 屏幕坐标（CSS px）。graph 坐标 → 画布元素 px 用 convertOffsetToCanvas
+// （convertEventToCanvasOffset 的逆变换，同单位不乘 DPR）；缺失时手写同式逆变换兜底。
+function historyGroupCenterScreen(group) {
+  const canvas = app && app.canvas;
+  const el = canvas && (canvas.canvas || canvas.canvasEl || null);
+  if (!canvas || !el || !group) return null;
+  const b =
+    group.bounding ||
+    (group.pos && group.size ? [group.pos[0], group.pos[1], group.size[0], group.size[1]] : null);
+  if (!b || b[2] == null || b[3] == null) return null;
+  let p = null;
+  try {
+    p = canvas.convertOffsetToCanvas([b[0] + b[2] / 2, b[1] + b[3] / 2]);
+  } catch {
+    p = null;
+  }
+  if (!p) {
+    const ds = canvas.ds || canvas;
+    const scale = (ds && ds.scale) || 1;
+    const ox = (ds && ds.offset && ds.offset[0]) || 0;
+    const oy = (ds && ds.offset && ds.offset[1]) || 0;
+    p = [(b[0] + b[2] / 2 - ox) / scale, (b[1] + b[3] / 2 - oy) / scale];
+  }
+  const rect = el.getBoundingClientRect();
+  return { x: rect.left + p[0], y: rect.top + p[1] };
+}
+
+// 拉取并渲染提交列表（只在弹层打开时 fetch 一次；不缓存不轮询）。
+// 竞态：reqId 不等于当前哨兵 → 弹层已切其他 group 或已收起，旧响应直接丢弃。
+async function historyBarLoad(reqId, cards, countEl) {
+  let wfName = "(未命名)";
+  try {
+    wfName = currentWorkflowInfo().name || wfName;
+  } catch {
+    /* 保持默认 */
+  }
+  try {
+    const resp = await api.fetchApi(HISTORY_LIST_PATH + "?workflow=" + encodeURIComponent(wfName), {
+      method: "GET",
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    if (!data || data.ok !== true) throw new Error(String((data && data.error) || "返回异常"));
+    if (reqId !== historyBarRequestId) return; // 已切/已收起：作废
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    historyBarLatestEntry = entries.length ? entries[entries.length - 1] : null; // P3-G1：索引末条＝最近提交（比对基线）
+    if (countEl) countEl.textContent = entries.length + " 条提交";
+    cards.textContent = "";
+    if (!entries.length) {
+      const empty = document.createElement("div");
+      empty.className = "hhb-empty";
+      empty.textContent = "这个工作流还没有提交记录";
+      cards.appendChild(empty);
+      return;
+    }
+    for (const ent of entries) {
+      const seq = ent && ent.seq != null ? String(ent.seq) : "?";
+      const card = document.createElement("div");
+      card.className = "hhb-card";
+      const thumb = document.createElement("div");
+      thumb.className = "hhb-thumb";
+      thumb.textContent = seq; // P4：换 .thumb.webp 真缩略图，当前灰底占位显示 seq
+      const meta = document.createElement("div");
+      const seqEl = document.createElement("div");
+      seqEl.className = "hhb-seq";
+      seqEl.textContent = "#" + seq.padStart(3, "0");
+      const row = document.createElement("div");
+      row.className = "hhb-row";
+      const dot = document.createElement("span");
+      dot.className = "hhb-dot";
+      const src = String((ent && ent.source) || "unknown");
+      if (src === "user" || src === "agent") dot.dataset.src = src; // unknown 走默认灰
+      const time = document.createElement("span");
+      time.textContent = historyFmtTime(ent && ent.at);
+      row.append(dot, time);
+      meta.append(seqEl, row);
+      card.append(thumb, meta);
+      // P3-G1：卡片可点选（选中态高亮）；换选复位二次确认状态（规格 4）
+      card.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (historyRollback.busy) return;
+        const file = ent && ent.file ? String(ent.file) : null;
+        const seq = ent && ent.seq != null ? ent.seq : null;
+        const prev = historyBarSelection;
+        if (prev && prev.file === file && prev.seq === seq) return; // 重复点同一卡片
+        historyRollbackBtnReset();
+        historyBarSelection = { file, seq };
+        cards.querySelectorAll(".hhb-card.hhb-card-sel").forEach((c) => c.classList.remove("hhb-card-sel"));
+        card.classList.add("hhb-card-sel");
+        historyBarTip("已选 #" + String(seq != null ? seq : "?").padStart(3, "0") + "，点「回到这一版」执行", false);
+      });
+      cards.appendChild(card);
+    }
+  } catch (err) {
+    if (reqId !== historyBarRequestId) return;
+    cards.textContent = "";
+    const errEl = document.createElement("div");
+    errEl.className = "hhb-err";
+    errEl.textContent = "提交历史加载失败：" + String((err && err.message) || err);
+    cards.appendChild(errEl);
+    // 不抛异常：失败只落在弹层内
+  }
+}
+
+// 打开弹层（重复调用=切换：先拆旧再建新）。anchor={x,y} 为屏幕 CSS px（group 几何中心）。
+function historyBarOpen(anchor) {
+  historyBarStyleEnsure();
+  historyRollbackStateReset(); // P3-G1：切换 group → 回跳态复位（同收起语义）
+  historyBarSelection = null;
+  historyBarLatestEntry = null;
+  if (historyBarEl && historyBarEl.parentElement) {
+    historyBarEl.parentElement.removeChild(historyBarEl);
+  }
+  const bar = document.createElement("div");
+  bar.id = HISTORY_BAR_ID;
+  historyBarEl = bar;
+  // 标题行：工作流名 + 提交数（fetch 后回填）+ ✕
+  const title = document.createElement("div");
+  title.className = "hhb-title";
+  const wf = document.createElement("span");
+  wf.className = "hhb-wf";
+  try {
+    wf.textContent = currentWorkflowInfo().name || "(未命名)";
+  } catch {
+    wf.textContent = "(未命名)";
+  }
+  wf.title = wf.textContent;
+  const count = document.createElement("span");
+  count.className = "hhb-count";
+  count.textContent = "…";
+  const x = document.createElement("button");
+  x.type = "button";
+  x.className = "hhb-x";
+  x.textContent = "✕";
+  x.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyBarClose();
+  });
+  title.append(wf, count, x);
+  // 提交卡片列（横向滚动）；先放加载占位
+  const cards = document.createElement("div");
+  cards.className = "hhb-cards";
+  const loading = document.createElement("div");
+  loading.className = "hhb-empty";
+  loading.textContent = "加载中…";
+  cards.appendChild(loading);
+  // 底部：回到这一版（P3-G1 真功能）+ 弹层内提示行
+  const foot = document.createElement("div");
+  foot.className = "hhb-foot";
+  const roll = document.createElement("button");
+  roll.type = "button";
+  roll.className = "hhb-roll";
+  roll.textContent = "回到这一版";
+  roll.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    void historyRollbackClick(); // P3-G1：回跳动作（详见下方专块）
+  });
+  const tip = document.createElement("span");
+  tip.className = "hhb-msg";
+  foot.append(roll, tip);
+  bar.append(title, cards, foot);
+  document.body.appendChild(bar); // position:fixed 自行定位，挂 body 避免容器裁剪
+  // 锚定 group 几何中心下方，水平钳制视口；底部放不下则翻到中心上方
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const bw = bar.offsetWidth;
+  const bh = bar.offsetHeight;
+  const ax = anchor ? anchor.x : vw / 2;
+  const ay = anchor ? anchor.y : vh / 2;
+  let left = ax - bw / 2;
+  left = Math.max(8, Math.min(left, vw - bw - 8));
+  let top = ay + 12;
+  if (top + bh > vh - 8) top = Math.max(8, ay - bh - 12);
+  bar.style.left = Math.round(left) + "px";
+  bar.style.top = Math.round(top) + "px";
+  // 打开时才 fetch；竞态哨兵在途响应作废
+  const reqId = ++historyBarRequestId;
+  void historyBarLoad(reqId, cards, count);
+}
+
+// 点击钩子（只读）：命中 group → 弹出/切换；点空白 → 收起。任何分支不改画布状态。
+function historyOnCanvasMouseDown(e) {
+  if (!e || (e.button !== undefined && e.button !== 0)) return; // 只响应左键；其余不干预
+  const canvas = app && app.canvas;
+  if (!canvas) return;
+  let off = null;
+  try {
+    off = canvas.convertEventToCanvasOffset(e);
+  } catch {
+    off = null;
+  }
+  let group = null;
+  if (off && typeof canvas.getGroupOnPos === "function") {
+    try {
+      group = canvas.getGroupOnPos(off[0], off[1]) || null;
+    } catch {
+      group = null;
+    }
+  }
+  // 双保险：getGroupOnPos 不可用时，遍历 graph._groups 的 bounding 判定（口径同 canvas-outline.mjs）
+  if (!group && off && canvas.graph && Array.isArray(canvas.graph._groups)) {
+    for (const g of canvas.graph._groups) {
+      const b = g && g.bounding;
+      if (b && off[0] >= b[0] && off[0] <= b[0] + b[2] && off[1] >= b[1] && off[1] <= b[1] + b[3]) {
+        group = g;
+        break;
+      }
+    }
+  }
+  if (!group) {
+    if (historyBarEl) historyBarClose(); // 点空白 → 收起
+    return;
+  }
+  historyBarOpen(historyGroupCenterScreen(group)); // anchor 取不到时 historyBarOpen 内回退视口中心
+}
+
+// 安装 processMouseDown 包裹（幂等）。在 setup() 里调用一次。
+function installHistoryGroupClick() {
+  if (historyGroupClickInstalled) return;
+  const proto =
+    typeof LGraphCanvas !== "undefined" && LGraphCanvas && LGraphCanvas.prototype
+      ? LGraphCanvas.prototype
+      : null;
+  if (!proto || typeof proto.processMouseDown !== "function") {
+    console.warn(LOG_TAG, "P2-F1 跳过：LGraphCanvas.prototype.processMouseDown 不存在（前端版本不支持）");
+    return;
+  }
+  const orig = proto.processMouseDown;
+  proto.processMouseDown = function (e) {
+    // 钩子先行、只读：异常吞掉只 warn，绝不影响原生按下行为
+    try {
+      historyOnCanvasMouseDown(e);
+    } catch (err) {
+      console.warn(LOG_TAG, "P2-F1 点击钩子失败（不影响画布）", err);
+    }
+    // 只读透传：this / arguments / 返回值 / 抛错时机全保持原样
+    return orig.apply(this, arguments);
+  };
+  historyGroupClickInstalled = true;
+}
+
+// ── P3-G1（2026-10-11）：回跳到所选提交（branch 式原地回跳，不造副本）────────────
+// 设计依据：docs/方案-画布提交历史.md §六 —— 每次提交本身是存档点；回跳可逆（点回新节点
+// 即可），安全网从「副本」换「时间轴」。不自动落盘、不自动提交（回跳后画布相对文件是
+// 「已修改」，保存或再提交由用户决定）；不造「回滚前快照」（会往时间轴混入非运行节点，
+// 破坏「提交 = 运行」语义）。
+// 闸门复核（2026-10-11，实现前复核结论）：副驾驶写闸门只挂在 agent 的桥 op 通道上 ——
+// copilotWriteBlocked（约 L2700）只在 EVT_CALL 分发器（/hana_bridge/call 推来后的监听器，
+// 约 L2721）内调用，服务端也只经该通道下发 op；本回跳动作只从弹层按钮的 DOM click 触发，
+// 不产 op、不走 EVT_CALL → 不受 COPILOT_WRITE_EXEMPT / copilotWriteBlocked 约束（因此
+// 两个名单都不改；copilotReadState 也无涉）。副驾驶关闭时本功能同样可用。
+// 未提交编辑拦截（护栏 3）：canvas-diff.mjs 在 Node 侧，前端不可用 —— 简化口径 =
+// graphSignature()（同款，L634：节点数+连线数+逐节点 fnv1a 签名，不含位置）比对当前画布
+// 与最近一次提交（historyBarLoad 时回填的索引末条）。不一致 → 二次点击确认制（60s 超时/收
+// 起弹层复位）；一致 → 单击直接执行。
+// 装载：复用 loadWorkflowFile（L1339 起）的入口与参数语义 —— loadGraphData(graph, true,
+// true, aw) 装进当前页（第 4 参传当前活动页对象 aw，保持页身份；上游 activateLoadedWorkflow
+// 对「对象」走 store.openWorkflow(aw)）。graph 由快照端点直接传参，不经文件。
+// P3-G1 画布写边界：装载是画布写操作，但**只由用户点「回到这一版/确认回跳」触发**，代码
+// 内无任何自动触发路径（不接轮询/事件）。
+const HISTORY_SNAPSHOT_PATH = "/hana_bridge/history-snapshot"; // fetchApi 自动加 /api 前缀（同 history-list，已实测等价口径）
+
+// 二次确认状态复位（收起弹层 / 切换 group / 换选卡片 / 执行完成时调）
+function historyRollbackStateReset() {
+  if (historyRollback.timer) {
+    clearTimeout(historyRollback.timer);
+    historyRollback.timer = null;
+  }
+  historyRollback.armed = false;
+  historyRollback.busy = false;
+  historyRollbackBtnReset();
+}
+
+// 按钮回普通态（保留 busy；busy 时调用方自管文案）
+function historyRollbackBtnReset() {
+  if (!historyBarEl) return;
+  const roll = historyBarEl.querySelector(".hhb-roll");
+  if (roll) {
+    roll.textContent = "回到这一版";
+    roll.classList.remove("hhb-roll-armed");
+  }
+}
+
+// 简化口径的「画布 vs 某提交快照」一致性判定（同 graphSignature 口径：nodeCount +
+// linkCount + 逐节点 hash 集）。签名 / 快照读不出来 → null（调用方按「不一致」走确认制）。
+// 备注（P3-G1 实现时复核）：graphSignature 的逐节点 hash 串接顺序为 type:mode:title:widgets，
+// 且 widgets 项带 name= 前缀；快照落盘只有 widgets_values 数组（无 widget name）且无 mode
+// 字段，故 historySnapshotGraphSig 按 type:0(title):widgets_values 串接 —— 两者仅用于
+// 「当前画布 vs 最近提交快照」同口径对齐（同函数族、同 fnv1a），不要求跨形态哈希一致。
+function historyGraphSigForCompare() {
+  try {
+    const sig = graphSignature();
+    return { nodeCount: sig.nodeCount, linkCount: sig.linkCount, perNode: sig.perNode };
+  } catch {
+    return null;
+  }
+}
+
+// 快照 graph 对象 → 与 graphSignature 同构的签名（节点以 id+type+widgets 串接 hash）。
+// 只用 UI 格式字段（nodes[].id/type/widgets_values），与提交快照的落盘格式同源。
+function historySnapshotGraphSig(graph) {
+  const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  const perNode = {};
+  let linkCount = 0;
+  for (const n of nodes) {
+    if (!n || typeof n !== "object") continue;
+    let w = "";
+    const wv = Array.isArray(n.widgets_values) ? n.widgets_values : [];
+    for (const v of wv) {
+      const s = v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      w += s + ";";
+    }
+    const idStr = String(n.id);
+    perNode[idStr] = fnv1a(`${n.type}:0:${n.title || ""}:${w}`);
+  }
+  if (graph && Array.isArray(graph.links)) linkCount = graph.links.length;
+  return { nodeCount: nodes.length, linkCount, perNode };
+}
+
+function historySnapshotsDiffer(cur, snapSig) {
+  if (!cur || !snapSig) return true; // 比对材料不全 → 视为不一致（走确认制，宁可多问）
+  if (cur.nodeCount !== snapSig.nodeCount || cur.linkCount !== snapSig.linkCount) return true;
+  const a = cur.perNode || {};
+  const b = snapSig.perNode || {};
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return true;
+  for (const k of ka) if (a[k] !== b[k]) return true;
+  return false;
+}
+
+// 取快照完整 JSON（含 graph 本体）。seq 为空时用 file 定位；都空 → null。
+async function historyFetchSnapshot(sel) {
+  const qs = "?workflow=" + encodeURIComponent(currentWorkflowInfo().name || "(未命名)");
+  if (sel && sel.file) return historyFetchSnapshotQs(qs + "&file=" + encodeURIComponent(sel.file));
+  if (sel && sel.seq != null) return historyFetchSnapshotQs(qs + "&seq=" + encodeURIComponent(String(sel.seq)));
+  throw new Error("未选中要回到的提交");
+}
+
+async function historyFetchSnapshotQs(qs) {
+  const resp = await api.fetchApi(HISTORY_SNAPSHOT_PATH + qs, { method: "GET" });
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  const data = await resp.json();
+  if (!data || data.ok !== true) throw new Error(String((data && data.error) || "返回异常"));
+  const snap = data.snapshot;
+  if (!snap || typeof snap !== "object" || !snap.graph || typeof snap.graph !== "object") {
+    throw new Error("快照缺少 graph 本体");
+  }
+  return snap;
+}
+
+// 「回到这一版」点击处理（二次确认状态机，规格 4）：
+//   无选卡 → 提示；未提交改动 → 第一次点=警示+按钮变「确认回跳」，60s 内再点=执行；
+//   超时/收起弹层/换选 → 状态复位。执行中 busy 防重入。
+async function historyRollbackClick() {
+  if (!historyBarEl || historyRollback.busy) return;
+  const roll = historyBarEl.querySelector(".hhb-roll");
+  if (!roll) return;
+  if (!historyBarSelection) {
+    historyBarTip("先在上方点选一条提交，再点「回到这一版」", false);
+    return;
+  }
+  // 未提交编辑拦截（护栏 3，简化口径）：当前画布 ≠ 最近一次提交 → 需二次确认。
+  let needsConfirm = true;
+  try {
+    const cur = historyGraphSigForCompare();
+    if (!historyBarLatestEntry || historyBarLatestEntry.file == null) {
+      needsConfirm = true; // 拿不到最近提交（从未提交/索引缺失）→ 宁可多问
+    } else {
+      const latestSnap = await historyFetchSnapshotQs(
+        "?workflow=" + encodeURIComponent(currentWorkflowInfo().name || "(未命名)") +
+        "&file=" + encodeURIComponent(String(historyBarLatestEntry.file)),
+      );
+      needsConfirm = historySnapshotsDiffer(cur, historySnapshotGraphSig(latestSnap.graph));
+    }
+  } catch (err) {
+    console.warn(LOG_TAG, "P3-G1 未提交比对失败（按需确认处理）", err);
+    needsConfirm = true;
+  }
+  if (needsConfirm && !historyRollback.armed) {
+    historyRollback.armed = true;
+    if (historyRollback.timer) clearTimeout(historyRollback.timer);
+    historyRollback.timer = setTimeout(() => {
+      historyRollback.armed = false;
+      historyRollback.timer = null;
+      historyRollbackBtnReset();
+      historyBarTip("确认已超时，未执行回跳", false);
+    }, 60000);
+    const tipEl = historyBarEl.querySelector(".hhb-msg");
+    historyBarTip("当前有未提交的改动，回跳将丢弃。再点一次确认执行", false);
+    if (tipEl) tipEl.style.color = "#e8a0a0"; // 警告红字（成功后由 historyBarTip 回默认色）
+    roll.textContent = "确认回跳（丢弃未提交改动）";
+    roll.classList.add("hhb-roll-armed");
+    return;
+  }
+  await historyRollbackExecute();
+}
+
+// 执行回跳：拉快照 → loadGraphData 原地装载 → 关弹层 + 成功提示（规格 1/2/5）。
+// 失败路径（规格 6）：弹层内红字，画布不动（装载前校验 + loadGraphData 原子性，见注释）。
+async function historyRollbackExecute() {
+  if (!historyBarEl) return;
+  const roll = historyBarEl.querySelector(".hhb-roll");
+  const sel = historyBarSelection;
+  if (historyRollback.timer) {
+    clearTimeout(historyRollback.timer);
+    historyRollback.timer = null;
+  }
+  historyRollback.armed = false;
+  historyRollback.busy = true;
+  if (roll) {
+    roll.textContent = "回跳中…";
+    roll.classList.remove("hhb-roll-armed");
+  }
+  historyBarTip("正在拉取快照…", false);
+  try {
+    if (typeof app.loadGraphData !== "function") throw new Error("前端没有 app.loadGraphData");
+    const aw = activeWorkflowObj(); // 当前活动页对象（同 loadWorkflowFile L1342 的取法）
+    if (!aw) throw new Error("取不到当前活动页对象（activeWorkflowObj() 为空）");
+    const snap = await historyFetchSnapshot(sel);
+    const seqLabel = "#" + String(snap.seq != null ? snap.seq : (sel && sel.seq) != null ? sel.seq : "?").padStart(3, "0");
+    // 原子性依据（实现前复核）：loadGraphData 对「非法入参/装载中抛错」**先于**画布变更返回/抛出 ——
+    // v1.55.14 打包源（settingStore-X9ZV_dAu.js 内 ComfyApp.loadGraphData，offset≈1866877）
+    // 顺序：参数归一 + beforeLoadNewGraph → try{ … rootGraph.configure(e) … }catch{return false}
+    // —— configure 抛错走 reportGraphLoadFailure 后**直接返回 false**，不进入后续的 widget 修正、
+    // afterConfigureGraph、activateLoadedWorkflow；LiteGraph 的 LGraph.configure（同包 settingStore
+    // chunk，offset≈512279）首行即「入参非法 → return；configure 事件被拒绝 → return」，且节点
+    // 创建先在临时序列上逐个进行、任何阶段抛错即整体终止 —— 图未换（旧图原样）。
+    // 因此「成功=整图换血、失败=旧图不动」，无半装载态；前端任何残余只可能是节点级的
+    // last_serialization 记录，不影响画布内容。失败时 catch 落弹层红字（见下），不重试。
+    const loadP = Promise.resolve(
+      app.loadGraphData(snap.graph, true, true, aw, { checkForRerouteMigration: false, deferWarnings: false }),
+    );
+    const okGraph = await loadP.catch((e) => {
+      console.warn(LOG_TAG, "P3-G1 loadGraphData 失败（画布应未变）", e);
+      return null;
+    });
+    if (okGraph === null) throw new Error("画布装载失败（loadGraphData 报错，画布未变）");
+    // 成功：关弹层（规格 2）……
+    historyRollback.busy = false;
+    historyBarClose();
+    // ……提示改挂一次性元素（弹层已拆，规格 5 的成功文案仍在弹层顶部展示 5s）。
+    // 说明：historyBarTip 写在弹层内，而弹层已关；为同时满足「弹层顶部显示」与「关闭弹层」
+    // 两条规格，成功提示用同一样式的独立 toast 常驻到 5s 自动消失。
+    historyRollbackToast(`已回到 ${seqLabel}（此时画布未保存，保存或再提交由你决定）`);
+    return;
+  } catch (err) {
+    console.warn(LOG_TAG, "P3-G1 回跳失败", err);
+    historyRollback.busy = false;
+    if (historyBarEl) {
+      historyRollbackBtnReset();
+      historyBarTip("回跳失败：" + String((err && err.message) || err), true);
+    }
+  }
+}
+
+// 成功提示（同弹层样式，顶部居中，5s 自动消失）。
+function historyRollbackToast(msg) {
+  try {
+    const el = document.createElement("div");
+    el.id = HISTORY_BAR_ID + "-toast";
+    el.style.cssText =
+      "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:10002;" +
+      "background:rgba(28,32,39,.96);color:#b8e0a0;border:1px solid rgba(255,255,255,.2);" +
+      "border-radius:11px;box-shadow:0 10px 32px rgba(0,0,0,.45);padding:10px 16px;font-size:13px;" +
+      "pointer-events:auto;max-width:min(640px,calc(100vw - 16px));";
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => {
+      if (el.parentElement) el.parentElement.removeChild(el);
+    }, 5000);
+  } catch (err) {
+    console.warn(LOG_TAG, "P3-G1 成功提示失败", err);
+  }
+}
+
 // P6（2026-10-08）：写 op 白名单（与 app/index.js CANVAS_OPS 的 write:true 项一一对应）。
 // 执行期间把变更来源标为 "agent"；装载类窗口另标 "system"（见 beginSystemWindow）。
 // v2（2026-10-08）追加 canvas.copilot（开关自身也是写类；拦截豁免见下）。
@@ -2237,6 +3011,10 @@ app.registerExtension({
     // 壳页协同（修订 1.2）：把本实例身份推给 parent 壳页（定向直发用；与后端无关，先行；
     // 后端未就绪/hello 失败也不影响宣告——见上方 announceToShell 注释块）。
     announceToShell();
+    // P1-A2：常驻安装 api.queuePrompt 包装（与后端无关，先行；不依赖 hello 成败）。
+    installQueuePromptCapture();
+    // P2-F1：安装画布点击命中 group 的 processMouseDown 包裹（与后端无关，先行；幂等）。
+    installHistoryGroupClick();
     try {
       await postJson(PATH_HELLO, {
         clientId: api.clientId || null,

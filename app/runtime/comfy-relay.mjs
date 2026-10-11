@@ -54,6 +54,7 @@ import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as os
 import { basename, dirname, extname, join } from "node:path";
 import { isPlainObject, convertUiToApi, applyInputs } from "../lib/workflow-tools.mjs";
 import { writeFileAtomic } from "../workflow-file.mjs"; // 原子写共享实现（T-fs 修复：中继代 app 落盘）
+import { handleHistoryCommit } from "./history-commit.mjs"; // 画布提交快照落盘（P1-B1，纯逻辑模块；中继只做路由接线）
 
 // ── 退出码 ──────────────────────────────────────────────────────────────────
 const EXIT = Object.freeze({ OK: 0, INTERNAL: 1, BACKEND: 2, USAGE: 3, PORT: 7 });
@@ -575,6 +576,24 @@ function probeEnv(force = false) {
   };
   envProbe.at = Date.now();
   return envProbe.result;
+}
+
+// 工作流目录（user/default/workflows）解析：复用安装探测结果，候选与 app 侧口径一致
+// （main.py 同级的 user/default；安装根直接子路径；外层布局的 ComfyUI/user/default）。
+// 取「首个存在的候选」；都不存在时退回首个候选（端点会 mkdirSync 自建）。
+function resolveWorkflowsDir() {
+  const env = probeEnv(true);
+  const hit = env && Array.isArray(env.installs) ? env.installs[0] : null;
+  if (!hit) return null;
+  const cands = [];
+  if (typeof hit.mainPy === "string" && hit.mainPy) cands.push(join(dirname(hit.mainPy), "user", "default", "workflows"));
+  if (typeof hit.path === "string" && hit.path) {
+    cands.push(join(hit.path, "user", "default", "workflows"));
+    cands.push(join(hit.path, "ComfyUI", "user", "default", "workflows"));
+  }
+  const list = [...new Set(cands.filter(Boolean))];
+  if (!list.length) return null;
+  return list.find((p) => existsSync(p)) || list[0];
 }
 
 // ── 主机指标采集（GPU / CPU / 内存）──────────────────────────────────────────
@@ -2931,6 +2950,30 @@ const server = http.createServer((req, res) => {
       return;
     }
     void handleHistory(req, res);
+    return;
+  }
+  if (pathOnly === "/_relay/history/commit") {
+    // 画布提交快照落盘（P1-B1）：接一次提交上报 → 写快照文件 + 追一行索引。
+    // 逻辑全在 history-commit.mjs（纯模块，可单测）；此处只做注册/读体/解析目录/拆状态码。
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    void (async () => {
+      try {
+        const body = await readBodyJson(req, 40 * 1024 * 1024).catch((e) => {
+          jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) });
+          return null;
+        });
+        if (!body) return;
+        const workflowsDir = resolveWorkflowsDir();
+        const out = handleHistoryCommit(body, { workflowsDir });
+        const { status, ...payload } = out;
+        jsonOut(res, status || (out.ok ? 200 : 500), payload, req.method);
+      } catch (e) {
+        jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }, req.method);
+      }
+    })();
     return;
   }
   if (pathOnly === "/_relay/submit-file") {
