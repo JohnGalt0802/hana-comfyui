@@ -153,6 +153,13 @@ const HANA_CSS_MAP = [
   ["--node-component-header-icon", "--text-muted"],
   // 新前端（1.x）新增的面板/顶栏变量（2026-09-25 从内置色板键表对比补齐；
   // 缺这几个时“左侧设置栏 / 顶部标签栏”会停在内置色板的原色）
+  // 2026-10-11 回归修复（左侧栏不跟随宿主主题）：补 interface-panel-surface / interface-stroke 两条。
+  // interface-panel-surface 是这一族的**基底**——内置色板里 hover/selected-surface 都是
+  // color-mix(in srgb, var(--interface-panel-surface) …, var(--contrast-mix-color)) 派生，
+  // 此前漏映射 → 左侧栏拿内置色板原色（暗色 charcoal/#000 系），与宿主主题脱节；
+  // interface-stroke 是面板/栏位的描边色，同属该族基色。
+  ["--interface-panel-surface", "--sidebar-bg"],
+  ["--interface-stroke", "--border"],
   ["--interface-panel-hover-surface", "--accent-light"],
   ["--interface-panel-selected-surface", "--accent-light"],
   ["--interface-panel-box-shadow", "--shadow"],

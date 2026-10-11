@@ -5,15 +5,185 @@ import { hana } from "./sdk.js";
 const $ = (id) => document.getElementById(id);
 
 // ── 主题跟随 ──────────────────────────────────────────────────────────────
-function syncTheme() {
-  let snap = null;
-  try { snap = hana.theme?.getSnapshot?.() || null; } catch { snap = null; }
-  const label = String(snap?.theme || "");
-  let dark = snap?.appearance === "dark" || /dark|midnight|contrast|深|夜/i.test(label);
-  if (!snap?.appearance && (!label || label === "inherit")) {
-    dark = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+// 2026-10-11 修复：面板主题不跟随（整块白底）。
+// 症结：`hana.theme.getSnapshot()` 的值来自宿主注入的 URL 参数，只在宿主推 THEME_CHANGED 时
+// 更新；宿主刚更新过卡片/面板系统后本页确实可能拿不到快照（值空）→ 旧逻辑直接落到
+// `prefers-color-scheme`，系统浅色就把面板判成浅色 → 白底。
+// 改为三级判定（可靠性从高到低）：
+//   ① 快照明确给出 appearance / 主题名 → 按原有正则判（保留，不删）；
+//   ② 快照不可用 → 直接看色值：拉宿主主题 CSS 取 `--bg`，luma > 0.5 判浅色
+//      （抄 workspace.js 的 parseThemeCssVars / cssColorToRgb / themeIsLightByColor。
+//       为什么加色值兜底：明暗的权威来源是主题**实际色值**，主题名正则和系统偏好都不可靠——
+//       正则覆盖不了全部主题名，系统偏好又与宿主主题无关）；
+//   ③ 色值也拿不到 → 才回落 prefers-color-scheme。
+// syncTheme() 幂等、可重复调用（宿主推 / 订阅回调 / 低频轮询都会调）：色值解析结果按 URL 缓存，
+// 签名不变不重复拉取、不重复写 DOM。
+const PANEL_THEME_POLL_MS = 4000;                          // 低频轮询：订阅失效时的最后保险
+const PANEL_THEME_CSS_FALLBACK = "/api/apps/theme.css";    // 不带 theme 参数 → 服务端默认主题
+
+let panelThemeVars = null;        // 已解析的宿主主题变量表（含 --bg）
+let panelThemeVarsUrl = null;     // 上面这份变量表对应的 CSS URL
+let panelThemeVarsFailed = new Set(); // 取不到 --bg 的 CSS URL（不再反复重试）
+let panelThemeInflight = null;    // 正在拉的 CSS URL（同一 URL 不并发重复拉）
+let lastThemeDecision = null;     // 上一次判定 { dark, tier }：仅变化时打日志
+
+function safeThemeSnapshot() {
+  try { return hana.theme?.getSnapshot?.() || null; } catch { return null; }
+}
+
+function systemPrefersDark() {
+  return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+}
+
+// 主题 CSS 候选地址（按可靠性排序）：快照 → 页面 URL 参数 → 端点默认主题
+function themeCssUrlCandidates() {
+  const out = [];
+  const snap = safeThemeSnapshot();
+  if (snap && typeof snap.cssUrl === "string" && snap.cssUrl) out.push(snap.cssUrl);
+  let params = null;
+  try { params = new URLSearchParams(window.location.search); } catch { params = null; }
+  if (params) {
+    const fromParam = params.get("hana-css");
+    if (fromParam) out.push(fromParam);
+    const themeId = params.get("hana-theme");
+    if (themeId) out.push(`${PANEL_THEME_CSS_FALLBACK}?theme=${encodeURIComponent(themeId)}`);
   }
-  document.body.classList.toggle("t-dark", dark);
+  out.push(PANEL_THEME_CSS_FALLBACK);
+  return out.filter((u, i) => u && out.indexOf(u) === i);
+}
+
+// ── 色值工具（与 workspace.js 同一套口径）───────────────────────────────
+function parseThemeCssVars(cssText) {
+  const vars = {};
+  const re = /(--[a-zA-Z0-9_-]+)\s*:\s*([^;}]+)[;}]/g;
+  let m;
+  while ((m = re.exec(cssText))) {
+    const name = m[1];
+    const value = m[2].trim();
+    if (!value || value.startsWith("url(")) continue; // 跳过背景图等非色值
+    vars[name] = value;
+  }
+  return vars;
+}
+
+function cssColorToRgb(value) {
+  if (typeof value !== "string") return null;
+  const v = value.trim();
+  let m = /^#([0-9a-f]{6})$/i.exec(v);
+  if (m) {
+    const n = parseInt(m[1], 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  m = /^#([0-9a-f]{3})$/i.exec(v);
+  if (m) return [0, 1, 2].map((i) => parseInt(m[1][i] + m[1][i], 16));
+  m = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i.exec(v);
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+  return null;
+}
+
+// --bg 实际亮度：luma > 0.5 即浅色；取不到色值返回 null（交给下一级/下一候选）
+function themeIsLightByBg(vars) {
+  if (!vars) return null;
+  const bg = vars["--bg"] || vars["--bg-card"] || vars["--sidebar-bg"];
+  const rgb = cssColorToRgb(bg || "");
+  if (!rgb) return null;
+  const luma = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+  return luma > 0.5;
+}
+
+// 一级判定：快照明确给了 appearance / 主题名才给结果，否则 null（交给二级）
+function tier1Decision() {
+  const snap = safeThemeSnapshot();
+  const label = String(snap?.theme || "");
+  const ap = snap && snap.appearance;
+  if (ap === "dark") return { dark: true, detail: "appearance=dark" };
+  if (ap === "light") return { dark: false, detail: "appearance=light" };
+  if (label && label !== "inherit" && label !== "auto") {
+    // 保留原有正则：命中暗色关键词判暗；拿到具体主题名但未命中则判亮
+    return { dark: /dark|midnight|contrast|深|夜/i.test(label), detail: `theme=${label}` };
+  }
+  return null;
+}
+
+function applyThemeDecision(dark, tier, detail) {
+  // 幂等：结果与当前 class 一致就不碰 DOM（宿主推、订阅回调、轮询都会调到）
+  const roots = [document.documentElement, document.body];
+  if (document.body.classList.contains("t-dark") !== dark) {
+    for (const el of roots) if (el) el.classList.toggle("t-dark", dark);
+  }
+  // 同步根元素 color-scheme（panel.html 里 :root.t-dark 用它换 iframe 画布底色）：
+  // 白底块的直接来源就是根元素 color-scheme 与主题不合拍，body.t-dark 管不到它。
+  const want = dark ? "dark" : "light";
+  try {
+    if (document.documentElement && document.documentElement.style.colorScheme !== want) {
+      document.documentElement.style.colorScheme = want;
+    }
+  } catch { /* 忽略 */ }
+  // 有宿主 --bg 色值时，直接把面板底涂成宿主底色（一个直接治「白底」的强兜底；无值时保持透明）
+  try {
+    const bg = panelThemeVars && (panelThemeVars["--bg"] || panelThemeVars["--bg-card"]);
+    const cur = document.documentElement.style.background;
+    if (bg && cur !== bg) document.documentElement.style.background = bg;
+  } catch { /* 忽略 */ }
+  if (!lastThemeDecision || lastThemeDecision.dark !== dark || lastThemeDecision.tier !== tier) {
+    try { console.debug(`[comfyui-hana] 面板主题判定：dark=${dark} ← 第 ${tier} 级（${detail}）`); } catch { /* 忽略 */ }
+  }
+  lastThemeDecision = { dark, tier, detail };
+  // 自查用：面板页 console 里 `__comfyPanelTheme` 看判定依据/结果，`__comfyPanelThemeRefresh()` 手动重判
+  try {
+    window.__comfyPanelTheme = { dark, tier, detail, at: new Date().toISOString(), cssUrl: panelThemeVarsUrl, snapshot: safeThemeSnapshot() };
+  } catch { /* 忽略 */ }
+}
+
+// 二级所需的色值：拉宿主主题 CSS 并缓存；同一 URL 不并发重复拉，成功后重跑一次判定（命中缓存）
+function ensureThemeVars(force) {
+  const candidates = themeCssUrlCandidates();
+  const target = candidates.find((u) => !panelThemeVarsFailed.has(u)) || candidates[0] || null;
+  if (!target) return;
+  if (!force && panelThemeVars && panelThemeVarsUrl === target) return;                 // 已缓存
+  if (panelThemeInflight) return;                                                       // 已有一单在飞
+  panelThemeInflight = target;
+  fetch(target, { credentials: "same-origin", cache: "no-store" })
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error("theme css HTTP " + r.status))))
+    .then((text) => {
+      const vars = parseThemeCssVars(text);
+      if (themeIsLightByBg(vars) === null) throw new Error("theme css 无可用色值");
+      panelThemeVars = vars;
+      panelThemeVarsUrl = target;
+      panelThemeVarsFailed.delete(target);
+      syncTheme(); // 色值就绪 → 重判（此时命中缓存，不再发起请求）
+    })
+    .catch((e) => {
+      panelThemeVarsFailed.add(target);
+      if (panelThemeVarsUrl === target) panelThemeVarsUrl = null;
+      try { console.warn("[comfyui-hana] 面板主题色值兜底失败：", (e && e.message) || e); } catch { /* 忽略 */ }
+    })
+    .finally(() => { if (panelThemeInflight === target) panelThemeInflight = null; });
+}
+
+function syncTheme(opts) {
+  const force = !!(opts && opts.force);
+
+  // ① 快照明确 → 直接用（判定不依赖 CSS）
+  const t1 = tier1Decision();
+  if (t1) {
+    applyThemeDecision(t1.dark, 1, t1.detail);
+    void ensureThemeVars(false); // 后台补一次主题 CSS（每主题一次、缓存）→ 拿到 --bg 好上底色
+    return;
+  }
+
+  // ② 色值（缓存命中即同步判定；未就绪先按三级给初值，拉取成功后自动重判）
+  const best = themeCssUrlCandidates()[0] || null;
+  const vars = (panelThemeVars && (!best || panelThemeVarsUrl === best)) ? panelThemeVars : null;
+  const light = themeIsLightByBg(vars);
+  if (light !== null) {
+    applyThemeDecision(!light, 2, `${best || "cached"} --bg=${vars["--bg"] || vars["--bg-card"] || vars["--sidebar-bg"]}`);
+    if (!force) return;
+  } else {
+    // ③ 色值拿不到 → 回落系统偏好
+    applyThemeDecision(systemPrefersDark(), 3, "prefers-color-scheme");
+  }
+  void ensureThemeVars(force);
 }
 
 // ── 连接状态 ──────────────────────────────────────────────────────────────
@@ -635,6 +805,18 @@ window.addEventListener("resize", () => { redrawAll(); });
 async function main() {
   syncTheme();
   try { hana.theme?.subscribe?.(() => { syncTheme(); redrawAll(); }); } catch { /* 忽略 */ }
+  // 订阅兜底（2026-10-11）：宿主快照恒空时 subscribe 回调也可能不来，低频重跑判定（含重新拉主题 CSS）。
+  // 频率 4s；退出条件：页面卸载（interval 随文档销毁）。只有非一级判定（快照不可用）才轮询，
+  // 即一级已经给了结果就不再定期拉 CSS；判定结果不变时不写 DOM、不打日志。
+  setInterval(() => {
+    if (!lastThemeDecision || lastThemeDecision.tier !== 1) syncTheme({ force: true });
+  }, PANEL_THEME_POLL_MS);
+  // 三级（系统偏好）状态下，系统明暗切换也要重判
+  try {
+    window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener?.("change", () => syncTheme());
+  } catch { /* 忽略 */ }
+  // 自查入口：console 里手动重判并打印依据
+  try { window.__comfyPanelThemeRefresh = () => { syncTheme({ force: true }); return window.__comfyPanelTheme; }; } catch { /* 忽略 */ }
   try { await hana.ready(); } catch { /* 忽略 */ }
   void poll();
   setInterval(() => { void poll(); }, 2000);
@@ -643,8 +825,8 @@ async function main() {
   void updStatusTick(); // 初始显示当前版本 / 上次更新结果
   void silentUpdateCheck(); // 信号灯：启动静默查一次更新（失败不打扰）
   setInterval(() => { void silentUpdateCheck(); }, 10 * 60_000); // …此后每 10 分钟一次
-  document.addEventListener("visibilitychange", () => { // 页面由不可见转可见（回到工作区）：静默再查一次
-    if (document.visibilityState === "visible") void silentUpdateCheck();
+  document.addEventListener("visibilitychange", () => { // 页面由不可见转可见（回到工作区）：静默再查更新 + 重判主题
+    if (document.visibilityState === "visible") { void silentUpdateCheck(); syncTheme({ force: true }); }
   });
 }
 void main();

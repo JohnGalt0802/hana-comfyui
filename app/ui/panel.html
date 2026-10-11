@@ -6,10 +6,15 @@
 <title>ComfyUI 状态</title>
 <style>
 :root {
+  color-scheme: light; /* iframe 画布底色由根元素 color-scheme 决定：不明写就恒为白 */
   --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
   --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
   --ok: #2e7d32; --bad: #c62828; --gold: #b8860b;
 }
+/* 2026-10-11 修复：面板主题不跟随（整块白底）。
+   body 是透明底，白块来自 iframe 自身画布（UA 默认底色）——它只看**根元素** color-scheme，
+   body 上的 class 管不到；这里把 t-dark 同时挂到 :root（JS 同步切换 html 与 body）。 */
+:root.t-dark { color-scheme: dark; }
 body.t-dark {
   --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
   --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
