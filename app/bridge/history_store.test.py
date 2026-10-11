@@ -131,15 +131,14 @@ class TestBuildSnapshot(TempRootTestCase):
         self.assertEqual(hs.build_snapshot(None)["graph"], None or hs.build_snapshot(None)["graph"])
         self.assertEqual(hs.build_snapshot(None)["nodeCount"], 0)
 
-    def test_blocks_passthrough_and_omitted(self):
-        # P2-F2：带 blocks → 原样透传（同一对象引用，不拷贝不改写）；None → 不写该字段
+    def test_blocks_never_in_snapshot(self):
+        # N3：快照不再重复存 blocks（块归属只由索引行存）；入参 blocks 被忽略，恒不写该字段
         blocks = [{"name": "加载", "source": "group", "nodeIds": [3, 1, 2]}]
         snap = hs.build_snapshot({"nodes": [], "links": []}, blocks=blocks)
-        self.assertIs(snap["blocks"], blocks)
-        self.assertEqual(snap["blocks"][0]["nodeIds"], [3, 1, 2])
+        self.assertNotIn("blocks", snap)
         self.assertNotIn("blocks", hs.build_snapshot({}))
         self.assertNotIn("blocks", hs.build_snapshot({}, blocks=None))
-        # 非列表（畸形态，防御性）→ 不写该字段
+        # 非列表（畸形态，防御性）→ 同样不写该字段
         self.assertNotIn("blocks", hs.build_snapshot({}, blocks="bad"))
         self.assertNotIn("blocks", hs.build_snapshot({}, blocks={}))
 
@@ -295,7 +294,7 @@ class TestCommit(TempRootTestCase):
         self.assertEqual(snap["graph"]["nodes"][0]["id"], 1)
 
     def test_commit_with_blocks_index_full(self):
-        # P5：索引行存**完整版** blocks（含 source / nodeIds），不再写摘要
+        # N3：索引行仍存**完整版** blocks（含 source / nodeIds），但快照**不再重复存**
         blocks = [
             {"name": "组1", "source": "group", "nodeIds": [1, 2]},
             {"name": "采样", "source": "role", "nodeIds": [7]},
@@ -311,7 +310,7 @@ class TestCommit(TempRootTestCase):
         self.assertTrue(out["ok"])
         with open(os.path.join(out["dir"], out["file"]), encoding="utf-8") as fh:
             snap = json.loads(fh.read())
-        self.assertEqual(snap["blocks"], blocks)  # 原样落盘
+        self.assertNotIn("blocks", snap)  # N3：快照不再写 blocks（去重）
         self.assertEqual(snap["schemaVersion"], 2)
         with open(os.path.join(out["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
             entry = json.loads(fh.readline())
@@ -319,6 +318,23 @@ class TestCommit(TempRootTestCase):
         # list_commits 读回一致
         listed = hs.list_commits("wf", self.root)
         self.assertEqual(listed["entries"][0]["blocks"], blocks)
+
+    def test_read_snapshot_legacy_with_blocks_ok(self):
+        # N3 兼容口径：旧快照（尚带 blocks 字段）读取正常，不报错、字段原样读回
+        out = self.commit({"workflow": "wf", "promptId": "cccccccc-3", "graph": {"nodes": [{"id": 1}], "links": []}})
+        self.assertTrue(out["ok"])
+        abs_file = os.path.join(out["dir"], out["file"])
+        # 手工改写为「旧形态」（含 blocks），再读回
+        with open(abs_file, encoding="utf-8") as fh:
+            snap = json.loads(fh.read())
+        legacy_blocks = [{"name": "组1", "source": "group", "nodeIds": [1]}]
+        snap["blocks"] = legacy_blocks
+        with open(abs_file, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(snap, ensure_ascii=False))
+        got = hs.read_snapshot("wf", self.root, seq=1)
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["status"], 200)
+        self.assertEqual(got["snapshot"]["blocks"], legacy_blocks)
 
     def test_commit_without_blocks_reads_back_empty(self):
         # P5：不带 blocks 的提交 → 快照无该字段；索引行 blocks 缺省为 []（新形态总写该字段）

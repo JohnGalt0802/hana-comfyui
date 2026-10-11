@@ -1,3 +1,9 @@
+// ⚠️ 已弃用（2026-10-12）——此中继落盘通道（POST /_relay/history/commit）无任何调用方，勿使用。
+//   原因：桥页面直连 8188（跨源）够不到中继该路由（见 app/bridge/__init__.py:578），P1 最终改道
+//   桥 Python 端点 /hana_bridge/history-commit（history_store.py）。本模块停留在 P1 旧结构——
+//   无 parent/kind/sig/runs/delta/mergeInto/sidecar，若将来恢复中继通道需先补齐这些字段，
+//   并与 history_store.py 对齐。保留仅为档案参考。
+//
 // app/runtime/history-commit.mjs — 画布提交历史 P1-B1：提交快照落盘（纯逻辑模块 · 单文件）
 // ─────────────────────────────────────────────────────────────────────────────
 // 干什么：接收一次「提交上报」→ 把画布快照写成一个文件 + 追加一行 JSONL 索引。

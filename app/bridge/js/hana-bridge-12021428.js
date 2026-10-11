@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-11 hana-bridge-12010616";
+const BUILD_TAG = "2026-10-11 hana-bridge-12021428";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -107,6 +107,8 @@ const CHANGE_POLL_MS = 1500;
 const CHANGE_KEEP = 50;
 let graphRevision = 0;
 let lastSignature = null;
+// N1修（2026-10-12）：工作流名基线，事件路径与轮询兜底**共用同一判据**（谁先到谁更新，另一方不再重复动作）。
+// 只在 historyOnWorkflowSwitch() 内读写（setup 里先建一次基线），别处不再各记一份。
 let lastWorkflowName = null;
 let changes = [];
 
@@ -655,9 +657,16 @@ function graphSignature() {
 
 function pollGraph() {
   const sig = graphSignature();
+  // N1修（2026-10-12）：换工作流的判据统一到 historyOnWorkflowSwitch（与事件路径同一入口、同一基线）。
+  // 该入口内部比对 lastWorkflowName 并负责更新 → 这里不再自己算 wfChanged，避免两套逻辑。
+  // 返回 true = 确换了工作流（名字变了）；false = 同名（进子图 / 回跳装载）/ 基线未建立。
+  let wfChanged = false;
+  try {
+    wfChanged = historyOnWorkflowSwitch();
+  } catch (err) {
+    console.warn(LOG_TAG, "N1 换工作流处理失败（不影响画布）", err);
+  }
   // 工作流身份也算一种变化：切了/重命名了工作流，页面就该重报一次
-  const wfName = currentWorkflowInfo().name;
-  const wfChanged = lastWorkflowName !== null && wfName !== lastWorkflowName;
   if ((lastSignature && sig.hash !== lastSignature.hash) || wfChanged) {
     graphRevision += 1;
     // 按节点算差异：agent 不只该知道“变了”，还该知道“哪个节点变了”
@@ -692,7 +701,10 @@ function pollGraph() {
   } else if (!copilotEl || !copilotEl.isConnected) {
     copilotUiEnsure();
   }
-  lastWorkflowName = wfName;
+  // N1 兜底（2026-10-12）：工作流切换 —— 用**本已有**的轮询做名字比对，不新开定时器。
+  // 主路径见 installHistoryGraphSwitchListener（canvas 元素上的 litegraph:set-graph 监听）；
+  // 该监听会随 canvas 元素重建而丢失（延迟重试只覆盖启动后 6s）→ 这里用轮询名比对兜底。
+  // N1修：判据与动作已上移到函数头部的 historyOnWorkflowSwitch()（统一入口），此处不再重复。
   lastSignature = sig;
   return sig;
 }
@@ -2526,6 +2538,9 @@ const HISTORY_BAR_STYLE_ID = "hana-history-bar-style";
 const HISTORY_LIGHTBOX_ID = "hana-history-lightbox"; // P4：点缩略图看原图的全屏浮层
 const HISTORY_CONFIRM_ID = "hana-history-bar-confirm"; // P6-1：双击刻度的回跳确认框
 const HISTORY_TICK_DBL_MS = 240; // P6-1：单击/双击消歧窗口（240ms 内二次点击算双击）
+// P6-2（2026-10-12）：弹层跟随画布 —— 缩放钳制区间（zoom out 到很小也不缩没，保证可读）
+const HISTORY_BAR_MIN_SCALE = 0.55;
+const HISTORY_BAR_MAX_SCALE = 1.6;
 
 let historyBarEl = null; // 弹层单例：null=收起
 let historyBarRequestId = 0; // 竞态哨兵：切换/收起后递增，在途旧响应作废
@@ -2545,6 +2560,9 @@ let historyBarGroup = null;
 // P6-1：横轴三态交互状态（单击/双击消歧、缩略图浮层延迟关）
 let historyTickClickTimer = null; // 非空 = 已收到第一次单击，正在等消歧窗口结束
 let historyShotsCloseTimer = null; // 缩略图浮层「移开延迟关」定时器
+// P6-2：弹层跟随画布的 rAF 循环句柄 + 上一帧视图态（scale/offset）——变了才写 style
+let historyBarRafId = null;
+let historyBarFollowPrev = null;
 
 function historyBarStyleEnsure() {
   if (document.getElementById(HISTORY_BAR_STYLE_ID)) return;
@@ -2656,10 +2674,12 @@ function historyBarStyleEnsure() {
 // 收起弹层（幂等）：递增竞态哨兵作废在途 fetch 响应
 function historyBarClose() {
   historyBarRequestId++;
+  historyBarFollowStop(); // P6-2：收起 → 停 rAF 循环（防泄漏），清上一帧视图态
   historyTickStateClear(); // P6-1：收起 → 三态残留（消歧定时器 / 浮层 / 确认框）一并清掉
   historyRollbackStateReset(); // P3-G1：收起 → 二次确认状态复位（规格 4）
   historyBarSelection = null;
   historyBarLatestEntry = null;
+  if (historyBarEl) historyBarEl.style.transform = ""; // P6-2：复位跟随 transform（可选，避免残留）
   if (historyBarEl && historyBarEl.parentElement) {
     historyBarEl.parentElement.removeChild(historyBarEl);
   }
@@ -2790,6 +2810,79 @@ function historyBarClampLeft(left, bw) {
   }
   if (hi < lo) return Math.max(4, lo);
   return Math.max(lo, Math.min(left, hi));
+}
+
+// ── P6-2（2026-10-12）：弹层跟随画布 ──────────────────────────────────────
+// 弹层仍挂 body + position:fixed，但不再「打开时算一次位置」：改用 rAF 循环读画布视图态
+// （app.canvas.ds.scale / ds.offset），与上一帧比对，**变了才重算锚点与 transform**（避免无谓重排），
+// 没变只续帧。效果＝弹层像画布里的模块：zoom in 变大、zoom out 变小、拖画布跟着走。
+// 只在弹层打开时跑；关闭 / 元素被移除即停（不留悬挂 rAF）。
+function historyBarFollowStop() {
+  if (historyBarRafId !== null) {
+    cancelAnimationFrame(historyBarRafId);
+    historyBarRafId = null;
+  }
+  historyBarFollowPrev = null;
+}
+
+// 当前跟随缩放系数（与 historyBarFollowApply 同源）：无画布/异常 → 1。
+// 给「弹层内部按屏幕坐标定位的元素」用（弹层自身带 scale，内部偏移须除以 k 才不被二次缩放）。
+function historyBarFollowK() {
+  const canvas = app && app.canvas;
+  const ds = canvas && canvas.ds;
+  const scale = ds && typeof ds.scale === "number" && ds.scale > 0 ? ds.scale : 1;
+  return Math.max(HISTORY_BAR_MIN_SCALE, Math.min(HISTORY_BAR_MAX_SCALE, scale));
+}
+
+// 单帧应用：锚点（框顶中心屏幕坐标）+ 缩放（clamp(ds.scale, MIN, MAX)）。
+// 视图态未变 → 直接返回（不写 style，不触发重排/重绘）。
+function historyBarFollowApply() {
+  const bar = historyBarEl;
+  if (!bar) return false;
+  const canvas = app && app.canvas;
+  const ds = canvas && canvas.ds;
+  if (!ds) return false;
+  const scale = typeof ds.scale === "number" && ds.scale > 0 ? ds.scale : 1;
+  const off = ds.offset || [];
+  const ox = typeof off[0] === "number" ? off[0] : 0;
+  const oy = typeof off[1] === "number" ? off[1] : 0;
+  const prev = historyBarFollowPrev;
+  if (prev && prev.scale === scale && prev.ox === ox && prev.oy === oy) return true; // 视图态未变：跳过写入
+  historyBarFollowPrev = { scale, ox, oy };
+
+  // 缩放：clamp 到 [MIN, MAX]（下限保证 zoom out 到很小也不缩没）
+  const k = Math.max(HISTORY_BAR_MIN_SCALE, Math.min(HISTORY_BAR_MAX_SCALE, scale));
+  // 锚点：框顶中心（屏幕 CSS px，复用 historyGroupTopScreen）；取不到框 → 回退视口中心
+  const anchor = historyGroupTopScreen(historyBarGroup);
+  const ax = anchor ? anchor.x : window.innerWidth / 2;
+  const ay = anchor ? anchor.y : window.innerHeight / 2;
+  // 水平钳制：跟随模式按「缩放后的可视宽度」算（transform 不改布局宽度，故取 offsetWidth * k）
+  const bw = bar.offsetWidth || 0;
+  const visW = bw * k;
+  const left = visW > 0 ? historyBarClampLeft(ax - visW / 2, visW) + visW / 2 : ax;
+
+  bar.style.transformOrigin = "50% 100%"; // 底边中心对准框顶
+  bar.style.transform = "translate(-50%, -100%) scale(" + k + ")"; // translate 已含对齐 → left/top 直接给锚点
+  bar.style.left = Math.round(left) + "px";
+  bar.style.top = Math.round(ay) + "px";
+  return true;
+}
+
+function historyBarFollowTick() {
+  const bar = historyBarEl;
+  if (!bar || !bar.isConnected) {
+    historyBarFollowStop(); // 弹层已被移除 → 不留悬挂 rAF
+    return;
+  }
+  historyBarFollowApply();
+  historyBarRafId = requestAnimationFrame(historyBarFollowTick);
+}
+
+// 启动跟随：先停旧循环（切换框时防叠加）→ 立即应用一帧（避免首帧错位）→ 续帧。
+function historyBarFollowStart() {
+  historyBarFollowStop();
+  historyBarFollowApply();
+  historyBarRafId = requestAnimationFrame(historyBarFollowTick);
 }
 
 // 头部第一段取「分组框名」（P6-1：头文案由工作流名改为框名）。
@@ -3142,12 +3235,16 @@ function historyBarBubbleShow(tick, ent) {
     const br = historyBarEl.getBoundingClientRect();
     const bw = b.offsetWidth;
     const bh = b.offsetHeight;
-    let left = tr.left + tr.width / 2 - br.left - bw / 2;
-    const maxL = Math.max(0, br.width - bw); // 最右：气泡右边贴弹层右边
+    // P6-2：弹层带 scale(k) —— 气泡是本层内绝对定位，getBoundingClientRect 的差值已含 k，
+    // 写回本地坐标前需除以 k，否则气泡会被二次缩放而错位。
+    const k = historyBarFollowK();
+    const barW = historyBarEl.offsetWidth || br.width;
+    let left = (tr.left + tr.width / 2 - br.left) / k - bw / 2;
+    const maxL = Math.max(0, barW - bw); // 最右：气泡右边贴弹层右边
     left = Math.max(0, Math.min(left, maxL));
     // 默认在刻度上方；弹层顶放不下 → 落到刻度下方
-    let top = tr.top - br.top - bh - 6;
-    if (tr.top - bh - 6 < 4 && tr.bottom + 6 + bh < window.innerHeight - 4) top = tr.bottom - br.top + 6;
+    let top = (tr.top - br.top) / k - bh - 6;
+    if (tr.top - bh * k - 6 < 4 && tr.bottom + 6 + bh * k < window.innerHeight - 4) top = (tr.bottom - br.top) / k + 6;
     b.style.left = left.toFixed(1) + "px";
     b.style.top = top.toFixed(1) + "px";
   } catch {
@@ -3446,19 +3543,9 @@ function historyBarOpen(group) {
     }
   });
   bar.addEventListener("mouseleave", () => historyBarShotsHideSoon());
-  // 锚定：group 框矩形顶部上方（弹层底边贴近框顶 6px）；水平钳制在画布左右边界内
-  const anchor = historyGroupTopScreen(group);
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  const bw = bar.offsetWidth;
-  const bh = bar.offsetHeight;
-  const ax = anchor ? anchor.x : vw / 2;
-  const ay = anchor ? anchor.y : vh / 2;
-  const left = historyBarClampLeft(ax - bw / 2, bw);
-  let top = ay - bh - 6; // 底边贴近框顶
-  if (top < 8) top = Math.max(8, ay + 6); // 上方放不下 → 落到框顶下方
-  bar.style.left = Math.round(left) + "px";
-  bar.style.top = Math.round(top) + "px";
+  // P6-2：定位改为「跟随画布」——底边中心对准框顶，随 ds.scale 缩放（clamp 到 [MIN, MAX]）。
+  // 起 rAF 循环：打开期间每帧比对视图态，变了才重算锚点/transform；locate 由 historyBarFollowApply 落到 style。
+  historyBarFollowStart();
   // 打开时才 fetch；竞态哨兵在途响应作废
   const ctx = { axis, times, shots, shotsBody };
   const reqId = ++historyBarRequestId;
@@ -3682,8 +3769,85 @@ function scheduleHistoryGroupInstallRetries() {
       } catch (err) {
         console.warn(LOG_TAG, "P2-F1 延迟安装失败（不影响画布）", err);
       }
+      // N1（2026-10-12）：复用同一批延迟时机补装「换图」监听（app.canvas 可能晚到；已绑则内部跳过）
+      try {
+        installHistoryGraphSwitchListener();
+      } catch (err) {
+        console.warn(LOG_TAG, "N1 延迟安装失败（不影响画布）", err);
+      }
     }, ms);
   }
+}
+
+// ── N1（2026-10-12）：工作流切换感知（画布换图 → 刷新提交树 + 收起弹层）──────────────
+// 背景：setup() 只装了 queuePrompt 捕获 / 出图捕获 / 树容器 / 点击命中 / pollGraph，没监听
+//   「换图」→ 切工作流后底部提交树仍显示上一个工作流的计数（新工作流显示「0 节点」），
+//   弹层比对基线（historyBarLatestEntry）也过期。
+// 事件依据（前端包 comfyui_frontend_package 1.55.14 实证，static/assets/settingStore-X9ZV_dAu.js）：
+//   LGraphCanvas.setGraph(e)：`e!==t&&( … this.dispatch(`litegraph:set-graph`,{newGraph:e,oldGraph:t}) … )`
+//   LGraphCanvas.dispatch(e,t)：`let n=new CustomEvent(e,{detail:t,bubbles:!0});return this.canvas.dispatchEvent(n)`
+//   → 事件派发在 **canvas 画布元素**（this.canvas = setCanvas 传入的 HTMLCanvasElement）上，bubbles=true。
+//   故挂点与点击命中同源：`app.canvas.canvas`（或 canvasEl）。
+// 幂等：WeakSet 按元素区分（元素重建 → 视为新元素，重入自愈）；多次装不重复。
+// 异常：一律 try/catch 吞 + warn，绝不影响画布；只加「触发刷新」入口，不改树/弹层既有逻辑。
+const historyGraphSwitchBoundElements = new WeakSet(); // 已挂 litegraph:set-graph 监听的 canvas 元素（幂等）
+
+// 换工作流后的**统一判据 + 动作**（主路径事件回调 与 兜底轮询共用同一入口）。
+// N1修（2026-10-12）：litegraph:set-graph 在**任意 setGraph** 时都触发（进/出子图 openSubgraph、
+//   回跳装载 loadGraphData 也走 setGraph）→ 事件本身不代表「换了工作流」，必须先比对工作流名。
+// 判据（与轮询兜底同源，统一到这里，不再两套）：
+//   取当前工作流名 currentWorkflowInfo().name（try/catch，取不到则保守不动）；
+//   与基线 lastWorkflowName 比 —— 名字**变了**才是真换工作流；
+//   名字**没变**（进子图 / 回跳装载：页身份不变）→ 直接返回，不误关用户正开着的弹层。
+// 动作（仅真换工作流时执行）：
+//   ① 刷新底部提交树（新工作流 → 重新取数，计数/渲染跟着走）；
+//   ② 弹层若开着 → 收起（弹层锚定的框属于旧图，关掉最稳，符合「点空白收起」语义）。
+// 幂等：同名重复调用直接返回 false；基线未建立时只记录、不执行（避免首次误判）。
+// 返回：true = 真换了工作流（已执行动作）；false = 未换 / 取不到 / 基线未建立。
+function historyOnWorkflowSwitch() {
+  let name = null;
+  try {
+    name = currentWorkflowInfo().name || null;
+  } catch {
+    name = null;
+  }
+  if (name === null) return false; // 取不到工作流名 → 保守不动
+  if (lastWorkflowName === null) {
+    // 基线未建立（首次）→ 只记录，不执行（避免首轮就误判成「换工作流」把弹层关掉）
+    lastWorkflowName = name;
+    return false;
+  }
+  if (name === lastWorkflowName) return false; // 同名 → 进子图 / 回跳装载，不误关弹层
+  lastWorkflowName = name; // 真换了工作流：更新基线，往下执行动作
+  try {
+    void historyTreeRefresh();
+  } catch (err) {
+    console.warn(LOG_TAG, "N1 换图刷新提交树失败（不影响画布）", err);
+  }
+  try {
+    if (historyBarEl) historyBarClose();
+  } catch (err) {
+    console.warn(LOG_TAG, "N1 换图收起弹层失败（不影响画布）", err);
+  }
+  return true;
+}
+
+// 安装「换图」监听（幂等 + 可重入）。setup() 里调用一次；另有延迟重试（见 scheduleHistoryGroupInstallRetries）。
+// 只读：不改 e、不 prevent/stop；异常吞掉只 warn。
+function installHistoryGraphSwitchListener() {
+  const c = app && app.canvas;
+  if (!c) return; // 时序：setup() 时 app.canvas 可能尚不存在 → 由延迟重试补齐（轮询兜底再保一层）
+  const el = c.canvas || c.canvasEl || null;
+  if (!el || typeof el.addEventListener !== "function") return;
+  if (historyGraphSwitchBoundElements.has(el)) return; // 幂等：同一元素只挂一次
+  el.addEventListener("litegraph:set-graph", () => {
+    try {
+      historyOnWorkflowSwitch();
+    } catch (err) {
+      console.warn(LOG_TAG, "N1 换图处理失败（不影响画布）", err);
+    }
+  });
+  historyGraphSwitchBoundElements.add(el);
 }
 
 // ── P3-G1（2026-10-11）：回跳到所选提交（branch 式原地回跳，不造副本）────────────
@@ -4088,34 +4252,41 @@ function historyTreeStyleEnsure() {
 #${HISTORY_TREE_ID} .htr-tree {
   position: relative; height: 100%; display: flex; flex-direction: column; gap: 2px; overflow: auto;
 }
-#${HISTORY_TREE_ID} .htr-row { flex: 1 1 0; min-height: 20px; display: flex; align-items: stretch; }
-/* 行内等分压缩：cell flex:1 min-width 10px —— 节点多时整体缩窄，不横向溢出（同弹层刻度口径） */
+#${HISTORY_TREE_ID} .htr-row { flex: 0 0 auto; min-height: 24px; display: flex; align-items: flex-end; }
+/* 行内等分压缩：cell flex:1 min-width 16px —— 节点多时整体缩窄，不横向溢出 */
 #${HISTORY_TREE_ID} .htr-cell {
-  flex: 1 1 0; min-width: 10px; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 2px;
+  flex: 1 1 0; min-width: 16px; display: flex; flex-direction: column;
+  align-items: center; justify-content: flex-end; gap: 2px;
 }
-/* 柱顶叠色条：宽度 ∝ 该提交触及的框数（blockNames.length，null 旧数据按 1 计） */
-#${HISTORY_TREE_ID} .htr-strip { height: 3px; border-radius: 2px; background: var(--htr-c, #5aa0d8); flex: none; }
-/* 刻度柱：色相分 source（--htr-c）、实心/空心分 kind（save=空心环），同弹层 tick 口径 */
+/* P7-2 节点（改造自旧刻度柱）：整体为可点选/悬停容器，内部 = 竖排色条堆 + stem */
 #${HISTORY_TREE_ID} .htr-tick {
-  flex: none; position: relative; width: 9px; height: 16px; padding: 0; margin: 0;
-  border: 0; border-radius: 4px; cursor: pointer;
-  background: var(--htr-c, #5aa0d8);
-  box-shadow: 0 0 0 1px rgba(0,0,0,.35);
+  flex: none; position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 0; margin: 0; border: 0; background: transparent; cursor: pointer;
 }
-#${HISTORY_TREE_ID} .htr-tick[data-kind="save"] {
-  background: transparent; border: 2px solid var(--htr-c, #5aa0d8); box-shadow: none;
+/* 色条堆：全局框数根小色条（每根 = 一个框）；命中亮（--htr-c 按 source）、未命中灰 */
+#${HISTORY_TREE_ID} .htr-bars { display: flex; flex-direction: column; gap: 1px; }
+#${HISTORY_TREE_ID} .htr-bar {
+  display: block; width: 14px; height: 3px; border-radius: 1.5px;
+  background: var(--htr-c, #5aa0d8); opacity: .9;
+}
+#${HISTORY_TREE_ID} .htr-bar.htr-bar-off { background: rgba(255,255,255,.18); opacity: 1; }
+/* stem：色条堆下方竖线，表 kind（run 实线 / save 虚线）；颜色按 source */
+#${HISTORY_TREE_ID} .htr-stem {
+  width: 2px; height: 10px; border-radius: 1px; background: var(--htr-c, #5aa0d8);
+}
+#${HISTORY_TREE_ID} .htr-stem[data-kind="save"] {
+  background: repeating-linear-gradient(180deg, var(--htr-c, #5aa0d8) 0 2px, transparent 2px 4px);
 }
 #${HISTORY_TREE_ID} .htr-tick:hover { filter: brightness(1.28); }
-#${HISTORY_TREE_ID} .htr-tick-sel { box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
-/* HEAD 高亮：柱下小金点（放柱下方，避开柱顶叠色条） */
+#${HISTORY_TREE_ID} .htr-tick-sel { outline: 2px solid rgba(255,255,255,.9); outline-offset: 2px; border-radius: 4px; }
+/* HEAD 高亮：节点下小金点 */
 #${HISTORY_TREE_ID} .htr-tick-head::after {
-  content: ""; position: absolute; bottom: -5px; left: 50%; transform: translateX(-50%);
+  content: ""; position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%);
   width: 6px; height: 6px; border-radius: 50%; background: #e8c268;
 }
 /* 旧数据（blockNames === null）：淡化（同弹层 [data-legacy] 口径） */
-#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-strip,
-#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-tick { opacity: .55; }
+#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-bars,
+#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-stem { opacity: .55; }
 /* 父子连线层：渲染后按真实位置补画（SVG），只描边不填充 */
 #${HISTORY_TREE_ID} .htr-edges {
   position: absolute; inset: 0; pointer-events: none;
@@ -4184,7 +4355,23 @@ function historyTreeRenderTree(entries) {
     rows.get(d).push(ent);
   }
   const depths = Array.from(rows.keys()).sort((a, b) => a - b);
-  const nodeEls = new Map(); // seq → tick 元素（连线测量用）
+  // P7-2（2026-10-12）全局框列表：扫一遍 entries，取 blocks[].name 的并集（按首次出现序）。
+  // 兼容旧数据（blocks 只有 {name, nodeCount}）→ 同样取 name。列表为空 → 每节点退化为单根色条。
+  const globalBlocks = [];
+  const blockSeen = new Set();
+  for (const ent of entries) {
+    const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
+    for (const b of bl) {
+      if (!b || typeof b !== "object") continue;
+      const nm = b.name == null ? "" : String(b.name);
+      if (!blockSeen.has(nm)) {
+        blockSeen.add(nm);
+        globalBlocks.push(nm);
+      }
+    }
+  }
+  const singleBar = globalBlocks.length === 0; // 无任何框 → 单根色条兜底
+  const nodeEls = new Map(); // seq → 节点元素（连线测量用）
   const head = historyHeadGet();
   for (const d of depths) {
     const row = document.createElement("div");
@@ -4192,39 +4379,51 @@ function historyTreeRenderTree(entries) {
     for (const ent of rows.get(d)) {
       const cell = document.createElement("div");
       cell.className = "htr-cell";
-      // 柱顶叠色条：触及框数（null 旧数据按 1 计 + 打 legacy 标记）
-      const strip = document.createElement("div");
-      strip.className = "htr-strip";
-      strip.style.setProperty("--htr-c", historyTickColor(ent && ent.source));
-      if (Array.isArray(ent.blockNames)) {
-        strip.style.width = Math.min(ent.blockNames.length, 6) * 3 + "px";
-        strip.title = "触及 " + ent.blockNames.length + " 个框";
-      } else {
-        strip.style.width = "3px";
-        strip.title = "历史旧数据（无法细分到框，按 1 计）";
-        cell.dataset.legacy = "1";
+      // 旧数据（blockNames 非数组）：全部色条灰 + data-legacy 淡化标记
+      const legacy = !(ent && Array.isArray(ent.blockNames));
+      if (legacy) cell.dataset.legacy = "1";
+      const srcColor = historyTickColor(ent && ent.source);
+      const hitSet = legacy ? null : new Set(ent.blockNames.map((n) => String(n)));
+      const node = document.createElement("button");
+      node.type = "button";
+      node.className = "htr-tick";
+      node.dataset.src = String((ent && ent.source) || "unknown");
+      node.title = ""; // 自绘气泡，不用原生 tooltip
+      if (head && ent.seq != null && head.seq === ent.seq) node.classList.add("htr-tick-head");
+      // 色条堆：全局框数根（无框 → 单根）；命中亮色（source）、未命中灰
+      const bars = document.createElement("div");
+      bars.className = "htr-bars";
+      const barNames = singleBar ? [null] : globalBlocks;
+      for (const nm of barNames) {
+        const bar = document.createElement("i");
+        bar.className = "htr-bar";
+        bar.style.setProperty("--htr-c", srcColor);
+        let hit;
+        if (legacy) hit = false;
+        else if (singleBar) hit = true;
+        else hit = hitSet.has(nm);
+        if (!hit) bar.classList.add("htr-bar-off");
+        bars.appendChild(bar);
       }
-      const tick = document.createElement("button");
-      tick.type = "button";
-      tick.className = "htr-tick";
-      tick.style.setProperty("--htr-c", historyTickColor(ent && ent.source));
-      tick.dataset.kind = String((ent && ent.kind) || "run");
-      tick.dataset.src = String((ent && ent.source) || "unknown");
-      tick.title = ""; // 自绘气泡，不用原生 tooltip
-      if (head && ent.seq != null && head.seq === ent.seq) tick.classList.add("htr-tick-head");
+      // stem：表 kind（run 实线 / save 虚线），颜色按 source
+      const stem = document.createElement("div");
+      stem.className = "htr-stem";
+      stem.dataset.kind = String((ent && ent.kind) || "run");
+      stem.style.setProperty("--htr-c", srcColor);
       // P7 补完（2026-10-12）：悬停气泡 / 单击点选回跳（回跳链：historyBarSelection → historyRollbackConfirmOpen → historyRollbackExecute）。
-      tick.addEventListener("mouseenter", () => historyTreeBubbleShow(tick, ent));
-      tick.addEventListener("mouseleave", () => historyTreeBubbleHide());
-      tick.addEventListener("click", (ev) => {
+      node.addEventListener("mouseenter", () => historyTreeBubbleShow(node, ent));
+      node.addEventListener("mouseleave", () => historyTreeBubbleHide());
+      node.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        historyTreePick(tick, ent);
+        historyTreePick(node, ent);
       });
-      // 组装并挂行（cell ← strip+tick，row ← cell，tree ← row；seq → tick 供连线测量）。
-      cell.append(strip, tick);
+      // 组装并挂行（cell ← node(bars+stem)，row ← cell，tree ← row；seq → node 供连线测量）。
+      node.append(bars, stem);
+      cell.appendChild(node);
       row.appendChild(cell);
       tree.appendChild(row);   // ⚠️ 曾缺失：行建了却从未挂进 DOM（空面板根因）
-      if (ent.seq != null) nodeEls.set(ent.seq, tick);
+      if (ent.seq != null) nodeEls.set(ent.seq, node);
     }
   }
   return { nodeEls };
@@ -4550,6 +4749,8 @@ app.registerExtension({
     void historyTreeRefresh();
     // P2-F1b：安装画布点击命中 group（包原型 + 重绑实例事件回调 + 元素 capture 监听；与后端无关，先行；幂等）。
     installHistoryGroupClick();
+    // N1（2026-10-12）：安装「换图」监听（litegraph:set-graph；与后端无关，先行；幂等）。
+    installHistoryGraphSwitchListener();
     // 延迟重试：setup() 时 app.canvas / canvas 元素可能尚未就绪（已绑则内部跳过）。
     scheduleHistoryGroupInstallRetries();
     try {
@@ -4558,6 +4759,13 @@ app.registerExtension({
         href: location.href,
         workflow: currentWorkflowInfo(),
       });
+      // N1修（2026-10-12）：建立工作流名基线（统一判据 lastWorkflowName），
+      // 让首轮轮询 / 启动期事件不会把「初始工作流」误判成「换工作流」。
+      try {
+        lastWorkflowName = currentWorkflowInfo().name;
+      } catch {
+        /* 取不到则留 null，由 historyOnWorkflowSwitch() 首轮自记 */
+      }
       // 变更感知轮询（P2）：先建一次基线，之后定期比对签名
       pollGraph();
       setInterval(pollGraph, CHANGE_POLL_MS);

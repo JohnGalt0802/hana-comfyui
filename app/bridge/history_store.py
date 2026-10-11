@@ -432,8 +432,10 @@ def _to_iso(at):
 
 def build_snapshot(graph, prompt_id=None, seq=1, at=None, source="unknown", blocks=None):
     """构造一份快照对象（graph 原样嵌入，不做拷贝）。
-    P2-F2：blocks（块归属，[{name, source, nodeIds:[…]}]，由桥前端计算）原样透传；
-    None / 非列表 → 不写该字段（旧快照兼容：无 blocks 的条目读回 null，schemaVersion 不 bump）。
+    N3（2026-10-12）：快照**不再重复存 blocks**（方案 §2.4：块归属只由索引行存完整版）。
+      · 入参 blocks 保留仅为向后兼容（调用方可不传/传了也被忽略），快照恒不写该字段；
+      · 读侧兼容：旧快照若已带 blocks，read_snapshot 原样读回、不报错；新快照无该字段也正常；
+      · schemaVersion 不 bump（字段缺席向后兼容）。
     """
     g = graph if isinstance(graph, dict) else {}
     nodes = g.get("nodes") if isinstance(g.get("nodes"), list) else []
@@ -448,8 +450,7 @@ def build_snapshot(graph, prompt_id=None, seq=1, at=None, source="unknown", bloc
         "linkCount": len(links),
         "graph": graph,
     }
-    if isinstance(blocks, list):
-        snap["blocks"] = blocks  # 原样透传（不校验/不拷贝，语义归桥前端）
+    # N3：不写 blocks（块归属由 build_index_line 写完整版；入参 blocks 忽略）
     return snap
 
 
@@ -767,7 +768,8 @@ def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, 
     file_name = snapshot_file_name(seq, prompt_id)
     abs_file = os.path.join(dir_path, file_name)
 
-    snapshot = build_snapshot(graph, prompt_id, seq, at, source, blocks)
+    # N3：快照不再写 blocks（build_snapshot 忽略 blocks 入参）
+    snapshot = build_snapshot(graph, prompt_id, seq, at, source)
     try:
         text = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
@@ -800,7 +802,7 @@ def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, 
             "delta": delta,
             "nodeCount": snapshot["nodeCount"],
             "linkCount": snapshot["linkCount"],
-            "blocks": snapshot.get("blocks"),  # P2-F2：块归属 → 索引行写完整版
+            "blocks": blocks,  # N3：索引行仍写完整版 blocks（取自上报入参；与快照无关）
         }
     )
 
