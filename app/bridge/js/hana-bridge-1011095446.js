@@ -2370,7 +2370,12 @@ const HISTORY_BAR_STYLE_ID = "hana-history-bar-style";
 
 let historyBarEl = null; // 弹层单例：null=收起
 let historyBarRequestId = 0; // 竞态哨兵：切换/收起后递增，在途旧响应作废
-let historyGroupClickInstalled = false; // processMouseDown 包裹幂等哨兵
+// P2-F1b-3 安装哨兵（拆分为「原型 / 实例 / 元素 / 事件」四层，各自幂等、可分别重入）
+let historyGroupProtoWrapped = false; // ① 原型包装幂等哨兵（全局只做一次）
+const historyGroupInstanceWrapped = new WeakSet(); // 实例自持 processMouseDown 覆盖时已就地再包（幂等）
+const historyGroupBoundCanvases = new WeakSet(); // ② 已重绑 _mousedown_callback 的 canvas 实例（幂等）
+const historyGroupBoundElements = new WeakSet(); // ③ 已挂 capture 监听的 canvas 元素（幂等）
+const historyGroupHookSeenEvents = new WeakSet(); // 同一事件多入口去重（实例回调 + capture 监听会收到同一 Event）
 // P3-G1：回跳态（卡片点选 / 最近提交基线 / 二次确认状态机）
 let historyBarSelection = null; // 卡片点选的提交 {file, seq}（file 为空时按 seq 定位）
 let historyBarLatestEntry = null; // 最近一次提交条目（未提交比对基线；historyBarLoad 渲染时回填）
@@ -2448,16 +2453,45 @@ function historyFmtTime(at) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// LGraphGroup 的矩形取法（按实际存在的字段取值，不猜）。
+// 依据两层：
+//  [A] 真机运行时实测（2026-10-11，新前端 comfyui_frontend_package 1.55.14 —— 活动实例形态）：
+//      g.bounding    → **undefined**（桥旧代码读的就是它，永远取不到 → 弹层根本不弹的根因）
+//      g._bounding   → ✅ 有值，如 [520,-90,396.9,708]（数组，含 _pos/_size 子对象）
+//      g._pos / g._size → ✅ 有（{0:x,1:y} 形态）
+//      g.getBounding() / g.isPointInside(x,y) → ✅ 方法存在
+//      序列化后（落盘 JSON）字段才叫 bounding: [520,-90,396.9,708]
+//  [B] 源码核对（同包 static/assets/settingStore-X9ZV_dAu.js，offset≈290672 `Xu=class LGraphGroup`）：
+//      类体声明 bounds / _pos / _size / _bounding，get boundingRect()/pos()/size() 存在，
+//      无 `get bounding`；bounding 仅是 configure() 入参、serialize() 输出名。
+// 故读取顺序（按运行时存在性）：boundingRect → _bounding（运行时首选）→ _pos+_size → bounding（旧版/序列化）。
+// 注：运行时实例与序列化对象的字段名互斥 —— 运行时只有 _bounding/_pos/_size，无 bounding；
+// 序列化 JSON 只有 bounding，无 _bounding/_pos/_size。故后两项的先后对实际取值无影响，
+// 此处按命中链优先级（_bounding 先于 bounding）排列。
+function historyGroupRect(group) {
+  if (!group) return null;
+  let b = null;
+  if (group.boundingRect) b = group.boundingRect;
+  else if (group._bounding) b = group._bounding;
+  if (b && b[2] != null && b[3] != null) return [b[0], b[1], b[2], b[3]];
+  const p = group._pos || group.pos;
+  const s = group._size || group.size;
+  if (p && s) return [p[0], p[1], s[0], s[1]];
+  if (group.bounding) {
+    const bb = group.bounding;
+    if (bb[2] != null && bb[3] != null) return [bb[0], bb[1], bb[2], bb[3]];
+  }
+  return null;
+}
+
 // group 几何中心 → 屏幕坐标（CSS px）。graph 坐标 → 画布元素 px 用 convertOffsetToCanvas
 // （convertEventToCanvasOffset 的逆变换，同单位不乘 DPR）；缺失时手写同式逆变换兜底。
 function historyGroupCenterScreen(group) {
   const canvas = app && app.canvas;
   const el = canvas && (canvas.canvas || canvas.canvasEl || null);
   if (!canvas || !el || !group) return null;
-  const b =
-    group.bounding ||
-    (group.pos && group.size ? [group.pos[0], group.pos[1], group.size[0], group.size[1]] : null);
-  if (!b || b[2] == null || b[3] == null) return null;
+  const b = historyGroupRect(group); // 字段依据见 historyGroupRect 注释
+  if (!b) return null;
   let p = null;
   try {
     p = canvas.convertOffsetToCanvas([b[0] + b[2] / 2, b[1] + b[3] / 2]);
@@ -2633,7 +2667,11 @@ function historyBarOpen(anchor) {
 
 // 点击钩子（只读）：命中 group → 弹出/切换；点空白 → 收起。任何分支不改画布状态。
 function historyOnCanvasMouseDown(e) {
-  if (!e || (e.button !== undefined && e.button !== 0)) return; // 只响应左键；其余不干预
+  if (!e) return;
+  // 同一事件可能经多入口到达（实例重绑回调 / 自挂 capture 监听）→ 只处理一次（防重复弹层/重复 fetch）
+  if (historyGroupHookSeenEvents.has(e)) return;
+  historyGroupHookSeenEvents.add(e);
+  if (e.button !== undefined && e.button !== 0) return; // 只响应左键；其余不干预
   const canvas = app && app.canvas;
   if (!canvas) return;
   let off = null;
@@ -2643,18 +2681,55 @@ function historyOnCanvasMouseDown(e) {
     off = null;
   }
   let group = null;
-  if (off && typeof canvas.getGroupOnPos === "function") {
-    try {
-      group = canvas.getGroupOnPos(off[0], off[1]) || null;
-    } catch {
-      group = null;
+  // 主命中路径修正（P2-F1b）：getGroupOnPos 定义在 graph（LGraph）上，不在 canvas 上。
+  // 真机实测（2026-10-11，新前端 comfyui_frontend_package 1.55.14）：
+  //   · canvas.getGroupOnPos               → ❌ 不存在
+  //   · graph.getGroupOnPos(x, y)          → ✅ 存在（注意是 graph，不是 canvas）
+  // 源码核对（同包 static/assets/settingStore-X9ZV_dAu.js 内 `class LGraph`，方法体 offset≈495576）：
+  //   getGroupOnPos(e,t){for(let n=this._groups.length-1;n>=0;n--){let r=this._groups[n];if(r.isPointInside(e,t))return r}}
+  //   → 「倒序遍历 + isPointInside」：重叠时取最后添加的 group，且尊重 group 的实际形状。
+  //     官方调用点同此口径（同包 getCanvasContextMenuTarget / processMouseDown 均走 e.graph.getGroupOnPos）。
+  // 兼容：未来前端版本可能把它挪回 canvas，故 graph 优先、canvas 次之，取先存在的那个。
+  if (off) {
+    const getOnPos =
+      canvas.graph && typeof canvas.graph.getGroupOnPos === "function"
+        ? canvas.graph.getGroupOnPos.bind(canvas.graph)
+        : typeof canvas.getGroupOnPos === "function"
+          ? canvas.getGroupOnPos.bind(canvas)
+          : null;
+    if (getOnPos) {
+      try {
+        group = getOnPos(off[0], off[1]) || null;
+      } catch {
+        group = null;
+      }
     }
   }
-  // 双保险：getGroupOnPos 不可用时，遍历 graph._groups 的 bounding 判定（口径同 canvas-outline.mjs）
+  // 兜底（主/次路径都不可用或抛错）：倒序遍历 graph._groups —— 与 getGroupOnPos 语义对齐（后添加的框优先）。
+  // 正序会命中最先添加的框，与官方口径相反；重叠时结果会错。
+  // 命中判定按可用性依次尝试：g.isPointInside(x,y)（首选，尊重真实形状）→ historyGroupRect(g)，
+  // 后者内部再依次：boundingRect → _bounding（真机实测有值，如 [520,-90,396.9,708]）→ bounding（旧版/序列化）
+  // → _pos/_size → pos/size。任一命中即停。
   if (!group && off && canvas.graph && Array.isArray(canvas.graph._groups)) {
-    for (const g of canvas.graph._groups) {
-      const b = g && g.bounding;
-      if (b && off[0] >= b[0] && off[0] <= b[0] + b[2] && off[1] >= b[1] && off[1] <= b[1] + b[3]) {
+    const groups = canvas.graph._groups;
+    for (let i = groups.length - 1; i >= 0; i--) {
+      const g = groups[i];
+      if (!g) continue;
+      let hit = false;
+      if (typeof g.isPointInside === "function") {
+        try {
+          hit = !!g.isPointInside(off[0], off[1]);
+        } catch {
+          hit = false;
+        }
+      }
+      if (!hit) {
+        const b = historyGroupRect(g);
+        if (b && off[0] >= b[0] && off[0] <= b[0] + b[2] && off[1] >= b[1] && off[1] <= b[1] + b[3]) {
+          hit = true;
+        }
+      }
+      if (hit) {
         group = g;
         break;
       }
@@ -2667,9 +2742,52 @@ function historyOnCanvasMouseDown(e) {
   historyBarOpen(historyGroupCenterScreen(group)); // anchor 取不到时 historyBarOpen 内回退视口中心
 }
 
-// 安装 processMouseDown 包裹（幂等）。在 setup() 里调用一次。
+// 安装 group 点击命中（幂等 + 可重入）。setup() 里调用；另有延迟重试（见 scheduleHistoryGroupInstallRetries）。
+//
+// P2-F1b-3（2026-10-11）真机根因（桥旧版只包原型、事件到不了）：
+//   litegraph 在「绑事件那一刻」就冻结了回调 —— bindEvents() 内：
+//     this._mousedown_callback = this.processMouseDown.bind(this)
+//   桥在此之后才替换原型 → 事件触发时走的仍是**旧绑定函数**，我们的包装被完全绕过。
+//   实测（真机 headless Chrome + CDP）：prototype.processMouseDown 含包装=true，
+//   canvas._mousedown_callback 含包装=false，canvas._events_binded=true。
+//   同时印证：直接 proto.processMouseDown.call(canvas,e) 手工调用时命中链完全正确
+//   （convertEventToCanvasOffset → graph.getGroupOnPos → 命中目标 group）—— 判定逻辑无误，
+//   问题只在「事件到不了」。故必须：① 包原型（保留，兼容未来重新 bindEvents）；
+//   ② 重新指向实例上的事件回调（并把元素监听同步换新）；③ 在 canvas 元素上自挂 capture 监听
+//   （独立于 litegraph 绑定，最稳；只读不改事件）。
+//
+// bindEvents 源码原文（comfyui_frontend_package 1.55.14，static/assets/settingStore-X9ZV_dAu.js，
+// `LGraphCanvas.bindEvents`，offset≈373756）：
+//   this._mousedown_callback   = this.processMouseDown.bind(this)
+//   this._mouseup_callback     = this.processMouseUp.bind(this)
+//   this._mousemove_callback   = this.processMouseMove.bind(this)
+//   this._mouseout_callback    = this.processMouseOut.bind(this)
+//   this._mousecancel_callback = this.processMouseCancel.bind(this)
+//   e.addEventListener(`pointerdown`,   this._mousedown_callback,   !0)   ← 事件名 pointerdown，capture=true
+//   e.addEventListener(`wheel`,         this._mousewheel_callback,  !1)   ← bubble
+//   e.addEventListener(`pointerup`,     this._mouseup_callback,    !0)
+//   e.addEventListener(`pointermove`,   this._mousemove_callback)          ← 无第三参 = bubble
+//   e.addEventListener(`pointerout`,    this._mouseout_callback)
+//   e.addEventListener(`pointercancel`, this._mousecancel_callback, !0)
+//   e.addEventListener(`contextmenu`,   this._doNothing)
+//   e.addEventListener(`auxclick`,      this._preventMiddleAuxClick)
+//   this._key_callback = this.processKey.bind(this); e.addEventListener(`keydown`, this._key_callback, !0)
+//   t.addEventListener(`keyup`, this._key_callback, !0)
+//   e.addEventListener(`dragover`/`dragend`/`dragenter`, ...)
+//   → 要点：① 按下只绑 **pointerdown**（没有 mousedown 监听，故重绑按 pointerdown 对齐）；
+//           ② capture 标志 = **true**（第三个参数 !0）——重绑/摘除必须带同一标志，否则摘不掉、也行为不一致；
+//           ③ **未使用 AbortController**，摘除完全依赖实例字段 this._mousedown_callback：
+//              unbindEvents(){ ... t.removeEventListener(`pointerdown`, this._mousedown_callback); ...
+//                              this._mousedown_callback = void 0; ... }
+//              → 故重绑时必须**同步更新 this._mousedown_callback**，否则日后 unbindEvents 会摘不到新回调。
 function installHistoryGroupClick() {
-  if (historyGroupClickInstalled) return;
+  installHistoryGroupProto();
+  installHistoryGroupCanvasBind();
+}
+
+// ① 包原型（幂等，只做一次）。留作「之后重新 bindEvents / 未来版本」的兼容层。
+function installHistoryGroupProto() {
+  if (historyGroupProtoWrapped) return;
   const proto =
     typeof LGraphCanvas !== "undefined" && LGraphCanvas && LGraphCanvas.prototype
       ? LGraphCanvas.prototype
@@ -2689,7 +2807,83 @@ function installHistoryGroupClick() {
     // 只读透传：this / arguments / 返回值 / 抛错时机全保持原样
     return orig.apply(this, arguments);
   };
-  historyGroupClickInstalled = true;
+  historyGroupProtoWrapped = true;
+}
+
+// ② 对当前 canvas 实例安装（幂等、可重入；对每个实例/元素各做一次）。
+//    与原型包装互补：即便某实例自持 processMouseDown 覆盖而绕过原型，这里也会补包。
+function installHistoryGroupCanvasBind() {
+  const c = app && app.canvas;
+  if (!c) return; // 时序：setup() 时 app.canvas 可能尚不存在 → 由延迟重试补齐
+  const el = c.canvas || c.canvasEl || null;
+
+  // ②-a 实例自持 processMouseDown 覆盖（会绕过原型包装）→ 就地再包一层（幂等）
+  if (
+    typeof c.processMouseDown === "function" &&
+    Object.prototype.hasOwnProperty.call(c, "processMouseDown") &&
+    !historyGroupInstanceWrapped.has(c)
+  ) {
+    const own = c.processMouseDown;
+    c.processMouseDown = function (e) {
+      try {
+        historyOnCanvasMouseDown(e);
+      } catch (err) {
+        console.warn(LOG_TAG, "P2-F1 点击钩子失败（不影响画布）", err);
+      }
+      return own.apply(this, arguments);
+    };
+    historyGroupInstanceWrapped.add(c);
+  }
+
+  // ②-b 重新指向实例事件回调：litegraph 冻结的是 bindEvents 那一刻的绑定函数，必须换新。
+  //      条件用「实例上存在 _mousedown_callback 函数」（unbindEvents 会把它置 void 0）。
+  //      此时 c.processMouseDown 已是包装版（原型已在 ① 替换；若实例自持则 ②-a 已补包），
+  //      故 next 内部必然经过 historyOnCanvasMouseDown。
+  if (typeof c._mousedown_callback === "function" && !historyGroupBoundCanvases.has(c)) {
+    const old = c._mousedown_callback;
+    const next = c.processMouseDown.bind(c);
+    if (el && typeof el.removeEventListener === "function") {
+      el.removeEventListener("pointerdown", old, true); // flags 与 bindEvents 一致（capture=true）
+    }
+    c._mousedown_callback = next; // 同步字段：unbindEvents 才摘得到新回调
+    if (el && typeof el.addEventListener === "function") {
+      el.addEventListener("pointerdown", next, true);
+    }
+    historyGroupBoundCanvases.add(c);
+  }
+
+  // ②-c 自挂 capture 监听（独立于 litegraph 的内部绑定，最稳；只读：不改 e、不 prevent/stop）。
+  //      与 litegraph 同元素同事件（pointerdown）+ 同 capture 标志，故必定随事件到；
+  //      与 ②-b 可能同时到达同一事件 → 由 historyGroupHookSeenEvents 去重，只处理一次。
+  if (el && typeof el.addEventListener === "function" && !historyGroupBoundElements.has(el)) {
+    el.addEventListener(
+      "pointerdown",
+      (e) => {
+        try {
+          historyOnCanvasMouseDown(e);
+        } catch (err) {
+          console.warn(LOG_TAG, "P2-F1 点击钩子失败（不影响画布）", err);
+        }
+      },
+      true
+    );
+    historyGroupBoundElements.add(el);
+  }
+}
+
+// 延迟重试：setup() 执行时 app.canvas / canvas 元素可能尚未就绪（有就绪也有未就绪两种实测）。
+// 已绑则内部各哨兵跳过（幂等）；元素/实例若在启动后重建，重入也会自愈（WeakSet 按对象区分）。
+function scheduleHistoryGroupInstallRetries() {
+  const delays = [500, 1500, 3000, 6000];
+  for (const ms of delays) {
+    setTimeout(() => {
+      try {
+        installHistoryGroupClick();
+      } catch (err) {
+        console.warn(LOG_TAG, "P2-F1 延迟安装失败（不影响画布）", err);
+      }
+    }, ms);
+  }
 }
 
 // ── P3-G1（2026-10-11）：回跳到所选提交（branch 式原地回跳，不造副本）────────────
@@ -3013,8 +3207,10 @@ app.registerExtension({
     announceToShell();
     // P1-A2：常驻安装 api.queuePrompt 包装（与后端无关，先行；不依赖 hello 成败）。
     installQueuePromptCapture();
-    // P2-F1：安装画布点击命中 group 的 processMouseDown 包裹（与后端无关，先行；幂等）。
+    // P2-F1b：安装画布点击命中 group（包原型 + 重绑实例事件回调 + 元素 capture 监听；与后端无关，先行；幂等）。
     installHistoryGroupClick();
+    // 延迟重试：setup() 时 app.canvas / canvas 元素可能尚未就绪（已绑则内部跳过）。
+    scheduleHistoryGroupInstallRetries();
     try {
       await postJson(PATH_HELLO, {
         clientId: api.clientId || null,
