@@ -601,6 +601,65 @@ def latest_entry(entries):
     return lst[-1] if lst else None
 
 
+# ── 9.5 head 定位（P5b：合并判定 / delta 需要读 head 节点快照 graph）──────
+def _find_entry_by_seq(entries, seq):
+    """按 seq 在索引里找 entry；找不到 → None。"""
+    n = _to_int(seq, None)
+    if n is None:
+        return None
+    for e in entries if isinstance(entries, list) else []:
+        if isinstance(e, dict) and _to_int(e.get("seq"), None) == n:
+            return e
+    return None
+
+
+def _read_graph_from_snapshot_file(dir_path, snapshot_file):
+    """读某快照文件里的 graph（UI 格式对象）；路径非法/文件缺失/坏 JSON/非对象 → None。"""
+    if not isinstance(snapshot_file, str) or not snapshot_file.strip():
+        return None
+    fname = snapshot_file.strip()
+    if fname != os.path.basename(fname) or fname in (".", ".."):
+        return None
+    path = os.path.join(dir_path, fname)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            snap = json.loads(fh.read())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(snap, dict):
+        return None
+    graph = snap.get("graph")
+    return graph if isinstance(graph, dict) else None
+
+
+def _head_node_graph(dir_path, entries, head_seq):
+    """按 headSeq 定位节点 → 读其快照 graph；定位不到 / file 缺失 / 读不到 → None。
+    head_seq 指向 mergeInto 标记行时解析到其目标节点（容错）。
+    """
+    entry = _find_entry_by_seq(entries, head_seq)
+    if entry is None:
+        return None
+    if entry.get("mergeInto") is not None:
+        entry = _find_entry_by_seq(entries, entry.get("mergeInto"))
+    return _read_graph_from_snapshot_file(dir_path, entry.get("file")) if entry else None
+
+
+def _last_node_seq(entries):
+    """线性默认头：索引里最后一条**节点主行**（无 mergeInto）的 seq；无 → None。
+    mergeInto 标记行不入选（它不携带快照，不是节点）。
+    """
+    seq = None
+    for e in entries if isinstance(entries, list) else []:
+        if not isinstance(e, dict) or e.get("mergeInto") is not None:
+            continue
+        n = _to_int(e.get("seq"), None)
+        if n is not None:
+            seq = n
+    return seq
+
+
 # ── 10. 提交落盘 ────────────────────────────────────────────────────────────
 def commit(body, user_dir):
     """处理一次提交上报：写快照 + 追加索引行。返回带 status 的结果对象，由路由拆出 HTTP 码。
@@ -611,6 +670,11 @@ def commit(body, user_dir):
 
     P2-F2 可选入参：blocks —— 块归属（[{name, source, nodeIds:[…]}]，桥前端算好随请求体带上）。
     非列表 → 视为未提供，快照/索引均不写该字段；schemaVersion 不 bump（新增可选字段向后兼容）。
+
+    P5b 新增入参：source（缺省 "user"）、kind（缺省 "run"，白名单 run/save）、parent（缺省 None）。
+    合并判定（仅 kind=="run"）：headSeq 可读、且其快照 graph 的归一化签名（忽略 seed 类 widget）
+    与本轮 graph 相同 → 追加一行 mergeInto 标记行（**不改已写行、不写新快照**），
+    返回 {merged:True, targetSeq:headSeq}；否则新建节点（parent=headSeq、delta=compute_delta(headGraph, graph)）。
     """
     b = body if isinstance(body, dict) else {}
     workflow = b.get("workflow") if isinstance(b.get("workflow"), str) else ""
@@ -621,6 +685,14 @@ def commit(body, user_dir):
         return {"ok": False, "status": 400, "error": "需要 graph（画布快照对象）"}
     if not isinstance(user_dir, str) or not user_dir.strip():
         return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
+
+    # P5b：新字段
+    src = b.get("source")
+    if src is None:
+        src = "user"
+    kind = _norm_kind(b.get("kind"))
+    parent_raw = b.get("parent")
+    parent_given = parent_raw is not None and parent_raw != ""
 
     prompt_id = b.get("promptId")
     prompt_id = None if prompt_id is None else str(prompt_id)
@@ -636,11 +708,66 @@ def commit(body, user_dir):
     except OSError as exc:
         return {"ok": False, "status": 500, "error": "读取索引失败：%s" % exc}
 
+    # 归一化签名（忽略 seed 类 widget）+ 确定 headSeq（parent 传了就用它；否则索引末条 seq）
+    sig = graph_sig_ignoring_seed(b.get("graph"))
+    if parent_given:
+        head_seq = _norm_parent(parent_raw)
+    else:
+        head_seq = _last_node_seq(entries)
+    head_graph = _head_node_graph(dir_path, entries, head_seq)
+
+    # 合并判定（仅 kind=="run"）：headSeq 存在 + 能读到 head 节点快照 graph + 签名相同
+    if kind == "run" and head_seq is not None and head_graph is not None:
+        if graph_sig_ignoring_seed(head_graph) == sig:
+            seq = next_seq(entries)
+            merge_line = json.dumps(
+                {
+                    "seq": seq,
+                    "mergeInto": head_seq,
+                    "promptId": prompt_id,
+                    "at": _to_iso(b.get("at")),
+                    "kind": "run",
+                    "source": normalize_source(src),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            try:
+                os.makedirs(dir_path, exist_ok=True)
+                with open(index_path, "a", encoding="utf-8", newline="") as fh:
+                    fh.write(merge_line + "\n")
+            except OSError as exc:
+                return {"ok": False, "status": 500, "error": "追加合并行失败：%s" % exc}
+            return {"ok": True, "status": 200, "merged": True, "targetSeq": head_seq, "dir": dir_path}
+
+    # 新建节点（kind="save"、或签名不同 / 无 head）
+    return _create_node(
+        dir_path,
+        index_path,
+        entries,
+        b.get("graph"),
+        prompt_id=prompt_id,
+        at=b.get("at"),
+        source=src,
+        blocks=b.get("blocks"),
+        kind=kind,
+        parent=head_seq,
+        head_graph=head_graph,
+        sig=sig,
+    )
+
+
+def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, source="unknown",
+                 blocks=None, kind="run", parent=None, head_graph=None, sig=None):
+    """新建一个提交节点：算 delta → 写快照 → 追加索引主行。
+    commit 的「新建」分支与 save_commit 共用（kind/promptId/parent/delta 由调用方给定）。
+    返回 {ok, status, merged:False, seq, file, dir}；体积超限 → 413（不写盘、不建目录）。
+    """
     seq = next_seq(entries)
     file_name = snapshot_file_name(seq, prompt_id)
     abs_file = os.path.join(dir_path, file_name)
 
-    snapshot = build_snapshot(b.get("graph"), prompt_id, seq, b.get("at"), b.get("source"), b.get("blocks"))
+    snapshot = build_snapshot(graph, prompt_id, seq, at, source, blocks)
     try:
         text = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
@@ -654,7 +781,12 @@ def commit(body, user_dir):
             "size": size,
         }
 
-    # 索引行（不含 graph；字段取自 snapshot，保证与落盘快照一致）
+    # delta：相对 head 节点快照 graph（head 读不到 → None）
+    delta = compute_delta(head_graph, graph)
+    if sig is None:
+        sig = graph_sig_ignoring_seed(graph)
+
+    # 索引主行（不含 graph；字段取自 snapshot，保证与落盘快照一致）
     line = build_index_line(
         {
             "seq": seq,
@@ -662,9 +794,13 @@ def commit(body, user_dir):
             "promptId": snapshot["promptId"],
             "at": snapshot["at"],
             "source": snapshot["source"],
+            "kind": kind,
+            "parent": parent,
+            "sig": sig,
+            "delta": delta,
             "nodeCount": snapshot["nodeCount"],
             "linkCount": snapshot["linkCount"],
-            "blocks": snapshot.get("blocks"),  # P2-F2：块归属 → 索引行写摘要
+            "blocks": snapshot.get("blocks"),  # P2-F2：块归属 → 索引行写完整版
         }
     )
 
@@ -702,16 +838,67 @@ def commit(body, user_dir):
             "dir": dir_path,
         }
 
-    return {"ok": True, "status": 200, "seq": seq, "file": file_name, "dir": dir_path}
+    return {"ok": True, "status": 200, "merged": False, "seq": seq, "file": file_name, "dir": dir_path}
+
+
+def save_commit(body, user_dir):
+    """P5b：存档当前画布 —— 永远**新建**一个 kind="save" 节点（无 promptId、不参与合并判定）。
+    请求体: { workflow, graph, at?, source? }（无 promptId）。返回 {ok, status, seq, file, dir}。
+    复用 _create_node；delta 相对 head（索引末条）算，parent=head。
+    """
+    b = body if isinstance(body, dict) else {}
+    workflow = b.get("workflow") if isinstance(b.get("workflow"), str) else ""
+    workflow = workflow.strip()
+    if not workflow:
+        return {"ok": False, "status": 400, "error": "需要 workflow（工作流名）"}
+    if not isinstance(b.get("graph"), dict):
+        return {"ok": False, "status": 400, "error": "需要 graph（画布快照对象）"}
+    if not isinstance(user_dir, str) or not user_dir.strip():
+        return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
+
+    src = b.get("source")
+    if src is None:
+        src = "user"
+
+    dir_path = history_dir(user_dir, workflow)
+    index_path = os.path.join(dir_path, INDEX_FILE_NAME)
+    entries = []
+    try:
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as fh:
+                entries = parse_index(fh.read())["entries"]
+    except OSError as exc:
+        return {"ok": False, "status": 500, "error": "读取索引失败：%s" % exc}
+
+    head_seq = _last_node_seq(entries)
+    head_graph = _head_node_graph(dir_path, entries, head_seq)
+
+    return _create_node(
+        dir_path,
+        index_path,
+        entries,
+        b.get("graph"),
+        prompt_id=None,
+        at=b.get("at"),
+        source=src,
+        blocks=b.get("blocks"),
+        kind="save",
+        parent=head_seq,
+        head_graph=head_graph,
+        sig=graph_sig_ignoring_seed(b.get("graph")),
+    )
 
 
 # ── 11. 查询 ────────────────────────────────────────────────────────────────
 def list_commits(workflow, user_dir):
     """读某工作流的索引。目录不存在 → 空 entries（ok=True）；索引坏行只计数不抛异常。
 
-    P4 修：每条 entry **新增**两个只读合并字段（不写回索引磁盘）：
-      · runs   —— 有 sidecar 图 → 单元素 [{promptId, at, images}]；无 → []
-      · images —— runs 里所有 images 的扁平合并；无 → []
+    P5b：折叠 mergeInto 行 + 新字段。每条主行 entry **只读合并**（不写回索引磁盘）：
+      · parent/kind/sig/delta —— 由 normalize_entry 缺省补全（旧条目兼容）
+      · runs   —— 该节点的全部 run（主行 promptId + 各 mergeInto 行的 promptId +
+                  sidecar 里其余 run），去重排序；每 run 的 images 由 sidecar 提供
+      · images —— runs 里所有 images 的扁平合并
+    mergeInto 行**不单独成 entry**（其 promptId 并入目标节点的 runs）。
     """
     if not isinstance(user_dir, str) or not user_dir.strip():
         return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
@@ -724,22 +911,31 @@ def list_commits(workflow, user_dir):
             parsed = parse_index(fh.read())
     except OSError as exc:
         return {"ok": False, "status": 500, "error": "读取索引失败：%s" % exc}
+
+    # 折叠 mergeInto 行：目标 seq → [merge 行…]（按索引顺序）
+    merge_rows = {}
+    for e in parsed["entries"]:
+        if not isinstance(e, dict) or e.get("mergeInto") is None:
+            continue
+        key = _to_int(e.get("mergeInto"), None)
+        if key is not None:
+            merge_rows.setdefault(key, []).append(e)
+
     out_entries = []
     for e in parsed["entries"]:
         if not isinstance(e, dict):
             out_entries.append(e)
             continue
-        raw_file = e.get("file")
-        imgs = _read_sidecar_images(dir_path, raw_file.strip()) if isinstance(raw_file, str) and raw_file.strip() else []
-        merged = dict(e)
-        if imgs:
-            merged["runs"] = [
-                {"promptId": e.get("promptId"), "at": e.get("at"), "images": imgs}
-            ]
-        else:
-            merged["runs"] = []
-        merged["images"] = _merge_images([], [im for r in merged["runs"] for im in r["images"]])
-        out_entries.append(merged)
+        if e.get("mergeInto") is not None:
+            continue  # 折叠：不单独成 entry
+        norm = normalize_entry(e)
+        snapshot_file = _entry_snapshot_file(e)
+        sidecar_runs = _read_sidecar_runs(dir_path, snapshot_file) if snapshot_file else []
+        seq_key = _to_int(e.get("seq"), None)
+        rows = merge_rows.get(seq_key, []) if seq_key is not None else []
+        norm["runs"] = _node_runs(e, sidecar_runs, rows)
+        norm["images"] = _merge_images([], [im for r in norm["runs"] for im in r["images"]])
+        out_entries.append(norm)
     return {"ok": True, "status": 200, "entries": out_entries, "badLines": parsed["badLines"]}
 
 
@@ -859,17 +1055,25 @@ def _merge_images(existing, incoming):
     return out
 
 
-def _find_entry_by_prompt_id(entries, prompt_id):
-    """按 promptId 在索引里找 entry（首个匹配）；找不到 → None。"""
-    pid = None if prompt_id is None else str(prompt_id)
-    for e in entries if isinstance(entries, list) else []:
-        if isinstance(e, dict) and e.get("promptId") is not None and str(e.get("promptId")) == pid:
-            return e
-    return None
+def _sidecar_obj_to_runs(obj):
+    """sidecar 对象 → runs 归一化列表（P5b）。
+    新形态 {runs:[{promptId,at,images}]} → 归一；
+    旧形态 {promptId,images,updatedAt} → 单元素 runs（at 取 updatedAt）；
+    其余/非对象 → []。
+    """
+    if not isinstance(obj, dict):
+        return []
+    if isinstance(obj.get("runs"), list):
+        return _norm_runs(obj.get("runs"))
+    if "promptId" in obj or "images" in obj:
+        return _norm_runs(
+            [{"promptId": obj.get("promptId"), "at": obj.get("updatedAt"), "images": obj.get("images")}]
+        )
+    return []
 
 
-def _read_sidecar_images(dir_path, snapshot_file):
-    """读 <dir>/<snapshot_file>.images.json 的 images；无/坏/非对象 → []。"""
+def _read_sidecar_runs(dir_path, snapshot_file):
+    """读 <dir>/<snapshot_file>.images.json 的 runs（含旧形态归一）；无/坏/非对象 → []。"""
     name = _sidecar_file_name(snapshot_file)
     if not name:
         return []
@@ -881,13 +1085,46 @@ def _read_sidecar_images(dir_path, snapshot_file):
             obj = json.loads(fh.read())
     except (OSError, ValueError):
         return []
-    if not isinstance(obj, dict):
-        return []
-    return _merge_images([], obj.get("images"))
+    return _sidecar_obj_to_runs(obj)
+
+
+def _find_target_entry_by_prompt_id(entries, prompt_id):
+    """按 promptId 定位其所属的**主行节点** entry（P5b）。
+    先查主行（无 mergeInto）；未中再查 mergeInto 行，解析其 mergeInto=目标 seq 回主行。
+    合并场景下第二次运行的 promptId 只出现在 mergeInto 行 —— 本函数负责归位。找不到 → None。
+    """
+    pid = None if prompt_id is None else str(prompt_id)
+    if not pid:
+        return None
+    lst = entries if isinstance(entries, list) else []
+    for e in lst:
+        if not isinstance(e, dict):
+            continue
+        if e.get("mergeInto") is None and e.get("promptId") is not None and str(e.get("promptId")) == pid:
+            return e
+    for e in lst:
+        if not isinstance(e, dict):
+            continue
+        if e.get("mergeInto") is not None and e.get("promptId") is not None and str(e.get("promptId")) == pid:
+            return _find_entry_by_seq(lst, e.get("mergeInto"))
+    return None
+
+
+def _entry_snapshot_file(entry):
+    """取主行 entry 的快照文件名（带路径穿越防护）；非法 → None。"""
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("file")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    fname = raw.strip()
+    if fname != os.path.basename(fname) or fname in (".", ".."):
+        return None
+    return fname
 
 
 def read_images_for(workflow, user_dir, prompt_id):
-    """内部用：读某工作流某 promptId 的产物图 list；无 sidecar / 无该 promptId → []。"""
+    """内部用：读某工作流某 promptId 所属 run 的产物图 list；无 sidecar / 无该 promptId → []。"""
     if not isinstance(workflow, str) or not workflow.strip():
         return []
     if not isinstance(user_dir, str) or not user_dir.strip():
@@ -903,26 +1140,65 @@ def read_images_for(workflow, user_dir, prompt_id):
             entries = parse_index(fh.read())["entries"]
     except OSError:
         return []
-    entry = _find_entry_by_prompt_id(entries, prompt_id)
-    if entry is None:
+    entry = _find_target_entry_by_prompt_id(entries, prompt_id)
+    snapshot_file = _entry_snapshot_file(entry)
+    if snapshot_file is None:
         return []
-    raw_file = entry.get("file")
-    if not isinstance(raw_file, str) or not raw_file.strip():
-        return []
-    snapshot_file = raw_file.strip()
-    if snapshot_file != os.path.basename(snapshot_file) or snapshot_file in (".", ".."):
-        return []
-    return _read_sidecar_images(dir_path, snapshot_file)
+    pid = str(prompt_id)
+    for r in _read_sidecar_runs(dir_path, snapshot_file):
+        if r["promptId"] == pid:
+            return r["images"]
+    return []
+
+
+def _node_runs(entry, sidecar_runs, merge_rows):
+    """拼一个节点的 runs（P5b）：
+    顺序 = 主 run（entry.promptId）→ 各 mergeInto 行的 run（按索引顺序）→ sidecar 里其余 run。
+    同一 promptId 只保留一条；有 sidecar images 则并入；at 优先取索引行的 at（权威运行时间），
+    索引无（仅 sidecar 有）则用 sidecar 的 at。save 节点（promptId=None）不产主 run。
+    """
+    by_pid = {}
+    for r in sidecar_runs:
+        if r["promptId"] is not None and r["promptId"] not in by_pid:
+            by_pid[r["promptId"]] = r
+    ordered = []
+    seen = set()
+
+    def add(pid, at):
+        if pid is None:
+            return
+        k = str(pid)
+        if k in seen:
+            return
+        seen.add(k)
+        r = by_pid.get(k)
+        ordered.append(
+            {
+                "promptId": k,
+                "at": at if at else (r["at"] if r else None),
+                "images": list(r["images"]) if r else [],
+            }
+        )
+
+    add(entry.get("promptId"), entry.get("at"))
+    for m in merge_rows:
+        add(m.get("promptId"), m.get("at"))
+    for r in sidecar_runs:
+        if r["promptId"] is not None and r["promptId"] not in seen:
+            seen.add(r["promptId"])
+            ordered.append(r)
+    return ordered
 
 
 def attach_images(workflow, user_dir, prompt_id, images, at=None):
-    """把一次出图的产物文件名持久化到 sidecar（P4 修）。
+    """把一次出图的产物文件名持久化到 sidecar（P4 修；P5b 升级为 runs）。
 
     校验 workflow / promptId / images（非空数组，每项含 filename）→ 非法 400；
-    读索引按 promptId 找 entry → 找不到 404；
+    读索引按 promptId 定位所属**主行节点**（含 mergeInto 归位）→ 找不到 404；
     取其 file 基名 → sidecar = <基名>.images.json；
-    读旧 sidecar → 按 filename+subfolder+type 去重合并 → 原子写回（.tmp → os.replace）。
-    返回 {ok, status, file, count}；file = sidecar 文件名，count = 累计张数。
+    读旧 sidecar（含旧形态归一）→ 按 promptId 找该 run → 去重合并 images；无则新建 run；
+    原子写回（.tmp → os.replace）。
+    返回 {ok, status, file, count}；file = sidecar 文件名，count = 该 run 累计张数。
     """
     wf = workflow.strip() if isinstance(workflow, str) else ""
     if not wf:
@@ -950,20 +1226,23 @@ def attach_images(workflow, user_dir, prompt_id, images, at=None):
                 entries = parse_index(fh.read())["entries"]
     except OSError as exc:
         return {"ok": False, "status": 500, "error": "读取索引失败：%s" % exc}
-    entry = _find_entry_by_prompt_id(entries, pid)
+    entry = _find_target_entry_by_prompt_id(entries, pid)
     if entry is None:
         return {"ok": False, "status": 404, "error": "索引里没有 promptId=%s 这条提交" % pid}
-    raw_file = entry.get("file")
-    if not isinstance(raw_file, str) or not raw_file.strip():
-        return {"ok": False, "status": 500, "error": "索引条目缺少 file 字段"}
-    snapshot_file = raw_file.strip()
-    if snapshot_file != os.path.basename(snapshot_file) or snapshot_file in (".", ".."):
-        return {"ok": False, "status": 500, "error": "索引条目 file 字段非法（含路径）"}
+    snapshot_file = _entry_snapshot_file(entry)
+    if snapshot_file is None:
+        return {"ok": False, "status": 500, "error": "索引条目缺少/非法 file 字段"}
 
     sidecar_name = _sidecar_file_name(snapshot_file)
     sidecar_path = os.path.join(dir_path, sidecar_name)
-    merged = _merge_images(_read_sidecar_images(dir_path, snapshot_file), norm_in)
-    obj = {"promptId": pid, "images": merged, "updatedAt": _to_iso(at)}
+    runs = _read_sidecar_runs(dir_path, snapshot_file)
+    target = next((r for r in runs if r["promptId"] == pid), None)
+    if target is None:
+        target = {"promptId": pid, "at": _to_iso(at), "images": []}
+        runs.append(target)
+    target["images"] = _merge_images(target["images"], norm_in)
+    merged = target["images"]
+    obj = {"runs": runs}
     try:
         text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:

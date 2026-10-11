@@ -60,11 +60,13 @@ else:
 
 try:
     from .history_store import commit as _history_commit
+    from .history_store import save_commit as _history_save_commit
     from .history_store import list_commits as _history_list_commits
     from .history_store import read_snapshot as _history_read_snapshot
     from .history_store import attach_images as _history_attach_images
 except Exception as _exc:  # P1-C1：history_store 纯标准库，正常不会失败；防御性保护
     _history_commit = None
+    _history_save_commit = None
     _history_list_commits = None
     _history_read_snapshot = None
     _history_attach_images = None
@@ -96,7 +98,7 @@ except ValueError:
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
 # 2026-10-11（P3-H1）：对齐新活动桥 hana-bridge-1011095446（P2-F1/F2 + P3-G1 转正；diag 呈现待下次 ComfyUI 重启转正）。
-BRIDGE_BUILD_TAG = "2026-10-11 hana-bridge-11232933"
+BRIDGE_BUILD_TAG = "2026-10-11 hana-bridge-11235537"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -590,7 +592,7 @@ if _ROUTES is not None:
                 name
                 for name, ok in (
                     ("routes", _ROUTES is not None),
-                    ("history_store", _history_commit is not None),
+                    ("history_store", _history_commit is not None and _history_save_commit is not None),
                     ("folder_paths", folder_paths is not None),
                     ("user_manager", _user_manager is not None),
                 )
@@ -620,6 +622,20 @@ if _ROUTES is not None:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
         body = await _json(request)
         out = _history_commit(body, user_dir)
+        status = out.pop("status", 200 if out.get("ok") else 500)
+        return web.json_response(out, status=status)
+
+    # P5b：存档端点 —— 请求 { workflow, graph, at?, source? }（无 promptId），永远新建 kind="save" 节点。
+    # 信任模型同其它 history-* 端点（P1-D1）：8188 同源、本机-only，不校验 token。
+    @_ROUTES.post("/hana_bridge/history-save")
+    async def _hana_history_save(request):
+        """存档当前画布（不运行）。请求体: { workflow, graph, at?, source? }"""
+        try:
+            user_dir = _history_user_dir()
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        body = await _json(request)
+        out = _history_save_commit(body, user_dir)
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
@@ -684,7 +700,7 @@ if _ROUTES is not None:
         return web.json_response(out, status=status)
 
     LOG.info(
-        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-attach-images / history-list / history-snapshot），"
+        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-save / history-attach-images / history-list / history-snapshot），"
         "token 就绪，超时 %gs",
         CALL_TIMEOUT_SEC,
     )

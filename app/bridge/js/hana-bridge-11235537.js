@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-11 hana-bridge-11232933";
+const BUILD_TAG = "2026-10-11 hana-bridge-11235537";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -2212,10 +2212,69 @@ function installQueuePromptCapture() {
   queuePromptCaptureInstalled = true;
 }
 
+// ── P5b（2026-10-11）：HEAD 管理（per-workflow localStorage）──────────────────
+// 契约见 docs/方案-画布提交历史-P5b-数据模型接线.md §3.1。键结构照抄 copilot：
+//   hana.history.head.v1:<ws>:<hashPath(pageKey)>（pageKey 取法同 copilotPageKey）。
+// 值：{ seq, at }。seq 为 null → 删键。只存最小信息；异常一律 try/catch 吞。
+const HISTORY_HEAD_LS_PREFIX = "hana.history.head.v1:";
+
+// pageKey = activeWorkflow.path（fallback：key → name）；取不到返回 null（同 copilotPageKey 口径）
+function historyPageKey() {
+  try {
+    const wf = activeWorkflowObj();
+    if (!wf) return null;
+    const p = wf.path ? String(wf.path).trim() : "";
+    if (p) return p;
+    const k = wf.key ? String(wf.key).trim() : "";
+    if (k) return k;
+    const n = String(wf.filename || wf.name || "").trim();
+    return n || null;
+  } catch {
+    return null;
+  }
+}
+
+function historyHeadKey(pageKey) {
+  return HISTORY_HEAD_LS_PREFIX + copilotWorkspaceId() + ":" + hashPathKey(pageKey);
+}
+
+// 读当前页 HEAD：{seq, at} | null（坏 JSON / 无 pageKey / 无键 → null）
+function historyHeadGet() {
+  try {
+    const pk = historyPageKey();
+    if (!pk) return null;
+    const raw = localStorage.getItem(historyHeadKey(pk));
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== "object" || v.seq == null) return null;
+    return { seq: v.seq, at: v.at != null ? v.at : null };
+  } catch {
+    return null;
+  }
+}
+
+// 写当前页 HEAD；seq 为 null → 删键。异常一律吞。
+function historyHeadSet(seq, at) {
+  try {
+    const pk = historyPageKey();
+    if (!pk) return;
+    const key = historyHeadKey(pk);
+    if (seq == null) {
+      localStorage.removeItem(key);
+      return;
+    }
+    localStorage.setItem(key, JSON.stringify({ seq, at: at != null ? at : null }));
+  } catch {
+    /* 忽略 */
+  }
+}
+
 // 上报一次提交（契约字段冻结，勿改字段名）：POST /hana_bridge/history-commit
 // ⚠️ P1-C2：目标改道桥 Python 后端（同源）；端点由 P1-C1 并行实现，未就绪时静默失败。
-// source 恒为 "user"（前端通道都是人在点；agent 若经此通道也先记 user，后续批次再细分）。
-async function reportHistoryCommit({ graph, promptId, blocks }) {
+// P5b：增 source / kind（可选参，默认 "user" / "run"，为 P8 agent 通道预留）与 parent
+//      （读 HEAD；无 HEAD → 不传该字段，后端用线性默认）。读响应判 merged：
+//      未合并 → 写新 seq 到 HEAD；merged:true → HEAD 不变（仍是目标节点）。
+async function reportHistoryCommit({ graph, promptId, blocks, source = "user", kind = "run" }) {
   try {
     let workflow = null;
     try {
@@ -2223,17 +2282,34 @@ async function reportHistoryCommit({ graph, promptId, blocks }) {
     } catch {
       workflow = null;
     }
+    const at = new Date().toISOString();
     const body = {
       workflow,
       promptId,
       graph: graph || {},
-      at: new Date().toISOString(),
-      source: "user",
+      at,
+      source: source || "user",
+      kind: kind || "run",
     };
+    // P5b：parent = 当前 HEAD 节点 seq；无 HEAD → 不带字段（后端线性默认 = 索引末条）。
+    try {
+      const head = historyHeadGet();
+      if (head && head.seq != null) body.parent = head.seq;
+    } catch { /* 忽略 */ }
     // P2-F2：块归属（[{name, source:"group"|"role", nodeIds:[…]}]）随快照上报；
     // 仅在算出数组时携带 —— null / 计算失败 → 不带字段（Python 端快照同样省略，读回 null）。
     if (Array.isArray(blocks)) body.blocks = blocks;
-    await postJson(HISTORY_COMMIT_PATH, body);
+    const resp = await postJson(HISTORY_COMMIT_PATH, body);
+    // P5b：读响应判合并。未合并（新建节点）→ HEAD 移到新 seq；合并 → HEAD 不变。
+    let data = null;
+    try {
+      data = await resp.json();
+    } catch {
+      data = null;
+    }
+    if (data && data.ok === true && data.merged !== true && data.seq != null) {
+      historyHeadSet(data.seq, at);
+    }
   } catch (err) {
     // 端点由 P1-C1 实现，未就绪时静默失败。
     console.warn(LOG_TAG, "提交历史上报失败（端点由 P1-C1 实现，未就绪时静默失败）", err);
@@ -2462,6 +2538,9 @@ const historyGroupHookSeenEvents = new WeakSet(); // 同一事件多入口去重
 let historyBarSelection = null; // 卡片点选的提交 {file, seq}（file 为空时按 seq 定位）
 let historyBarLatestEntry = null; // 最近一次提交条目（未提交比对基线；historyBarLoad 渲染时回填）
 let historyRollback = { armed: false, timer: null, busy: false };
+// P5b：存档动作状态（防重入）+ 当前弹层锚定的 group（存档后刷新弹层用）
+let historySaveBusy = false;
+let historyBarGroup = null;
 // P6-1：横轴三态交互状态（单击/双击消歧、缩略图浮层延迟关）
 let historyTickClickTimer = null; // 非空 = 已收到第一次单击，正在等消歧窗口结束
 let historyShotsCloseTimer = null; // 缩略图浮层「移开延迟关」定时器
@@ -2535,6 +2614,9 @@ function historyBarStyleEnsure() {
 #${HISTORY_BAR_ID} .hhb-roll { background:rgba(127,178,217,.15); border:1px solid rgba(127,178,217,.5); color:#cfe4f5; border-radius:7px; padding:3px 10px; cursor:pointer; font-size:12px; }
 #${HISTORY_BAR_ID} .hhb-roll:hover { background:rgba(127,178,217,.28); }
 #${HISTORY_BAR_ID} .hhb-roll-armed { background:rgba(232,160,160,.18); border-color:rgba(232,160,160,.75); color:#f3c6c6; }
+#${HISTORY_BAR_ID} .hhb-save { background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.24); color:#dfe7ef; border-radius:7px; padding:3px 10px; cursor:pointer; font-size:12px; }
+#${HISTORY_BAR_ID} .hhb-save:hover { background:rgba(255,255,255,.14); }
+#${HISTORY_BAR_ID} .hhb-save[disabled] { opacity:.55; cursor:default; }
 #${HISTORY_BAR_ID} .hhb-topmsg { color:#b8e0a0; font-size:12px; margin-bottom:6px; }
 #${HISTORY_BAR_ID} .hhb-msg { color:#e8c268; font-size:11px; }
 #${HISTORY_BAR_ID} .hhb-msg:empty { display:none; }
@@ -2574,6 +2656,7 @@ function historyBarClose() {
     historyBarEl.parentElement.removeChild(historyBarEl);
   }
   historyBarEl = null;
+  historyBarGroup = null;
 }
 
 // 弹层内提示行（替代 alert）
@@ -3168,6 +3251,7 @@ function historyBarOpen(group) {
   const bar = document.createElement("div");
   bar.id = HISTORY_BAR_ID;
   historyBarEl = bar;
+  historyBarGroup = group || null; // P5b：存档后重开弹层用（同 group 重载）
   // 头部：<分组框名> · <N 次提交>（fetch 后回填）+ 构建号 + ✕
   const title = document.createElement("div");
   title.className = "hhb-title";
@@ -3230,7 +3314,17 @@ function historyBarOpen(group) {
   });
   const tip = document.createElement("span");
   tip.className = "hhb-msg";
-  foot.append(roll, tip);
+  // P5b（契约 §3.3）：存档当前画布（人的入口，独立动作，不参与回跳选中态）。
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "hhb-save";
+  saveBtn.textContent = "存档当前画布";
+  saveBtn.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    void historySaveClick();
+  });
+  foot.append(roll, saveBtn, tip);
   bar.append(title, axis, times, shots, foot);
   document.body.appendChild(bar); // position:fixed 自行定位，挂 body 避免容器裁剪
   // 鼠标离开弹层 → 缩略图浮层延迟关；进入弹层则取消关闭（浮层本身 hover 不关，移出才算）
@@ -3682,6 +3776,12 @@ async function historyRollbackExecute() {
       return null;
     });
     if (okGraph === null) throw new Error("画布装载失败（loadGraphData 报错，画布未变）");
+    // P5b（契约 §3.1）：回跳成功 → 写 HEAD = 回跳到的 seq。
+    // 这样「回跳后改再提交」时 parent 指向回跳节点 = 分支。异常吞掉，不影响回跳。
+    try {
+      const backSeq = snap.seq != null ? snap.seq : (sel && sel.seq);
+      if (backSeq != null) historyHeadSet(backSeq, snap.at != null ? snap.at : null);
+    } catch { /* 忽略 */ }
     // 成功：关弹层（规格 2）……
     historyRollback.busy = false;
     historyBarClose();
@@ -3718,6 +3818,74 @@ function historyRollbackToast(msg) {
   } catch (err) {
     console.warn(LOG_TAG, "P3-G1 成功提示失败", err);
   }
+}
+
+// ── P5b（2026-10-11）：存档当前画布（人的入口，契约 §3.3）─────────────────────
+// 点击「存档当前画布」→ 取当前 app.graph.toJSON() → POST /hana_bridge/history-save
+// （body {workflow, graph, at}；无 promptId——不运行）。成功后刷新弹层 + 提示「已存档 #NNN」。
+// 失败 → 弹层内红字提示，不影响画布。存档独立动作，不参与回跳选中态。
+// 端点由并行 worker（A）实现；未就绪时静默失败（落弹层红字）。
+const HISTORY_SAVE_PATH = "/hana_bridge/history-save";
+
+async function historySaveClick() {
+  if (!historyBarEl || historySaveBusy) return;
+  const btn = historyBarEl.querySelector(".hhb-save");
+  let graph = null;
+  try {
+    if (app && app.graph && typeof app.graph.toJSON === "function") {
+      graph = app.graph.toJSON();
+    }
+  } catch (err) {
+    console.warn(LOG_TAG, "存档前抓画布失败", err);
+    graph = null;
+  }
+  if (!graph || !graph.nodes || !Object.keys(graph.nodes).length) {
+    historyBarTip("存档失败：当前画布为空", true);
+    return;
+  }
+  historySaveBusy = true;
+  if (btn) btn.disabled = true;
+  historyBarTip("正在存档…", false);
+  const at = new Date().toISOString();
+  let workflow = null;
+  try {
+    workflow = currentWorkflowInfo().name;
+  } catch {
+    workflow = null;
+  }
+  try {
+    const resp = await api.fetchApi(HISTORY_SAVE_PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workflow, graph, at }),
+    });
+    let data = null;
+    try {
+      data = await resp.json();
+    } catch {
+      data = null;
+    }
+    if (!resp.ok || !data || data.ok !== true) {
+      throw new Error(String((data && data.error) || "HTTP " + resp.status));
+    }
+    // 存档成功：存档不参与合并判定，后端永远新建节点（kind="save"）。刷新弹层 + 顶部提示。
+    const seq = data.seq != null ? data.seq : null;
+    historySaveBusy = false;
+    historyRollbackToast(seq != null ? "已存档 #" + String(seq).padStart(3, "0") : "已存档");
+    historyBarReopen();
+    return;
+  } catch (err) {
+    historySaveBusy = false;
+    if (btn) btn.disabled = false;
+    if (historyBarEl) historyBarTip("存档失败：" + String((err && err.message) || err), true);
+  }
+}
+
+// 存档后刷新弹层：同 group 重开（复用 historyBarOpen 的「先拆旧再建新」+ 重新 load）。
+function historyBarReopen() {
+  const g = historyBarGroup;
+  if (!historyBarEl) return;
+  historyBarOpen(g);
 }
 
 // P6（2026-10-08）：写 op 白名单（与 app/index.js CANVAS_OPS 的 write:true 项一一对应）。

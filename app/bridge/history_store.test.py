@@ -353,7 +353,7 @@ class TestCommit(TempRootTestCase):
         out = hs.list_commits("legacy", self.root)
         self.assertTrue(out["ok"])
         self.assertEqual(len(out["entries"]), 1)
-        self.assertEqual(out["entries"][0].get("blocks"), None)  # 旧条目 → null 语义
+        self.assertEqual(out["entries"][0].get("blocks"), [])  # P5b：旧条目经 normalize_entry 补全为 []
         self.assertEqual(out["badLines"], 0)
 
     def test_second_commit_appends_not_overwrites(self):
@@ -375,7 +375,7 @@ class TestCommit(TempRootTestCase):
     def test_atomic_write_roundtrip(self):
         # 造 10 次提交，全部读回且内容逐字节等于直接序列化结果（.tmp 已被 replace 消费掉）；
         # at 用固定值，排除「两次调用各取当前时间」的毫秒差干扰。
-        graphs = [{"nodes": [{"id": i, "w": "值-%d" % i}], "links": []} for i in range(10)]
+        graphs = [{"nodes": [{"id": i, "widgets_values": ["值-%d" % i]}], "links": []} for i in range(10)]
         fixed_at = "2026-10-11T00:00:00.000Z"
         outs = [
             self.commit({"workflow": "原子", "graph": g, "promptId": "pid%08d" % i, "at": fixed_at})
@@ -389,7 +389,7 @@ class TestCommit(TempRootTestCase):
             with open(path, "r", encoding="utf-8") as fh:
                 text = fh.read()
             expect = json.dumps(
-                hs.build_snapshot(g, "pid%08d" % i, i + 1, fixed_at, "unknown"),
+                hs.build_snapshot(g, "pid%08d" % i, i + 1, fixed_at, "user"),
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -413,8 +413,9 @@ class TestCommit(TempRootTestCase):
         self.assertEqual(os.path.basename(out["dir"]), "abc")
 
     def test_list_commits_after_commits(self):
+        # 两次用不同 graph（sig 不同）→ 两个节点（同 sig 会被 P5b 合并）
         self.commit({"workflow": "wf", "graph": {"nodes": [], "links": []}, "promptId": "aaaaaaaa-1"})
-        self.commit({"workflow": "wf", "graph": {"nodes": [], "links": []}, "promptId": "bbbbbbbb-2"})
+        self.commit({"workflow": "wf", "graph": {"nodes": [{"id": 1}], "links": []}, "promptId": "bbbbbbbb-2"})
         out = hs.list_commits("wf", self.root)
         self.assertTrue(out["ok"])
         self.assertEqual(len(out["entries"]), 2)
@@ -632,6 +633,220 @@ class TestP5Purity(TempRootTestCase):
         self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "cac7e860")
 
 
+class TestP5bWiring(TempRootTestCase):
+    """P5b：commit 新字段/合并判定/分支/save/sidecar runs 升级/list 折叠。"""
+
+    # 仅 seed 变化 → 同 sig
+    G_BASE = {"nodes": [
+        {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 20}},
+        {"id": 2, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512}},
+    ], "links": []}
+    G_SEED2 = {"nodes": [
+        {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 999, "steps": 20}},
+        {"id": 2, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512}},
+    ], "links": []}
+    G_STEPS = {"nodes": [
+        {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 30}},
+        {"id": 2, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512}},
+    ], "links": []}
+
+    def index_lines(self):
+        path = os.path.join(self.root, "workflows", ".history", "wf", hs.INDEX_FILE_NAME)
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(x) for x in fh.read().splitlines()]
+
+    def test_commit_writes_new_fields(self):
+        out = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1", "source": "agent", "kind": "run"})
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["merged"])
+        e = self.index_lines()[0]
+        self.assertEqual(e["kind"], "run")
+        self.assertEqual(e["source"], "agent")
+        self.assertIsNone(e["parent"])
+        self.assertEqual(e["sig"], hs.graph_sig_ignoring_seed(self.G_BASE))
+        self.assertIsNone(e["delta"])  # 无 head -> None
+
+    def test_commit_defaults_source_user_kind_run(self):
+        out = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        self.assertTrue(out["ok"])
+        e = self.index_lines()[0]
+        self.assertEqual(e["source"], "user")
+        self.assertEqual(e["kind"], "run")
+
+    def test_merge_on_same_sig(self):
+        # 连提两次，仅改 seed → 索引多 1 主行 + 1 mergeInto 行
+        first = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        second = self.commit({"workflow": "wf", "graph": self.G_SEED2, "promptId": "p2", "source": "user"})
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["merged"])
+        self.assertEqual(second["targetSeq"], first["seq"])
+        lines = self.index_lines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["seq"], 1)
+        self.assertNotIn("mergeInto", lines[0])  # 主行未被改
+        self.assertEqual(lines[1]["mergeInto"], 1)
+        self.assertEqual(lines[1]["promptId"], "p2")
+        self.assertEqual(lines[1]["kind"], "run")
+        # 合并不写新快照
+        d = os.path.join(self.root, "workflows", ".history", "wf")
+        snaps = [f for f in os.listdir(d) if f.endswith(".json") and not f.endswith(hs.IMAGES_SUFFIX)]
+        self.assertEqual(snaps, ["0001-p1.json"])
+        # list 折叠：该节点 runs 有 2 条
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(len(listed["entries"]), 1)
+        runs = listed["entries"][0]["runs"]
+        self.assertEqual([r["promptId"] for r in runs], ["p1", "p2"])
+
+    def test_no_merge_on_different_sig(self):
+        first = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        second = self.commit({"workflow": "wf", "graph": self.G_STEPS, "promptId": "p2"})
+        self.assertFalse(second["merged"])
+        self.assertEqual(second["seq"], 2)
+        self.assertEqual(len(self.index_lines()), 2)
+        # parent = 上一节点
+        self.assertEqual(self.index_lines()[1]["parent"], first["seq"])
+        # delta 相对 head 算（steps 变）
+        delta = self.index_lines()[1]["delta"]
+        self.assertEqual(delta["changed"], [{"id": 1, "title": "KSampler", "fields": ["steps"]}])
+
+    def test_branch_parent_given(self):
+        r1 = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        r2 = self.commit({"workflow": "wf", "graph": self.G_STEPS, "promptId": "p2"})
+        # 回跳到 #1，改（sig 与 #1 不同）再提交 → 新节点，parent 指向 1
+        r3 = self.commit({"workflow": "wf", "graph": self.G_STEPS, "promptId": "p3", "parent": r1["seq"]})
+        self.assertFalse(r3["merged"])
+        self.assertEqual(self.index_lines()[2]["parent"], 1)
+        # parent 传值优先于索引末条（末条是 #2）
+        self.assertNotEqual(self.index_lines()[2]["parent"], r2["seq"])
+
+    def test_merge_uses_given_parent_head(self):
+        r1 = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        r2 = self.commit({"workflow": "wf", "graph": self.G_STEPS, "promptId": "p2"})
+        # parent 指回 #1（sig == #1 的 sig）→ 合并进 #1（不是末条 #2）
+        r3 = self.commit({"workflow": "wf", "graph": self.G_SEED2, "promptId": "p3", "parent": r1["seq"]})
+        self.assertTrue(r3["merged"])
+        self.assertEqual(r3["targetSeq"], 1)
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(len(listed["entries"]), 2)
+        self.assertEqual([x["seq"] for x in listed["entries"]], [1, 2])
+        self.assertEqual([r["promptId"] for r in listed["entries"][0]["runs"]], ["p1", "p3"])
+
+    def test_merge_with_parent_given_nonexistent_no_merge(self):
+        self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        # parent 指一个不存在的 seq → head 读不到 → 不合并，新建
+        out = self.commit({"workflow": "wf", "graph": self.G_SEED2, "promptId": "p2", "parent": 999})
+        self.assertFalse(out["merged"])
+        self.assertEqual(self.index_lines()[1]["parent"], 999)
+
+    def test_save_commit_always_new(self):
+        r1 = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        # save 即使 sig 相同也不合并
+        s1 = hs.save_commit({"workflow": "wf", "graph": self.G_SEED2, "source": "user"}, self.root)
+        self.assertTrue(s1["ok"])
+        self.assertFalse(s1["merged"])
+        e = self.index_lines()[1]
+        self.assertEqual(e["kind"], "save")
+        self.assertIsNone(e["promptId"])
+        self.assertEqual(e["parent"], r1["seq"])
+        self.assertEqual(e["source"], "user")
+        self.assertNotIn("mergeInto", e)
+        # 再存档一次（同 sig）仍新建
+        s2 = hs.save_commit({"workflow": "wf", "graph": self.G_BASE, "source": "agent"}, self.root)
+        self.assertFalse(s2["merged"])
+        self.assertEqual(len(self.index_lines()), 3)
+        self.assertEqual(self.index_lines()[2]["kind"], "save")
+        self.assertEqual(self.index_lines()[2]["source"], "agent")
+        # 存档文件名用 noid
+        self.assertTrue(self.index_lines()[1]["file"].endswith("-noid.json"))
+
+    def test_save_commit_bad_params(self):
+        self.assertEqual(hs.save_commit({"graph": {}}, self.root)["status"], 400)
+        self.assertEqual(hs.save_commit({"workflow": "wf"}, self.root)["status"], 400)
+        self.assertEqual(hs.save_commit({"workflow": "wf", "graph": {}}, "")["status"], 500)
+
+    def test_sidecar_runs_upgrade_and_list(self):
+        r1 = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        r2 = self.commit({"workflow": "wf", "graph": self.G_SEED2, "promptId": "p2"})  # 合并进 p1
+        self.assertTrue(r2["merged"])
+        # 两个 promptId 的图都回填 → 都进同一节点的同一 sidecar
+        hs.attach_images("wf", self.root, "p1", [{"filename": "a.png"}])
+        hs.attach_images("wf", self.root, "p2", [{"filename": "b.png"}])
+        sidecar = os.path.join(r1["dir"], "0001-p1.json" + hs.IMAGES_SUFFIX)
+        with open(sidecar, encoding="utf-8") as fh:
+            obj = json.loads(fh.read())
+        self.assertEqual([x["promptId"] for x in obj["runs"]], ["p1", "p2"])
+        self.assertEqual(obj["runs"][0]["images"], [{"filename": "a.png", "subfolder": "", "type": "output"}])
+        self.assertEqual(obj["runs"][1]["images"], [{"filename": "b.png", "subfolder": "", "type": "output"}])
+        # list：节点一条，runs 两条各自带图，images 扁平
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(len(listed["entries"]), 1)
+        entry = listed["entries"][0]
+        self.assertEqual([r["promptId"] for r in entry["runs"]], ["p1", "p2"])
+        self.assertEqual(entry["runs"][0]["images"][0]["filename"], "a.png")
+        self.assertEqual(entry["runs"][1]["images"][0]["filename"], "b.png")
+        self.assertEqual([im["filename"] for im in entry["images"]], ["a.png", "b.png"])
+
+    def test_attach_locates_node_via_merge_row(self):
+        # p2 只出现在 mergeInto 行；attach 须归位到目标节点 0001 的 sidecar
+        self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        self.commit({"workflow": "wf", "graph": self.G_SEED2, "promptId": "p2"})
+        res = hs.attach_images("wf", self.root, "p2", [{"filename": "z.png"}])
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["file"], "0001-p1.json" + hs.IMAGES_SUFFIX)
+        self.assertEqual(hs.read_images_for("wf", self.root, "p2"), [{"filename": "z.png", "subfolder": "", "type": "output"}])
+        self.assertEqual(hs.read_images_for("wf", self.root, "p1"), [])
+
+    def test_sidecar_legacy_shape_reads_as_single_run(self):
+        out = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        sidecar = os.path.join(out["dir"], out["file"] + hs.IMAGES_SUFFIX)
+        # 手写旧形态
+        with open(sidecar, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"promptId": "p1", "images": [{"filename": "old.png", "subfolder": "", "type": "output"}],
+                 "updatedAt": "2026-10-11T00:00:00.000Z"},
+                fh,
+            )
+        self.assertEqual(
+            hs.read_images_for("wf", self.root, "p1"),
+            [{"filename": "old.png", "subfolder": "", "type": "output"}],
+        )
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(listed["entries"][0]["runs"][0]["images"][0]["filename"], "old.png")
+        # 旧形态上 attach → 升级为新形态，且保留旧 run
+        res = hs.attach_images("wf", self.root, "p1", [{"filename": "new.png"}])
+        self.assertEqual(res["count"], 2)
+        with open(sidecar, encoding="utf-8") as fh:
+            obj = json.loads(fh.read())
+        self.assertEqual(list(obj.keys()), ["runs"])
+        self.assertEqual([im["filename"] for im in obj["runs"][0]["images"]], ["old.png", "new.png"])
+
+    def test_list_folds_merge_into_single_entry(self):
+        # 3 次提交：1 主 + 2 合并（同 sig）→ list 只 1 entry
+        self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        self.commit({"workflow": "wf", "graph": self.G_SEED2, "promptId": "p2"})
+        self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p3"})
+        self.assertEqual(len(self.index_lines()), 3)
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(len(listed["entries"]), 1)
+        self.assertEqual([r["promptId"] for r in listed["entries"][0]["runs"]], ["p1", "p2", "p3"])
+
+    def test_list_entry_has_new_fields(self):
+        r1 = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        r2 = self.commit({"workflow": "wf", "graph": self.G_STEPS, "promptId": "p2", "kind": "run"})
+        listed = hs.list_commits("wf", self.root)
+        e1 = listed["entries"][1]
+        self.assertEqual(e1["parent"], 1)
+        self.assertEqual(e1["kind"], "run")
+        self.assertEqual(e1["sig"], hs.graph_sig_ignoring_seed(self.G_STEPS))
+        self.assertIsNotNone(e1["delta"])
+
+    def test_no_real_history_dir_touched(self):
+        self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        hs.save_commit({"workflow": "wf", "graph": self.G_STEPS}, self.root)
+        self.assertFalse(os.path.exists(os.path.join(os.getcwd(), ".history")))
+
+
 class TestAttachImages(TempRootTestCase):
     """P4 修：产物图 sidecar（attach_images / read_images_for / list_commits 合并）。"""
 
@@ -666,9 +881,13 @@ class TestAttachImages(TempRootTestCase):
         self.assertFalse(os.path.exists(path + ".tmp"), "临时文件应已被 os.replace 消费")
         with open(path, encoding="utf-8") as fh:
             obj = json.loads(fh.read())
-        self.assertEqual(obj["promptId"], "a3f9c2e1-9b7c-4d2e-8f01-234567890abc")
-        self.assertEqual(obj["updatedAt"], "2026-10-11T00:00:00.000Z")
-        self.assertEqual(obj["images"], [{"filename": "a.png", "subfolder": "", "type": "output"}])
+        # P5b：sidecar 升级为 {runs:[{promptId, at, images}]}
+        self.assertEqual(list(obj.keys()), ["runs"])
+        self.assertEqual(obj["runs"], [{
+            "promptId": "a3f9c2e1-9b7c-4d2e-8f01-234567890abc",
+            "at": "2026-10-11T00:00:00.000Z",
+            "images": [{"filename": "a.png", "subfolder": "", "type": "output"}],
+        }])
         # 读回
         self.assertEqual(
             hs.read_images_for("wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc"),
@@ -767,8 +986,9 @@ class TestAttachImages(TempRootTestCase):
         self.assertEqual(hs.read_images_for("wf", self.root, "x"), [])
 
     def test_list_commits_merges_sidecar(self):
-        a = self.commit_one("wf", "aaaaaaaa-1111")
-        b = self.commit_one("wf", "bbbbbbbb-2222")
+        # 两次提交用**不同** graph（sig 不同）→ 两个节点；否则同 sig 会被 P5b 合并
+        a = self.commit({"workflow": "wf", "promptId": "aaaaaaaa-1111", "graph": {"nodes": [{"id": 1, "widgets_values": ["a"]}], "links": []}})
+        b = self.commit({"workflow": "wf", "promptId": "bbbbbbbb-2222", "graph": {"nodes": [{"id": 1, "widgets_values": ["b"]}], "links": []}})
         hs.attach_images(
             "wf", self.root, "aaaaaaaa-1111",
             [{"filename": "a1.png", "subfolder": "", "type": "output"}, {"filename": "a2.png", "subfolder": "", "type": "output"}],
@@ -780,7 +1000,9 @@ class TestAttachImages(TempRootTestCase):
         e0, e1 = listed["entries"]
         # runs[].at 取该 entry 的提交时间 at（P5a 形态），非 sidecar.updatedAt
         with open(os.path.join(a["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
-            entry0_at = json.loads(fh.readline())["at"]
+            lines = fh.read().splitlines()
+        entry0_at = json.loads(lines[0])["at"]
+        entry1_at = json.loads(lines[1])["at"]
         # 有 sidecar 的 entry → 单元素 runs + 扁平 images
         self.assertEqual(e0["runs"], [{
             "promptId": "aaaaaaaa-1111",
@@ -789,21 +1011,25 @@ class TestAttachImages(TempRootTestCase):
                        {"filename": "a2.png", "subfolder": "", "type": "output"}],
         }])
         self.assertEqual(e0["images"], e0["runs"][0]["images"])
-        # 无 sidecar 的 entry → 空数组
-        self.assertEqual(e1["runs"], [])
+        # 无 sidecar 的 entry → 单 run（promptId 在、images 空）
+        self.assertEqual(e1["runs"], [{"promptId": "bbbbbbbb-2222", "at": entry1_at, "images": []}])
         self.assertEqual(e1["images"], [])
-        # 索引磁盘内容未被改（runs 仍为 P5 缺省 []、无 images 字段）
+        # 索引磁盘内容未被改（主行 runs 仍为 P5 缺省 []、无 images 字段；仍两行）
         with open(os.path.join(a["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
             raw = json.loads(fh.readline())
         self.assertEqual(raw["runs"], [])
         self.assertNotIn("images", raw)
-        self.assertEqual(len(open(os.path.join(a["dir"], hs.INDEX_FILE_NAME), encoding="utf-8").read().splitlines()), 2)
+        self.assertEqual(len(lines), 2)
 
     def test_list_commits_no_sidecar_all_empty(self):
+        # P5b：无 sidecar 时，主行 promptId 仍作为一条 run（images 空）；images 扁平为空
         self.commit_one("wf", "aaaaaaaa-1111")
         listed = hs.list_commits("wf", self.root)
-        self.assertEqual(listed["entries"][0]["runs"], [])
-        self.assertEqual(listed["entries"][0]["images"], [])
+        e0 = listed["entries"][0]
+        self.assertEqual(len(e0["runs"]), 1)
+        self.assertEqual(e0["runs"][0]["promptId"], "aaaaaaaa-1111")
+        self.assertEqual(e0["runs"][0]["images"], [])
+        self.assertEqual(e0["images"], [])
 
     def test_sidecar_bad_json_reads_empty(self):
         out = self.commit_one()
