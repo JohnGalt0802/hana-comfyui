@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-11 hana-bridge-12000952";
+const BUILD_TAG = "2026-10-11 hana-bridge-12010616";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -2309,6 +2309,7 @@ async function reportHistoryCommit({ graph, promptId, blocks, source = "user", k
     }
     if (data && data.ok === true && data.merged !== true && data.seq != null) {
       historyHeadSet(data.seq, at);
+      historyTreeRefresh(); // P7-树（2026-10-12）：新提交落地 → 刷新底部提交树（展开着重渲染；收起着只更新计数）
     }
   } catch (err) {
     // 端点由 P1-C1 实现，未就绪时静默失败。
@@ -3849,8 +3850,9 @@ async function historyRollbackClick() {
 // 执行回跳：拉快照 → loadGraphData 原地装载 → 关弹层 + 成功提示（规格 1/2/5）。
 // 失败路径（规格 6）：弹层内红字，画布不动（装载前校验 + loadGraphData 原子性，见注释）。
 async function historyRollbackExecute() {
-  if (!historyBarEl) return;
-  const roll = historyBarEl.querySelector(".hhb-roll");
+  // P7-树（2026-10-12）：确认框可由底部提交树触发（弹层未开时也允许回跳）→ 两容器任一在即可。
+  if (!historyBarEl && !historyTreeEl) return;
+  const roll = historyBarEl ? historyBarEl.querySelector(".hhb-roll") : null;
   const sel = historyBarSelection;
   if (historyRollback.timer) {
     clearTimeout(historyRollback.timer);
@@ -3899,6 +3901,7 @@ async function historyRollbackExecute() {
     // 说明：historyBarTip 写在弹层内，而弹层已关；为同时满足「弹层顶部显示」与「关闭弹层」
     // 两条规格，成功提示用同一样式的独立 toast 常驻到 5s 自动消失。
     historyRollbackToast(`已回到 ${seqLabel}（此时画布未保存，保存或再提交由你决定）`);
+    historyTreeRefresh(); // P7-树：回跳成功 → HEAD 已变，重渲染树（HEAD 高亮跟随；收起着只更新计数）
     return;
   } catch (err) {
     console.warn(LOG_TAG, "P3-G1 回跳失败", err);
@@ -3998,7 +4001,463 @@ function historyBarReopen() {
   historyBarOpen(g);
 }
 
-// P6（2026-10-08）：写 op 白名单（与 app/index.js CANVAS_OPS 的 write:true 项一一对应）。
+// ── P7-树（2026-10-12）：画布底部可收纳「全局提交树」───────────────────────────
+// 规格：docs/方案-画布提交历史-P7-提交树.md。只读 + 点选回跳；复用弹层族的数据（history-list）、
+// 视觉口径（historyTickColor / historyFmtTime / historySeqLabel / historyTickChangedNames）与
+// 回跳链（historyBarSelection → historyRollbackExecute）。z-index：本树 9990 < 弹层 10001 < lightbox 10050。
+// 布局：拓扑深度分层行（depth = depth(parent)+1；parent 为 null / 指向不存在 seq（孤儿，如被清理的
+// 上游）→ depth=0）；同层按 seq（入队时间）从左到右；行内 flex 等分压缩（节点多不溢出）；
+// 父子连线在渲染后按真实 DOM 位置用 SVG 折线补画（父刻度底边中点 → 下行 ≤10px → 横移 → 下行到
+// 子刻度顶边；同 x 直连）。分叉 = 一个 parent 有 ≥2 子，呈 "y" 形。
+const HISTORY_TREE_ID = "hana-history-tree";
+const HISTORY_TREE_STYLE_ID = "hana-history-tree-style";
+// 收纳状态 per-page localStorage（键结构照抄 HEAD：hana.history.tree.v1:<ws>:<hashPath(pageKey)>），值 {open:bool}
+const HISTORY_TREE_LS_PREFIX = "hana.history.tree.v1:";
+let historyTreeEl = null; // 底部容器单例（收纳条 + 展开面板）；null = 未初始化
+let historyTreePanelEl = null;
+let historyTreeTreeEl = null; // 展开面板里的行容器（rows + svg 连线层）
+let historyTreeCountEl = null; // 收纳条「N 节点 · M 分支」
+let historyTreeToggleEl = null; // 展开/收起按钮
+let historyTreeOpen = false; // 展开态（内存镜像；持久化走 historyTreeState*）
+let historyTreeReqId = 0; // 竞态哨兵：重渲染/收起后递增，在途旧响应作废
+let historyTreeEntries = []; // 最近一次成功 fetch 的 entries（resize 重画连线用，不 refetch）
+
+// —— 收纳状态存取（键结构同 historyHeadKey；pageKey 取不到 → 不持久化，按收纳默认）——
+function historyTreeLsKey() {
+  try {
+    const pk = historyPageKey();
+    if (!pk) return null;
+    return HISTORY_TREE_LS_PREFIX + copilotWorkspaceId() + ":" + hashPathKey(pk);
+  } catch {
+    return null;
+  }
+}
+
+function historyTreeStateGet() {
+  try {
+    const k = historyTreeLsKey();
+    if (!k) return false; // 无 pageKey → 默认收纳
+    const raw = localStorage.getItem(k);
+    if (!raw) return false;
+    const v = JSON.parse(raw);
+    return !!(v && v.open);
+  } catch {
+    return false;
+  }
+}
+
+function historyTreeStateSet(open) {
+  try {
+    const k = historyTreeLsKey();
+    if (!k) return;
+    localStorage.setItem(k, JSON.stringify({ open: !!open, updatedAt: Date.now() }));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+// 独立 style 注入（新 style id，与弹层同族深色）。
+function historyTreeStyleEnsure() {
+  if (document.getElementById(HISTORY_TREE_STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = HISTORY_TREE_STYLE_ID;
+  style.textContent = `
+#${HISTORY_TREE_ID} {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 9990;
+  pointer-events: none; user-select: none;
+  font-size: 12px; line-height: 1.4; color: #e6edf5;
+}
+#${HISTORY_TREE_ID} .htr-collapsed {
+  pointer-events: auto; height: 26px; display: flex; align-items: center; gap: 8px;
+  padding: 0 10px; cursor: pointer;
+  background: rgba(24,28,34,.94); border-top: 1px solid rgba(255,255,255,.14);
+}
+#${HISTORY_TREE_ID} .htr-sum { font-weight: 600; }
+#${HISTORY_TREE_ID} .htr-count { color: #9fb3c8; }
+#${HISTORY_TREE_ID} .htr-toggle {
+  margin-left: auto; background: transparent; border: 1px solid rgba(255,255,255,.24);
+  color: #dfe7ef; border-radius: 6px; padding: 1px 8px; cursor: pointer; font-size: 11px;
+}
+#${HISTORY_TREE_ID} .htr-toggle:hover { background: rgba(255,255,255,.1); }
+#${HISTORY_TREE_ID} .htr-panel {
+  pointer-events: auto; display: none; height: 200px;
+  background: rgba(24,28,34,.96); border-top: 1px solid rgba(255,255,255,.14);
+  padding: 6px 10px;
+}
+#${HISTORY_TREE_ID}.htr-open .htr-panel { display: block; }
+#${HISTORY_TREE_ID} .htr-tree {
+  position: relative; height: 100%; display: flex; flex-direction: column; gap: 2px; overflow: auto;
+}
+#${HISTORY_TREE_ID} .htr-row { flex: 1 1 0; min-height: 20px; display: flex; align-items: stretch; }
+/* 行内等分压缩：cell flex:1 min-width 10px —— 节点多时整体缩窄，不横向溢出（同弹层刻度口径） */
+#${HISTORY_TREE_ID} .htr-cell {
+  flex: 1 1 0; min-width: 10px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 2px;
+}
+/* 柱顶叠色条：宽度 ∝ 该提交触及的框数（blockNames.length，null 旧数据按 1 计） */
+#${HISTORY_TREE_ID} .htr-strip { height: 3px; border-radius: 2px; background: var(--htr-c, #5aa0d8); flex: none; }
+/* 刻度柱：色相分 source（--htr-c）、实心/空心分 kind（save=空心环），同弹层 tick 口径 */
+#${HISTORY_TREE_ID} .htr-tick {
+  flex: none; position: relative; width: 9px; height: 16px; padding: 0; margin: 0;
+  border: 0; border-radius: 4px; cursor: pointer;
+  background: var(--htr-c, #5aa0d8);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.35);
+}
+#${HISTORY_TREE_ID} .htr-tick[data-kind="save"] {
+  background: transparent; border: 2px solid var(--htr-c, #5aa0d8); box-shadow: none;
+}
+#${HISTORY_TREE_ID} .htr-tick:hover { filter: brightness(1.28); }
+#${HISTORY_TREE_ID} .htr-tick-sel { box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
+/* HEAD 高亮：柱下小金点（放柱下方，避开柱顶叠色条） */
+#${HISTORY_TREE_ID} .htr-tick-head::after {
+  content: ""; position: absolute; bottom: -5px; left: 50%; transform: translateX(-50%);
+  width: 6px; height: 6px; border-radius: 50%; background: #e8c268;
+}
+/* 旧数据（blockNames === null）：淡化（同弹层 [data-legacy] 口径） */
+#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-strip,
+#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-tick { opacity: .55; }
+/* 父子连线层：渲染后按真实位置补画（SVG），只描边不填充 */
+#${HISTORY_TREE_ID} .htr-edges {
+  position: absolute; inset: 0; pointer-events: none;
+  stroke: rgba(255,255,255,.35); stroke-width: 1.5; fill: none;
+}
+#${HISTORY_TREE_ID} .htr-empty { color: #9fb3c8; padding: 6px 2px; }
+#${HISTORY_TREE_ID} .htr-err { color: #e8a0a0; padding: 6px 2px; }
+/* 悬停气泡（同弹层 .hhb-bubble 家族） */
+#${HISTORY_TREE_ID} .htr-bubble {
+  position: absolute; z-index: 5; max-width: 280px; pointer-events: none;
+  background: rgba(18,22,28,.98); color: #e6edf5;
+  border: 1px solid rgba(255,255,255,.22); border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.5); padding: 5px 8px; font-size: 11px; line-height: 1.45;
+}
+#${HISTORY_TREE_ID} .htr-bub-time { color: #9fb3c8; }
+`;
+  document.head.appendChild(style);
+}
+
+// 计数：N 节点 = entries 数；M 分支 = 分叉点数（parent 被 ≥2 个节点指向的 parent 个数，口径见 记录-存疑项）。
+function historyTreeUpdateCounts(entries) {
+  if (!historyTreeCountEl) return;
+  const cnt = new Map();
+  for (const ent of entries) {
+    const p = ent && ent.parent;
+    if (p == null) continue;
+    cnt.set(p, (cnt.get(p) || 0) + 1);
+  }
+  let branches = 0;
+  for (const v of cnt.values()) if (v >= 2) branches += 1;
+  historyTreeCountEl.textContent = entries.length + " 节点 · " + branches + " 分支";
+}
+
+// 树渲染：entries（按 seq 升序）→ depth 分层行 → 行内 seq 从左到右 → 渲染后 rAF 补 SVG 连线。
+function historyTreeRenderTree(entries) {
+  const tree = historyTreeTreeEl;
+  if (!tree) return;
+  tree.textContent = "";
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "htr-empty";
+    empty.textContent = "这个工作流还没有提交记录";
+    tree.appendChild(empty);
+    return;
+  }
+  const bySeq = new Map(); // seq → ent（parent 定位用）
+  for (const ent of entries) {
+    if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
+  }
+  // depth：单遍即可（parent 的 seq 恒小于 child，entries 按 seq 升序 → parent 先入表）。
+  // parent 非空但指向不存在的 seq（孤儿）→ 视为根 depth=0（不丢节点）。
+  const depthOf = new Map();
+  for (const ent of entries) {
+    const seq = ent && ent.seq;
+    if (seq == null) continue;
+    const p = ent.parent;
+    const d = p == null || !bySeq.has(p) || !depthOf.has(p) ? 0 : depthOf.get(p) + 1;
+    depthOf.set(seq, d);
+  }
+  const rows = new Map(); // depth → [ent]（entries 升序 push → 同层即按 seq 从左到右）
+  for (const ent of entries) {
+    const seq = ent && ent.seq;
+    if (seq == null) continue;
+    const d = depthOf.get(seq) || 0;
+    if (!rows.has(d)) rows.set(d, []);
+    rows.get(d).push(ent);
+  }
+  const depths = Array.from(rows.keys()).sort((a, b) => a - b);
+  const nodeEls = new Map(); // seq → tick 元素（连线测量用）
+  const head = historyHeadGet();
+  for (const d of depths) {
+    const row = document.createElement("div");
+    row.className = "htr-row";
+    for (const ent of rows.get(d)) {
+      const cell = document.createElement("div");
+      cell.className = "htr-cell";
+      // 柱顶叠色条：触及框数（null 旧数据按 1 计 + 打 legacy 标记）
+      const strip = document.createElement("div");
+      strip.className = "htr-strip";
+      strip.style.setProperty("--htr-c", historyTickColor(ent && ent.source));
+      if (Array.isArray(ent.blockNames)) {
+        strip.style.width = Math.min(ent.blockNames.length, 6) * 3 + "px";
+        strip.title = "触及 " + ent.blockNames.length + " 个框";
+      } else {
+        strip.style.width = "3px";
+        strip.title = "历史旧数据（无法细分到框，按 1 计）";
+        cell.dataset.legacy = "1";
+      }
+      const tick = document.createElement("button");
+      tick.type = "button";
+      tick.className = "htr-tick";
+      tick.style.setProperty("--htr-c", historyTickColor(ent && ent.source));
+      tick.dataset.kind = String((ent && ent.kind) || "run");
+      tick.dataset.src = String((ent && ent.source) || "unknown");
+      tick.title = ""; // 自绘气泡，不用原生 tooltip
+      if (head && ent.seq != null && head.seq === ent.seq) tick.classList.add("htr-tick-head");
+      // P7 补完（2026-10-12）：悬停气泡 / 单击点选回跳（回跳链：historyBarSelection → historyRollbackConfirmOpen → historyRollbackExecute）。
+      tick.addEventListener("mouseenter", () => historyTreeBubbleShow(tick, ent));
+      tick.addEventListener("mouseleave", () => historyTreeBubbleHide());
+      tick.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        historyTreePick(tick, ent);
+      });
+      // 组装并挂行（cell ← strip+tick，row ← cell，tree ← row；seq → tick 供连线测量）。
+      cell.append(strip, tick);
+      row.appendChild(cell);
+      tree.appendChild(row);   // ⚠️ 曾缺失：行建了却从未挂进 DOM（空面板根因）
+      if (ent.seq != null) nodeEls.set(ent.seq, tick);
+    }
+  }
+  return { nodeEls };
+}
+
+// ── P7 补完（2026-10-12）：容器挂载 / 取数 / 交互 / 连线 ────────────────────────
+
+// 容器挂载（幂等）：底部收纳条 + 展开面板（行容器 + SVG 连线层）挂 document.body。
+// 初始展开态从 historyTreeStateGet() 恢复；展开/收起走 historyTreeStateSet 持久化。
+let historyTreeResizeBound = false; // resize 重画连线只绑一次（防 historyTreeEnsure 重建容器时重复绑）
+function historyTreeEnsure() {
+  historyTreeStyleEnsure();
+  if (historyTreeEl && historyTreeEl.isConnected) return;
+  const root = document.createElement("div");
+  root.id = HISTORY_TREE_ID;
+  const open0 = historyTreeStateGet();
+  if (open0) root.classList.add("htr-open");
+  historyTreeOpen = open0;
+  // 收纳条：提交树 · N 节点 · M 分支 + 展开/收起按钮
+  const collapsed = document.createElement("div");
+  collapsed.className = "htr-collapsed";
+  const sum = document.createElement("span");
+  sum.className = "htr-sum";
+  sum.textContent = "提交树";
+  const count = document.createElement("span");
+  count.className = "htr-count";
+  count.textContent = "0 节点 · 0 分支";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "htr-toggle";
+  const setToggleLabel = () => {
+    toggle.textContent = root.classList.contains("htr-open") ? "收起" : "展开";
+  };
+  const toggleTree = () => {
+    const open = !root.classList.contains("htr-open");
+    root.classList.toggle("htr-open", open);
+    historyTreeStateSet(open);
+    historyTreeOpen = open;
+    setToggleLabel();
+    if (open) void historyTreeRefresh(); // 展开时取数渲染；收起不 fetch（下次提交/回跳的 refresh 只更计数）
+  };
+  collapsed.addEventListener("click", toggleTree);
+  toggle.addEventListener("click", (ev) => {
+    // 按钮在收纳条内：stopPropagation 防止冒泡触发两次切换
+    ev.preventDefault();
+    ev.stopPropagation();
+    toggleTree();
+  });
+  collapsed.append(sum, count, toggle);
+  // 展开面板：行容器（rows）+ SVG 连线层（渲染后按真实位置补画）
+  const panel = document.createElement("div");
+  panel.className = "htr-panel";
+  const tree = document.createElement("div");
+  tree.className = "htr-tree";
+  panel.appendChild(tree);
+  root.append(collapsed, panel);
+  document.body.appendChild(root);
+  historyTreeEl = root;
+  historyTreePanelEl = panel;
+  historyTreeTreeEl = tree;
+  historyTreeCountEl = count;
+  historyTreeToggleEl = toggle;
+  setToggleLabel();
+  // resize 重画连线：用缓存的 historyTreeEntries 重渲染（不 refetch）；收起着跳过（下次展开时 refresh 会画）
+  if (!historyTreeResizeBound) {
+    historyTreeResizeBound = true;
+    let rt = null;
+    window.addEventListener("resize", () => {
+      if (!historyTreeEl || !historyTreeEl.classList.contains("htr-open")) return;
+      if (rt) clearTimeout(rt);
+      rt = setTimeout(() => {
+        const res = historyTreeRenderTree(historyTreeEntries);
+        historyTreeDrawEdges(res && res.nodeEls);
+      }, 120);
+    });
+  }
+}
+
+// 取数 + 渲染（commit 成功 / 回跳成功 / 展开时各调一次；函数本体补上即通，两处调用点不动）。
+// 竞态：每次 refresh 递增 historyTreeReqId，回包校验，旧的作废。
+async function historyTreeRefresh() {
+  if (!historyTreeEl) historyTreeEnsure();
+  const reqId = ++historyTreeReqId;
+  let wfName = "";
+  try {
+    wfName = currentWorkflowInfo().name || "";
+  } catch {
+    wfName = "";
+  }
+  try {
+    // 照抄弹层取法（HISTORY_LIST_PATH = /hana_bridge/history-list，fetchApi 自动加 /api 前缀）
+    const resp = await api.fetchApi(HISTORY_LIST_PATH + "?workflow=" + encodeURIComponent(wfName), {
+      method: "GET",
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    if (!data || data.ok !== true) throw new Error(String((data && data.error) || "返回异常"));
+    if (reqId !== historyTreeReqId) return; // 已有更新的 refresh / 已收起重开：作废
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    historyTreeEntries = entries; // 缓存：resize 重画连线用，不 refetch
+    historyTreeUpdateCounts(entries);
+    if (historyTreeEl && historyTreeEl.classList.contains("htr-open") && historyTreeTreeEl) {
+      const res = historyTreeRenderTree(entries);
+      historyTreeDrawEdges(res && res.nodeEls);
+    }
+  } catch (err) {
+    if (reqId !== historyTreeReqId) return;
+    console.warn(LOG_TAG, "P7-树取数失败（静默，不影响画布）", err);
+    if (historyTreeEl && historyTreeEl.classList.contains("htr-open") && historyTreeTreeEl) {
+      historyTreeTreeEl.textContent = "";
+      const errEl = document.createElement("div");
+      errEl.className = "htr-err";
+      errEl.textContent = "提交树取数失败：" + String((err && err.message) || err);
+      historyTreeTreeEl.appendChild(errEl);
+    }
+  }
+}
+
+// 悬停气泡（仿弹层 historyBarBubbleShow；内容：#NNN · 时间 / kind/source · 变更节点名）。
+// 绝对定位在树容器内（.htr-bubble），移开由 mouseleave 隐藏。
+function historyTreeBubbleShow(tick, ent) {
+  if (!historyTreeEl || !tick) return;
+  historyTreeBubbleHide();
+  const b = document.createElement("div");
+  b.className = "htr-bubble";
+  const t = document.createElement("div");
+  t.className = "htr-bub-time";
+  t.textContent = "#" + historySeqLabel(ent) + " · " + historyFmtTime(ent && ent.at);
+  const names = document.createElement("div");
+  names.textContent =
+    String((ent && ent.kind) || "run") + " / " + String((ent && ent.source) || "unknown") +
+    " · " + historyTickChangedNames(ent).join("、");
+  b.append(t, names);
+  // 先隐藏挂入：需要 offsetWidth/offsetHeight 才能算定位
+  b.style.visibility = "hidden";
+  b.style.left = "0px";
+  b.style.top = "0px";
+  historyTreeEl.appendChild(b);
+  try {
+    const tr = tick.getBoundingClientRect();
+    const rr = historyTreeEl.getBoundingClientRect();
+    const bw = b.offsetWidth;
+    const bh = b.offsetHeight;
+    let left = tr.left + tr.width / 2 - rr.left - bw / 2;
+    left = Math.max(0, Math.min(left, Math.max(0, rr.width - bw))); // 水平钳在容器内
+    // 树贴底：默认气泡在刻度上方；上方放不下 → 落刻度下方（树面板内部兜底）
+    let top = tr.top - rr.top - bh - 6;
+    if (top < 4) top = tr.bottom - rr.top + 6;
+    b.style.left = left.toFixed(1) + "px";
+    b.style.top = top.toFixed(1) + "px";
+  } catch {
+    /* 定位失败也显示（左上角），不影响 hover 语义 */
+  }
+  b.style.visibility = "visible";
+}
+
+function historyTreeBubbleHide() {
+  if (!historyTreeEl) return;
+  const b = historyTreeEl.querySelector(".htr-bubble");
+  if (b && b.parentElement) b.parentElement.removeChild(b);
+}
+
+// 点选回跳：写 historyBarSelection（historyRollbackExecute 读它）→ 复用弹层确认框。
+// 防重入：historyRollback.busy 时忽略。树内旧选中态自清（弹层轴选中态归弹层管，互不干扰）。
+function historyTreePick(tick, ent) {
+  if (!ent || ent.seq == null || historyRollback.busy) return;
+  historyTreeBubbleHide();
+  const file = ent && ent.file ? String(ent.file) : null;
+  historyBarSelection = { file, seq: ent.seq };
+  if (historyTreeTreeEl) {
+    historyTreeTreeEl.querySelectorAll(".htr-tick.htr-tick-sel").forEach((t) => t.classList.remove("htr-tick-sel"));
+  }
+  if (tick) tick.classList.add("htr-tick-sel");
+  historyRollbackConfirmOpen(tick, ent); // 确认框 → 「回跳」走 historyRollbackExecute（现有链）
+}
+
+// 连线：渲染完各行后按真实 DOM 位置画 SVG 折线（父刻度底边中点 → 下行 ≤10px → 横移 → 下行到
+// 子刻度顶边中点；同 x 直连）。nodeEls 来自 historyTreeRenderTree；rAF 等一帧布局稳定后测量。
+function historyTreeDrawEdges(nodeEls) {
+  const tree = historyTreeTreeEl;
+  if (!tree || !nodeEls || !nodeEls.size) return;
+  const bySeq = new Map();
+  for (const ent of historyTreeEntries) {
+    if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
+  }
+  // 渲染时 tree.textContent="" 已清掉旧 svg，这里新挂一层
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "htr-edges");
+  tree.appendChild(svg);
+  requestAnimationFrame(() => {
+    let tr = null;
+    try {
+      tr = tree.getBoundingClientRect();
+    } catch {
+      return;
+    }
+    if (!tr || (!tr.width && !tr.height)) return; // 已收起 / 不可见：不画
+    let d = "";
+    for (const ent of historyTreeEntries) {
+      const seq = ent && ent.seq;
+      if (seq == null) continue;
+      const p = ent.parent;
+      if (p == null || !bySeq.has(p)) continue; // 根 / 孤儿不画
+      const childEl = nodeEls.get(seq);
+      const parentEl = nodeEls.get(p);
+      if (!childEl || !parentEl) continue;
+      let cr, pr;
+      try {
+        cr = childEl.getBoundingClientRect();
+        pr = parentEl.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (!cr.width || !pr.width) continue;
+      const x1 = pr.left + pr.width / 2 - tr.left;
+      const y1 = pr.bottom - tr.top;
+      const x2 = cr.left + cr.width / 2 - tr.left;
+      const y2 = cr.top - tr.top;
+      if (y2 <= y1) continue; // 异常布局（父在下/同点）：跳过，不画
+      if (Math.abs(x2 - x1) < 0.5) {
+        d += "M" + x1.toFixed(1) + " " + y1.toFixed(1) + "L" + x2.toFixed(1) + " " + y2.toFixed(1);
+      } else {
+        const midY = y1 + Math.min(10, (y2 - y1) / 2); // 父底先短竖下行，再横移，再落到子顶
+        d +=
+          "M" + x1.toFixed(1) + " " + y1.toFixed(1) +
+          "L" + x1.toFixed(1) + " " + midY.toFixed(1) +
+          "L" + x2.toFixed(1) + " " + midY.toFixed(1) +
+          "L" + x2.toFixed(1) + " " + y2.toFixed(1);
+      }
+    }
+    svg.innerHTML = d ? '<path d="' + d + '"/>' : "";
+  });
+}
 // 执行期间把变更来源标为 "agent"；装载类窗口另标 "system"（见 beginSystemWindow）。
 // v2（2026-10-08）追加 canvas.copilot（开关自身也是写类；拦截豁免见下）。
 const WRITE_OPS = new Set([
@@ -4086,6 +4545,9 @@ app.registerExtension({
     installQueuePromptCapture();
     // P4 修：常驻安装出图产物捕获（与后端无关，先行；幂等；上报失败静默）。
     installOutputCapture();
+    // P7-树（2026-10-12）：底部提交树容器挂载（幂等）+ 首次刷新（收起着只更新计数）。
+    historyTreeEnsure();
+    void historyTreeRefresh();
     // P2-F1b：安装画布点击命中 group（包原型 + 重绑实例事件回调 + 元素 capture 监听；与后端无关，先行；幂等）。
     installHistoryGroupClick();
     // 延迟重试：setup() 时 app.canvas / canvas 元素可能尚未就绪（已绑则内部跳过）。
