@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-11 hana-bridge-1011095446";
+const BUILD_TAG = "2026-10-11 hana-bridge-11232933";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -2240,6 +2240,85 @@ async function reportHistoryCommit({ graph, promptId, blocks }) {
   }
 }
 
+// ── P4 修（2026-10-11）：出图产物回填（捕获点见 方案-画布提交历史-P4修-P6.md §五）──────
+// 背景：P4 缩略图旧口径走 GET /history/{promptId}（ComfyUI 内存态，重启即空）→ 修法是把
+// 产物「文件名」在出图后持久化到后端 sidecar（POST /hana_bridge/history-attach-images，
+// 端点由 A 方实现，未就绪时静默失败）。桥只上报文件名，不存字节、不重算 sig。
+// 边界（硬性）：只读事件 + fire-and-forget 上报；异常一律 try/catch 吞掉 + console.warn，
+// 绝不影响画布与执行链路。
+const HISTORY_ATTACH_PATH = "/hana_bridge/history-attach-images";
+let outputCaptureInstalled = false;
+// 暂存：promptId → images[]（executed 逐节点累积，execution_success 时上报并清空）
+const pendingImages = new Map();
+
+// 安装出图捕获（幂等）。在 setup() 里调用一次。
+function installOutputCapture() {
+  if (outputCaptureInstalled) return;
+  // 逐节点事件：e.detail.output 里各值是产物数组（如 { images:[{filename,subfolder,type}] }）
+  api.addEventListener("executed", (e) => {
+    try {
+      const d = e && e.detail;
+      if (!d || typeof d.prompt_id !== "string") return;
+      const out = d.output && typeof d.output === "object" ? d.output : null;
+      if (!out) return;
+      const arr = pendingImages.get(d.prompt_id) || [];
+      for (const v of Object.values(out)) {
+        if (!Array.isArray(v)) continue;
+        for (const item of v) {
+          if (item && typeof item === "object" && typeof item.filename === "string") {
+            arr.push({
+              filename: item.filename,
+              subfolder: typeof item.subfolder === "string" ? item.subfolder : "",
+              type: typeof item.type === "string" ? item.type : "output",
+            });
+          }
+        }
+      }
+      pendingImages.set(d.prompt_id, arr);
+    } catch (err) {
+      console.warn(LOG_TAG, "P4 出图产物捕获失败（不影响执行）", err);
+    }
+  });
+  // 一次运行结束：上报并清暂存。后端按 filename+subfolder+type 去重合并（重复上报无害）。
+  api.addEventListener("execution_success", (e) => {
+    try {
+      const d = e && e.detail;
+      const pid = d && typeof d.prompt_id === "string" ? d.prompt_id : null;
+      if (!pid) return;
+      const images = pendingImages.get(pid) || [];
+      pendingImages.delete(pid);
+      if (images.length) void reportHistoryImages(pid, images);
+    } catch (err) {
+      console.warn(LOG_TAG, "P4 出图产物上报失败（不影响执行）", err);
+    }
+  });
+  // 出错/中断/取消也清暂存（防泄漏）
+  ["execution_error", "execution_interrupted"].forEach((evt) => {
+    api.addEventListener(evt, (e) => {
+      try {
+        const d = e && e.detail;
+        const pid = d && typeof d.prompt_id === "string" ? d.prompt_id : null;
+        if (pid) pendingImages.delete(pid);
+      } catch { /* 清理失败静默 */ }
+    });
+  });
+  outputCaptureInstalled = true;
+}
+
+// 上报一次出图产物（契约字段冻结，勿改字段名）：POST /hana_bridge/history-attach-images
+// ⚠️ 端点在索引里按 promptId 找 entry → 写/合并 sidecar；未就绪时静默失败。
+async function reportHistoryImages(promptId, images) {
+  try {
+    let workflow = null;
+    try { workflow = currentWorkflowInfo().name; } catch { workflow = null; }
+    await postJson(HISTORY_ATTACH_PATH, {
+      workflow, promptId, images, at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn(LOG_TAG, "P4 出图产物回填失败（不影响画布）", err);
+  }
+}
+
 // ── P2-F2（2026-10-11）：提交快照的块归属 blocks ──────────────────────────────
 // graphBlocks(graph)：对「UI 格式 JSON」算块归属 → [{name, source:"group"|"role", nodeIds:[…]}]。
 // 归组口径移植自 app/lib/canvas-outline.mjs（group 优先 + 角色兜底两级），纯函数零依赖 ——
@@ -2367,6 +2446,9 @@ function graphBlocks(graph) {
 const HISTORY_LIST_PATH = "/hana_bridge/history-list"; // fetchApi 自动加 /api 前缀 → /api/hana_bridge/history-list（已实测等价）
 const HISTORY_BAR_ID = "hana-history-bar";
 const HISTORY_BAR_STYLE_ID = "hana-history-bar-style";
+const HISTORY_LIGHTBOX_ID = "hana-history-lightbox"; // P4：点缩略图看原图的全屏浮层
+const HISTORY_CONFIRM_ID = "hana-history-bar-confirm"; // P6-1：双击刻度的回跳确认框
+const HISTORY_TICK_DBL_MS = 240; // P6-1：单击/双击消歧窗口（240ms 内二次点击算双击）
 
 let historyBarEl = null; // 弹层单例：null=收起
 let historyBarRequestId = 0; // 竞态哨兵：切换/收起后递增，在途旧响应作废
@@ -2380,6 +2462,9 @@ const historyGroupHookSeenEvents = new WeakSet(); // 同一事件多入口去重
 let historyBarSelection = null; // 卡片点选的提交 {file, seq}（file 为空时按 seq 定位）
 let historyBarLatestEntry = null; // 最近一次提交条目（未提交比对基线；historyBarLoad 渲染时回填）
 let historyRollback = { armed: false, timer: null, busy: false };
+// P6-1：横轴三态交互状态（单击/双击消歧、缩略图浮层延迟关）
+let historyTickClickTimer = null; // 非空 = 已收到第一次单击，正在等消歧窗口结束
+let historyShotsCloseTimer = null; // 缩略图浮层「移开延迟关」定时器
 
 function historyBarStyleEnsure() {
   if (document.getElementById(HISTORY_BAR_STYLE_ID)) return;
@@ -2391,20 +2476,56 @@ function historyBarStyleEnsure() {
   background: rgba(28,32,39,.96); color: #fff;
   border: 1px solid rgba(255,255,255,.2); border-radius: 11px;
   box-shadow: 0 10px 32px rgba(0,0,0,.45);
-  padding: 8px 10px; font-size: 12px; line-height: 1.4;
+  padding: 7px 10px 8px; font-size: 12px; line-height: 1.4;
   pointer-events: auto; user-select: none;
-  max-width: min(640px, calc(100vw - 16px));
+  max-width: min(760px, calc(100vw - 16px));
 }
 #${HISTORY_BAR_ID} .hhb-title { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
 #${HISTORY_BAR_ID} .hhb-wf { font-weight:600; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #${HISTORY_BAR_ID} .hhb-count { color:#9fb3c8; }
 #${HISTORY_BAR_ID} .hhb-x { margin-left:auto; background:transparent; border:0; color:#cfd8e3; font-size:14px; cursor:pointer; padding:0 4px; line-height:1; }
 #${HISTORY_BAR_ID} .hhb-x:hover { color:#fff; }
-#${HISTORY_BAR_ID} .hhb-cards { display:flex; gap:8px; overflow-x:auto; padding-bottom:2px; }
-#${HISTORY_BAR_ID} .hhb-card { flex:none; display:flex; gap:6px; align-items:center; padding:5px 7px; border:1px solid rgba(255,255,255,.14); border-radius:8px; background:rgba(255,255,255,.04); cursor:pointer; }
-#${HISTORY_BAR_ID} .hhb-card:hover { border-color:rgba(255,255,255,.35); }
-#${HISTORY_BAR_ID} .hhb-card-sel { border-color:rgba(127,178,217,.9); background:rgba(127,178,217,.16); }
-#${HISTORY_BAR_ID} .hhb-thumb { width:48px; height:48px; flex:none; border-radius:6px; background:#3a414b; color:#aab4c0; display:flex; align-items:center; justify-content:center; font-size:12px; }
+#${HISTORY_BAR_ID} .hhb-build { color:#6f8194; font-size:10px; margin-left:2px; }
+/* P6-1 横轴骨架：一条水平线 + 刻度（左旧右新）；线用背景渐变画，刻度骑在线上 */
+#${HISTORY_BAR_ID} .hhb-axis {
+  position: relative; display: flex; align-items: center; gap: 10px;
+  min-width: 280px; min-height: 30px; padding: 3px 2px;
+  overflow-x: auto; overflow-y: hidden;
+  background: linear-gradient(to bottom,
+    transparent calc(50% - .5px), rgba(255,255,255,.26) calc(50% - .5px),
+    rgba(255,255,255,.26) calc(50% + .5px), transparent calc(50% + .5px));
+}
+/* 刻度：色相分「谁」（--hhb-c），形态分「跑/存」（save=空心环） */
+#${HISTORY_BAR_ID} .hhb-tick {
+  flex: none; position: relative; width: 9px; height: 22px; padding: 0; margin: 0;
+  border: 0; border-radius: 4px; cursor: pointer;
+  background: var(--hhb-c, #5aa0d8);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.35);
+}
+#${HISTORY_BAR_ID} .hhb-tick[data-kind="save"] { background: transparent; border: 2px solid var(--hhb-c, #5aa0d8); box-shadow: none; }
+#${HISTORY_BAR_ID} .hhb-tick:hover { filter: brightness(1.28); }
+#${HISTORY_BAR_ID} .hhb-tick-sel { box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
+#${HISTORY_BAR_ID} .hhb-times { display:flex; justify-content:space-between; gap:12px; margin-top:3px; color:#8fa3b8; font-size:11px; }
+#${HISTORY_BAR_ID} .hhb-times span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* 悬停气泡（锚在刻度上方；越界落到刻度下方）。pointer-events:none → 不挡刻度 hover */
+#${HISTORY_BAR_ID} .hhb-bubble {
+  position:absolute; z-index:3; max-width:280px; pointer-events:none;
+  background:rgba(18,22,28,.98); color:#e6edf5;
+  border:1px solid rgba(255,255,255,.22); border-radius:8px;
+  box-shadow:0 6px 20px rgba(0,0,0,.5); padding:5px 8px; font-size:11px; line-height:1.45;
+}
+#${HISTORY_BAR_ID} .hhb-bub-time { color:#9fb3c8; }
+/* 单击刻度的缩略图浮层（默认隐藏；移开自动关） */
+#${HISTORY_BAR_ID} .hhb-shots { display:none; }
+#${HISTORY_BAR_ID} .hhb-shots-on { display:block; margin-top:6px; }
+#${HISTORY_BAR_ID} .hhb-shots-body { display:flex; align-items:center; gap:4px; max-width:none; overflow-x:auto; padding-bottom:2px; }
+#${HISTORY_BAR_ID} .hhb-shots-ph { color:#9fb3c8; font-size:11px; padding:4px 2px; }
+#${HISTORY_BAR_ID} .hhb-thumb { width:58px; height:58px; flex:none; border-radius:6px; background:#3a414b; color:#aab4c0; display:flex; align-items:center; justify-content:center; font-size:12px; overflow:hidden; }
+#${HISTORY_BAR_ID} .hhb-thumb-has { background:transparent; }
+#${HISTORY_BAR_ID} .hhb-thumb-multi { width:auto; max-width:208px; }
+#${HISTORY_BAR_ID} .hhb-thumb-img { width:58px; height:58px; object-fit:cover; border-radius:6px; display:block; cursor:zoom-in; background:#3a414b; }
+#${HISTORY_BAR_ID} .hhb-thumb-strip { display:flex; gap:4px; height:58px; overflow-x:auto; }
+#${HISTORY_BAR_ID} .hhb-thumb-strip .hhb-thumb-img { flex:none; }
 #${HISTORY_BAR_ID} .hhb-seq { font-weight:600; }
 #${HISTORY_BAR_ID} .hhb-row { display:flex; align-items:center; gap:4px; color:#9fb3c8; font-size:11px; }
 #${HISTORY_BAR_ID} .hhb-dot { width:7px; height:7px; border-radius:50%; flex:none; background:#9aa0a8; }
@@ -2416,8 +2537,28 @@ function historyBarStyleEnsure() {
 #${HISTORY_BAR_ID} .hhb-roll-armed { background:rgba(232,160,160,.18); border-color:rgba(232,160,160,.75); color:#f3c6c6; }
 #${HISTORY_BAR_ID} .hhb-topmsg { color:#b8e0a0; font-size:12px; margin-bottom:6px; }
 #${HISTORY_BAR_ID} .hhb-msg { color:#e8c268; font-size:11px; }
+#${HISTORY_BAR_ID} .hhb-msg:empty { display:none; }
 #${HISTORY_BAR_ID} .hhb-empty, #${HISTORY_BAR_ID} .hhb-err { color:#9fb3c8; padding:6px 2px; }
 #${HISTORY_BAR_ID} .hhb-err { color:#e8a0a0; }
+#${HISTORY_LIGHTBOX_ID} { position:fixed; inset:0; z-index:10050; background:rgba(0,0,0,.82); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; cursor:zoom-out; pointer-events:auto; user-select:none; }
+#${HISTORY_LIGHTBOX_ID} img { max-width:92vw; max-height:84vh; border-radius:8px; box-shadow:0 10px 40px rgba(0,0,0,.6); background:#222; }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-cap { color:#cfd8e3; font-size:12px; max-width:90vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-x { position:absolute; top:10px; right:14px; background:transparent; border:0; color:#cfd8e3; font-size:20px; cursor:pointer; line-height:1; padding:0 4px; }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-x:hover { color:#fff; }
+#${HISTORY_CONFIRM_ID} {
+  position: fixed; z-index: 10003; min-width: 220px; max-width: min(420px, calc(100vw - 16px));
+  background: rgba(28,32,39,.98); color: #fff;
+  border: 1px solid rgba(255,255,255,.22); border-radius: 11px;
+  box-shadow: 0 12px 36px rgba(0,0,0,.55); padding: 12px 14px; font-size: 13px;
+  pointer-events: auto; user-select: none;
+}
+#${HISTORY_CONFIRM_ID} .hhb-cf-text { margin-bottom: 10px; }
+#${HISTORY_CONFIRM_ID} .hhb-cf-warn { color:#e8a0a0; font-size:12px; margin:-4px 0 10px; }
+#${HISTORY_CONFIRM_ID} .hhb-cf-warn:empty { display:none; }
+#${HISTORY_CONFIRM_ID} .hhb-cf-row { display:flex; justify-content:flex-end; gap:8px; }
+#${HISTORY_CONFIRM_ID} .hhb-cf-btn { background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.22); color:#dfe7ef; border-radius:7px; padding:4px 12px; cursor:pointer; font-size:12px; }
+#${HISTORY_CONFIRM_ID} .hhb-cf-ok { background:rgba(127,178,217,.18); border-color:rgba(127,178,217,.6); color:#cfe4f5; }
+#${HISTORY_CONFIRM_ID} .hhb-cf-ok:hover { background:rgba(127,178,217,.3); }
 `;
   document.head.appendChild(style);
 }
@@ -2425,6 +2566,7 @@ function historyBarStyleEnsure() {
 // 收起弹层（幂等）：递增竞态哨兵作废在途 fetch 响应
 function historyBarClose() {
   historyBarRequestId++;
+  historyTickStateClear(); // P6-1：收起 → 三态残留（消歧定时器 / 浮层 / 确认框）一并清掉
   historyRollbackStateReset(); // P3-G1：收起 → 二次确认状态复位（规格 4）
   historyBarSelection = null;
   historyBarLatestEntry = null;
@@ -2509,15 +2651,472 @@ function historyGroupCenterScreen(group) {
   return { x: rect.left + p[0], y: rect.top + p[1] };
 }
 
+// P6-1：group 框矩形**顶部**中心 → 屏幕坐标（CSS px）。与 historyGroupCenterScreen 同式，
+// 只是纵向取 b[1]（框顶）而非几何中心；供「弹层底边贴近框顶」的锚定用。
+function historyGroupTopScreen(group) {
+  const canvas = app && app.canvas;
+  const el = canvas && (canvas.canvas || canvas.canvasEl || null);
+  if (!canvas || !el || !group) return null;
+  const b = historyGroupRect(group); // 字段依据见 historyGroupRect 注释
+  if (!b) return null;
+  const cx = b[0] + b[2] / 2;
+  const cy = b[1];
+  let p = null;
+  try {
+    p = canvas.convertOffsetToCanvas([cx, cy]);
+  } catch {
+    p = null;
+  }
+  if (!p) {
+    const ds = canvas.ds || canvas;
+    const scale = (ds && ds.scale) || 1;
+    const ox = (ds && ds.offset && ds.offset[0]) || 0;
+    const oy = (ds && ds.offset && ds.offset[1]) || 0;
+    p = [(cx - ox) / scale, (cy - oy) / scale];
+  }
+  const rect = el.getBoundingClientRect();
+  return { x: rect.left + p[0], y: rect.top + p[1] };
+}
+
+function historyCanvasEl() {
+  const canvas = app && app.canvas;
+  return (canvas && (canvas.canvas || canvas.canvasEl || null)) || null;
+}
+
+// 弹层水平钳制：优先钳在画布元素左右边界内（再兜一层视口 8px 边距）。
+// 画布比弹层还窄 → 退回「贴画布左边」，此时右侧可能溢出（见记录-存疑项）。
+function historyBarClampLeft(left, bw) {
+  const vw = window.innerWidth;
+  let lo = 8;
+  let hi = vw - bw - 8;
+  const el = historyCanvasEl();
+  if (el && typeof el.getBoundingClientRect === "function") {
+    const r = el.getBoundingClientRect();
+    if (r && r.width > 0) {
+      lo = Math.max(lo, r.left + 4);
+      hi = Math.min(hi, r.right - bw - 4);
+    }
+  }
+  if (hi < lo) return Math.max(4, lo);
+  return Math.max(lo, Math.min(left, hi));
+}
+
+// 头部第一段取「分组框名」（P6-1：头文案由工作流名改为框名）。
+function historyGroupName(group) {
+  if (!group) return "(未命名)";
+  const n = group.title != null ? group.title : group.name;
+  const s = n == null ? "" : String(n);
+  return s || "分组";
+}
+
+// 构建号短串（契约 §2.4）：BUILD_TAG 尾部数字串，如 "2026-10-11 hana-bridge-11225527" → "11225527"。
+function historyBuildShort() {
+  const m = String(BUILD_TAG || "").match(/(\d{5,})\s*$/);
+  return m ? m[1] : String(BUILD_TAG || "");
+}
+
+// 序号显示：#003（不足三位左补 0；缺 seq → #?）。
+function historySeqLabel(ent) {
+  return String(ent && ent.seq != null ? ent.seq : "?").padStart(3, "0");
+}
+
+// P6-1 三态残留清理（弹层收起 / 重开时调）。
+function historyTickStateClear() {
+  if (historyTickClickTimer) {
+    clearTimeout(historyTickClickTimer);
+    historyTickClickTimer = null;
+  }
+  if (historyShotsCloseTimer) {
+    clearTimeout(historyShotsCloseTimer);
+    historyShotsCloseTimer = null;
+  }
+  historyRollbackConfirmClose();
+}
+
+// P6-1 双击确认框：关（幂等）。
+function historyRollbackConfirmClose() {
+  const el = document.getElementById(HISTORY_CONFIRM_ID);
+  if (el && el.parentElement) el.parentElement.removeChild(el);
+}
+
+// ── P4 修（P6-2）：出图缩略图（历史条卡片）────────────────────────────────────
+// 数据源＝ `history-list` 每条 entry 已合并好的 `images`（后端读 sidecar 拼出，见方案 §2.2）；
+// **不再 fetch `/history/{promptId}`** —— 那是 ComfyUI 内存态，重启即空（P4 真实根因）。
+// 口径对齐 App 侧 viewPathOf（app/index.js:640）：/view?filename=..&subfolder=..&type=..
+// （subfolder 可能为空串，仍带上）；缩略图 = 同 URL 再加 &preview=webp;75 ——
+// ComfyUI 后端 /view 的 preview 分支就地转 webp（实测返回 image/webp），无需自写编码。
+// 入参形态：[{filename,subfolder,type}]（缺/非法项跳过）；空数组 → 空清单（调用方保留 seq 占位）。
+function historyImagesToUrls(images) {
+  const out = [];
+  const list = Array.isArray(images) ? images : [];
+  for (const im of list) {
+    if (!im || !im.filename) continue;
+    const qs =
+      "filename=" + encodeURIComponent(im.filename) +
+      "&subfolder=" + encodeURIComponent(im.subfolder || "") +
+      "&type=" + encodeURIComponent(im.type || "output");
+    out.push({
+      thumbUrl: historyViewUrl(qs + "&preview=webp;75"), // 缩略：后端就地转 webp
+      fullUrl: historyViewUrl(qs), // 原图：不带 preview
+      label: String(im.filename),
+    });
+  }
+  return out;
+}
+
+// 取图 URL：优先走前端 api.apiURL（自动补 api_base + /api 前缀，与桥其他 fetch 同口径）；
+// 缺失时退回相对路径 /view?…（8188 同源页内可解析）。
+function historyViewUrl(qs) {
+  const p = "/view?" + qs;
+  try {
+    if (api && typeof api.apiURL === "function") return api.apiURL(p);
+  } catch {
+    /* 退回相对路径 */
+  }
+  return p;
+}
+
+// 全屏浮层看原图（点任意处或 ✕ 关闭）。样式与历史条弹层同族（深色、圆角，z-index 更高）。
+function historyOpenLightbox(fullUrl, caption) {
+  if (!fullUrl) return;
+  historyLightboxClose();
+  historyBarStyleEnsure();
+  const box = document.createElement("div");
+  box.id = HISTORY_LIGHTBOX_ID;
+  const img = document.createElement("img");
+  img.src = fullUrl;
+  img.alt = caption ? String(caption) : "";
+  const cap = document.createElement("div");
+  cap.className = "hhb-lb-cap";
+  cap.textContent = caption ? String(caption) : "";
+  const x = document.createElement("button");
+  x.type = "button";
+  x.className = "hhb-lb-x";
+  x.textContent = "✕";
+  x.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyLightboxClose();
+  });
+  box.append(img, cap, x);
+  // 点任意处关闭（✕ 已 stopPropagation，不会重复触发）
+  box.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyLightboxClose();
+  });
+  document.body.appendChild(box);
+}
+
+function historyLightboxClose() {
+  const el = document.getElementById(HISTORY_LIGHTBOX_ID);
+  if (el && el.parentElement) el.parentElement.removeChild(el);
+}
+
+// 回填缩略图（数据源＝ list 条目已合并好的 images，纯本地渲染，无 fetch）。
+// 竞态：reqId 过期（弹层已收起 / 已切到别的框）→ 丢弃，不写 DOM。
+function historyFillThumb(reqId, thumb, images) {
+  const imgs = historyImagesToUrls(images);
+  if (reqId !== historyBarRequestId) return; // 弹层已切 / 已收起：作废
+  if (!imgs.length) return; // 无图 → 保留 seq 占位
+  if (!thumb || !thumb.isConnected) return;
+  thumb.textContent = "";
+  thumb.classList.add("hhb-thumb-has");
+  const makeImg = (it) => {
+    const img = document.createElement("img");
+    img.className = "hhb-thumb-img";
+    img.src = it.thumbUrl;
+    img.alt = it.label;
+    // 弹层「点开即看」：缩略图用 eager（lazy 会让点开的图延迟出现；同源小 webp 无性能顾虑）
+    img.loading = "eager";
+    img.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation(); // 点图只开原图，不触发卡片选中
+      historyOpenLightbox(it.fullUrl, it.label);
+    });
+    return img;
+  };
+  if (imgs.length === 1) {
+    thumb.appendChild(makeImg(imgs[0]));
+    return;
+  }
+  // 多图（batch / 多输出节点）：横向小条，溢出横向滚动
+  thumb.classList.add("hhb-thumb-multi");
+  const strip = document.createElement("div");
+  strip.className = "hhb-thumb-strip";
+  for (const it of imgs) strip.appendChild(makeImg(it));
+  thumb.appendChild(strip);
+}
+
+// ── P6-1：横轴三态交互（悬停气泡 / 单击缩略图 / 双击确认）────────────────────
+// 消歧：任一 tick 被点、且距上一次点击未超 HISTORY_TICK_DBL_MS → 判为双击
+// （由 historyBarTickClick 内唯一一个定时器实现：非空即表示「已收到第一次单击」）。
+
+// 变更节点名（悬停气泡正文）：主读 P5a 的 ent.delta.changed[].title；
+// 退化为 delta.added/removed 的 title；delta 缺失（P5b 前恒为 null）→ 退化为该提交触及的块名
+// （ent.blocks[].title/name，P5a 完整版块表）；再不行 → "#编号"。
+function historyTickChangedNames(ent) {
+  const out = [];
+  const seen = new Set();
+  const push = (s) => {
+    const v = s == null ? "" : String(s).trim();
+    if (!v || seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
+  const d = ent && ent.delta && typeof ent.delta === "object" ? ent.delta : null;
+  if (d) {
+    for (const c of Array.isArray(d.changed) ? d.changed : []) push(c && c.title);
+    if (out.length) return out;
+    for (const c of Array.isArray(d.added) ? d.added : []) push(c && c.title);
+    for (const c of Array.isArray(d.removed) ? d.removed : []) push(c && c.title);
+    if (out.length) return out;
+    return ["无节点变更"];
+  }
+  // delta 缺失：退化到块名
+  const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
+  for (const b of bl) {
+    if (b && typeof b === "object") push(b.title != null ? b.title : b.name);
+  }
+  if (out.length) return out;
+  push("#" + historySeqLabel(ent));
+  return out;
+}
+
+// 色相分「谁」：agent → 暖紫；否则（user/unknown）→ 冷色。写成内联 CSS 变量（不新增样式规则）。
+function historyTickColor(source) {
+  return String(source || "") === "agent" ? "#b189e0" : "#5aa0d8";
+}
+
+// 造一根刻度（button；形态分「跑/存」由 data-kind 控制）。
+function historyBarTickMake(reqId, ent, ctx) {
+  const tick = document.createElement("button");
+  tick.type = "button";
+  tick.className = "hhb-tick";
+  const seq = historySeqLabel(ent);
+  const src = String((ent && ent.source) || "unknown");
+  const kind = String((ent && ent.kind) || "run");
+  tick.style.setProperty("--hhb-c", historyTickColor(src));
+  tick.dataset.src = src;
+  tick.dataset.kind = kind;
+  tick.title = ""; // 用自绘气泡，不用原生 tooltip
+  tick.addEventListener("mouseenter", () => historyBarBubbleShow(tick, ent));
+  tick.addEventListener("mouseleave", () => historyBarBubbleHide());
+  tick.addEventListener("click", (ev) => historyBarTickClick(ev, tick, ent, ctx));
+  return tick;
+}
+
+// 单击/双击消歧入口（240ms）；双击走「选中 + 确认框 → historyRollbackExecute」。
+function historyBarTickClick(ev, tick, ent, ctx) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  if (historyTickClickTimer) {
+    // 消歧窗口内二次点击 = 双击
+    clearTimeout(historyTickClickTimer);
+    historyTickClickTimer = null;
+    historyTickSelect(tick, ent, ctx);
+    historyBarShotsHide(); // 双击 = 回跳，收起单击可能已展开的缩略图浮层
+    historyRollbackConfirmOpen(tick, ent);
+    return;
+  }
+  historyTickClickTimer = setTimeout(() => {
+    historyTickClickTimer = null;
+    historyTickSelect(tick, ent, ctx);
+    historyBarShotsToggle(tick, ent, ctx); // 单击：展开该提交的缩略图
+  }, HISTORY_TICK_DBL_MS);
+}
+
+// 选中某刻（模拟选中该提交）：写 historyBarSelection（供 historyRollbackClick/Execute 读）+ 高亮。
+function historyTickSelect(tick, ent, ctx) {
+  if (historyRollback.busy) return;
+  const file = ent && ent.file ? String(ent.file) : null;
+  const seq = ent && ent.seq != null ? ent.seq : null;
+  const prev = historyBarSelection;
+  const axis = ctx && ctx.axis ? ctx.axis : null;
+  historyRollbackBtnReset();
+  historyBarSelection = { file, seq };
+  if (axis) axis.querySelectorAll(".hhb-tick.hhb-tick-sel").forEach((t) => t.classList.remove("hhb-tick-sel"));
+  if (tick) tick.classList.add("hhb-tick-sel");
+  if (prev && prev.file === file && prev.seq === seq) return;
+  historyBarTip("已选 #" + historySeqLabel(ent) + "，点「回到这一版」或双击刻度执行", false);
+}
+
+// ── 悬停气泡（同主题：时间 + 变更节点名）────────────────────────────
+function historyBarBubbleShow(tick, ent) {
+  if (!historyBarEl || !tick) return;
+  historyBarBubbleHide();
+  const b = document.createElement("div");
+  b.className = "hhb-bubble";
+  const t = document.createElement("div");
+  t.className = "hhb-bub-time";
+  t.textContent = "#" + historySeqLabel(ent) + " · " + historyFmtTime(ent && ent.at);
+  const names = document.createElement("div");
+  names.className = "hhb-bub-names";
+  names.textContent = historyTickChangedNames(ent).join("、");
+  b.append(t, names);
+  // 先隐藏挂入：需要其 offsetWidth 才能算定位
+  b.style.visibility = "hidden";
+  b.style.left = "0px";
+  b.style.top = "0px";
+  historyBarEl.appendChild(b);
+  try {
+    const tr = tick.getBoundingClientRect();
+    const br = historyBarEl.getBoundingClientRect();
+    const bw = b.offsetWidth;
+    const bh = b.offsetHeight;
+    let left = tr.left + tr.width / 2 - br.left - bw / 2;
+    const maxL = Math.max(0, br.width - bw); // 最右：气泡右边贴弹层右边
+    left = Math.max(0, Math.min(left, maxL));
+    // 默认在刻度上方；弹层顶放不下 → 落到刻度下方
+    let top = tr.top - br.top - bh - 6;
+    if (tr.top - bh - 6 < 4 && tr.bottom + 6 + bh < window.innerHeight - 4) top = tr.bottom - br.top + 6;
+    b.style.left = left.toFixed(1) + "px";
+    b.style.top = top.toFixed(1) + "px";
+  } catch {
+    /* 定位失败也显示（左上角），不影响 hover 语义 */
+  }
+  b.style.visibility = "visible";
+}
+
+function historyBarBubbleHide() {
+  if (!historyBarEl) return;
+  const b = historyBarEl.querySelector(".hhb-bubble");
+  if (b && b.parentElement) b.parentElement.removeChild(b);
+}
+
+// ── 单击缩略图浮层（用现有 historyFillThumb 渲染；鼠标移开自动关）────
+function historyBarShotsToggle(tick, ent, ctx) {
+  const shots = ctx && ctx.shots ? ctx.shots : null;
+  if (!shots) return;
+  if (historyShotsCloseTimer) {
+    clearTimeout(historyShotsCloseTimer);
+    historyShotsCloseTimer = null;
+  }
+  const body = ctx.shotsBody || shots.querySelector(".hhb-shots-body");
+  if (body) body.textContent = "";
+  shots.classList.add("hhb-shots-on");
+  // 数据源＝ list 条目已合并好的 images（不再碰 /history）
+  const images = ent && Array.isArray(ent.images) ? ent.images : [];
+  if (!images.length) {
+    const ph0 = document.createElement("div");
+    ph0.className = "hhb-shots-ph";
+    ph0.textContent = "这次提交没有关联出图";
+    if (body) body.appendChild(ph0);
+    return;
+  }
+  // 复用 P4 的缩略图渲染（historyFillThumb：images → 缩略/原图 URL + lightbox 点击）
+  const thumb = document.createElement("div");
+  thumb.className = "hhb-thumb";
+  thumb.textContent = historySeqLabel(ent);
+  if (body) body.appendChild(thumb);
+  historyFillThumb(historyBarRequestId, thumb, images);
+}
+
+// 鼠标移开弹层 → 延迟关（弹层自身 hover 不关；进入弹层则取消关闭）
+function historyBarShotsHideSoon() {
+  if (historyShotsCloseTimer) clearTimeout(historyShotsCloseTimer);
+  historyShotsCloseTimer = setTimeout(() => {
+    historyShotsCloseTimer = null;
+    historyBarShotsHide();
+  }, 180);
+}
+
+function historyBarShotsHide() {
+  if (!historyBarEl) return;
+  const shots = historyBarEl.querySelector(".hhb-shots");
+  if (!shots) return;
+  shots.classList.remove("hhb-shots-on");
+  const body = shots.querySelector(".hhb-shots-body");
+  if (body) body.textContent = "";
+}
+
+// ── 双击确认框（复用 P3-G1 historyRollbackExecute）─────────────────
+function historyRollbackConfirmOpen(tick, ent) {
+  historyRollbackConfirmClose();
+  if (!historyBarEl || historyRollback.busy) return;
+  const box = document.createElement("div");
+  box.id = HISTORY_CONFIRM_ID;
+  const text = document.createElement("div");
+  text.className = "hhb-cf-text";
+  text.textContent = "回到 #" + historySeqLabel(ent) + " 这一刻？";
+  const warn = document.createElement("div"); // 未提交改动警告行（异步比对后回填；一致则留空）
+  warn.className = "hhb-cf-warn";
+  const row = document.createElement("div");
+  row.className = "hhb-cf-row";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "hhb-cf-btn";
+  cancel.textContent = "取消";
+  cancel.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyRollbackConfirmClose();
+  });
+  const ok = document.createElement("button");
+  ok.type = "button";
+  ok.className = "hhb-cf-btn hhb-cf-ok";
+  ok.textContent = "回跳";
+  ok.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyRollbackConfirmClose();
+    void historyRollbackExecute(); // 选中态已由 historyTickSelect 设好；未提交编辑拦截仍在 historyRollbackClick 一侧
+  });
+  row.append(cancel, ok);
+  box.append(text, warn, row);
+  document.body.appendChild(box);
+  // 锚在刻度下方；越界翻到上方；水平钳在视口内
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const bw = box.offsetWidth;
+  const bh = box.offsetHeight;
+  let r = null;
+  try {
+    r = tick && tick.getBoundingClientRect ? tick.getBoundingClientRect() : null;
+  } catch {
+    r = null;
+  }
+  let left = r && r.width ? r.left + r.width / 2 - bw / 2 : vw / 2 - bw / 2;
+  left = Math.max(8, Math.min(left, vw - bw - 8));
+  let top = r && r.width ? r.bottom + 8 : vh / 2 - bh / 2;
+  if (top + bh > vh - 8) top = Math.max(8, (r && r.width ? r.top : vh / 2) - bh - 8);
+  box.style.left = Math.round(left) + "px";
+  box.style.top = Math.round(top) + "px";
+  // 未提交改动提示：异步取该提交快照 vs 当前画布比对（复用 P3 同款公共函数）。
+  // 不一致 / 比对失败 / 材料不全 → 显示警告行（宁可多提醒）；一致 → 留空（:empty 不占位）。
+  // 竞态：确认框已关（或被新开的替换）→ 不回填。
+  const sel = {
+    file: ent && ent.file != null ? String(ent.file) : null,
+    seq: ent && ent.seq != null ? ent.seq : null,
+  };
+  void historyDiffAgainstSnapshot(sel).then((differ) => {
+    if (!differ) return;
+    if (!box.isConnected || box.id !== HISTORY_CONFIRM_ID) return;
+    warn.textContent = "当前画布有未提交的改动，回跳会一并丢弃。";
+  });
+}
+
 // 拉取并渲染提交列表（只在弹层打开时 fetch 一次；不缓存不轮询）。
 // 竞态：reqId 不等于当前哨兵 → 弹层已切其他 group 或已收起，旧响应直接丢弃。
-async function historyBarLoad(reqId, cards, countEl) {
+// P6-1：不再渲染卡片列，改为在横轴（ctx.axis）上渲染刻度；轴下两端补最早/最新时间。
+async function historyBarLoad(reqId, ctx, countEl) {
   let wfName = "(未命名)";
   try {
     wfName = currentWorkflowInfo().name || wfName;
   } catch {
     /* 保持默认 */
   }
+  const axis = ctx && ctx.axis ? ctx.axis : null;
+  const times = ctx && ctx.times ? ctx.times : null;
+  const fail = (msg) => {
+    if (reqId !== historyBarRequestId || !axis) return;
+    axis.textContent = "";
+    const errEl = document.createElement("div");
+    errEl.className = "hhb-err";
+    errEl.textContent = msg;
+    axis.appendChild(errEl);
+    if (times) times.textContent = "";
+  };
   try {
     const resp = await api.fetchApi(HISTORY_LIST_PATH + "?workflow=" + encodeURIComponent(wfName), {
       method: "GET",
@@ -2528,68 +3127,38 @@ async function historyBarLoad(reqId, cards, countEl) {
     if (reqId !== historyBarRequestId) return; // 已切/已收起：作废
     const entries = Array.isArray(data.entries) ? data.entries : [];
     historyBarLatestEntry = entries.length ? entries[entries.length - 1] : null; // P3-G1：索引末条＝最近提交（比对基线）
-    if (countEl) countEl.textContent = entries.length + " 条提交";
-    cards.textContent = "";
+    if (countEl) countEl.textContent = entries.length + " 次提交";
+    if (!axis) return;
+    axis.textContent = "";
+    if (times) times.textContent = "";
     if (!entries.length) {
       const empty = document.createElement("div");
       empty.className = "hhb-empty";
       empty.textContent = "这个工作流还没有提交记录";
-      cards.appendChild(empty);
+      axis.appendChild(empty);
       return;
     }
-    for (const ent of entries) {
-      const seq = ent && ent.seq != null ? String(ent.seq) : "?";
-      const card = document.createElement("div");
-      card.className = "hhb-card";
-      const thumb = document.createElement("div");
-      thumb.className = "hhb-thumb";
-      thumb.textContent = seq; // P4：换 .thumb.webp 真缩略图，当前灰底占位显示 seq
-      const meta = document.createElement("div");
-      const seqEl = document.createElement("div");
-      seqEl.className = "hhb-seq";
-      seqEl.textContent = "#" + seq.padStart(3, "0");
-      const row = document.createElement("div");
-      row.className = "hhb-row";
-      const dot = document.createElement("span");
-      dot.className = "hhb-dot";
-      const src = String((ent && ent.source) || "unknown");
-      if (src === "user" || src === "agent") dot.dataset.src = src; // unknown 走默认灰
-      const time = document.createElement("span");
-      time.textContent = historyFmtTime(ent && ent.at);
-      row.append(dot, time);
-      meta.append(seqEl, row);
-      card.append(thumb, meta);
-      // P3-G1：卡片可点选（选中态高亮）；换选复位二次确认状态（规格 4）
-      card.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        if (historyRollback.busy) return;
-        const file = ent && ent.file ? String(ent.file) : null;
-        const seq = ent && ent.seq != null ? ent.seq : null;
-        const prev = historyBarSelection;
-        if (prev && prev.file === file && prev.seq === seq) return; // 重复点同一卡片
-        historyRollbackBtnReset();
-        historyBarSelection = { file, seq };
-        cards.querySelectorAll(".hhb-card.hhb-card-sel").forEach((c) => c.classList.remove("hhb-card-sel"));
-        card.classList.add("hhb-card-sel");
-        historyBarTip("已选 #" + String(seq != null ? seq : "?").padStart(3, "0") + "，点「回到这一版」执行", false);
-      });
-      cards.appendChild(card);
+    // 刻度左旧右新：按 entries 原序（索引本身按 seq/时间递增）直接 append
+    for (const ent of entries) axis.appendChild(historyBarTickMake(reqId, ent, ctx));
+    // 轴下：左端最早时间 / 右端最新时间（historyFmtTime）
+    if (times) {
+      const first = document.createElement("span");
+      first.textContent = historyFmtTime(entries[0] && entries[0].at);
+      const last = document.createElement("span");
+      last.textContent = historyFmtTime(entries[entries.length - 1] && entries[entries.length - 1].at);
+      times.append(first, last);
     }
   } catch (err) {
-    if (reqId !== historyBarRequestId) return;
-    cards.textContent = "";
-    const errEl = document.createElement("div");
-    errEl.className = "hhb-err";
-    errEl.textContent = "提交历史加载失败：" + String((err && err.message) || err);
-    cards.appendChild(errEl);
+    fail("提交历史加载失败：" + String((err && err.message) || err));
     // 不抛异常：失败只落在弹层内
   }
 }
 
-// 打开弹层（重复调用=切换：先拆旧再建新）。anchor={x,y} 为屏幕 CSS px（group 几何中心）。
-function historyBarOpen(anchor) {
+// 打开弹层（重复调用=切换：先拆旧再建新）。
+// P6-1：参数由 anchor 点改为 group 本体 —— 锚定「框矩形顶部上方」（弹层底边贴近框顶）。
+function historyBarOpen(group) {
   historyBarStyleEnsure();
+  historyTickStateClear(); // P6-1：重开 → 三态残留先清
   historyRollbackStateReset(); // P3-G1：切换 group → 回跳态复位（同收起语义）
   historyBarSelection = null;
   historyBarLatestEntry = null;
@@ -2599,20 +3168,28 @@ function historyBarOpen(anchor) {
   const bar = document.createElement("div");
   bar.id = HISTORY_BAR_ID;
   historyBarEl = bar;
-  // 标题行：工作流名 + 提交数（fetch 后回填）+ ✕
+  // 头部：<分组框名> · <N 次提交>（fetch 后回填）+ 构建号 + ✕
   const title = document.createElement("div");
   title.className = "hhb-title";
   const wf = document.createElement("span");
   wf.className = "hhb-wf";
-  try {
-    wf.textContent = currentWorkflowInfo().name || "(未命名)";
-  } catch {
-    wf.textContent = "(未命名)";
+  if (group) {
+    wf.textContent = historyGroupName(group);
+  } else {
+    try {
+      wf.textContent = currentWorkflowInfo().name || "(未命名)";
+    } catch {
+      wf.textContent = "(未命名)";
+    }
   }
   wf.title = wf.textContent;
   const count = document.createElement("span");
   count.className = "hhb-count";
   count.textContent = "…";
+  const build = document.createElement("span"); // 契约 §2.4：版本标志（构建号短串）
+  build.className = "hhb-build";
+  build.textContent = historyBuildShort();
+  build.title = BUILD_TAG;
   const x = document.createElement("button");
   x.type = "button";
   x.className = "hhb-x";
@@ -2622,14 +3199,23 @@ function historyBarOpen(anchor) {
     ev.stopPropagation();
     historyBarClose();
   });
-  title.append(wf, count, x);
-  // 提交卡片列（横向滚动）；先放加载占位
-  const cards = document.createElement("div");
-  cards.className = "hhb-cards";
+  title.append(wf, count, build, x);
+  // 横轴（默认态：只有轴 + 刻度）；先放加载占位
+  const axis = document.createElement("div");
+  axis.className = "hhb-axis";
   const loading = document.createElement("div");
   loading.className = "hhb-empty";
   loading.textContent = "加载中…";
-  cards.appendChild(loading);
+  axis.appendChild(loading);
+  // 轴下两端时间（fetch 后回填）
+  const times = document.createElement("div");
+  times.className = "hhb-times";
+  // 单击刻度的缩略图浮层（默认隐藏，交互触发）
+  const shots = document.createElement("div");
+  shots.className = "hhb-shots";
+  const shotsBody = document.createElement("div");
+  shotsBody.className = "hhb-shots-body";
+  shots.appendChild(shotsBody);
   // 底部：回到这一版（P3-G1 真功能）+ 弹层内提示行
   const foot = document.createElement("div");
   foot.className = "hhb-foot";
@@ -2645,24 +3231,33 @@ function historyBarOpen(anchor) {
   const tip = document.createElement("span");
   tip.className = "hhb-msg";
   foot.append(roll, tip);
-  bar.append(title, cards, foot);
+  bar.append(title, axis, times, shots, foot);
   document.body.appendChild(bar); // position:fixed 自行定位，挂 body 避免容器裁剪
-  // 锚定 group 几何中心下方，水平钳制视口；底部放不下则翻到中心上方
+  // 鼠标离开弹层 → 缩略图浮层延迟关；进入弹层则取消关闭（浮层本身 hover 不关，移出才算）
+  bar.addEventListener("mouseenter", () => {
+    if (historyShotsCloseTimer) {
+      clearTimeout(historyShotsCloseTimer);
+      historyShotsCloseTimer = null;
+    }
+  });
+  bar.addEventListener("mouseleave", () => historyBarShotsHideSoon());
+  // 锚定：group 框矩形顶部上方（弹层底边贴近框顶 6px）；水平钳制在画布左右边界内
+  const anchor = historyGroupTopScreen(group);
   const vw = window.innerWidth;
   const vh = window.innerHeight;
   const bw = bar.offsetWidth;
   const bh = bar.offsetHeight;
   const ax = anchor ? anchor.x : vw / 2;
   const ay = anchor ? anchor.y : vh / 2;
-  let left = ax - bw / 2;
-  left = Math.max(8, Math.min(left, vw - bw - 8));
-  let top = ay + 12;
-  if (top + bh > vh - 8) top = Math.max(8, ay - bh - 12);
+  const left = historyBarClampLeft(ax - bw / 2, bw);
+  let top = ay - bh - 6; // 底边贴近框顶
+  if (top < 8) top = Math.max(8, ay + 6); // 上方放不下 → 落到框顶下方
   bar.style.left = Math.round(left) + "px";
   bar.style.top = Math.round(top) + "px";
   // 打开时才 fetch；竞态哨兵在途响应作废
+  const ctx = { axis, times, shots, shotsBody };
   const reqId = ++historyBarRequestId;
-  void historyBarLoad(reqId, cards, count);
+  void historyBarLoad(reqId, ctx, count);
 }
 
 // 点击钩子（只读）：命中 group → 弹出/切换；点空白 → 收起。任何分支不改画布状态。
@@ -2739,7 +3334,7 @@ function historyOnCanvasMouseDown(e) {
     if (historyBarEl) historyBarClose(); // 点空白 → 收起
     return;
   }
-  historyBarOpen(historyGroupCenterScreen(group)); // anchor 取不到时 historyBarOpen 内回退视口中心
+  historyBarOpen(group); // P6-1：锚定改为「框矩形顶部上方」，由 historyBarOpen 内部用 historyGroupRect/convertOffsetToCanvas 算；取不到框 → 回退视口中心
 }
 
 // 安装 group 点击命中（幂等 + 可重入）。setup() 里调用；另有延迟重试（见 scheduleHistoryGroupInstallRetries）。
@@ -2996,6 +3591,22 @@ async function historyFetchSnapshotQs(qs) {
   return snap;
 }
 
+// 当前画布 vs 某提交快照是否有差异（＝该提交之后画布是否还有未提交改动）。
+// 公共函数：P3-G1「回到这一版」护栏 3 与 P6-1 双击确认框共用（勿抄两遍）。
+// sel：{file, seq}（file 优先，缺失退回 seq）。
+// 返回 true = 有差异 / 材料不全 / 比对失败（调用方按「需确认」处理，宁可多问）。
+async function historyDiffAgainstSnapshot(sel) {
+  try {
+    if (!sel || (sel.file == null && sel.seq == null)) return true; // 无定位材料 → 按不一致
+    const cur = historyGraphSigForCompare();
+    const snap = await historyFetchSnapshot(sel);
+    return historySnapshotsDiffer(cur, historySnapshotGraphSig(snap.graph));
+  } catch (err) {
+    console.warn(LOG_TAG, "未提交比对失败（按不一致处理）", err);
+    return true;
+  }
+}
+
 // 「回到这一版」点击处理（二次确认状态机，规格 4）：
 //   无选卡 → 提示；未提交改动 → 第一次点=警示+按钮变「确认回跳」，60s 内再点=执行；
 //   超时/收起弹层/换选 → 状态复位。执行中 busy 防重入。
@@ -3008,22 +3619,10 @@ async function historyRollbackClick() {
     return;
   }
   // 未提交编辑拦截（护栏 3，简化口径）：当前画布 ≠ 最近一次提交 → 需二次确认。
-  let needsConfirm = true;
-  try {
-    const cur = historyGraphSigForCompare();
-    if (!historyBarLatestEntry || historyBarLatestEntry.file == null) {
-      needsConfirm = true; // 拿不到最近提交（从未提交/索引缺失）→ 宁可多问
-    } else {
-      const latestSnap = await historyFetchSnapshotQs(
-        "?workflow=" + encodeURIComponent(currentWorkflowInfo().name || "(未命名)") +
-        "&file=" + encodeURIComponent(String(historyBarLatestEntry.file)),
-      );
-      needsConfirm = historySnapshotsDiffer(cur, historySnapshotGraphSig(latestSnap.graph));
-    }
-  } catch (err) {
-    console.warn(LOG_TAG, "P3-G1 未提交比对失败（按需确认处理）", err);
-    needsConfirm = true;
-  }
+  // 拿不到最近提交（从未提交 / 索引缺失）→ 直判需确认（宁可多问）。
+  const latest = historyBarLatestEntry;
+  const needsConfirm =
+    !latest || latest.file == null ? true : await historyDiffAgainstSnapshot({ file: String(latest.file) });
   if (needsConfirm && !historyRollback.armed) {
     historyRollback.armed = true;
     if (historyRollback.timer) clearTimeout(historyRollback.timer);
@@ -3207,6 +3806,8 @@ app.registerExtension({
     announceToShell();
     // P1-A2：常驻安装 api.queuePrompt 包装（与后端无关，先行；不依赖 hello 成败）。
     installQueuePromptCapture();
+    // P4 修：常驻安装出图产物捕获（与后端无关，先行；幂等；上报失败静默）。
+    installOutputCapture();
     // P2-F1b：安装画布点击命中 group（包原型 + 重绑实例事件回调 + 元素 capture 监听；与后端无关，先行；幂等）。
     installHistoryGroupClick();
     // 延迟重试：setup() 时 app.canvas / canvas 元素可能尚未就绪（已绑则内部跳过）。

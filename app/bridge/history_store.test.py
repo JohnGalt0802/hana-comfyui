@@ -100,7 +100,7 @@ class TestBuildSnapshot(TempRootTestCase):
     def test_full_shape(self):
         graph = {"nodes": [{"id": 1}, {"id": 2}], "links": [[1, 2]]}
         snap = hs.build_snapshot(graph, "a3f9c2e1-xxxx", 3, "2026-10-11T00:00:00.000Z", "agent")
-        self.assertEqual(snap["schemaVersion"], 1)
+        self.assertEqual(snap["schemaVersion"], 2)
         self.assertEqual(snap["seq"], 3)
         self.assertEqual(snap["promptId"], "a3f9c2e1-xxxx")
         self.assertEqual(snap["at"], "2026-10-11T00:00:00.000Z")
@@ -184,11 +184,42 @@ class TestIndex(TempRootTestCase):
              "source": "user", "nodeCount": 5, "linkCount": 4}
         )
         obj = json.loads(line)
-        self.assertEqual(sorted(obj.keys()), ["at", "file", "linkCount", "nodeCount", "promptId", "seq", "source"])
+        self.assertEqual(
+            sorted(obj.keys()),
+            ["at", "blocks", "delta", "file", "kind", "linkCount", "nodeCount", "parent", "promptId", "runs", "seq", "sig", "source"],
+        )
         self.assertEqual(obj["file"], "0002-abcd.json")
+        # P5 新字段缺省
+        self.assertIsNone(obj["parent"])
+        self.assertEqual(obj["kind"], "run")
+        self.assertEqual(obj["sig"], "")
+        self.assertEqual(obj["blocks"], [])
+        self.assertIsNone(obj["delta"])
+        self.assertEqual(obj["runs"], [])
 
-    def test_build_index_line_blocks_summary(self):
-        # P2-F2：索引行只写摘要（name + nodeCount），不写 nodeIds / source 全量
+    def test_build_index_line_new_fields(self):
+        line = hs.build_index_line(
+            {"seq": 3, "file": "0003-x.json", "parent": 2, "kind": "save", "sig": "deadbeef",
+             "blocks": [{"name": "组1", "source": "group", "nodeIds": [1, 2]}],
+             "delta": {"changed": [], "added": [{"id": 5, "title": "X"}], "removed": []},
+             "runs": [{"promptId": "p1", "at": "2026-10-11T00:00:00.000Z",
+                       "images": [{"filename": "a.png", "subfolder": "", "type": "output"}]}]}
+        )
+        obj = json.loads(line)
+        self.assertEqual(obj["parent"], 2)
+        self.assertEqual(obj["kind"], "save")
+        self.assertEqual(obj["sig"], "deadbeef")
+        self.assertEqual(obj["blocks"], [{"name": "组1", "source": "group", "nodeIds": [1, 2]}])
+        self.assertEqual(obj["runs"][0]["promptId"], "p1")
+        self.assertEqual(obj["runs"][0]["images"][0]["filename"], "a.png")
+        # 非法 kind → run；blocks 缺 source/nodeIds → 补 group/[]
+        obj2 = json.loads(hs.build_index_line({"kind": "bot", "blocks": [{"name": "b"}]}))
+        self.assertEqual(obj2["kind"], "run")
+        self.assertEqual(obj2["blocks"], [{"name": "b", "source": "group", "nodeIds": []}])
+        # blocks 非列表 → []
+
+    def test_build_index_line_blocks_full(self):
+        # P5：索引行写**完整版** blocks（name + source + nodeIds），不再是摘要
         line = hs.build_index_line(
             {"seq": 1, "file": "0001-a.json",
              "blocks": [
@@ -197,12 +228,15 @@ class TestIndex(TempRootTestCase):
              ]}
         )
         obj = json.loads(line)
-        self.assertEqual(obj["blocks"], [{"name": "加载", "nodeCount": 3}, {"name": "采样", "nodeCount": 2}])
-        # 畸形块（非对象）剔除；nodeCount 非法 → 0；blocks 非列表 → 字段不出现
-        line2 = json.loads(hs.build_index_line({"blocks": ["bad", {"name": "x", "nodeCount": "y"}]}))
-        self.assertEqual(line2["blocks"], [{"name": "x", "nodeCount": 0}])
-        self.assertNotIn("blocks", json.loads(hs.build_index_line({"blocks": "bad"})))
-        self.assertNotIn("blocks", json.loads(hs.build_index_line({})))
+        self.assertEqual(
+            obj["blocks"],
+            [{"name": "加载", "source": "group", "nodeIds": [1, 2, 3]}, {"name": "采样", "source": "role", "nodeIds": [9, 8]}],
+        )
+        # 缺 source/nodeIds 的块 → 补 group/[]；nodeIds 值原样保留；非对象块剔除
+        line2 = json.loads(hs.build_index_line({"blocks": ["bad", {"name": "x"}]}))
+        self.assertEqual(line2["blocks"], [{"name": "x", "source": "group", "nodeIds": []}])
+        self.assertEqual(json.loads(hs.build_index_line({"blocks": "bad"}))["blocks"], [])
+        self.assertEqual(json.loads(hs.build_index_line({}))["blocks"], [])
 
     def test_parse_index_good_bad_blank(self):
         good1 = json.dumps({"seq": 1, "file": "0001-a.json"})
@@ -255,13 +289,13 @@ class TestCommit(TempRootTestCase):
         self.assertEqual(out["dir"], os.path.join(self.root, "workflows", ".history", "my workflow"))
         with open(os.path.join(out["dir"], out["file"]), encoding="utf-8") as fh:
             snap = json.loads(fh.read())
-        self.assertEqual(snap["schemaVersion"], 1)
+        self.assertEqual(snap["schemaVersion"], 2)
         self.assertEqual(snap["promptId"], "a3f9c2e1-9b7c-4d2e-8f01-234567890abc")
         self.assertEqual(snap["nodeCount"], 1)
         self.assertEqual(snap["graph"]["nodes"][0]["id"], 1)
 
-    def test_commit_with_blocks_and_index_summary(self):
-        # P2-F2：带 blocks 的提交 → 快照含 blocks 原样、索引行只含摘要（name+nodeCount）
+    def test_commit_with_blocks_index_full(self):
+        # P5：索引行存**完整版** blocks（含 source / nodeIds），不再写摘要
         blocks = [
             {"name": "组1", "source": "group", "nodeIds": [1, 2]},
             {"name": "采样", "source": "role", "nodeIds": [7]},
@@ -278,19 +312,16 @@ class TestCommit(TempRootTestCase):
         with open(os.path.join(out["dir"], out["file"]), encoding="utf-8") as fh:
             snap = json.loads(fh.read())
         self.assertEqual(snap["blocks"], blocks)  # 原样落盘
-        self.assertEqual(snap["schemaVersion"], 1)  # schemaVersion 不 bump
+        self.assertEqual(snap["schemaVersion"], 2)
         with open(os.path.join(out["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
             entry = json.loads(fh.readline())
-        self.assertEqual(entry["blocks"], [{"name": "组1", "nodeCount": 2}, {"name": "采样", "nodeCount": 1}])
-        self.assertNotIn("nodeIds", json.dumps(entry))  # 索引行不写 nodeIds 全量
-        # list_commits 读回：索引行摘要可见
+        self.assertEqual(entry["blocks"], blocks)  # 索引行完整版（name + source + nodeIds）
+        # list_commits 读回一致
         listed = hs.list_commits("wf", self.root)
-        self.assertEqual(listed["entries"][0]["blocks"], entry["blocks"])
+        self.assertEqual(listed["entries"][0]["blocks"], blocks)
 
-    def test_commit_without_blocks_reads_back_null(self):
-        # P2-F2 兼容：不带 blocks 的提交（等价旧快照）→ 落盘无该字段；索引行也无；list 读回不报错。
-        # （「读回 blocks:null」语义：查询端消费方对缺失字段按 null 处理——索引行本身是 JSON 对象，
-        #   字段缺失即 JSON null 语义；这里验证缺失且不出错。）
+    def test_commit_without_blocks_reads_back_empty(self):
+        # P5：不带 blocks 的提交 → 快照无该字段；索引行 blocks 缺省为 []（新形态总写该字段）
         out = self.commit({"workflow": "旧", "promptId": "bbbbbbbb-2", "graph": {"nodes": [], "links": []}})
         self.assertTrue(out["ok"])
         with open(os.path.join(out["dir"], out["file"]), encoding="utf-8") as fh:
@@ -298,11 +329,13 @@ class TestCommit(TempRootTestCase):
         self.assertNotIn("blocks", snap)
         with open(os.path.join(out["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
             entry = json.loads(fh.readline())
-        self.assertNotIn("blocks", entry)
-        self.assertEqual(entry.get("blocks"), None)  # 缺失字段按 null 读回
+        self.assertEqual(entry["blocks"], [])
+        self.assertEqual(entry["kind"], "run")
+        self.assertIsNone(entry["parent"])
+        self.assertEqual(entry["runs"], [])
         listed = hs.list_commits("旧", self.root)
         self.assertTrue(listed["ok"])
-        self.assertEqual(listed["entries"][0].get("blocks"), None)
+        self.assertEqual(listed["entries"][0]["blocks"], [])
 
     def test_list_commits_legacy_entries_no_blocks_ok(self):
         # P2-F2 兼容：手写一条 P1 旧格式索引行（无 blocks）+ 一个旧格式快照，list 读回不报错
@@ -316,7 +349,7 @@ class TestCommit(TempRootTestCase):
         with open(os.path.join(d, hs.INDEX_FILE_NAME), "w", encoding="utf-8") as fh:
             fh.write(legacy_line + "\n")
         with open(os.path.join(d, "0001-noid.json"), "w", encoding="utf-8") as fh:
-            json.dump({"schemaVersion": 1, "seq": 1, "graph": {"nodes": [], "links": []}}, fh)
+            json.dump({"schemaVersion": 2, "seq": 1, "graph": {"nodes": [], "links": []}}, fh)
         out = hs.list_commits("legacy", self.root)
         self.assertTrue(out["ok"])
         self.assertEqual(len(out["entries"]), 1)
@@ -474,7 +507,7 @@ class TestReadSnapshot(TempRootTestCase):
         # 缺 workflow → 400
         self.assertEqual(hs.read_snapshot("", self.root, seq=1)["status"], 400)
         # file 带路径分隔/上级目录 → 400（拒绝穿越，不落盘任何东西）
-        for bad in ("..\\0001-a3f9c2e1.json", "..\evil.json", "sub/0001-a3f9c2e1.json", "..", "."):
+        for bad in (r"..\0001-a3f9c2e1.json", r"..\evil.json", "sub/0001-a3f9c2e1.json", "..", "."):
             out = hs.read_snapshot("wf", self.root, file_name=bad)
             self.assertFalse(out["ok"])
             self.assertEqual(out["status"], 400, bad)
@@ -502,6 +535,290 @@ class TestReadSnapshot(TempRootTestCase):
         out = hs.read_snapshot("wf", self.root, seq=1)
         self.assertFalse(out["ok"])
         self.assertEqual(out["status"], 500)
+
+
+class TestP5Purity(TempRootTestCase):
+    """P5a：纯逻辑层（graphSigIgnoringSeed / computeDelta / shouldMergeWithHead / normalizeEntry）。"""
+
+    SIG_GRAPH = {
+        "nodes": [
+            {"id": 1, "type": "CheckpointLoaderSimple", "widgets_values": ["model.safetensors"]},
+            {"id": 2, "type": "KSampler", "widgets_values_named": {"seed": 42, "steps": 20, "cfg": 7}},
+            {"id": 3, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512, "height": 512}},
+        ],
+        "links": [[1, 1, 0, 2, 0, "MODEL"]],
+    }
+
+    def test_schema_version_is_2(self):
+        self.assertEqual(hs.SCHEMA_VERSION, 2)
+
+    def test_graph_sig_ignoring_seed_stable(self):
+        sig = hs.graph_sig_ignoring_seed(self.SIG_GRAPH)
+        self.assertRegex(sig, r"^[0-9a-f]{8}$")
+        self.assertEqual(sig, "c1271398")  # 跨语言一致基准（JS 侧同值）
+        self.assertEqual(hs.graph_sig_ignoring_seed(self.SIG_GRAPH), sig)
+
+    def test_graph_sig_ignores_seed_sensitive_otherwise(self):
+        import copy
+
+        seed_changed = copy.deepcopy(self.SIG_GRAPH)
+        seed_changed["nodes"][1]["widgets_values_named"]["seed"] = 999999
+        self.assertEqual(hs.graph_sig_ignoring_seed(seed_changed), hs.graph_sig_ignoring_seed(self.SIG_GRAPH))
+        steps_changed = copy.deepcopy(self.SIG_GRAPH)
+        steps_changed["nodes"][1]["widgets_values_named"]["steps"] = 30
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(steps_changed), hs.graph_sig_ignoring_seed(self.SIG_GRAPH))
+        noise_seed = copy.deepcopy(self.SIG_GRAPH)
+        noise_seed["nodes"][1]["widgets_values_named"]["noise_seed"] = 7
+        self.assertEqual(hs.graph_sig_ignoring_seed(noise_seed), hs.graph_sig_ignoring_seed(self.SIG_GRAPH))
+
+    def test_compute_delta_three_kinds(self):
+        prev = {"nodes": [
+            {"id": 1, "type": "A", "title": "甲", "widgets_values_named": {"value": 1, "steps": 20}},
+            {"id": 2, "type": "B"},
+        ]}
+        nxt = {"nodes": [
+            {"id": 1, "type": "A", "title": "甲", "widgets_values_named": {"value": 1, "steps": 30}},
+            {"id": 3, "type": "C"},
+        ]}
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["changed"], [{"id": 1, "title": "甲", "fields": ["steps"]}])
+        self.assertEqual(d["added"], [{"id": 3, "title": "C"}])
+        self.assertEqual(d["removed"], [{"id": 2, "title": "B"}])
+
+    def test_compute_delta_type_and_positional_widgets(self):
+        prev = {"nodes": [{"id": 1, "type": "A", "widgets_values": ["a", "b"]}]}
+        nxt = {"nodes": [{"id": 1, "type": "A2", "widgets_values": ["a", "z"]}]}
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["changed"], [{"id": 1, "title": "A2", "fields": ["type", "widget_1"]}])
+
+    def test_compute_delta_none_for_invalid_prev(self):
+        self.assertIsNone(hs.compute_delta(None, {}))
+        self.assertIsNone(hs.compute_delta("x", {}))
+        self.assertIsNone(hs.compute_delta([], {}))
+
+    def test_should_merge_with_head(self):
+        self.assertTrue(hs.should_merge_with_head("abc", "abc"))
+        self.assertFalse(hs.should_merge_with_head("abc", "abd"))
+        self.assertFalse(hs.should_merge_with_head(None, None))
+        self.assertFalse(hs.should_merge_with_head(1, 1))
+
+    def test_normalize_entry_legacy(self):
+        old = {"seq": 1, "file": "0001-noid.json", "promptId": "p9", "at": "2026-01-01T00:00:00.000Z",
+               "source": "user", "nodeCount": 2, "linkCount": 1}
+        n = hs.normalize_entry(old)
+        self.assertIsNone(n["parent"])
+        self.assertEqual(n["kind"], "run")
+        self.assertEqual(n["sig"], "")
+        self.assertIsNone(n["delta"])
+        self.assertEqual(n["blocks"], [])
+        self.assertEqual(n["runs"], [{"promptId": "p9", "at": "2026-01-01T00:00:00.000Z", "images": []}])
+        self.assertNotIn("parent", old)  # 不改入参
+
+    def test_normalize_entry_keeps_new_fields(self):
+        n = hs.normalize_entry({"seq": 5, "kind": "save", "parent": 3, "sig": "aa",
+                                "blocks": [{"name": "b", "source": "role", "nodeIds": [7]}], "runs": []})
+        self.assertEqual(n["runs"], [])
+        self.assertEqual(n["kind"], "save")
+        self.assertEqual(n["parent"], 3)
+        self.assertEqual(n["sig"], "aa")
+        self.assertEqual(n["blocks"], [{"name": "b", "source": "role", "nodeIds": [7]}])
+
+    def test_joint_sig_matches_js_fixture(self):
+        # 跨语言一致性固定 fixture：与 JS 测试里的同一 graph 必须同串
+        fixture = {"nodes": [
+            {"id": 1, "type": "PrimitiveInt", "widgets_values": [1024]},
+            {"id": 2, "type": "KSampler", "widgets_values_named": {"seed": 123, "sampler_name": "euler", "steps": 20}},
+        ]}
+        self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "cac7e860")
+
+
+class TestAttachImages(TempRootTestCase):
+    """P4 修：产物图 sidecar（attach_images / read_images_for / list_commits 合并）。"""
+
+    def commit_one(self, workflow="wf", prompt_id="a3f9c2e1-9b7c-4d2e-8f01-234567890abc"):
+        out = self.commit(
+            {"workflow": workflow, "graph": {"nodes": [{"id": 1}], "links": []}, "promptId": prompt_id}
+        )
+        self.assertTrue(out["ok"])
+        return out
+
+    def sidecar_path_for(self, out):
+        # 快照 0001-a3f9c2e1.json → sidecar 0001-a3f9c2e1.json.images.json
+        return os.path.join(out["dir"], out["file"] + hs.IMAGES_SUFFIX)
+
+    def test_suffix_constant(self):
+        self.assertEqual(hs.IMAGES_SUFFIX, ".images.json")
+
+    def test_attach_roundtrip(self):
+        out = self.commit_one()
+        res = hs.attach_images(
+            "wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc",
+            [{"filename": "a.png", "subfolder": "", "type": "output"}],
+            at="2026-10-11T00:00:00.000Z",
+        )
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["status"], 200)
+        self.assertEqual(res["file"], "0001-a3f9c2e1.json.images.json")
+        self.assertEqual(res["count"], 1)
+        # 侧车文件真的写在快照同名目录、名为 <快照名>.images.json
+        path = self.sidecar_path_for(out)
+        self.assertTrue(os.path.isfile(path))
+        self.assertFalse(os.path.exists(path + ".tmp"), "临时文件应已被 os.replace 消费")
+        with open(path, encoding="utf-8") as fh:
+            obj = json.loads(fh.read())
+        self.assertEqual(obj["promptId"], "a3f9c2e1-9b7c-4d2e-8f01-234567890abc")
+        self.assertEqual(obj["updatedAt"], "2026-10-11T00:00:00.000Z")
+        self.assertEqual(obj["images"], [{"filename": "a.png", "subfolder": "", "type": "output"}])
+        # 读回
+        self.assertEqual(
+            hs.read_images_for("wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc"),
+            [{"filename": "a.png", "subfolder": "", "type": "output"}],
+        )
+
+    def test_attach_normalizes_and_drops_extra_fields(self):
+        self.commit_one()
+        res = hs.attach_images(
+            "wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc",
+            [{"filename": "a.png", "subfolder": "sub", "type": "temp", "extra": 1, "nodeId": 7}],
+        )
+        self.assertTrue(res["ok"])
+        imgs = hs.read_images_for("wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc")
+        self.assertEqual(imgs, [{"filename": "a.png", "subfolder": "sub", "type": "temp"}])
+        # 缺 subfolder/type → "" / "output"
+        res2 = hs.attach_images("wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc", [{"filename": "b.png"}])
+        self.assertEqual(res2["count"], 2)
+        imgs2 = hs.read_images_for("wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc")
+        self.assertEqual(imgs2[1], {"filename": "b.png", "subfolder": "", "type": "output"})
+
+    def test_attach_idempotent_same_and_append_new(self):
+        self.commit_one()
+        pid = "a3f9c2e1-9b7c-4d2e-8f01-234567890abc"
+        img = {"filename": "a.png", "subfolder": "", "type": "output"}
+        first = hs.attach_images("wf", self.root, pid, [img])
+        self.assertEqual(first["count"], 1)
+        # 同图重复上报 → 不累加
+        again = hs.attach_images("wf", self.root, pid, [dict(img)])
+        self.assertEqual(again["count"], 1)
+        self.assertEqual(len(hs.read_images_for("wf", self.root, pid)), 1)
+        # 新图 → 追加
+        newer = hs.attach_images("wf", self.root, pid, [{"filename": "b.png", "subfolder": "", "type": "output"}])
+        self.assertEqual(newer["count"], 2)
+        # 批内去重
+        batch = hs.attach_images(
+            "wf", self.root, pid,
+            [{"filename": "c.png", "subfolder": "", "type": "output"}, {"filename": "c.png", "subfolder": "", "type": "output"}],
+        )
+        self.assertEqual(batch["count"], 3)
+        names = [im["filename"] for im in hs.read_images_for("wf", self.root, pid)]
+        self.assertEqual(names, ["a.png", "b.png", "c.png"])
+
+    def test_attach_same_filename_diff_subfolder_not_deduped(self):
+        self.commit_one()
+        pid = "a3f9c2e1-9b7c-4d2e-8f01-234567890abc"
+        hs.attach_images("wf", self.root, pid, [{"filename": "a.png", "subfolder": "", "type": "output"}])
+        res = hs.attach_images("wf", self.root, pid, [{"filename": "a.png", "subfolder": "s", "type": "output"}])
+        self.assertEqual(res["count"], 2)
+
+    def test_attach_404_unknown_prompt_id(self):
+        self.commit_one()
+        res = hs.attach_images("wf", self.root, "does-not-exist", [{"filename": "a.png"}])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], 404)
+        self.assertFalse(os.path.exists(self.sidecar_path_for(self.commit_one("wf2", "zzzzzzzz-1"))))
+
+    def test_attach_404_unknown_workflow(self):
+        self.commit_one()
+        res = hs.attach_images("不存在", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc", [{"filename": "a.png"}])
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], 404)
+
+    def test_attach_400_missing_fields(self):
+        self.commit_one()
+        pid = "a3f9c2e1-9b7c-4d2e-8f01-234567890abc"
+        img = [{"filename": "a.png"}]
+        for wf, p, imgs in (("", pid, img), (None, pid, img), ("wf", "", img), ("wf", None, img)):
+            out = hs.attach_images(wf, self.root, p, imgs)
+            self.assertFalse(out["ok"], (wf, p, imgs))
+            self.assertEqual(out["status"], 400)
+        # images 非数组 / 空数组 → 400
+        for bad in (None, "x", {}, [], "a.png"):
+            out = hs.attach_images("wf", self.root, pid, bad)
+            self.assertFalse(out["ok"], bad)
+            self.assertEqual(out["status"], 400)
+        # 图项无 filename / filename 空 / 非对象项 → 400
+        for bad in ([{"subfolder": "s"}], [{"filename": ""}], [{"filename": None}], ["a.png"], [1]):
+            out = hs.attach_images("wf", self.root, pid, bad)
+            self.assertFalse(out["ok"], bad)
+            self.assertEqual(out["status"], 400)
+        # 以上 400 路径都不该落 sidecar
+        self.assertFalse(os.path.exists(os.path.join(self.root, "workflows", ".history", "wf", "0001-a3f9c2e1.json.images.json")))
+
+    def test_attach_500_missing_user_dir(self):
+        out = hs.attach_images("wf", "", "pid", [{"filename": "a.png"}])
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], 500)
+
+    def test_read_images_for_absent(self):
+        self.commit_one()
+        # 有索引但无 sidecar → []
+        self.assertEqual(hs.read_images_for("wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc"), [])
+        # 未知 workflow / 未知 promptId → []
+        self.assertEqual(hs.read_images_for("不存在", self.root, "x"), [])
+        self.assertEqual(hs.read_images_for("wf", self.root, "x"), [])
+
+    def test_list_commits_merges_sidecar(self):
+        a = self.commit_one("wf", "aaaaaaaa-1111")
+        b = self.commit_one("wf", "bbbbbbbb-2222")
+        hs.attach_images(
+            "wf", self.root, "aaaaaaaa-1111",
+            [{"filename": "a1.png", "subfolder": "", "type": "output"}, {"filename": "a2.png", "subfolder": "", "type": "output"}],
+            at="2026-10-11T01:00:00.000Z",
+        )
+        listed = hs.list_commits("wf", self.root)
+        self.assertTrue(listed["ok"])
+        self.assertEqual(len(listed["entries"]), 2)
+        e0, e1 = listed["entries"]
+        # runs[].at 取该 entry 的提交时间 at（P5a 形态），非 sidecar.updatedAt
+        with open(os.path.join(a["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
+            entry0_at = json.loads(fh.readline())["at"]
+        # 有 sidecar 的 entry → 单元素 runs + 扁平 images
+        self.assertEqual(e0["runs"], [{
+            "promptId": "aaaaaaaa-1111",
+            "at": entry0_at,
+            "images": [{"filename": "a1.png", "subfolder": "", "type": "output"},
+                       {"filename": "a2.png", "subfolder": "", "type": "output"}],
+        }])
+        self.assertEqual(e0["images"], e0["runs"][0]["images"])
+        # 无 sidecar 的 entry → 空数组
+        self.assertEqual(e1["runs"], [])
+        self.assertEqual(e1["images"], [])
+        # 索引磁盘内容未被改（runs 仍为 P5 缺省 []、无 images 字段）
+        with open(os.path.join(a["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
+            raw = json.loads(fh.readline())
+        self.assertEqual(raw["runs"], [])
+        self.assertNotIn("images", raw)
+        self.assertEqual(len(open(os.path.join(a["dir"], hs.INDEX_FILE_NAME), encoding="utf-8").read().splitlines()), 2)
+
+    def test_list_commits_no_sidecar_all_empty(self):
+        self.commit_one("wf", "aaaaaaaa-1111")
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(listed["entries"][0]["runs"], [])
+        self.assertEqual(listed["entries"][0]["images"], [])
+
+    def test_sidecar_bad_json_reads_empty(self):
+        out = self.commit_one()
+        with open(self.sidecar_path_for(out), "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        pid = "a3f9c2e1-9b7c-4d2e-8f01-234567890abc"
+        self.assertEqual(hs.read_images_for("wf", self.root, pid), [])
+        self.assertEqual(hs.list_commits("wf", self.root)["entries"][0]["images"], [])
+
+    def test_attach_does_not_touch_real_history_dir(self):
+        # 所有落盘都在 tempfile 临时根下，绝不在 cwd / 真实 .history 下建任何东西
+        self.commit_one()
+        hs.attach_images("wf", self.root, "a3f9c2e1-9b7c-4d2e-8f01-234567890abc", [{"filename": "a.png"}])
+        self.assertFalse(os.path.exists(os.path.join(os.getcwd(), ".history")))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "workflows", ".history", "wf")))
 
 
 if __name__ == "__main__":

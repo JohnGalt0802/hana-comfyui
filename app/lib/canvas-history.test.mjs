@@ -17,6 +17,10 @@ import {
   nextSeq,
   latestEntry,
   normalizeSource,
+  graphSigIgnoringSeed,
+  computeDelta,
+  shouldMergeWithHead,
+  normalizeEntry,
 } from "./canvas-history.mjs";
 
 // ── 1. sanitizeWorkflowName ─────────────────────────────────────────────────
@@ -325,4 +329,176 @@ test("normalizeSource：白名单外一律 unknown", () => {
   assert.equal(normalizeSource("agent"), "agent");
   assert.equal(normalizeSource("unknown"), "unknown");
   assert.equal(normalizeSource("nope"), "unknown");
+});
+
+// ── 11. P5a：索引字段扩展 ───────────────────────────────────────────────────
+test("buildIndexLine：新字段默认值", () => {
+  const v = JSON.parse(buildIndexLine({ seq: 1, file: "0001-x.json" }));
+  assert.equal(v.parent, null);
+  assert.equal(v.kind, "run");
+  assert.equal(v.sig, "");
+  assert.deepEqual(v.blocks, []);
+  assert.equal(v.delta, null);
+  assert.deepEqual(v.runs, []);
+});
+
+test("buildIndexLine：新字段写入 / 归一化", () => {
+  const v = JSON.parse(
+    buildIndexLine({
+      seq: 3,
+      file: "0003-x.json",
+      parent: 2,
+      kind: "save",
+      sig: "deadbeef",
+      blocks: [{ name: "组1", source: "group", nodeIds: [1, 2] }],
+      delta: { changed: [], added: [{ id: 5, title: "X" }], removed: [] },
+      runs: [{ promptId: "p1", at: "2026-10-11T00:00:00.000Z", images: [{ filename: "a.png", subfolder: "", type: "output" }] }],
+    }),
+  );
+  assert.equal(v.parent, 2);
+  assert.equal(v.kind, "save");
+  assert.equal(v.sig, "deadbeef");
+  assert.deepEqual(v.blocks, [{ name: "组1", source: "group", nodeIds: [1, 2] }]);
+  assert.deepEqual(v.delta, { changed: [], added: [{ id: 5, title: "X" }], removed: [] });
+  assert.equal(v.runs[0].promptId, "p1");
+  assert.equal(v.runs[0].images[0].filename, "a.png");
+  // 非法 kind → run；blocks 缺 source/nodeIds → 补 group/[]
+  const v2 = JSON.parse(buildIndexLine({ kind: "bot", blocks: [{ name: "b" }] }));
+  assert.equal(v2.kind, "run");
+  assert.deepEqual(v2.blocks, [{ name: "b", source: "group", nodeIds: [] }]);
+});
+
+// ── 12. P5a：graphSigIgnoringSeed ───────────────────────────────────────────
+const SIG_GRAPH = {
+  nodes: [
+    { id: 1, type: "CheckpointLoaderSimple", widgets_values: ["model.safetensors"] },
+    { id: 2, type: "KSampler", widgets_values_named: { seed: 42, steps: 20, cfg: 7 } },
+    { id: 3, type: "EmptyLatentImage", widgets_values_named: { width: 512, height: 512 } },
+  ],
+  links: [[1, 1, 0, 2, 0, "MODEL"]],
+};
+
+test("graphSigIgnoringSeed：稳定 8 位 hex，且与固定期望一致", () => {
+  const sig = graphSigIgnoringSeed(SIG_GRAPH);
+  assert.match(sig, /^[0-9a-f]{8}$/);
+  assert.equal(sig, "c1271398"); // 跨语言一致基准（Python 侧同值）
+  assert.equal(graphSigIgnoringSeed(SIG_GRAPH), sig); // 幂等
+});
+
+test("graphSigIgnoringSeed：忽略 seed 类 widget，对非 seed 变化敏感", () => {
+  const base = structuredClone(SIG_GRAPH);
+  const seedChanged = structuredClone(SIG_GRAPH);
+  seedChanged.nodes[1].widgets_values_named.seed = 999999;
+  assert.equal(graphSigIgnoringSeed(seedChanged), graphSigIgnoringSeed(base), "seed 变化不应改变签名");
+  const stepsChanged = structuredClone(SIG_GRAPH);
+  stepsChanged.nodes[1].widgets_values_named.steps = 30;
+  assert.notEqual(graphSigIgnoringSeed(stepsChanged), graphSigIgnoringSeed(base), "steps 变化应改变签名");
+  const noiseSeed = structuredClone(SIG_GRAPH);
+  noiseSeed.nodes[1].widgets_values_named.noise_seed = 7;
+  assert.equal(graphSigIgnoringSeed(noiseSeed), graphSigIgnoringSeed(base), "noise_seed 同样忽略");
+});
+
+// ── 13. P5a：computeDelta ───────────────────────────────────────────────────
+test("computeDelta：changed / added / removed 三类", () => {
+  const prev = {
+    nodes: [
+      { id: 1, type: "A", title: "甲", widgets_values_named: { value: 1, steps: 20 } },
+      { id: 2, type: "B" },
+    ],
+  };
+  const next = {
+    nodes: [
+      { id: 1, type: "A", title: "甲", widgets_values_named: { value: 1, steps: 30 } },
+      { id: 3, type: "C" },
+    ],
+  };
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.changed, [{ id: 1, title: "甲", fields: ["steps"] }]);
+  assert.deepEqual(d.added, [{ id: 3, title: "C" }]);
+  assert.deepEqual(d.removed, [{ id: 2, title: "B" }]);
+});
+
+test("computeDelta：type 变化计入 fields；title 缺失用 type；无 widgets 用 widget_<i>", () => {
+  const prev = { nodes: [{ id: 1, type: "A", widgets_values: ["a", "b"] }] };
+  const next = { nodes: [{ id: 1, type: "A2", widgets_values: ["a", "z"] }] };
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.changed, [{ id: 1, title: "A2", fields: ["type", "widget_1"] }]);
+});
+
+test("computeDelta：prevGraph 为 null/非法 → null", () => {
+  assert.equal(computeDelta(null, {}), null);
+  assert.equal(computeDelta(undefined, {}), null);
+  assert.equal(computeDelta("x", {}), null);
+  assert.equal(computeDelta([], {}), null);
+});
+
+// ── 14. P5a：shouldMergeWithHead ────────────────────────────────────────────
+test("shouldMergeWithHead：相等即 true，非字符串 false", () => {
+  assert.equal(shouldMergeWithHead("abc", "abc"), true);
+  assert.equal(shouldMergeWithHead("abc", "abd"), false);
+  assert.equal(shouldMergeWithHead(null, null), false);
+  assert.equal(shouldMergeWithHead(undefined, "x"), false);
+  assert.equal(shouldMergeWithHead(1, 1), false);
+});
+
+// ── 15. P5a：normalizeEntry 兼容旧条目 ──────────────────────────────────────
+test("normalizeEntry：旧条目补全新字段", () => {
+  const old = { seq: 1, file: "0001-noid.json", promptId: "p9", at: "2026-01-01T00:00:00.000Z", source: "user", nodeCount: 2, linkCount: 1 };
+  const n = normalizeEntry(old);
+  assert.equal(n.parent, null);
+  assert.equal(n.kind, "run");
+  assert.equal(n.sig, "");
+  assert.equal(n.delta, null);
+  assert.deepEqual(n.blocks, []);
+  assert.deepEqual(n.runs, [{ promptId: "p9", at: "2026-01-01T00:00:00.000Z", images: [] }]);
+  // 不改入参
+  assert.equal("parent" in old, false);
+});
+
+test("normalizeEntry：promptId 缺失 → runs 为空；已有新字段原样保留", () => {
+  const n = normalizeEntry({ seq: 5, kind: "save", parent: 3, sig: "aa", blocks: [{ name: "b", source: "role", nodeIds: [7] }], runs: [] });
+  assert.deepEqual(n.runs, []);
+  assert.equal(n.kind, "save");
+  assert.equal(n.parent, 3);
+  assert.equal(n.sig, "aa");
+  assert.deepEqual(n.blocks, [{ name: "b", source: "role", nodeIds: [7] }]);
+});
+
+test("SCHEMA_VERSION：P5 换代后为 2", () => {
+  assert.equal(SCHEMA_VERSION, 2);
+});
+
+// ── 16. P5a：跨语言签名一致性 fixture ────────────────────────────────────
+test("graphSigIgnoringSeed：跨语言 fixture 与 Python 侧同串", () => {
+  const fixture = {
+    nodes: [
+      { id: 1, type: "PrimitiveInt", widgets_values: [1024] },
+      { id: 2, type: "KSampler", widgets_values_named: { seed: 123, sampler_name: "euler", steps: 20 } },
+    ],
+  };
+  assert.equal(graphSigIgnoringSeed(fixture), "cac7e860");
+});
+
+// ── 17. P5a：组合（新字段落索引行 → 解析 → normalizeEntry 读回）───────────
+test("组合：buildIndexLine 新字段 → parseIndex → normalizeEntry 读回", () => {
+  const sig = graphSigIgnoringSeed(SIG_GRAPH);
+  const delta = computeDelta(
+    { nodes: [{ id: 1, type: "A", widgets_values_named: { value: 1 } }] },
+    { nodes: [{ id: 1, type: "A", widgets_values_named: { value: 2 } }] },
+  );
+  const line = buildIndexLine({
+    seq: 2, parent: 1, file: "0002-p2.json", promptId: "p2", at: "2026-10-11T00:00:00.000Z",
+    source: "agent", kind: "run", nodeCount: 1, linkCount: 0, sig,
+    blocks: [{ name: "g", source: "group", nodeIds: [1] }], delta,
+    runs: [{ promptId: "p2", at: "2026-10-11T00:00:00.000Z", images: [] }],
+  });
+  const { entries, badLines } = parseIndex(line);
+  assert.equal(badLines.length, 0);
+  const n = normalizeEntry(entries[0]);
+  assert.equal(n.parent, 1);
+  assert.equal(n.kind, "run");
+  assert.equal(n.sig, sig);
+  assert.deepEqual(n.blocks, [{ name: "g", source: "group", nodeIds: [1] }]);
+  assert.deepEqual(n.delta.changed, [{ id: 1, title: "A", fields: ["value"] }]);
+  assert.equal(n.runs.length, 1);
 });

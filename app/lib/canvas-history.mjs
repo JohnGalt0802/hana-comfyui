@@ -14,8 +14,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { join, resolve } from "node:path";
 
-// 快照结构版本（字段增删时递增，供将来迁移判断）
-export const SCHEMA_VERSION = 1;
+// 快照结构版本（字段增删时递增，供将来迁移判断）——P5 换代：1 → 2
+//   v2 起索引行携带 parent/kind/sig/blocks(完整版)/delta/runs；旧条目按缺省读（normalizeEntry）。
+export const SCHEMA_VERSION = 2;
 // 目录/文件名段长度上限（含中文按字符数计）
 export const MAX_NAME_LEN = 80;
 // 净化后为空时的回退名
@@ -33,6 +34,8 @@ const ILLEGAL_RE = /[/\\:*?"<>|]/g;
 const EDGE_RE = /^[\s.]+|[\s.]+$/g;
 
 const SOURCES = new Set(["user", "agent", "unknown"]);
+// kind 白名单（跑出来的 / 主动存档的）；非法/缺省 → "run"
+const KINDS = new Set(["run", "save"]);
 
 /** 归一化 source：非 user/agent/unknown 一律 unknown。 */
 export function normalizeSource(source) {
@@ -163,11 +166,291 @@ export function stripHeavyFields(graph) {
   return { graph: copy, stripped };
 }
 
+// ── 5.5 归一化签名 / 画布差异 / 兼容补全（P5a）───────────────────────────────
+// 与「桥 js 的 graphSignature」同族的**简化可复现版**：只看逐节点 type + widget 值，
+// 不看位置/尺寸/连线细节，且跳过 seed 类 widget，用于「当前画布 vs 最近提交」的合并判定。
+// 本模块与 Python 版 history_store.py 必须给出**同一串**，故哈希算法在两处逐字节对齐。
+
+/** 是否为普通对象（非 null / 非数组）。 */
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+// ── FNV-1a（32 位）稳定 hex 版 ──
+// 算法（JS / Python 两侧逐字节一致）：
+//   · offset basis = 2166136261（0x811c9dc5）
+//   · prime        = 16777619（0x01000193）
+//   · 输入先按 **UTF-8** 编码成字节序列，再逐字节：h ^= byte; h = (h * prime) mod 2^32
+//   · 结果输出为 **8 位小写十六进制**（左补 0）
+const FNV_OFFSET_BASIS = 2166136261;
+const FNV_PRIME = 16777619;
+
+/** 字符串 → UTF-8 字节数组（手写，避免引入 Buffer 依赖；口径同 Python str.encode("utf-8")）。 */
+function utf8Bytes(str) {
+  const out = [];
+  for (const ch of String(str)) {
+    const cp = ch.codePointAt(0);
+    if (cp < 0x80) out.push(cp);
+    else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+  }
+  return out;
+}
+
+/** FNV-1a 32 位 → 8 位小写 hex（见上方算法说明）。 */
+function fnv1aHex(str) {
+  const bytes = utf8Bytes(str);
+  let h = FNV_OFFSET_BASIS;
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= bytes[i];
+    h = Math.imul(h, FNV_PRIME) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/** 规范化取值串（跨语言一致）：null/undefined → ""；对象/数组 → 排序键的紧凑 JSON；其余 → String。 */
+function canonValue(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") return canonJson(v);
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return String(v);
+}
+
+/** 紧凑规范化 JSON（对象键排序、无空格；整数值用整型串，对齐 Python 侧写法）。 */
+function canonJson(v) {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return `[${v.map(canonJson).join(",")}]`;
+  if (typeof v === "object") {
+    const keys = Object.keys(v).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonJson(v[k])}`).join(",")}}`;
+  }
+  if (typeof v === "string") return JSON.stringify(v);
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : "null";
+  return "null";
+}
+
+// seed 类 widget 名（seed / noise_seed / rand_seed …）
+const SEED_WIDGET_RE = /seed/i;
+
+/** 节点 widget 段串：优先 widgets_values_named（可按名跳过 seed 类）；否则按位置 widgets_values。 */
+function widgetsPart(node) {
+  const named = isPlainObject(node.widgets_values_named) ? node.widgets_values_named : null;
+  let out = "";
+  if (named && Object.keys(named).length) {
+    for (const k of Object.keys(named)) {
+      if (SEED_WIDGET_RE.test(k)) continue;
+      out += `${k}=${canonValue(named[k])};`;
+    }
+    return out;
+  }
+  const wv = node.widgets_values;
+  if (Array.isArray(wv)) {
+    for (let i = 0; i < wv.length; i++) out += `widget_${i}=${canonValue(wv[i])};`;
+  } else if (isPlainObject(wv)) {
+    for (const k of Object.keys(wv)) {
+      if (SEED_WIDGET_RE.test(k)) continue;
+      out += `${k}=${canonValue(wv[k])};`;
+    }
+  }
+  return out;
+}
+
+/**
+ * 归一化画布签名（忽略 seed 类 widget）。
+ * 口径：按 `graph.nodes` 数组顺序，逐节点 `type + "|" + widget 段`，各节点段先 fnv1a，
+ * 再以 "|" 串接整体 fnv1a，输出 8 位小写 hex。
+ * 与桥 js `graphSignature()` 同族但**更简化**（不含 mode/title/位置/连线数；不含节点 id）。
+ * @param {object} graph UI 格式画布
+ * @returns {string} 8 位 hex
+ */
+export function graphSigIgnoringSeed(graph) {
+  const g = isPlainObject(graph) ? graph : {};
+  const nodes = Array.isArray(g.nodes) ? g.nodes : [];
+  const parts = [];
+  for (const n of nodes) {
+    if (!isPlainObject(n)) continue;
+    const type = n.type == null ? "" : String(n.type);
+    parts.push(fnv1aHex(`${type}|${widgetsPart(n)}`));
+  }
+  return fnv1aHex(parts.join("|"));
+}
+
+/** id → 节点（跳过无 id / 非对象）。 */
+function indexNodesById(graph) {
+  const map = new Map();
+  const g = isPlainObject(graph) ? graph : {};
+  const nodes = Array.isArray(g.nodes) ? g.nodes : [];
+  for (const n of nodes) {
+    if (!isPlainObject(n) || n.id === undefined || n.id === null) continue;
+    map.set(String(n.id), n);
+  }
+  return map;
+}
+
+/** 节点显示名：title 非空则用，否则 type，否则 ""。 */
+function nodeTitle(n) {
+  if (typeof n.title === "string" && n.title) return n.title;
+  return n.type == null ? "" : String(n.type);
+}
+
+/** 节点 widget 名/值对（named 优先命名，否则位置命名 widget_<i>）。 */
+function widgetEntries(node) {
+  const named = isPlainObject(node.widgets_values_named) ? node.widgets_values_named : null;
+  const wv = node.widgets_values;
+  if (Array.isArray(wv)) return { names: named ? Object.keys(named) : null, values: wv };
+  if (isPlainObject(wv)) {
+    const keys = Object.keys(wv);
+    return { names: keys, values: keys.map((k) => wv[k]) };
+  }
+  if (named) {
+    const keys = Object.keys(named);
+    return { names: keys, values: keys.map((k) => named[k]) };
+  }
+  return { names: null, values: [] };
+}
+
+/** 同 id 两节点的 widget 变化名列表（逐项比较位置值；缺失项按 "" 参与比较）。 */
+function changedWidgetNames(a, b) {
+  const ea = widgetEntries(a);
+  const eb = widgetEntries(b);
+  const n = Math.max(ea.values.length, eb.values.length);
+  const fields = [];
+  for (let i = 0; i < n; i++) {
+    const va = i < ea.values.length ? ea.values[i] : undefined;
+    const vb = i < eb.values.length ? eb.values[i] : undefined;
+    if (canonValue(va) !== canonValue(vb)) {
+      fields.push((ea.names && ea.names[i]) || (eb.names && eb.names[i]) || `widget_${i}`);
+    }
+  }
+  return fields;
+}
+
+/** id 排序：两数按数值，否则按字符串（对齐 Python 侧）。 */
+function cmpId(a, b) {
+  const na = typeof a === "number";
+  const nb = typeof b === "number";
+  if (na && nb) return a - b;
+  const sa = String(a);
+  const sb = String(b);
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
+/**
+ * 对比两画布（UI 格式），相对 prev 算三类变化。
+ * @param {object} prevGraph 父画布（null/非法 → 返回 null）
+ * @param {object} nextGraph 本画布
+ * @returns {{changed:{id:*,title:string,fields:string[]}[], added:{id:*,title:string}[], removed:{id:*,title:string}[]}|null}
+ */
+export function computeDelta(prevGraph, nextGraph) {
+  if (!isPlainObject(prevGraph)) return null;
+  const prev = indexNodesById(prevGraph);
+  const next = indexNodesById(nextGraph);
+  const added = [];
+  const removed = [];
+  for (const [id, n] of next) if (!prev.has(id)) added.push({ id: n.id, title: nodeTitle(n) });
+  for (const [id, n] of prev) if (!next.has(id)) removed.push({ id: n.id, title: nodeTitle(n) });
+  const changed = [];
+  for (const [id, a] of prev) {
+    const b = next.get(id);
+    if (!b) continue;
+    const fields = [];
+    const ta = a.type == null ? "" : String(a.type);
+    const tb = b.type == null ? "" : String(b.type);
+    if (ta !== tb) fields.push("type");
+    for (const name of changedWidgetNames(a, b)) fields.push(name);
+    if (fields.length) changed.push({ id: b.id, title: nodeTitle(b), fields });
+  }
+  added.sort((x, y) => cmpId(x.id, y.id));
+  removed.sort((x, y) => cmpId(x.id, y.id));
+  changed.sort((x, y) => cmpId(x.id, y.id));
+  return { changed, added, removed };
+}
+
+/**
+ * 合并判定辅助（纯比较）：两侧签名串相等即 true（供桥侧调用）。
+ * 非字符串一律 false；空串相等亦返回 true（调用方应传真实 sig，非缺省空串）。
+ * 规格 §2.6 的完整判定（当前画布 sig vs 最近节点 sig）在桥侧做，本层只提供这一比较与 graphSigIgnoringSeed。
+ * @param {string} newSig
+ * @param {string} headSig
+ * @returns {boolean}
+ */
+export function shouldMergeWithHead(newSig, headSig) {
+  return typeof newSig === "string" && typeof headSig === "string" && newSig === headSig;
+}
+
+/** 归一化 kind：白名单 run/save，非法/缺省 → "run"。 */
+function normKind(k) {
+  return KINDS.has(k) ? k : "run";
+}
+
+/** 归一化 parent：有限数 → 整数；其余（含 null/""）→ null。 */
+function normParent(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+/** 归一化 images：[{filename,subfolder,type}]（缺省空串）。 */
+function normImages(imgs) {
+  if (!Array.isArray(imgs)) return [];
+  const out = [];
+  for (const im of imgs) {
+    if (!isPlainObject(im)) continue;
+    out.push({
+      filename: im.filename == null ? "" : String(im.filename),
+      subfolder: im.subfolder == null ? "" : String(im.subfolder),
+      type: im.type == null ? "" : String(im.type),
+    });
+  }
+  return out;
+}
+
+/** 归一化 runs：[{promptId, at, images}]。 */
+function normRuns(runs) {
+  if (!Array.isArray(runs)) return [];
+  const out = [];
+  for (const r of runs) {
+    if (!isPlainObject(r)) continue;
+    out.push({
+      promptId: r.promptId == null ? null : String(r.promptId),
+      at: r.at == null ? null : String(r.at),
+      images: normImages(r.images),
+    });
+  }
+  return out;
+}
+
+/** 归一化 block（完整版）：{name, source, nodeIds}；source 缺省 "group"，nodeIds 缺省 []。 */
+function normBlock(blk) {
+  const b = isPlainObject(blk) ? blk : {};
+  const src = typeof b.source === "string" && b.source ? b.source : "group";
+  return {
+    name: b.name == null ? "" : String(b.name),
+    source: src,
+    nodeIds: Array.isArray(b.nodeIds) ? b.nodeIds.slice() : [],
+  };
+}
+
+/** 归一化 blocks：非数组 → []；逐块补全 name/source/nodeIds（非对象块剔除）。 */
+function normBlocks(blocks) {
+  if (!Array.isArray(blocks)) return [];
+  const out = [];
+  for (const blk of blocks) {
+    if (!isPlainObject(blk)) continue;
+    out.push(normBlock(blk));
+  }
+  return out;
+}
+
 // ── 6. 索引行 ───────────────────────────────────────────────────────────────
 /**
  * 构造一行索引元数据（JSON 字符串，**不含 graph**）。
- * 字段：seq / file（文件名）/ promptId / at / source / nodeCount / linkCount。
+ * 字段（P5 v2）：seq / parent / file / promptId / at / source / kind /
+ *   nodeCount / linkCount / sig / blocks(完整版) / delta / runs。
  * 入参兼容别名：file ← file | fileName | name。
+ * 缺省：parent→null；kind→"run"；sig→""；blocks→[]；delta→null；runs→[]。
  * @param {object} meta
  * @returns {string}
  */
@@ -176,12 +459,18 @@ export function buildIndexLine(meta = {}) {
   const rawFile = m.file != null ? m.file : m.fileName != null ? m.fileName : m.name;
   return JSON.stringify({
     seq: toInt(m.seq, 0),
+    parent: normParent(m.parent),
     file: rawFile == null ? "" : String(rawFile),
     promptId: m.promptId == null ? null : String(m.promptId),
     at: m.at == null ? null : String(m.at),
     source: normalizeSource(m.source),
+    kind: normKind(m.kind),
     nodeCount: toInt(m.nodeCount, 0),
     linkCount: toInt(m.linkCount, 0),
+    sig: typeof m.sig === "string" ? m.sig : "",
+    blocks: normBlocks(m.blocks),
+    delta: isPlainObject(m.delta) ? m.delta : null,
+    runs: normRuns(m.runs),
   });
 }
 
@@ -212,6 +501,29 @@ export function parseIndex(text) {
     else badLines.push({ line: i + 1, text: line, error: "not-an-object" });
   }
   return { entries, badLines };
+}
+
+/**
+ * 兼容补全：把旧条目（缺新字段）读成新形态，**不改写磁盘**、不改入参。
+ * 缺省：parent→null；kind→"run"；sig→""；delta→null；blocks→[]；
+ *   runs → 缺则用顶层 promptId/at 造单元素 runs（promptId 为 null 时 → []）。
+ * @param {object} entry
+ * @returns {object}
+ */
+export function normalizeEntry(entry) {
+  const e = isPlainObject(entry) ? entry : {};
+  const out = { ...e };
+  out.parent = normParent(e.parent);
+  out.kind = normKind(e.kind);
+  out.sig = typeof e.sig === "string" ? e.sig : "";
+  out.delta = isPlainObject(e.delta) ? e.delta : null;
+  out.blocks = normBlocks(e.blocks);
+  out.runs = Array.isArray(e.runs)
+    ? normRuns(e.runs)
+    : e.promptId == null
+      ? []
+      : [{ promptId: String(e.promptId), at: e.at == null ? null : String(e.at), images: [] }];
+  return out;
 }
 
 // ── 8. 序号 ─────────────────────────────────────────────────────────────────
