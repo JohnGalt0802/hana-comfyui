@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-11 hana-bridge-12021428";
+const BUILD_TAG = "2026-10-12 hana-bridge-10121817";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -2492,7 +2492,7 @@ function graphBlocks(graph) {
     if (!nodes) continue; // 空 group 不成块（同 outline）
     const g = groups[gi] || {};
     const title = typeof g.title === "string" ? g.title.trim() : "";
-    rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", nodes });
+    rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", color: g.color, nodes });
   }
   for (const [role, nodes] of roleBuckets) {
     rawBlocks.push({ name: dedupName(role), source: "role", nodes });
@@ -2516,6 +2516,7 @@ function graphBlocks(graph) {
   return rawBlocks.map((b) => ({
     name: b.name,
     source: b.source,
+    color: b.color,
     nodeIds: b.nodes.map((n) => (n && typeof n === "object" ? n.id : null)).sort(cmpIds),
   }));
 }
@@ -2559,6 +2560,7 @@ let historySaveBusy = false;
 let historyBarGroup = null;
 // P6-1：横轴三态交互状态（单击/双击消歧、缩略图浮层延迟关）
 let historyTickClickTimer = null; // 非空 = 已收到第一次单击，正在等消歧窗口结束
+let historyTreeClickTimer = null; // 树节点单击/双击消歧（同框口径）
 let historyShotsCloseTimer = null; // 缩略图浮层「移开延迟关」定时器
 // P6-2：弹层跟随画布的 rAF 循环句柄 + 上一帧视图态（scale/offset）——变了才写 style
 let historyBarRafId = null;
@@ -2571,9 +2573,15 @@ function historyBarStyleEnsure() {
   style.textContent = `
 #${HISTORY_BAR_ID} {
   position: fixed; z-index: 10001;
-  background: rgba(28,32,39,.96); color: #fff;
-  border: 1px solid rgba(255,255,255,.2); border-radius: 11px;
-  box-shadow: 0 10px 32px rgba(0,0,0,.45);
+  background: linear-gradient(180deg, rgba(38,44,54,.94) 0%, rgba(27,32,40,.95) 100%);
+  color: #fff;
+  border: 0; border-radius: 13px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.075),
+    inset 0 0 0 1px rgba(255,255,255,.05),
+    0 10px 30px rgba(0,0,0,.5),
+    0 2px 6px rgba(0,0,0,.4);
+  backdrop-filter: blur(6px);
   padding: 7px 10px 8px; font-size: 12px; line-height: 1.4;
   pointer-events: auto; user-select: none;
   max-width: min(760px, calc(100vw - 16px));
@@ -2584,26 +2592,41 @@ function historyBarStyleEnsure() {
 #${HISTORY_BAR_ID} .hhb-x { margin-left:auto; background:transparent; border:0; color:#cfd8e3; font-size:14px; cursor:pointer; padding:0 4px; line-height:1; }
 #${HISTORY_BAR_ID} .hhb-x:hover { color:#fff; }
 #${HISTORY_BAR_ID} .hhb-build { color:#6f8194; font-size:10px; margin-left:2px; }
-/* P6-1 横轴骨架：一条水平线 + 刻度（左旧右新）；线用背景渐变画，刻度骑在线上 */
+/* P6-1 横轴骨架：刻度（左旧右新）。2026-10-12 按用户要求移除轴线（降低视觉噪音，空态不再裸奔一条横线） */
+#${HISTORY_BAR_ID} .hhb-axiswrap { position: relative; }
 #${HISTORY_BAR_ID} .hhb-axis {
   position: relative; display: flex; align-items: center; gap: 10px;
   min-width: 280px; min-height: 30px; padding: 3px 2px;
   overflow-x: auto; overflow-y: hidden;
-  background: linear-gradient(to bottom,
-    transparent calc(50% - .5px), rgba(255,255,255,.26) calc(50% - .5px),
-    rgba(255,255,255,.26) calc(50% + .5px), transparent calc(50% + .5px));
+  scrollbar-width: none;
 }
-/* 刻度：色相分「谁」（--hhb-c），形态分「跑/存」（save=空心环） */
+#${HISTORY_BAR_ID} .hhb-axis::-webkit-scrollbar { display: none; }
+#${HISTORY_BAR_ID} .hhb-fade { position: absolute; top: 0; bottom: 0; width: 18px; pointer-events: none; z-index: 2; opacity: 0; transition: opacity .2s; }
+#${HISTORY_BAR_ID} .hhb-fade.l { left: 0; background: linear-gradient(90deg, rgba(31,37,46,.95), transparent); }
+#${HISTORY_BAR_ID} .hhb-fade.r { right: 0; background: linear-gradient(270deg, rgba(31,37,46,.95), transparent); }
+#${HISTORY_BAR_ID} .hhb-fade.hhb-fade-on { opacity: 1; }
+/* 刻度（统一母题）：外框 = 线型(操作)+色(谁)；内条堆 = 本次碰过的画布框（框色，见 .hnode-bar） */
 #${HISTORY_BAR_ID} .hhb-tick {
-  flex: none; position: relative; width: 9px; height: 22px; padding: 0; margin: 0;
-  border: 0; border-radius: 4px; cursor: pointer;
-  background: var(--hhb-c, #5aa0d8);
-  box-shadow: 0 0 0 1px rgba(0,0,0,.35);
+  flex: none; position: relative; width: var(--hhb-tw, 9px); height: 23px; padding: 2px 1px; margin: 0;
+  box-sizing: border-box; display: flex; flex-direction: column;
+  border: 1.5px solid var(--hhb-c, #5aa0d8); border-style: solid; border-radius: 4.5px;
+  background: rgba(255,255,255,.025); cursor: pointer;
+  box-shadow: 0 1.5px 4px rgba(0,0,0,.45);
+  transition: transform .14s, box-shadow .14s, filter .14s;
 }
-#${HISTORY_BAR_ID} .hhb-tick[data-kind="save"] { background: transparent; border: 2px solid var(--hhb-c, #5aa0d8); box-shadow: none; }
-#${HISTORY_BAR_ID} .hhb-tick:hover { filter: brightness(1.28); }
+/* 密档降级：列宽小时收细外框与内边距，保证内条可见 */
+#${HISTORY_BAR_ID} .hhb-tick[data-tight] { border-width: 1px; padding: 1px 0; border-radius: 3px; }
+#${HISTORY_BAR_ID} .hhb-tick:hover {
+  transform: translateY(-1.5px); filter: brightness(1.12);
+  box-shadow: 0 1.5px 4px rgba(0,0,0,.55), 0 0 12px color-mix(in oklab, var(--hhb-c, #5aa0d8) 45%, transparent);
+}
+#${HISTORY_BAR_ID} .hhb-tick.hhb-tick-bulge { width: calc(var(--hhb-tw, 9px) + 3px); }
+#${HISTORY_BAR_ID} .hhb-tick .hhb-runs {
+  position: absolute; top: -5px; right: -6px; font-size: 8.5px; font-weight: 700;
+  color: #0d1014; background: #dfe8f2; border-radius: 5px; padding: 0 3px; line-height: 11px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none;
+}
 #${HISTORY_BAR_ID} .hhb-tick-sel { box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
-/* P7（2026-10-12）框视角：历史旧数据刻度（blockNames === null，无法细分到框）——淡化 + 右上小点 */
 #${HISTORY_BAR_ID} .hhb-tick[data-legacy] { opacity: .55; }
 #${HISTORY_BAR_ID} .hhb-tick[data-legacy]::after {
   content: ""; position: absolute; top: -3px; right: -3px;
@@ -2623,14 +2646,16 @@ function historyBarStyleEnsure() {
 /* 单击刻度的缩略图浮层（默认隐藏；移开自动关） */
 #${HISTORY_BAR_ID} .hhb-shots { display:none; }
 #${HISTORY_BAR_ID} .hhb-shots-on { display:block; margin-top:6px; }
-#${HISTORY_BAR_ID} .hhb-shots-body { display:flex; align-items:center; gap:4px; max-width:none; overflow-x:auto; padding-bottom:2px; }
+/* 铺满弹层宽度（单图图吃满；多图横滑） */
+#${HISTORY_BAR_ID} .hhb-shots-body { width:100%; max-width:none; }
 #${HISTORY_BAR_ID} .hhb-shots-ph { color:#9fb3c8; font-size:11px; padding:4px 2px; }
-#${HISTORY_BAR_ID} .hhb-thumb { width:58px; height:58px; flex:none; border-radius:6px; background:#3a414b; color:#aab4c0; display:flex; align-items:center; justify-content:center; font-size:12px; overflow:hidden; }
+#${HISTORY_BAR_ID} .hhb-thumb { width:100%; border-radius:8px; background:#3a414b; color:#aab4c0; display:flex; align-items:center; justify-content:center; font-size:12px; overflow:hidden; }
 #${HISTORY_BAR_ID} .hhb-thumb-has { background:transparent; }
-#${HISTORY_BAR_ID} .hhb-thumb-multi { width:auto; max-width:208px; }
-#${HISTORY_BAR_ID} .hhb-thumb-img { width:58px; height:58px; object-fit:cover; border-radius:6px; display:block; cursor:zoom-in; background:#3a414b; }
-#${HISTORY_BAR_ID} .hhb-thumb-strip { display:flex; gap:4px; height:58px; overflow-x:auto; }
-#${HISTORY_BAR_ID} .hhb-thumb-strip .hhb-thumb-img { flex:none; }
+#${HISTORY_BAR_ID} .hhb-thumb-multi { width:100%; }
+#${HISTORY_BAR_ID} .hhb-thumb-img { width:100%; height:auto; max-height:220px; object-fit:contain; border-radius:8px; display:block; cursor:zoom-in; background:#3a414b; }
+#${HISTORY_BAR_ID} .hhb-thumb-strip { display:flex; gap:4px; flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; scrollbar-width:none; padding-bottom:2px; }
+#${HISTORY_BAR_ID} .hhb-thumb-strip::-webkit-scrollbar { display:none; }
+#${HISTORY_BAR_ID} .hhb-thumb-strip .hhb-thumb-img { flex:none; width:auto; height:58px; max-height:none; }
 #${HISTORY_BAR_ID} .hhb-seq { font-weight:600; }
 #${HISTORY_BAR_ID} .hhb-row { display:flex; align-items:center; gap:4px; color:#9fb3c8; font-size:11px; }
 #${HISTORY_BAR_ID} .hhb-dot { width:7px; height:7px; border-radius:50%; flex:none; background:#9aa0a8; }
@@ -2669,6 +2694,7 @@ function historyBarStyleEnsure() {
 #${HISTORY_CONFIRM_ID} .hhb-cf-ok:hover { background:rgba(127,178,217,.3); }
 `;
   document.head.appendChild(style);
+  historyNodeStyleEnsure(); // 统一母题内条堆（两视图共用）
 }
 
 // 收起弹层（幂等）：递增竞态哨兵作废在途 fetch 响应
@@ -2794,6 +2820,21 @@ function historyCanvasEl() {
   return (canvas && (canvas.canvas || canvas.canvasEl || null)) || null;
 }
 
+// P6-3（2026-10-12）：选择工具栏避让 —— ComfyUI 选中框/节点时会在其上方浮出「选择工具栏」
+// （.selection-toolbox，fixed 定位，悬在框顶上方）。弹层原本贴框顶，会被它压住；
+// 取工具栏顶边屏幕 Y，弹层改贴它上方。取不到 / 不可见 → 返回 null（回退贴框顶，行为不变）。
+function historySelectionToolboxTop() {
+  try {
+    const el = document.querySelector(".selection-toolbox");
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) return null;
+    return r.top;
+  } catch {
+    return null;
+  }
+}
+
 // 弹层水平钳制：优先钳在画布元素左右边界内（再兜一层视口 8px 边距）。
 // 画布比弹层还窄 → 退回「贴画布左边」，此时右侧可能溢出（见记录-存疑项）。
 function historyBarClampLeft(left, bw) {
@@ -2847,15 +2888,18 @@ function historyBarFollowApply() {
   const ox = typeof off[0] === "number" ? off[0] : 0;
   const oy = typeof off[1] === "number" ? off[1] : 0;
   const prev = historyBarFollowPrev;
-  if (prev && prev.scale === scale && prev.ox === ox && prev.oy === oy) return true; // 视图态未变：跳过写入
-  historyBarFollowPrev = { scale, ox, oy };
+  const tb = historySelectionToolboxTop(); // P6-3：选择工具栏顶边（避让锚点；无则 null）
+  if (prev && prev.scale === scale && prev.ox === ox && prev.oy === oy && prev.tb === tb) return true; // 视图态未变：跳过写入
+  historyBarFollowPrev = { scale, ox, oy, tb };
 
   // 缩放：clamp 到 [MIN, MAX]（下限保证 zoom out 到很小也不缩没）
   const k = Math.max(HISTORY_BAR_MIN_SCALE, Math.min(HISTORY_BAR_MAX_SCALE, scale));
   // 锚点：框顶中心（屏幕 CSS px，复用 historyGroupTopScreen）；取不到框 → 回退视口中心
   const anchor = historyGroupTopScreen(historyBarGroup);
   const ax = anchor ? anchor.x : window.innerWidth / 2;
-  const ay = anchor ? anchor.y : window.innerHeight / 2;
+  let ay = anchor ? anchor.y : window.innerHeight / 2;
+  // P6-3：选择工具栏悬在框顶上方时，弹层再上移，底边贴工具栏顶（避让，避免压住工具栏）
+  if (tb != null && tb < ay) ay = tb - 8;
   // 水平钳制：跟随模式按「缩放后的可视宽度」算（transform 不改布局宽度，故取 offsetWidth * k）
   const bw = bar.offsetWidth || 0;
   const visW = bw * k;
@@ -3150,7 +3194,68 @@ function historyTickColor(source) {
   return String(source || "") === "agent" ? "#b189e0" : "#5aa0d8";
 }
 
-// 造一根刻度（button；形态分「跑/存」由 data-kind 控制）。
+// 外框线型分「操作」：save → dashed；run/其余 → solid（写成内联 CSS 变量）。
+function historyTickBorderStyle(kind) {
+  return String(kind || "") === "save" ? "dashed" : "solid";
+}
+
+// 内条默认色（框已不在画布 / 取不到色）——低存在感中性灰。
+const HNODE_BAR_DIM = "rgba(255,255,255,.16)";
+
+// 活图「框名 → 框色」映射（内条取色源 = 画布 bundle 框色）。
+// 框名口径与内条渲染完全同源（都走 graphBlocks，source === "group"）；取不到活图/无框 → 空 Map。
+function historyLiveBlockColors() {
+  const m = new Map();
+  try {
+    const g = app && app.graph ? app.graph : null;
+    if (!g || typeof g.toJSON !== "function") return m;
+    const blocks = graphBlocks(g.toJSON());
+    for (const b of Array.isArray(blocks) ? blocks : []) {
+      if (b && b.source === "group" && typeof b.color === "string" && b.color) m.set(b.name, b.color);
+    }
+  } catch { /* 取不到 → 空 Map（渲染退化为中性灰） */ }
+  return m;
+}
+
+// 统一母题样式（两视图共用，一次性注入）：外框由各视图自己画（线型=操作、色=谁），内条堆用此公共类。
+function historyNodeStyleEnsure() {
+  const ID = "hana-history-node-style";
+  if (document.getElementById(ID)) return;
+  const style = document.createElement("style");
+  style.id = ID;
+  style.textContent = `
+.hnode-bars { display:flex; flex-direction:column; gap:1.5px; align-items:stretch; justify-content:center; flex:1 1 auto; min-height:0; }
+.hnode-bar { display:block; flex:1 1 0; min-height:2px; border-radius:1px; background:${HNODE_BAR_DIM}; }
+.hnode-bar.hnode-bar-on { background:var(--hnode-bc, #5aa0d8); filter:brightness(1.15); box-shadow:0 0 5px var(--hnode-bc, transparent); }
+`;
+  document.head.appendChild(style);
+}
+
+// 内条堆（统一母题）：全局框各一根；「碰过」的框 → 该框真色（亮），未碰 → 中性灰。
+// barNames=全局框名（singleBar 时传 [null] 退化为单根）；hitSet=碰过的框名 Set（null=旧数据全灰）；
+// colorMap=框名→框色。
+function historyBarsBuild(barNames, hitSet, colorMap, singleBar) {
+  const bars = document.createElement("div");
+  bars.className = "hnode-bars";
+  const names = singleBar ? [null] : (Array.isArray(barNames) ? barNames : []);
+  for (const nm of names) {
+    const bar = document.createElement("i");
+    bar.className = "hnode-bar";
+    let on = false;
+    let col = HNODE_BAR_DIM;
+    if (singleBar) {
+      on = hitSet !== null; // 无框退化：有效提交 → 亮；旧数据 → 灰
+    } else if (nm != null) {
+      on = hitSet ? hitSet.has(nm) : false;
+      if (on) col = (colorMap && colorMap.get(nm)) || HNODE_BAR_DIM;
+    }
+    if (on) { bar.classList.add("hnode-bar-on"); bar.style.setProperty("--hnode-bc", col); }
+    bars.appendChild(bar);
+  }
+  return bars;
+}
+
+// 造一根刻度（button；外框=线型(操作)+色(谁)；内条堆=本次碰过的画布框，色取画布框色）。
 function historyBarTickMake(reqId, ent, ctx) {
   const tick = document.createElement("button");
   tick.type = "button";
@@ -3158,11 +3263,28 @@ function historyBarTickMake(reqId, ent, ctx) {
   const seq = historySeqLabel(ent);
   const src = String((ent && ent.source) || "unknown");
   const kind = String((ent && ent.kind) || "run");
-  tick.style.setProperty("--hhb-c", historyTickColor(src));
+  tick.style.setProperty("--hhb-c", historyTickColor(src)); // 外框色 = 谁
+  tick.style.borderStyle = historyTickBorderStyle(kind); // 外框线型 = 操作（run 实线 / save 虚线）
   tick.dataset.src = src;
   tick.dataset.kind = kind;
+  if (ctx && ctx.colW && ctx.colW < 14) tick.dataset.tight = "1"; // 密档降级
+  // 内条堆（统一母题）：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰；旧数据全灰。
+  const legacyTick = historyTickIsLegacy(ent);
+  const hitSet = legacyTick ? null : new Set((Array.isArray(ent && ent.blockNames) ? ent.blockNames : []).map((x) => String(x)));
+  const bars = historyBarsBuild(ctx && ctx.allBlocks, hitSet, ctx && ctx.colorMap, !!(ctx && ctx.singleBar));
+  tick.appendChild(bars);
+  // 合并提交（runs.length > 1）：刻度加粗（.hhb-tick-bulge）；列宽足够（colW >= 10）时再叠 ×N 徽标。
+  const runs = ent && Array.isArray(ent.runs) ? ent.runs : [];
+  const runsN = runs.length;
+  if (runsN > 1) tick.classList.add("hhb-tick-bulge");
+  if (runsN > 1 && ctx && ctx.colW >= 10) {
+    const badge = document.createElement("span");
+    badge.className = "hhb-runs";
+    badge.textContent = "×" + runsN;
+    tick.appendChild(badge);
+  }
   // P7：旧数据（无法细分到框）→ 打标记（淡化 + 右上小点；样式见 .hhb-tick[data-legacy]）
-  if (historyTickIsLegacy(ent)) tick.dataset.legacy = "1";
+  if (legacyTick) tick.dataset.legacy = "1";
   tick.title = ""; // 用自绘气泡，不用原生 tooltip
   tick.addEventListener("mouseenter", () => historyBarBubbleShow(tick, ent));
   tick.addEventListener("mouseleave", () => historyBarBubbleHide());
@@ -3422,6 +3544,21 @@ async function historyBarLoad(reqId, ctx, countEl) {
     if (!axis) return;
     axis.textContent = "";
     if (times) times.textContent = "";
+    // 统一母题「外框+内条」上下文：全局框列表（首次出现序）+ 活图框名→框色映射 + no-frame 退化标志。
+    if (ctx) {
+      const allBlocks = [];
+      const seen = new Set();
+      for (const ent of shown) {
+        const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
+        for (const b of bl) {
+          const nm = b && b.name != null ? String(b.name) : "";
+          if (nm && !seen.has(nm)) { seen.add(nm); allBlocks.push(nm); }
+        }
+      }
+      ctx.allBlocks = allBlocks;
+      ctx.colorMap = historyLiveBlockColors();
+      ctx.singleBar = allBlocks.length === 0;
+    }
     if (!shown.length) {
       const empty = document.createElement("div");
       empty.className = "hhb-empty";
@@ -3429,8 +3566,24 @@ async function historyBarLoad(reqId, ctx, countEl) {
       axis.appendChild(empty);
       return;
     }
+    // 宽度自适应（定稿卡数值）：少时加宽（≤44）、多时定宽（≥11）+ 横滚；刻度随之缩窄。
+    const n = shown.length;
+    const availW = axis.clientWidth || 0;
+    const colW = Math.min(72, Math.max(11, availW / n));
+    let tw = Math.min(11, Math.max(3, colW * 0.45));
+    tw = Math.min(tw, colW * 0.85);
+    const gap = Math.max(2, colW - tw);
+    axis.style.gap = gap + "px";
+    if (ctx) ctx.colW = colW;
     // 刻度左旧右新：按 entries 原序（索引本身按 seq/时间递增）直接 append
-    for (const ent of shown) axis.appendChild(historyBarTickMake(reqId, ent, ctx));
+    for (const ent of shown) {
+      const tick = historyBarTickMake(reqId, ent, ctx);
+      tick.style.setProperty("--hhb-tw", tw + "px");
+      axis.appendChild(tick);
+    }
+    // 定位到最新（左旧右新 + 打开滚到最右）
+    axis.scrollLeft = axis.scrollWidth;
+    historyBarUpdateAxisFade(axis);
     // 轴下：左端最早时间 / 右端最新时间（historyFmtTime）
     if (times) {
       const first = document.createElement("span");
@@ -3443,6 +3596,17 @@ async function historyBarLoad(reqId, ctx, countEl) {
     fail("提交历史加载失败：" + String((err && err.message) || err));
     // 不抛异常：失败只落在弹层内
   }
+}
+
+// 轴两端渐隐更新：左边不可再左滚（scrollLeft <= 1）→ 隐；右边到底 → 隐（scrollLeft+clientWidth >= scrollWidth-1）。
+function historyBarUpdateAxisFade(axis) {
+  if (!axis) return;
+  const wrap = axis.parentElement;
+  if (!wrap || !wrap.classList.contains("hhb-axiswrap")) return;
+  const l = wrap.querySelector(".hhb-fade.l");
+  const r = wrap.querySelector(".hhb-fade.r");
+  if (l) l.classList.toggle("hhb-fade-on", axis.scrollLeft > 1);
+  if (r) r.classList.toggle("hhb-fade-on", axis.scrollLeft + axis.clientWidth < axis.scrollWidth - 1);
 }
 
 // 打开弹层（重复调用=切换：先拆旧再建新）。
@@ -3492,13 +3656,38 @@ function historyBarOpen(group) {
     historyBarClose();
   });
   title.append(wf, count, build, x);
-  // 横轴（默认态：只有轴 + 刻度）；先放加载占位
+  // 横轴（默认态：只有轴 + 刻度）；先放加载占位。轴外包 .hhb-axiswrap + 两端渐隐。
   const axis = document.createElement("div");
   axis.className = "hhb-axis";
   const loading = document.createElement("div");
   loading.className = "hhb-empty";
   loading.textContent = "加载中…";
   axis.appendChild(loading);
+  const axisWrap = document.createElement("div");
+  axisWrap.className = "hhb-axiswrap";
+  const fadeL = document.createElement("div");
+  fadeL.className = "hhb-fade l";
+  const fadeR = document.createElement("div");
+  fadeR.className = "hhb-fade r";
+  axisWrap.append(axis, fadeL, fadeR);
+  // 横滚轴：优先 ΔX（触控板横滑），否则 ΔY（鼠标滚轮）；到两端放行（不 preventDefault）
+  const hscroll = (el) => (ev) => {
+    if (el.scrollWidth <= el.clientWidth) return; // 不可滚 → 放行
+    const d = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+    if (d > 0 && el.scrollLeft + el.clientWidth >= el.scrollWidth - 1) return; // 已在最右 → 放行
+    if (d < 0 && el.scrollLeft <= 0) return; // 已在最左 → 放行
+    ev.preventDefault();
+    el.scrollLeft += d;
+  };
+  axis.addEventListener(
+    "wheel",
+    (ev) => {
+      hscroll(axis)(ev);
+      historyBarUpdateAxisFade(axis);
+    },
+    { passive: false }
+  );
+  axis.addEventListener("scroll", () => historyBarUpdateAxisFade(axis));
   // 轴下两端时间（fetch 后回填）
   const times = document.createElement("div");
   times.className = "hhb-times";
@@ -3508,6 +3697,20 @@ function historyBarOpen(group) {
   const shotsBody = document.createElement("div");
   shotsBody.className = "hhb-shots-body";
   shots.appendChild(shotsBody);
+  // 多图横滚：滚轮作用在内部可滚条（.hhb-thumb-strip）；单图/不溢出 → 放行
+  shotsBody.addEventListener(
+    "wheel",
+    (ev) => {
+      const sc = shotsBody.querySelector(".hhb-thumb-strip");
+      if (!sc || sc.scrollWidth <= sc.clientWidth) return;
+      const d = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+      if (d > 0 && sc.scrollLeft + sc.clientWidth >= sc.scrollWidth - 1) return;
+      if (d < 0 && sc.scrollLeft <= 0) return;
+      ev.preventDefault();
+      sc.scrollLeft += d;
+    },
+    { passive: false }
+  );
   // 底部：回到这一版（P3-G1 真功能）+ 弹层内提示行
   const foot = document.createElement("div");
   foot.className = "hhb-foot";
@@ -3533,7 +3736,7 @@ function historyBarOpen(group) {
     void historySaveClick();
   });
   foot.append(roll, saveBtn, tip);
-  bar.append(title, axis, times, shots, foot);
+  bar.append(title, axisWrap, times, shots, foot);
   document.body.appendChild(bar); // position:fixed 自行定位，挂 body 避免容器裁剪
   // 鼠标离开弹层 → 缩略图浮层延迟关；进入弹层则取消关闭（浮层本身 hover 不关，移出才算）
   bar.addEventListener("mouseenter", () => {
@@ -4179,9 +4382,14 @@ const HISTORY_TREE_STYLE_ID = "hana-history-tree-style";
 const HISTORY_TREE_LS_PREFIX = "hana.history.tree.v1:";
 let historyTreeEl = null; // 底部容器单例（收纳条 + 展开面板）；null = 未初始化
 let historyTreePanelEl = null;
-let historyTreeTreeEl = null; // 展开面板里的行容器（rows + svg 连线层）
-let historyTreeCountEl = null; // 收纳条「N 节点 · M 分支」
+let historyTreeCanvasEl = null; // 展开面板里的横滚容器（.tcanvas）
+let historyTreeTreeEl = null; // 展开面板里的泳道层（.lanes；绝对定位节点 + svg 连线层）
+let historyTreeCountEl = null; // 收纳条「N 节点 · M 分支 · K 泳道」
 let historyTreeToggleEl = null; // 展开/收起按钮
+let historyTreeSleepEl = null; // 休眠折叠条（+N 休眠分支）
+let historyTreeFadeLEl = null; // 左端渐隐
+let historyTreeFadeREl = null; // 右端渐隐
+let historyTreeGeom = null; // 最近一次渲染几何 {colW,laneH,W,H}（预留）
 let historyTreeOpen = false; // 展开态（内存镜像；持久化走 historyTreeState*）
 let historyTreeReqId = 0; // 竞态哨兵：重渲染/收起后递增，在途旧响应作废
 let historyTreeEntries = []; // 最近一次成功 fetch 的 entries（resize 重画连线用，不 refetch）
@@ -4234,7 +4442,9 @@ function historyTreeStyleEnsure() {
 #${HISTORY_TREE_ID} .htr-collapsed {
   pointer-events: auto; height: 26px; display: flex; align-items: center; gap: 8px;
   padding: 0 10px; cursor: pointer;
-  background: rgba(24,28,34,.94); border-top: 1px solid rgba(255,255,255,.14);
+  background: linear-gradient(180deg, rgba(38,44,54,.94) 0%, rgba(27,32,40,.95) 100%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.075), 0 -1px 0 rgba(0,0,0,.3);
+  backdrop-filter: blur(6px);
 }
 #${HISTORY_TREE_ID} .htr-sum { font-weight: 600; }
 #${HISTORY_TREE_ID} .htr-count { color: #9fb3c8; }
@@ -4244,54 +4454,76 @@ function historyTreeStyleEnsure() {
 }
 #${HISTORY_TREE_ID} .htr-toggle:hover { background: rgba(255,255,255,.1); }
 #${HISTORY_TREE_ID} .htr-panel {
-  pointer-events: auto; display: none; height: 200px;
-  background: rgba(24,28,34,.96); border-top: 1px solid rgba(255,255,255,.14);
+  pointer-events: auto; display: none; height: auto; position: relative;
+  background: linear-gradient(180deg, rgba(38,44,54,.94) 0%, rgba(27,32,40,.95) 100%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.075), inset 0 0 0 1px rgba(255,255,255,.05), 0 -10px 30px rgba(0,0,0,.4);
+  backdrop-filter: blur(6px); border-radius: 13px 13px 0 0;
   padding: 6px 10px;
 }
 #${HISTORY_TREE_ID}.htr-open .htr-panel { display: block; }
-#${HISTORY_TREE_ID} .htr-tree {
-  position: relative; height: 100%; display: flex; flex-direction: column; gap: 2px; overflow: auto;
+/* 泳道画布：横向滚动（隐藏滚动条），高度自适应（行数决定，JS 设 —— 上限 176）；内部 .lanes 按算法尺寸绝对定位 */
+#${HISTORY_TREE_ID} .tcanvas {
+  position: relative; overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none; cursor: grab;
 }
-#${HISTORY_TREE_ID} .htr-row { flex: 0 0 auto; min-height: 24px; display: flex; align-items: flex-end; }
-/* 行内等分压缩：cell flex:1 min-width 16px —— 节点多时整体缩窄，不横向溢出 */
-#${HISTORY_TREE_ID} .htr-cell {
-  flex: 1 1 0; min-width: 16px; display: flex; flex-direction: column;
-  align-items: center; justify-content: flex-end; gap: 2px;
+#${HISTORY_TREE_ID} .tcanvas::-webkit-scrollbar { display: none; }
+#${HISTORY_TREE_ID} .lanes { position: relative; height: 100%; }
+/* 泳道基准线：每条显示泳道一根 1px 微亮横线 */
+#${HISTORY_TREE_ID} .htr-laneaxis {
+  position: absolute; left: 0; right: 0; height: 1px;
+  background: rgba(255,255,255,.032); pointer-events: none;
 }
-/* P7-2 节点（改造自旧刻度柱）：整体为可点选/悬停容器，内部 = 竖排色条堆 + stem */
-#${HISTORY_TREE_ID} .htr-tick {
-  flex: none; position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px;
-  padding: 0; margin: 0; border: 0; background: transparent; cursor: pointer;
+/* 节点（统一母题）：外框 = 线型(操作)+色(谁)；内条堆 = 本次碰过的画布框（框色，见 .hnode-bar） */
+#${HISTORY_TREE_ID} .node {
+  position: absolute; transform: translate(-50%, -50%);
+  display: flex; flex-direction: column; align-items: stretch;
+  width: var(--nw, 14px); min-width: 8px; min-height: 14px;
+  padding: 2px 1.5px; margin: 0; box-sizing: border-box;
+  border: 1.5px solid var(--htr-c, #5aa0d8); border-style: solid; border-radius: 4.5px;
+  background: rgba(255,255,255,.025); cursor: pointer;
 }
-/* 色条堆：全局框数根小色条（每根 = 一个框）；命中亮（--htr-c 按 source）、未命中灰 */
-#${HISTORY_TREE_ID} .htr-bars { display: flex; flex-direction: column; gap: 1px; }
-#${HISTORY_TREE_ID} .htr-bar {
-  display: block; width: 14px; height: 3px; border-radius: 1.5px;
-  background: var(--htr-c, #5aa0d8); opacity: .9;
+/* 密档降级（同框口径） */
+#${HISTORY_TREE_ID} .node[data-tight] { border-width: 1px; padding: 1px 0; border-radius: 3px; }
+/* 合并提交加粗（外框加粗 + 强光晕，同框口径） */
+#${HISTORY_TREE_ID} .node.htr-tick-bulge {
+  border-width: 2.5px;
+  box-shadow: 0 0 9px color-mix(in oklab, var(--htr-c, #5aa0d8) 60%, transparent);
 }
-#${HISTORY_TREE_ID} .htr-bar.htr-bar-off { background: rgba(255,255,255,.18); opacity: 1; }
-/* stem：色条堆下方竖线，表 kind（run 实线 / save 虚线）；颜色按 source */
-#${HISTORY_TREE_ID} .htr-stem {
-  width: 2px; height: 10px; border-radius: 1px; background: var(--htr-c, #5aa0d8);
+/* ×N 徽标（同框口径） */
+#${HISTORY_TREE_ID} .htr-runs {
+  position: absolute; top: -6px; right: -8px; font-size: 8.5px; font-weight: 700;
+  color: #0d1014; background: #dfe8f2; border-radius: 5px; padding: 0 3px; line-height: 11px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none;
 }
-#${HISTORY_TREE_ID} .htr-stem[data-kind="save"] {
-  background: repeating-linear-gradient(180deg, var(--htr-c, #5aa0d8) 0 2px, transparent 2px 4px);
-}
-#${HISTORY_TREE_ID} .htr-tick:hover { filter: brightness(1.28); }
+#${HISTORY_TREE_ID} .node:hover { filter: brightness(1.25); }
 #${HISTORY_TREE_ID} .htr-tick-sel { outline: 2px solid rgba(255,255,255,.9); outline-offset: 2px; border-radius: 4px; }
 /* HEAD 高亮：节点下小金点 */
 #${HISTORY_TREE_ID} .htr-tick-head::after {
-  content: ""; position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%);
+  content: ""; position: absolute; bottom: -7px; left: 50%; transform: translateX(-50%);
   width: 6px; height: 6px; border-radius: 50%; background: #e8c268;
 }
 /* 旧数据（blockNames === null）：淡化（同弹层 [data-legacy] 口径） */
-#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-bars,
-#${HISTORY_TREE_ID} .htr-cell[data-legacy] .htr-stem { opacity: .55; }
+#${HISTORY_TREE_ID} .node[data-legacy] .hnode-bars { opacity: .55; }
 /* 父子连线层：渲染后按真实位置补画（SVG），只描边不填充 */
 #${HISTORY_TREE_ID} .htr-edges {
   position: absolute; inset: 0; pointer-events: none;
-  stroke: rgba(255,255,255,.35); stroke-width: 1.5; fill: none;
+  stroke: rgba(150,172,198,.28); stroke-width: 1.3;
+  stroke-linecap: round; stroke-linejoin: round; fill: none;
 }
+/* 两端渐隐（同框口径） */
+#${HISTORY_TREE_ID} .htr-fade { position: absolute; top: 0; bottom: 0; width: 18px; pointer-events: none; z-index: 2; opacity: 0; transition: opacity .2s; }
+#${HISTORY_TREE_ID} .htr-fade.l { left: 10px; background: linear-gradient(90deg, rgba(31,37,46,.95), transparent); }
+#${HISTORY_TREE_ID} .htr-fade.r { right: 10px; background: linear-gradient(270deg, rgba(31,37,46,.95), transparent); }
+#${HISTORY_TREE_ID} .htr-fade.htr-fade-on { opacity: 1; }
+/* 休眠折叠条：虚线框 + +N（本期只显示+计数；展开折叠分支列为后续） */
+#${HISTORY_TREE_ID} .htr-sleep {
+  position: absolute; left: 10px; bottom: 4px; z-index: 3;
+  display: none; align-items: center; gap: 5px;
+  font-size: 10.5px; color: #9fb3c8;
+  border: 1px dashed rgba(255,255,255,.2); border-radius: 6px; padding: 1px 7px;
+  background: rgba(18,22,28,.6);
+}
+#${HISTORY_TREE_ID} .htr-sleep.htr-sleep-on { display: flex; }
 #${HISTORY_TREE_ID} .htr-empty { color: #9fb3c8; padding: 6px 2px; }
 #${HISTORY_TREE_ID} .htr-err { color: #e8a0a0; padding: 6px 2px; }
 /* 悬停气泡（同弹层 .hhb-bubble 家族） */
@@ -4302,11 +4534,91 @@ function historyTreeStyleEnsure() {
   box-shadow: 0 6px 20px rgba(0,0,0,.5); padding: 5px 8px; font-size: 11px; line-height: 1.45;
 }
 #${HISTORY_TREE_ID} .htr-bub-time { color: #9fb3c8; }
+/* 单击节点的缩略图浮层（默认隐藏；双击=回跳；点空白/移出关） */
+#${HISTORY_TREE_ID} .htr-shots {
+  position: absolute; z-index: 6; display: none;
+  background: rgba(18,22,28,.98); border: 1px solid rgba(255,255,255,.22);
+  border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.55);
+  padding: 8px 10px; max-width: min(560px, 88vw);
+}
+#${HISTORY_TREE_ID} .htr-shots.htr-shots-on { display: block; }
+#${HISTORY_TREE_ID} .htr-shots-ph { color: #9fb3c8; font-size: 11px; padding: 2px; white-space: nowrap; }
+#${HISTORY_TREE_ID} .htr-shots-strip {
+  display: flex; gap: 4px; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none; padding-bottom: 2px;
+}
+#${HISTORY_TREE_ID} .htr-shots-strip::-webkit-scrollbar { display: none; }
+#${HISTORY_TREE_ID} .htr-shots-img {
+  display: block; flex: none; border-radius: 7px; background: #3a414b;
+  cursor: zoom-in;
+}
+#${HISTORY_TREE_ID} .htr-shots-img.single { width: 100%; max-width: 520px; height: auto; max-height: 220px; object-fit: contain; }
+#${HISTORY_TREE_ID} .htr-shots-img.multi { height: 58px; width: auto; }
 `;
   document.head.appendChild(style);
+  historyNodeStyleEnsure(); // 统一母题内条堆（两视图共用）
 }
 
-// 计数：N 节点 = entries 数；M 分支 = 分叉点数（parent 被 ≥2 个节点指向的 parent 个数，口径见 记录-存疑项）。
+// ── W1 泳道算法（桥内内联版，逻辑与 app/lib/commit-graph-lanes.mjs 逐条一致）──────────
+// CSP 下桥内不能 import ESM，故此处必须内联；严禁改为 import。
+// 输入：entries（已按 seq 升序），每项至少 {seq, parent}。输出：
+//   { lanes:[{lane,headSeq,sleeping}], nodes:[{seq,lane,row}], rows:number, sleepingCount:number }
+// row = -1 → 折叠隐藏。确定性：同输入两次 deepEqual（不依赖遍历顺序；同 parent 多 child 时 seq 最小者先接手）。
+const LANES_MAX_ROWS = 4; // 最多显示 4 条泳道（定稿卡）
+function commitGraphLanes(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { lanes: [], nodes: [], rows: 0, sleepingCount: 0 };
+  }
+  // (1) 泳道分配（单遍，seq 升序）
+  const active = []; // active[L] = 该泳道悬挂末端 seq；只增不回收
+  const nodeLane = []; // 与 entries 同序的泳道号
+  for (let i = 0; i < entries.length; i += 1) {
+    const e = entries[i] || {};
+    const seq = e.seq;
+    const p = e.parent;
+    let lane = -1;
+    // parent 必须是 < seq 的整数；孤儿 / parent>=seq / 非整数 / 缺失 一律视同根
+    if (Number.isInteger(p) && p < seq) {
+      for (let L = 0; L < active.length; L += 1) {
+        if (active[L] === p) {
+          lane = L;
+          break;
+        }
+      }
+    }
+    if (lane < 0) {
+      lane = active.length;
+      active.push(null);
+    }
+    active[lane] = seq;
+    nodeLane.push(lane);
+  }
+  const laneCount = active.length;
+  // (2) 休眠判定 + 选显示集
+  const order = [];
+  for (let L = 0; L < laneCount; L += 1) order.push(L);
+  order.sort((a, b) => active[b] - active[a] || a - b); // headSeq 降序，同值按 lane 升序
+  const display = order.slice(0, LANES_MAX_ROWS);
+  const shown = new Array(laneCount).fill(false);
+  for (const L of display) shown[L] = true;
+  // (3) 紧凑重映射（显示集按 lane 升序 → row 0,1,2...）
+  const rowOf = new Array(laneCount).fill(-1);
+  const displayAsc = display.slice().sort((a, b) => a - b);
+  for (let r = 0; r < displayAsc.length; r += 1) rowOf[displayAsc[r]] = r;
+  const nodes = [];
+  for (let i = 0; i < entries.length; i += 1) {
+    const e = entries[i] || {};
+    const lane = nodeLane[i];
+    nodes.push({ seq: e.seq, lane, row: rowOf[lane] });
+  }
+  const lanes = [];
+  for (let L = 0; L < laneCount; L += 1) {
+    lanes.push({ lane: L, headSeq: active[L], sleeping: !shown[L] });
+  }
+  return { lanes, nodes, rows: displayAsc.length, sleepingCount: laneCount - displayAsc.length };
+}
+
+// 计数：N 节点；M 分支（parent 被 ≥2 个节点指向的 parent 数）；K 泳道（总泳道数）；折叠数走 .htr-sleep。
 function historyTreeUpdateCounts(entries) {
   if (!historyTreeCountEl) return;
   const cnt = new Map();
@@ -4317,46 +4629,56 @@ function historyTreeUpdateCounts(entries) {
   }
   let branches = 0;
   for (const v of cnt.values()) if (v >= 2) branches += 1;
-  historyTreeCountEl.textContent = entries.length + " 节点 · " + branches + " 分支";
+  const graph = commitGraphLanes(entries);
+  historyTreeCountEl.textContent =
+    entries.length + " 节点 · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
 }
 
-// 树渲染：entries（按 seq 升序）→ depth 分层行 → 行内 seq 从左到右 → 渲染后 rAF 补 SVG 连线。
+// 树渲染（泳道式）：entries → commitGraphLanes → 泳道定位（X=seq 轴，Y=泳道行）→ 只渲染 row>=0。
+// 返回 {nodeEls, graph}：nodeEls 供连线测量，graph 供连线/折叠条使用。
 function historyTreeRenderTree(entries) {
   const tree = historyTreeTreeEl;
-  if (!tree) return;
+  if (!tree) return { nodeEls: new Map(), graph: null };
   tree.textContent = "";
+  if (historyTreeClickTimer) { clearTimeout(historyTreeClickTimer); historyTreeClickTimer = null; } // 重渲染 → 清消歧态
+  historyTreeShotsHide(); // 重渲染 → 清预览浮层（防残留）
+  const sleepEl = historyTreeEl ? historyTreeEl.querySelector(".htr-sleep") : null;
   if (!entries.length) {
     const empty = document.createElement("div");
     empty.className = "htr-empty";
     empty.textContent = "这个工作流还没有提交记录";
     tree.appendChild(empty);
-    return;
+    tree.style.width = "";
+    tree.style.height = "";
+    if (sleepEl) sleepEl.classList.remove("htr-sleep-on");
+    return { nodeEls: new Map(), graph: null };
   }
-  const bySeq = new Map(); // seq → ent（parent 定位用）
+  const graph = commitGraphLanes(entries);
+  const bySeq = new Map(); // seq → ent
   for (const ent of entries) {
     if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
   }
-  // depth：单遍即可（parent 的 seq 恒小于 child，entries 按 seq 升序 → parent 先入表）。
-  // parent 非空但指向不存在的 seq（孤儿）→ 视为根 depth=0（不丢节点）。
-  const depthOf = new Map();
-  for (const ent of entries) {
-    const seq = ent && ent.seq;
-    if (seq == null) continue;
-    const p = ent.parent;
-    const d = p == null || !bySeq.has(p) || !depthOf.has(p) ? 0 : depthOf.get(p) + 1;
-    depthOf.set(seq, d);
-  }
-  const rows = new Map(); // depth → [ent]（entries 升序 push → 同层即按 seq 从左到右）
-  for (const ent of entries) {
-    const seq = ent && ent.seq;
-    if (seq == null) continue;
-    const d = depthOf.get(seq) || 0;
-    if (!rows.has(d)) rows.set(d, []);
-    rows.get(d).push(ent);
-  }
-  const depths = Array.from(rows.keys()).sort((a, b) => a - b);
-  // P7-2（2026-10-12）全局框列表：扫一遍 entries，取 blocks[].name 的并集（按首次出现序）。
-  // 兼容旧数据（blocks 只有 {name, nodeCount}）→ 同样取 name。列表为空 → 每节点退化为单根色条。
+  // 时间轴等距（2026-10-12 修）：每个「可见提交」占等宽一格。
+  // 旧实现 X=(seq-0.5)*colW 用 seq 值定距，而 seq 因合并（mergeInto 行不生成节点）跳号
+  // （实测 43 节点 seq 跨 1..144，相邻差 1~12 不等）→ 间距随序号差疏密悬殊、观感像按时间差伸缩。
+  // 改：rank = 可见节点（row>=0）序号，等距铺开；折叠节点不占位（收进 +N，不撑开间距）。
+  const shownNodes = graph.nodes.filter((nd) => nd && nd.row >= 0);
+  const rankOf = new Map();
+  shownNodes.forEach((nd, i) => rankOf.set(nd.seq, i));
+  const n = shownNodes.length || 1;
+  const availW = (historyTreeCanvasEl && historyTreeCanvasEl.clientWidth) || 320;
+  const colW = Math.max(11, Math.min(34, (availW - 28) / n)); // 中等间距：定稿口径上限 34
+  const laneH = 40; // 泳道行高（4 行 ≤ 176px 画布高）
+  const NW = 14; // 节点默认宽（色条宽）
+  const nw = Math.min(NW, colW * 0.8);
+  // 内容宽只由内容决定（n * colW），绝不被容器宽绑架（去 maxSeq*colW / availW-4，防右侧假留白）
+  const W = n * colW;
+  const H = Math.max(46, Math.min(176, graph.rows * laneH + 6)); // 高度自适应（行数定，上限 176）
+  historyTreeGeom = { colW, laneH, W, H };
+  tree.style.width = W + "px";
+  tree.style.height = H + "px";
+  if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 面板高度随内容（封顶）
+  // 全局框列表：扫 entries 取 blocks[].name 并集（首次出现序）；空 → 每节点退化为单根色条
   const globalBlocks = [];
   const blockSeen = new Set();
   for (const ent of entries) {
@@ -4370,63 +4692,70 @@ function historyTreeRenderTree(entries) {
       }
     }
   }
-  const singleBar = globalBlocks.length === 0; // 无任何框 → 单根色条兜底
+  const singleBar = globalBlocks.length === 0;
+  const liveColors = historyLiveBlockColors(); // 内条色 = 画布框色（整树算一次）
+  // 泳道基准线（每条显示泳道一根 1px 横线）
+  for (let row = 0; row < graph.rows; row += 1) {
+    const ax = document.createElement("div");
+    ax.className = "htr-laneaxis";
+    ax.style.top = row * laneH + laneH / 2 + "px";
+    tree.appendChild(ax);
+  }
   const nodeEls = new Map(); // seq → 节点元素（连线测量用）
   const head = historyHeadGet();
-  for (const d of depths) {
-    const row = document.createElement("div");
-    row.className = "htr-row";
-    for (const ent of rows.get(d)) {
-      const cell = document.createElement("div");
-      cell.className = "htr-cell";
-      // 旧数据（blockNames 非数组）：全部色条灰 + data-legacy 淡化标记
-      const legacy = !(ent && Array.isArray(ent.blockNames));
-      if (legacy) cell.dataset.legacy = "1";
-      const srcColor = historyTickColor(ent && ent.source);
-      const hitSet = legacy ? null : new Set(ent.blockNames.map((n) => String(n)));
-      const node = document.createElement("button");
-      node.type = "button";
-      node.className = "htr-tick";
-      node.dataset.src = String((ent && ent.source) || "unknown");
-      node.title = ""; // 自绘气泡，不用原生 tooltip
-      if (head && ent.seq != null && head.seq === ent.seq) node.classList.add("htr-tick-head");
-      // 色条堆：全局框数根（无框 → 单根）；命中亮色（source）、未命中灰
-      const bars = document.createElement("div");
-      bars.className = "htr-bars";
-      const barNames = singleBar ? [null] : globalBlocks;
-      for (const nm of barNames) {
-        const bar = document.createElement("i");
-        bar.className = "htr-bar";
-        bar.style.setProperty("--htr-c", srcColor);
-        let hit;
-        if (legacy) hit = false;
-        else if (singleBar) hit = true;
-        else hit = hitSet.has(nm);
-        if (!hit) bar.classList.add("htr-bar-off");
-        bars.appendChild(bar);
-      }
-      // stem：表 kind（run 实线 / save 虚线），颜色按 source
-      const stem = document.createElement("div");
-      stem.className = "htr-stem";
-      stem.dataset.kind = String((ent && ent.kind) || "run");
-      stem.style.setProperty("--htr-c", srcColor);
-      // P7 补完（2026-10-12）：悬停气泡 / 单击点选回跳（回跳链：historyBarSelection → historyRollbackConfirmOpen → historyRollbackExecute）。
-      node.addEventListener("mouseenter", () => historyTreeBubbleShow(node, ent));
-      node.addEventListener("mouseleave", () => historyTreeBubbleHide());
-      node.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        historyTreePick(node, ent);
-      });
-      // 组装并挂行（cell ← node(bars+stem)，row ← cell，tree ← row；seq → node 供连线测量）。
-      node.append(bars, stem);
-      cell.appendChild(node);
-      row.appendChild(cell);
-      tree.appendChild(row);   // ⚠️ 曾缺失：行建了却从未挂进 DOM（空面板根因）
-      if (ent.seq != null) nodeEls.set(ent.seq, node);
+  for (const nd of graph.nodes) {
+    if (!nd || nd.row < 0) continue; // 折叠泳道不渲染
+    const ent = bySeq.get(nd.seq);
+    if (!ent) continue;
+    const legacy = !(ent && Array.isArray(ent.blockNames));
+    const srcColor = historyTickColor(ent && ent.source);
+    const hitSet = legacy ? null : new Set(ent.blockNames.map((x) => String(x)));
+    const runsN = ent && Array.isArray(ent.runs) ? ent.runs.length : 0;
+    const node = document.createElement("button");
+    node.type = "button";
+    node.className = "node";
+    node.dataset.src = String((ent && ent.source) || "unknown");
+    if (legacy) node.dataset.legacy = "1"; // 旧数据淡化
+    if (runsN > 1) node.classList.add("htr-tick-bulge"); // 合并加粗
+    node.title = ""; // 自绘气泡，不用原生 tooltip
+    if (head && head.seq === nd.seq) node.classList.add("htr-tick-head"); // HEAD 金点
+    node.style.setProperty("--htr-c", srcColor); // 外框色 = 谁
+    node.style.borderStyle = historyTickBorderStyle(ent && ent.kind); // 外框线型 = 操作
+    const rk = rankOf.get(nd.seq);
+    node.style.left = ((rk == null ? 0 : rk) + 0.5) * colW + "px";
+    node.style.top = nd.row * laneH + laneH / 2 + 3 + "px";
+    node.style.setProperty("--nw", nw + "px");
+    if (colW < 14) node.dataset.tight = "1"; // 密档降级
+    // 统一母题内条堆：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰
+    node.appendChild(historyBarsBuild(globalBlocks, hitSet, liveColors, singleBar));
+    // ×N 徽标（合并提交；colW < 10 不渲染）
+    if (runsN > 1 && colW >= 10) {
+      const badge = document.createElement("span");
+      badge.className = "htr-runs";
+      badge.textContent = "×" + runsN;
+      node.appendChild(badge);
+    }
+    // 悬停气泡 / 单击点选回跳（回跳链：historyBarSelection → historyRollbackConfirmOpen → historyRollbackExecute）
+    node.addEventListener("mouseenter", () => historyTreeBubbleShow(node, ent));
+    node.addEventListener("mouseleave", () => historyTreeBubbleHide());
+    node.addEventListener("click", (ev) => historyTreeNodeClick(ev, node, ent));
+    tree.appendChild(node);
+    nodeEls.set(nd.seq, node);
+  }
+  // 休眠折叠条：显示 +N 休眠分支（本期只显示+计数；展开折叠分支列为后续）
+  if (sleepEl) {
+    if (graph.sleepingCount > 0) {
+      sleepEl.textContent = "+" + graph.sleepingCount + " 休眠分支";
+      sleepEl.classList.add("htr-sleep-on");
+    } else {
+      sleepEl.textContent = "";
+      sleepEl.classList.remove("htr-sleep-on");
     }
   }
-  return { nodeEls };
+  // 打开定位到最新（最右）
+  if (historyTreeCanvasEl) historyTreeCanvasEl.scrollLeft = historyTreeCanvasEl.scrollWidth;
+  historyTreeUpdateFade();
+  return { nodeEls, graph };
 }
 
 // ── P7 补完（2026-10-12）：容器挂载 / 取数 / 交互 / 连线 ────────────────────────
@@ -4473,19 +4802,47 @@ function historyTreeEnsure() {
     toggleTree();
   });
   collapsed.append(sum, count, toggle);
-  // 展开面板：行容器（rows）+ SVG 连线层（渲染后按真实位置补画）
+  // 展开面板：.tcanvas（横滚）> .lanes（节点层）+ 两端渐隐 + 休眠折叠条
   const panel = document.createElement("div");
   panel.className = "htr-panel";
-  const tree = document.createElement("div");
-  tree.className = "htr-tree";
-  panel.appendChild(tree);
+  const tcanvas = document.createElement("div");
+  tcanvas.className = "tcanvas";
+  const lanes = document.createElement("div");
+  lanes.className = "lanes";
+  tcanvas.appendChild(lanes);
+  const fadeL = document.createElement("div");
+  fadeL.className = "htr-fade l";
+  const fadeR = document.createElement("div");
+  fadeR.className = "htr-fade r";
+  const sleep = document.createElement("div");
+  sleep.className = "htr-sleep";
+  panel.append(tcanvas, fadeL, fadeR, sleep);
+  // 横向滚轮（同框口径：ΔX 优先，否则 ΔY；到两端放行）+ scroll 渐隐
+  tcanvas.addEventListener(
+    "wheel",
+    (ev) => {
+      if (tcanvas.scrollWidth <= tcanvas.clientWidth) return; // 不可滚 → 放行
+      const d = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+      if (d > 0 && tcanvas.scrollLeft + tcanvas.clientWidth >= tcanvas.scrollWidth - 1) return;
+      if (d < 0 && tcanvas.scrollLeft <= 0) return;
+      ev.preventDefault();
+      tcanvas.scrollLeft += d;
+      historyTreeUpdateFade();
+    },
+    { passive: false }
+  );
+  tcanvas.addEventListener("scroll", () => historyTreeUpdateFade());
   root.append(collapsed, panel);
   document.body.appendChild(root);
   historyTreeEl = root;
   historyTreePanelEl = panel;
-  historyTreeTreeEl = tree;
+  historyTreeCanvasEl = tcanvas;
+  historyTreeTreeEl = lanes;
   historyTreeCountEl = count;
   historyTreeToggleEl = toggle;
+  historyTreeSleepEl = sleep;
+  historyTreeFadeLEl = fadeL;
+  historyTreeFadeREl = fadeR;
   setToggleLabel();
   // resize 重画连线：用缓存的 historyTreeEntries 重渲染（不 refetch）；收起着跳过（下次展开时 refresh 会画）
   if (!historyTreeResizeBound) {
@@ -4496,10 +4853,18 @@ function historyTreeEnsure() {
       if (rt) clearTimeout(rt);
       rt = setTimeout(() => {
         const res = historyTreeRenderTree(historyTreeEntries);
-        historyTreeDrawEdges(res && res.nodeEls);
+        historyTreeDrawEdges(res && res.nodeEls, res && res.graph);
       }, 120);
     });
   }
+}
+
+// 泳道画布两端渐隐更新（同框口径）。
+function historyTreeUpdateFade() {
+  const c = historyTreeCanvasEl;
+  if (!c) return;
+  if (historyTreeFadeLEl) historyTreeFadeLEl.classList.toggle("htr-fade-on", c.scrollLeft > 1);
+  if (historyTreeFadeREl) historyTreeFadeREl.classList.toggle("htr-fade-on", c.scrollLeft + c.clientWidth < c.scrollWidth - 1);
 }
 
 // 取数 + 渲染（commit 成功 / 回跳成功 / 展开时各调一次；函数本体补上即通，两处调用点不动）。
@@ -4527,7 +4892,7 @@ async function historyTreeRefresh() {
     historyTreeUpdateCounts(entries);
     if (historyTreeEl && historyTreeEl.classList.contains("htr-open") && historyTreeTreeEl) {
       const res = historyTreeRenderTree(entries);
-      historyTreeDrawEdges(res && res.nodeEls);
+      historyTreeDrawEdges(res && res.nodeEls, res && res.graph);
     }
   } catch (err) {
     if (reqId !== historyTreeReqId) return;
@@ -4586,33 +4951,129 @@ function historyTreeBubbleHide() {
   if (b && b.parentElement) b.parentElement.removeChild(b);
 }
 
+// 单击/双击消歧（同框弹层口径）：单击 → 缩略图浮层；双击 → 回跳确认。
+// 消歧窗口复用 HISTORY_TICK_DBL_MS（240ms）。
+function historyTreeNodeClick(ev, tick, ent) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  if (historyTreeClickTimer) {
+    // 窗口内二次点击 = 双击 → 回跳确认
+    clearTimeout(historyTreeClickTimer);
+    historyTreeClickTimer = null;
+    historyTreeShotsHide();
+    historyTreePick(tick, ent);
+    return;
+  }
+  historyTreeClickTimer = setTimeout(() => {
+    historyTreeClickTimer = null;
+    historyTreeShotsToggle(tick, ent);
+  }, HISTORY_TICK_DBL_MS);
+}
+
+// 单击节点 → 其提交的缩略图浮层（复用 historyImagesToUrls + lightbox）。
+function historyTreeShotsToggle(tick, ent) {
+  const host = historyTreeEl;
+  if (!host || !tick) return;
+  historyTreeShotsHide();
+  const box = document.createElement("div");
+  box.className = "htr-shots htr-shots-on";
+  const images = ent && Array.isArray(ent.images) ? ent.images : [];
+  const imgs = historyImagesToUrls(images);
+  if (!imgs.length) {
+    const ph = document.createElement("div");
+    ph.className = "htr-shots-ph";
+    ph.textContent = "这次提交没有关联出图";
+    box.appendChild(ph);
+  } else {
+    const strip = document.createElement("div");
+    strip.className = "htr-shots-strip";
+    const single = imgs.length === 1;
+    for (const it of imgs) {
+      const img = document.createElement("img");
+      img.className = "htr-shots-img " + (single ? "single" : "multi");
+      img.src = it.thumbUrl;
+      img.alt = it.label;
+      img.loading = "eager";
+      img.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        historyOpenLightbox(it.fullUrl, it.label);
+      });
+      strip.appendChild(img);
+    }
+    box.appendChild(strip);
+    // 多图横滚：滚轮作用在浮层内部可滚条
+    box.addEventListener(
+      "wheel",
+      (e) => {
+        if (strip.scrollWidth <= strip.clientWidth) return;
+        const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+        if (d > 0 && strip.scrollLeft + strip.clientWidth >= strip.scrollWidth - 1) return;
+        if (d < 0 && strip.scrollLeft <= 0) return;
+        e.preventDefault();
+        strip.scrollLeft += d;
+      },
+      { passive: false }
+    );
+  }
+  host.appendChild(box);
+  // 定位：默认节点上方；越顶 → 落下方；水平钳在容器内
+  try {
+    const hr = host.getBoundingClientRect();
+    const tr = tick.getBoundingClientRect();
+    const bw = box.offsetWidth;
+    const bh = box.offsetHeight;
+    let left = tr.left + tr.width / 2 - hr.left - bw / 2;
+    left = Math.max(6, Math.min(left, (hr.width || bw) - bw - 6));
+    let top = tr.top - hr.top - bh - 8;
+    if (tr.top - bh - 8 < 4) top = tr.bottom - hr.top + 8;
+    box.style.left = Math.round(left) + "px";
+    box.style.top = Math.round(top) + "px";
+  } catch { /* 定位失败也显示（左上角），不影响预览语义 */ }
+}
+
+function historyTreeShotsHide() {
+  if (!historyTreeEl) return;
+  const b = historyTreeEl.querySelector(".htr-shots");
+  if (b && b.parentElement) b.parentElement.removeChild(b);
+}
+
 // 点选回跳：写 historyBarSelection（historyRollbackExecute 读它）→ 复用弹层确认框。
 // 防重入：historyRollback.busy 时忽略。树内旧选中态自清（弹层轴选中态归弹层管，互不干扰）。
 function historyTreePick(tick, ent) {
   if (!ent || ent.seq == null || historyRollback.busy) return;
   historyTreeBubbleHide();
+  historyTreeShotsHide();
   const file = ent && ent.file ? String(ent.file) : null;
   historyBarSelection = { file, seq: ent.seq };
   if (historyTreeTreeEl) {
-    historyTreeTreeEl.querySelectorAll(".htr-tick.htr-tick-sel").forEach((t) => t.classList.remove("htr-tick-sel"));
+    historyTreeTreeEl.querySelectorAll(".node.htr-tick-sel").forEach((t) => t.classList.remove("htr-tick-sel"));
   }
   if (tick) tick.classList.add("htr-tick-sel");
   historyRollbackConfirmOpen(tick, ent); // 确认框 → 「回跳」走 historyRollbackExecute（现有链）
 }
 
-// 连线：渲染完各行后按真实 DOM 位置画 SVG 折线（父刻度底边中点 → 下行 ≤10px → 横移 → 下行到
-// 子刻度顶边中点；同 x 直连）。nodeEls 来自 historyTreeRenderTree；rAF 等一帧布局稳定后测量。
-function historyTreeDrawEdges(nodeEls) {
+// 连线（泳道式）：按真实 DOM 位置画 SVG。
+//  · 同 row → 水平直线
+//  · 跨 row → 圆角贝塞尔 M x1,y1 C mx,y1 mx,y2 x2,y2
+//  · 一端在折叠泳道（row=-1，即节点未渲染）→ 淡出为水平短线 opacity .18（表示此处有分支被折叠）
+// nodeEls/graph 均来自 historyTreeRenderTree；rAF 等一帧布局稳定后测量。
+function historyTreeDrawEdges(nodeEls, graph) {
   const tree = historyTreeTreeEl;
   if (!tree || !nodeEls || !nodeEls.size) return;
   const bySeq = new Map();
   for (const ent of historyTreeEntries) {
     if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
   }
+  const rowOf = new Map(); // seq → row（来自算法结果；未渲染时也能查折叠）
+  if (graph && Array.isArray(graph.nodes)) {
+    for (const nd of graph.nodes) if (nd) rowOf.set(nd.seq, nd.row);
+  }
   // 渲染时 tree.textContent="" 已清掉旧 svg，这里新挂一层
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("class", "htr-edges");
   tree.appendChild(svg);
+  const geom = historyTreeGeom || { colW: 6, laneH: 40 };
   requestAnimationFrame(() => {
     let tr = null;
     try {
@@ -4622,6 +5083,7 @@ function historyTreeDrawEdges(nodeEls) {
     }
     if (!tr || (!tr.width && !tr.height)) return; // 已收起 / 不可见：不画
     let d = "";
+    let faded = "";
     for (const ent of historyTreeEntries) {
       const seq = ent && ent.seq;
       if (seq == null) continue;
@@ -4629,7 +5091,30 @@ function historyTreeDrawEdges(nodeEls) {
       if (p == null || !bySeq.has(p)) continue; // 根 / 孤儿不画
       const childEl = nodeEls.get(seq);
       const parentEl = nodeEls.get(p);
-      if (!childEl || !parentEl) continue;
+      const cRow = rowOf.get(seq);
+      const pRow = rowOf.get(p);
+      // 一端在折叠泳道（row=-1）→ 淡出短线（父或子自身未渲染）
+      if (childEl == null || parentEl == null) {
+        const visible = childEl || parentEl;
+        if (!visible) continue;
+        const r = rowOf.get(childEl ? p : seq);
+        void r;
+        let vr;
+        try {
+          vr = visible.getBoundingClientRect();
+        } catch {
+          continue;
+        }
+        if (!vr || !vr.width) continue;
+        const vx = vr.left + vr.width / 2 - tr.left;
+        const vy = vr.bottom - tr.top;
+        // 折叠分支方向：子未渲染（向右分出）→ 向右短横；父未渲染（向左接入）→ 向左短横
+        const dir = childEl ? -1 : 1;
+        faded +=
+          "M" + vx.toFixed(1) + " " + vy.toFixed(1) +
+          "L" + (vx + dir * 12).toFixed(1) + " " + vy.toFixed(1);
+        continue;
+      }
       let cr, pr;
       try {
         cr = childEl.getBoundingClientRect();
@@ -4639,22 +5124,27 @@ function historyTreeDrawEdges(nodeEls) {
       }
       if (!cr.width || !pr.width) continue;
       const x1 = pr.left + pr.width / 2 - tr.left;
-      const y1 = pr.bottom - tr.top;
+      const y1 = pr.top + pr.height / 2 - tr.top;
       const x2 = cr.left + cr.width / 2 - tr.left;
-      const y2 = cr.top - tr.top;
-      if (y2 <= y1) continue; // 异常布局（父在下/同点）：跳过，不画
-      if (Math.abs(x2 - x1) < 0.5) {
+      const y2 = cr.top + cr.height / 2 - tr.top;
+      if (pRow === cRow || Math.abs(y2 - y1) < 0.5) {
+        // 同泳道 → 水平直线
         d += "M" + x1.toFixed(1) + " " + y1.toFixed(1) + "L" + x2.toFixed(1) + " " + y2.toFixed(1);
       } else {
-        const midY = y1 + Math.min(10, (y2 - y1) / 2); // 父底先短竖下行，再横移，再落到子顶
+        // 跨泳道 → 圆角贝塞尔（水平出发、水平到达）
+        const mx = (x1 + x2) / 2;
         d +=
           "M" + x1.toFixed(1) + " " + y1.toFixed(1) +
-          "L" + x1.toFixed(1) + " " + midY.toFixed(1) +
-          "L" + x2.toFixed(1) + " " + midY.toFixed(1) +
-          "L" + x2.toFixed(1) + " " + y2.toFixed(1);
+          "C" + mx.toFixed(1) + " " + y1.toFixed(1) +
+          " " + mx.toFixed(1) + " " + y2.toFixed(1) +
+          " " + x2.toFixed(1) + " " + y2.toFixed(1);
       }
     }
-    svg.innerHTML = d ? '<path d="' + d + '"/>' : "";
+    let html = "";
+    if (d) html += '<path d="' + d + '"/>';
+    if (faded) html += '<path d="' + faded + '" opacity="0.18"/>';
+    svg.innerHTML = html;
+    void geom;
   });
 }
 // 执行期间把变更来源标为 "agent"；装载类窗口另标 "system"（见 beginSystemWindow）。

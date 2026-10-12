@@ -1118,9 +1118,8 @@ async function statusTick() {
       }
       if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; els.offWait.hidden = true; }
       // 服务运行中的常驻控制条已移除（2026-09-27）：服务控制只留左侧状态面板
-      if (themeStaleAfterLoad) {
-        setBar("info", "宿主主题已更新，正在刷新工作区…", []);
-      }
+      // 宿主主题变更提示条已移除（2026-10-11）：刷新动作由 scheduleThemeRefresh 自行完成，
+      // 该提示不消失（重载的是内层 iframe、外层壳页不重载，标志位留在 true 上），属视觉噪声。
     }
   } catch {
     // fetch 失败窗口（2026-10-08，盲区①）：参与「曾离线」判定——恢复时照常走闸门，

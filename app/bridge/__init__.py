@@ -97,8 +97,8 @@ except ValueError:
 
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
-# 2026-10-11（P3-H1）：对齐新活动桥 hana-bridge-1011095446（P2-F1/F2 + P3-G1 转正；diag 呈现待下次 ComfyUI 重启转正）。
-BRIDGE_BUILD_TAG = "2026-10-11 hana-bridge-12021428"
+# 2026-10-12（UI 定稿落地）：对齐新活动桥 hana-bridge-10121817（W2 框视觉 + W3 泳道式树）。
+BRIDGE_BUILD_TAG = "2026-10-12 hana-bridge-10121817"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
