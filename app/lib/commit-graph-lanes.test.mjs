@@ -1,7 +1,7 @@
 // app/lib/commit-graph-lanes.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { commitGraphLanes, MAX_ROWS } from "./commit-graph-lanes.mjs";
+import { commitGraphLanes } from "./commit-graph-lanes.mjs";
 
 const linear = (n) => {
   const out = [];
@@ -19,7 +19,7 @@ test("1. 线性 10 条 → 1 泳道、10 节点全 row=0、sleepingCount=0", () 
   assert.deepEqual(g.lanes, [{ lane: 0, headSeq: 10, sleeping: false }]);
 });
 
-test("2. 一次分叉（seq3 分出两支）→ 2 泳道", () => {
+test("2. 一次分叉（seq3 分出两支）→ 2 泳道、两行全显示", () => {
   const g = commitGraphLanes([
     { seq: 1, parent: null },
     { seq: 2, parent: 1 },
@@ -39,7 +39,7 @@ test("2. 一次分叉（seq3 分出两支）→ 2 泳道", () => {
   ]);
 });
 
-test("3. 分叉后一支长期不动（末端远落后于 latest）→ 该泳道 sleeping=true", () => {
+test("3. 分叉后一支长期不动 → 不折叠，sleeping 恒 false、row=lane", () => {
   const g = commitGraphLanes([
     { seq: 1, parent: null },
     { seq: 2, parent: 1 },
@@ -53,25 +53,24 @@ test("3. 分叉后一支长期不动（末端远落后于 latest）→ 该泳道
     { seq: 10, parent: 9 },
   ]);
   assert.equal(g.lanes.length, 5);
-  assert.equal(g.rows, 4);
-  assert.equal(g.sleepingCount, 1);
-  const stale = g.lanes.find((l) => l.lane === 1);
-  assert.deepEqual(stale, { lane: 1, headSeq: 3, sleeping: true });
-  // 长期不动的泳道其节点被折叠
-  assert.equal(g.nodes.find((n) => n.seq === 3).row, -1);
+  assert.equal(g.rows, 5); // 去折叠：全量 5 行
+  assert.equal(g.sleepingCount, 0);
+  assert.deepEqual(g.lanes.find((l) => l.lane === 1), { lane: 1, headSeq: 3, sleeping: false });
+  // 长期不动的泳道其节点不再被折叠（row 不再是 -1）
+  assert.equal(g.nodes.find((n) => n.seq === 3).row, 1);
+  assert.ok(g.lanes.every((l) => l.sleeping === false));
 });
 
-test("4. 泳道数 > MAX_ROWS → rows <= 4 且 sleepingCount > 0", () => {
+test("4. 泳道数 > 旧上限 4 → 全部显示：rows = laneCount、sleepingCount = 0", () => {
   const entries = [{ seq: 1, parent: null }];
   for (let s = 2; s <= 7; s++) entries.push({ seq: s, parent: 1 }); // 6 条泳道
   entries.push({ seq: 8, parent: 2 }, { seq: 9, parent: 8 });
   const g = commitGraphLanes(entries);
   assert.equal(g.lanes.length, 6);
-  assert.ok(g.rows <= MAX_ROWS, "rows 不得超过 MAX_ROWS");
-  assert.equal(g.rows, MAX_ROWS);
-  assert.ok(g.sleepingCount > 0);
-  assert.equal(g.sleepingCount, 6 - g.rows);
-  assert.equal(g.lanes.filter((l) => l.sleeping).length, g.sleepingCount);
+  assert.equal(g.rows, 6); // 不再截断到 4
+  assert.equal(g.sleepingCount, 0);
+  assert.equal(g.lanes.filter((l) => l.sleeping).length, 0);
+  assert.ok(g.rows > 4, "rows 应超过旧上限 4（取消折叠）");
 });
 
 test("5. 确定性：同输入两次调用 deepEqual", () => {
@@ -107,7 +106,7 @@ test("6. 空 / 孤儿 parent / 异常 parent 不抛异常", () => {
   assert.deepEqual(g.nodes.map((n) => n.lane), [0, 1, 2]);
 });
 
-test("7. 每个节点在 nodes 里都有 row（含 -1）", () => {
+test("7. 每个节点 row=lane（去折叠，无 -1）；nodes 与输入同序", () => {
   const entries = [{ seq: 1, parent: null }];
   for (let s = 2; s <= 7; s++) entries.push({ seq: s, parent: 1 });
   entries.push({ seq: 8, parent: 2 }, { seq: 9, parent: 8 });
@@ -116,9 +115,10 @@ test("7. 每个节点在 nodes 里都有 row（含 -1）", () => {
   for (const n of g.nodes) {
     assert.equal(typeof n.row, "number");
     assert.ok(Number.isInteger(n.row));
-    assert.ok(n.row >= -1);
+    assert.equal(n.row, n.lane); // 去折叠：row 直接等于 lane
+    assert.ok(n.row >= 0);
   }
-  assert.ok(g.nodes.some((n) => n.row === -1), "折叠泳道应有 row=-1 的节点");
+  assert.ok(!g.nodes.some((n) => n.row === -1), "去折叠后不应再有 row=-1 的节点");
   // nodes 的 seq 与输入同序
   assert.deepEqual(g.nodes.map((n) => n.seq), entries.map((e) => e.seq));
 });

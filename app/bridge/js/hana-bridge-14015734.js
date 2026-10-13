@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-12 hana-bridge-10121817";
+const BUILD_TAG = "2026-10-13 hana-bridge-14015734";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -205,6 +205,34 @@ function currentWorkflowInfo() {
   } catch {
     return { name: "(未命名)", path: null, modified: null };
   }
+}
+
+// 本页「全量已打开工作流」列表（2026-10-13，A 档 S1）。
+// 背景：桥此前只读 activeWorkflow → 同页其它标签（Tab）是结构性盲区。前端 Tab 条
+// 本身就是遍历 svc.openWorkflows 渲染（GraphView-CDjciZjE.js: S=N(()=>i.openWorkflows.map(...))）。
+// 数据源 = app.extensionManager.workflow.openWorkflows（Pinia `workflow` store，数组；setup store
+// 的 ref/computed 在 store 实例上已解包 → 直接是数组）。每项：
+//   name  = filename || name（名字链同 currentWorkflowInfo，取不到 → "(未命名)"）
+//   path  = wf.path（Copilot pageKey / 定向主键）
+//   key   = wf.key（前端 Tab 身份；同名多开时与 path 一起用于区分）
+//   active= 该项 === activeWorkflow
+//   dirty = workflowDirty(wf)（兼容 getter / 函数两种形态）
+// 取不到（无 store / 非数组 / 抛错）→ 空数组（消费侧如实当「不知道」，不猜）。
+// 只读：不写任何状态。
+function openWorkflowsInfo() {
+  try {
+    const svc = app && app.extensionManager && app.extensionManager.workflow;
+    if (!svc || !Array.isArray(svc.openWorkflows)) return [];
+    const aw = svc.activeWorkflow || null;
+    return svc.openWorkflows.map((wf) => ({
+      name: String((wf && (wf.filename || wf.name)) || "").trim() || "(未命名)",
+      path: (wf && wf.path) || null,
+      key: (wf && wf.key) || null,
+      active: !!wf && wf === aw,
+      dirty: workflowDirty(wf),
+    }));
+  } catch { /* 忽略 */ }
+  return [];
 }
 
 // ── D1：画布执行 + 副驾驶（canvas.queue / canvas.duplicate / canvas.visual 与开关 UI）──
@@ -731,6 +759,10 @@ async function pushStateSnapshot() {
       revision: graphRevision,
       sid: api.clientId || null,
       workflow: currentWorkflowInfo(),
+      // A 档 S1（2026-10-13）：随 state 一并上报本页全量打开工作流。
+      // 为何走 state 而非桥内 pages：canvas.pages 由 py 侧产出（bridge/__init__.py L378
+      // _pages_payload → L266），桥只推 state（本函数）。故 openWorkflows 从这里进去。
+      openWorkflows: openWorkflowsInfo(),
       summary: graphSummary(),
       copilot: copilotStateForPush(),
     });
@@ -1178,6 +1210,114 @@ function runPatchDryRun(list) {
 const NEW_PAGE_DEDUP_MS = 600_000; // 10 分钟：远大于卡侧 60s 短窗轮询 + 重试窗口
 let lastNewPageLoad = null; // { file, at, page, key, nodeCount, failed }
 
+// ── live 分组支撑（缺口 #5，2026-10-13）───────────────────────────────────────
+// 与文件版（app/lib/canvas-edit.mjs 的 addGroup/setGroup/removeGroup）同语义：
+//   自动 bounds = 节点 pos/size 外接矩形外扩 GROUP_PAD；无 nodeIds 无 bounds → [0,0,200,100]。
+const GROUP_PAD = 20;              // addGroup/setGroup 自动 bounding 的外扩边距（与文件版一致）
+const GROUP_DEFAULT_BOUNDS = [0, 0, 200, 100]; // 既无 bounds 又无 nodeIds 时的默认框（与文件版一致）
+
+// LGraphGroup 构造器取法（逐个探明，按可用性回退；2026-10-13 源码核对 comfyui_frontend 1.55.14）：
+//  · 前端 `useGlobalLitegraph()`（GraphView 内）显式 `window.LGraphGroup = <class LGraphGroup>`（源码确证）→ 首选。
+//  · LiteGraph 命名空间只读镜像：`window.LiteGraph.LGraphGroup`（settingStore 内 `LGraphGroup=Xu`）→ 次选。
+//  · 活图上已有组时：取其实例原型的 constructor → 末选（无组时拿不到）。
+// 为什么必须真类、不能用「纯对象 {title,bounding}」直接 push（已探明，勿再试）：
+//  前端序列化走 `_groups.map(g=>g.serialize())`（serialiseStoredGroups）——纯对象无 serialize() 会抛；
+//  且 `graph.add(e)` 只有 `e instanceof LGraphGroup` 才走分组分支，否则按节点处理。故纯对象不可行。
+function lgraphGroupCtor() {
+  if (typeof window.LGraphGroup === "function") return window.LGraphGroup;
+  const LG = liteGraph();
+  if (LG && typeof LG.LGraphGroup === "function") return LG.LGraphGroup;
+  try {
+    const g = app && app.graph;
+    const list = g && (Array.isArray(g.groups) ? g.groups : (Array.isArray(g._groups) ? g._groups : null));
+    if (list && list.length) {
+      const proto = list[list.length - 1] && Object.getPrototypeOf(list[list.length - 1]);
+      if (proto && typeof proto.constructor === "function") return proto.constructor;
+    }
+  } catch { /* 拿不到就算了，返回 null 由调用方报错 */ }
+  return null;
+}
+
+// 活图分组列表（新前端 graph.groups 是 _groups 的 getter；旧版兼容 _groups）
+// 注：命名避开 historyBlockNameOf 内的同名局部变量 liveGroups（自行阴面子坑）。
+function liveGroupList(graph) {
+  const g = graph || (app && app.graph);
+  if (!g) return [];
+  if (Array.isArray(g.groups)) return g.groups;
+  if (Array.isArray(g._groups)) return g._groups;
+  return [];
+}
+
+// 显式 bounds 校验（4 个有限数字，文案对齐 canvas-edit.mjs 的 assertBoundsArray）
+function asBounds4(v, label) {
+  if (!Array.isArray(v) || v.length !== 4 || v.some((x) => typeof x !== "number" || !Number.isFinite(x))) {
+    throw new Error(`${label} 需要四个数字的数组 [x, y, w, h]`);
+  }
+  return v.map(Number);
+}
+
+// 组矩形读法沿用 historyGroupRect（运行时 _bounding/_pos+_size，序列化 bounding，字段依据见其注释）
+function liveGroupRect(group) {
+  return historyGroupRect(group);
+}
+
+// 写回组矩形：运行时用 g.setBounds(x,y,w,h)（新前端；内部同步 layout store + 重绘），
+// 退而写 g.bounds（Rectangle）。两者都不可用 → 如实报错（不静默）。
+function applyGroupBounds(group, b) {
+  if (typeof group.setBounds === "function") {
+    group.setBounds(b[0], b[1], b[2], b[3]);
+    return;
+  }
+  if (group.bounds && typeof group.bounds.set === "function") {
+    group.bounds.set([b[0], b[1], b[2], b[3]]);
+    return;
+  }
+  throw new Error("该前端不支持设置分组矩形（LGraphGroup.setBounds / bounds 均不可用）");
+}
+
+// 由节点集算外接矩形（外扩 GROUP_PAD）。口径对齐 canvas-edit.mjs 的 boundsForNodes。
+function liveBoundsForNodes(nodeIds) {
+  if (!Array.isArray(nodeIds) || nodeIds.length === 0) {
+    throw new Error("nodeIds 需为非空数组（节点 id 列表）");
+  }
+  let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+  for (const id of nodeIds) {
+    const n = findNode(id);
+    if (!n) throw new Error(`找不到节点：#${id}`);
+    const p = n.pos;
+    if (!p || typeof p[0] !== "number" || typeof p[1] !== "number") {
+      throw new Error(`节点 #${n.id} 缺 pos，无法计算 bounds`);
+    }
+    const s = n.size;
+    const w = s && typeof s[0] === "number" ? s[0] : 0;
+    const h = s && typeof s[1] === "number" ? s[1] : 0;
+    minX = Math.min(minX, p[0]); minY = Math.min(minY, p[1]);
+    maxX = Math.max(maxX, p[0] + w); maxY = Math.max(maxY, p[1] + h);
+  }
+  return [minX - GROUP_PAD, minY - GROUP_PAD, (maxX - minX) + GROUP_PAD * 2, (maxY - minY) + GROUP_PAD * 2];
+}
+
+// 定位活图分组：index（groups 数组下标、0 基）优先；否则 title（trim 两端同口径，坑 #49）。
+// 越界 / 未命中 / 多重命中均如实报错，文案对齐 canvas-edit.mjs 的 locateGroup。
+function locateLiveGroup(a) {
+  const groups = liveGroupList(app.graph);
+  const hasIdx = a.index !== undefined && a.index !== null;
+  const hasTitle = a.title !== undefined && a.title !== null && String(a.title).trim() !== "";
+  if (!hasIdx && !hasTitle) throw new Error("需要 index（groups 数组下标，0 基）或 title（现有组标题）定位");
+  if (hasIdx) {
+    const i = Number(a.index);
+    if (!Number.isInteger(i) || i < 0) throw new Error("index 需为 ≥0 的整数（groups 数组下标，0 基）");
+    if (i >= groups.length) throw new Error(`组 index ${i} 越界（现有 ${groups.length} 个组，0 基下标 0..${Math.max(0, groups.length - 1)}）`);
+    return i;
+  }
+  const wanted = String(a.title).trim();
+  const hits = [];
+  groups.forEach((g, i) => { if (g && String(g.title == null ? "" : g.title).trim() === wanted) hits.push(i); });
+  if (!hits.length) throw new Error(`没有标题为「${wanted}」的组（现有：${groups.map((g) => (g && g.title) || "").filter(Boolean).join(" / ") || "无"}）`);
+  if (hits.length > 1) throw new Error(`标题「${wanted}」有 ${hits.length} 个组，无法唯一定位；请改用 index`);
+  return hits[0];
+}
+
 const OPS = {
   // 全量 UI 格式（等价 Ctrl+S 写出的结构）
   "canvas.get": () => app.graph.toJSON(),
@@ -1295,6 +1435,19 @@ const OPS = {
             const ap = Object.getPrototypeOf(aw) || {};
             out.workflowService.activeWorkflowMethods = Object.getOwnPropertyNames(ap).slice(0, 60);
           }
+          // A 档 S2（2026-10-13）切标签原语探查（只读）：把 svc 上所有名字里带
+          // activate / select / setActive / setActiveWorkflow / switch 的方法列出来。
+          // 已知候选（前端源码实测）：svc.openWorkflow(wfOrPath) —— 它是「完整装载」
+          // （queueWorkflowLoad → loadGraphData），不是轻量切 Tab；isActive / isOpen 只判不切。
+          const proto = Object.getPrototypeOf(svc) || {};
+          const names = []
+            .concat(Object.getOwnPropertyNames(svc), Object.getOwnPropertyNames(proto))
+            .filter((k) => typeof k === "string");
+          out.workflowService.activateLike = names.filter((k) => /activate|select|setactive|switch|toggle/i.test(k));
+          out.workflowService.fnNames = names.filter((k) => { try { return typeof svc[k] === "function"; } catch { return false; } }).slice(0, 60);
+          out.workflowService.hasOpenWorkflows = Array.isArray(svc.openWorkflows);
+          out.workflowService.openWorkflowsCount = Array.isArray(svc.openWorkflows) ? svc.openWorkflows.length : null;
+          out.openWorkflows = openWorkflowsInfo();
         }
       } catch (e) { out.workflowServiceErr = String(e); }
       const cmd = em.command;
@@ -1481,7 +1634,10 @@ const OPS = {
       } catch { /* 忽略 */ }
       return [];
     })();
-    const norm = (s) => String(s || "").replace(/\\/g, "/").toLowerCase();
+    // 名匹配对齐 openWorkflowsInfo（2026-10-13）：候选名一律 trim 首尾空白——磁盘名可带尾空格
+    //（如 "xxx (00012) .json"），上报端 trim 而比对端不 trim 会「列得出却打不开」。（与下方
+    // canvas.activateWorkflow 同一口径。）
+    const norm = (s) => String(s || "").trim().replace(/\\/g, "/").toLowerCase();
     const tNorm = norm(target);
     const tNoExt = tNorm.replace(/\.json$/, "");
     let hit = null;
@@ -1537,6 +1693,77 @@ const OPS = {
       activeAfter: expectAfter,
       nodeCount,
       note: "已发起完整装载（异步）：装载完成后画布刷新并激活该工作流，调用方按 nodeCount / activeAfter 落定校验确认",
+    };
+  },
+
+  // canvas.activateWorkflow（2026-10-13，A 档 S2）：把「已打开」的目标工作流切成前台（切标签）。
+  // 与 canvas.openWorkflow 的区别：openWorkflow ＝「打开」（未打开时装载/新开 + dirty 保护，会拦）；
+  // 本 op ＝「切标签」——不带 dirty 保护、不做列表匹配、只切「已打开」的标签，但同样走完整装载。
+  // 语义边界：仅切「已打开」的标签；目标未打开 → 如实报错（不偷偷去打开，那属 openWorkflow 语义）。
+  // 快返：不 await 重绘，立即回报由调用方落定校验 activeAfter / nodeCount。
+  "canvas.activateWorkflow": async (args) => {
+    const a = args || {};
+    // 定向字段兼容：workflow 是工具层 / 中继传入的定向字段（与 app 侧指引、py 侧定向同源），
+    // 此 op 兼容它——否则按指引用 workflow="<名>" 调用时 target 为空、直接抛错。
+    const target = String(a.path || a.name || a.workflow || "").trim();
+    if (!target) throw new Error("需要 name、path 或 workflow");
+    const svc = app.extensionManager && app.extensionManager.workflow;
+    if (!svc) {
+      throw new Error("前端没有 workflow store（app.extensionManager.workflow 不可用，版本不支持）");
+    }
+    // 名匹配对齐 openWorkflowsInfo（2026-10-13）：候选名一律 trim 首尾空白——磁盘名可带尾空格
+    //（如 "Qwen21 t2i 质量版 (00012) .json"），上报端已 trim、比对端不 trim 会「列得出却切不过去」。
+    const norm = (s) => String(s || "").trim().replace(/\\/g, "/").toLowerCase();
+    const tNorm = norm(target);
+    const tNoExt = tNorm.replace(/\.json$/, "");
+    // 目标解析：path 优先（getWorkflowByPath），拿不到再在 openWorkflows 里按 name/path 宽松匹配
+    // （去 .json、大小写不敏感）。
+    let hit = null;
+    if (a.path) {
+      try {
+        if (typeof svc.getWorkflowByPath === "function") hit = svc.getWorkflowByPath(target) || null;
+      } catch { hit = null; }
+    }
+    if (!hit) {
+      const open = Array.isArray(svc.openWorkflows) ? svc.openWorkflows : [];
+      for (const w of open) {
+        if (!w) continue;
+        if (tNorm === norm(w.path) || tNorm === norm(w.filename) || tNorm === norm(w.name)) { hit = w; break; }
+        if (tNoExt === norm(w.path).replace(/\.json$/, "") || tNoExt === norm(w.filename).replace(/\.json$/, "") || tNoExt === norm(w.name)) { hit = w; break; }
+      }
+    }
+    if (!hit) {
+      throw new Error(`未打开的工作流：${target}（activateWorkflow 只切已打开的标签）`);
+    }
+    const aw = svc.activeWorkflow || null;
+    const activeBefore = aw ? (aw.filename || aw.path || aw.name || null) : null;
+    const activeAfter = hit.filename || hit.name || hit.path || null;
+    const path = hit.path || null;
+    // 已是 active：直接回报，不重复触发切标签
+    if (aw && aw === hit) {
+      return { activated: true, alreadyActive: true, activeAfter, path };
+    }
+    if (typeof app.loadGraphData !== "function") {
+      throw new Error("前端没有 app.loadGraphData（版本不支持切标签装载）");
+    }
+    // 切标签＝完整装载（对齐前端「手点 Tab」的 workflowService.openWorkflow）：
+    // 只改 activeWorkflow 指向会留「页名≠画布内容」半状态（P1 老坑，见本文件 canvas.openWorkflow 注释）。
+    // 快返：loadGraphData 会等整图渲染，超前端 6s 回传上限 → 不 await，立即回报由调用方落定校验。
+    const wasLoaded = !!hit.isLoaded;
+    if (!wasLoaded) await hit.load();
+    try { hit.changeTracker?.prepareForSave?.(); } catch { /* 刷不动不阻断 */ }
+    const st = JSON.parse(JSON.stringify(hit.activeState));
+    if (!st || typeof st !== "object") throw new Error("取不到 activeState（无法装载目标标签）");
+    const nodeCount = Array.isArray(st.nodes) ? st.nodes.length : null;
+    const sysWin = beginSystemWindow();
+    const loadP = Promise.resolve(
+      app.loadGraphData(st, true, true, hit, { checkForRerouteMigration: false, deferWarnings: false, skipAssetScans: wasLoaded }),
+    ).catch((e) => { console.warn(LOG_TAG, "activateWorkflow loadGraphData 失败", e); });
+    armSystemWindow(sysWin, loadP);
+    return {
+      activated: true, pending: true, // 快返：装载在页面内继续
+      activeBefore, activeAfter, path, nodeCount,
+      note: "已切到该标签（完整装载，画布稍后刷新）；调用方按 activeAfter / nodeCount 落定校验",
     };
   },
 
@@ -1947,6 +2174,136 @@ const OPS = {
       label: mode === 2 ? "mute" : mode === 4 ? "bypass" : "正常",
       before,
     };
+  },
+
+  // ── live 分组（缺口 #5，2026-10-13；与 file 版 canvas-edit.mjs 同语义）──────────
+  // 归属口径：ComfyUI 归组靠「节点 pos 落在 group 边界内」（graphBlocks 同口径），
+  // 故自动 bounds 必须真框住 nodeIds（内含 GROUP_PAD 外扩）；显式 bounds 由调用方自担是否正确。
+  "canvas.addGroup": (args) => {
+    const a = args || {};
+    if (typeof a.title !== "string" || !a.title.trim()) throw new Error("需要 title（非空字符串）");
+    const title = a.title.trim();
+    const hasBounds = a.bounds !== undefined && a.bounds !== null;
+    const hasIds = Array.isArray(a.nodeIds);
+    if (hasIds && a.nodeIds.length === 0) throw new Error("nodeIds 需为非空数组（节点 id 列表）");
+    let bounds;
+    if (hasBounds) {
+      bounds = asBounds4(a.bounds, "bounds");
+      if (hasIds) for (const id of a.nodeIds) { if (!findNode(id)) throw new Error(`找不到节点：#${id}`); }
+    } else if (hasIds) {
+      bounds = liveBoundsForNodes(a.nodeIds);
+    } else {
+      bounds = GROUP_DEFAULT_BOUNDS.slice();
+    }
+    const Ctor = lgraphGroupCtor();
+    if (!Ctor) throw new Error("当前前端拿不到 LGraphGroup 构造器（window.LGraphGroup / LiteGraph.LGraphGroup 均不可用）");
+    const graph = app.graph;
+    const g = new Ctor(title);
+    // 显式 bounds 先设，再入图（graph.add 会 mintGroupId + attachGroupLayout，用当前 pos/size 建 layout）
+    applyGroupBounds(g, bounds);
+    if (a.color !== undefined && a.color !== null && String(a.color).trim()) g.color = String(a.color);
+    withChange(() => graph.add(g));
+    // 显式归属（若前端支持；拿不到就靠 bounds 内含判据，见上方口径注释）
+    try { if (typeof g.recomputeInsideNodes === "function") g.recomputeInsideNodes(); } catch { /* 归属非必需，失败不阻断 */ }
+    pollGraph();
+    pushUndo(`addGroup「${title}」`, () => {
+      withChange(() => {
+        if (typeof graph.remove === "function") graph.remove(g);
+        else {
+          const arr = liveGroupList(graph);
+          const i = arr.indexOf(g);
+          if (i >= 0) arr.splice(i, 1);
+        }
+      });
+      pollGraph();
+    });
+    const groups = liveGroupList(graph);
+    const index = groups.indexOf(g);
+    const rect = liveGroupRect(g) || bounds;
+    // 实际框住的节点数（pos 落在框内，含边界），供调用方核对归属是否如预期
+    let nodeCount = hasIds ? a.nodeIds.length : 0;
+    if (!hasIds) {
+      for (const n of nodeList(graph)) {
+        const p = n && n.pos;
+        if (p && typeof p[0] === "number" && typeof p[1] === "number"
+          && p[0] >= rect[0] && p[0] <= rect[0] + rect[2] && p[1] >= rect[1] && p[1] <= rect[1] + rect[3]) nodeCount += 1;
+      }
+    }
+    return { ok: true, index, title, bounds: rect, nodeCount };
+  },
+
+  "canvas.setGroup": (args) => {
+    const a = args || {};
+    const gi = locateLiveGroup(a);
+    const g = liveGroupList(app.graph)[gi];
+    const hasTitle = a.title !== undefined && a.title !== null;
+    const hasIds = Array.isArray(a.nodeIds);
+    const hasBounds = a.bounds !== undefined && a.bounds !== null;
+    if (hasIds && a.nodeIds.length === 0) throw new Error("nodeIds 需为非空数组（节点 id 列表）");
+    if (!hasTitle && !hasIds && !hasBounds) {
+      throw new Error("setGroup 没有可变更内容：需给 title（改名）/ nodeIds（重算 bounds）/ bounds（显式矩形）至少一项");
+    }
+    const beforeTitle = g.title;
+    const beforeBounds = liveGroupRect(g);
+    let nextTitle = beforeTitle;
+    let nextBounds = beforeBounds;
+    if (hasTitle) {
+      if (typeof a.title !== "string" || !a.title.trim()) throw new Error("title 需为非空字符串");
+      nextTitle = a.title.trim();
+    }
+    if (hasBounds) nextBounds = asBounds4(a.bounds, "bounds");
+    else if (hasIds) nextBounds = liveBoundsForNodes(a.nodeIds);
+    withChange(() => {
+      if (hasTitle) g.title = nextTitle;
+      if (nextBounds) applyGroupBounds(g, nextBounds);
+    });
+    try { if (hasIds && typeof g.recomputeInsideNodes === "function") g.recomputeInsideNodes(); } catch { /* 同上 */ }
+    pollGraph();
+    pushUndo(`setGroup #${gi}「${beforeTitle}」`, () => {
+      const cur = liveGroupList(app.graph)[gi];
+      if (!cur) throw new Error(`组 index ${gi} 已不在图中，无法回退`);
+      withChange(() => {
+        cur.title = beforeTitle;
+        if (beforeBounds) applyGroupBounds(cur, beforeBounds);
+      });
+      pollGraph();
+    });
+    return { ok: true, index: gi, title: g.title, bounds: liveGroupRect(g) || nextBounds, changed: { title: hasTitle, bounds: hasBounds || hasIds } };
+  },
+
+  "canvas.removeGroup": (args) => {
+    const a = args || {};
+    const graph = app.graph;
+    const gi = locateLiveGroup(a);
+    const g = liveGroupList(graph)[gi];
+    const snap = {
+      title: g && g.title != null ? String(g.title) : "",
+      bounds: liveGroupRect(g) || GROUP_DEFAULT_BOUNDS.slice(),
+      color: g ? g.color : undefined,
+      flags: g && g.flags ? JSON.parse(JSON.stringify(g.flags)) : undefined,
+    };
+    withChange(() => {
+      if (typeof graph.remove === "function") graph.remove(g);
+      else {
+        const arr = liveGroupList(graph);
+        const i = arr.indexOf(g);
+        if (i < 0) throw new Error(`组 index ${gi} 已不在图中`);
+        arr.splice(i, 1);
+      }
+    });
+    pollGraph();
+    pushUndo(`removeGroup「${snap.title}」`, () => {
+      const Ctor = lgraphGroupCtor();
+      if (!Ctor) throw new Error("恢复失败：拿不到 LGraphGroup 构造器");
+      const g2 = new Ctor(snap.title);
+      applyGroupBounds(g2, snap.bounds);
+      if (snap.color != null) g2.color = snap.color;
+      if (snap.flags) g2.flags = snap.flags;
+      withChange(() => graph.add(g2));
+      try { if (typeof g2.recomputeInsideNodes === "function") g2.recomputeInsideNodes(); } catch { /* 同上 */ }
+      pollGraph();
+    });
+    return { ok: true, index: gi, title: snap.title, bounds: snap.bounds, removed: true };
   },
 
   // 落盘（P2 修复，2026-10-08）：改走前端正规保存链，目标语义＝真保存——
@@ -2561,7 +2918,8 @@ let historyBarGroup = null;
 // P6-1：横轴三态交互状态（单击/双击消歧、缩略图浮层延迟关）
 let historyTickClickTimer = null; // 非空 = 已收到第一次单击，正在等消歧窗口结束
 let historyTreeClickTimer = null; // 树节点单击/双击消歧（同框口径）
-let historyShotsCloseTimer = null; // 缩略图浮层「移开延迟关」定时器
+let historyTreeShotsTick = null; // 2026-10-13 第2a：当前树预览浮层所属节点（同节点再点 → 关）
+let historyBarShotsTick = null; // 2026-10-13 第2a：当前框预览浮层所属刻度（同刻度再点 → 关；点别的 → 切换）
 // P6-2：弹层跟随画布的 rAF 循环句柄 + 上一帧视图态（scale/offset）——变了才写 style
 let historyBarRafId = null;
 let historyBarFollowPrev = null;
@@ -2607,25 +2965,29 @@ function historyBarStyleEnsure() {
 #${HISTORY_BAR_ID} .hhb-fade.hhb-fade-on { opacity: 1; }
 /* 刻度（统一母题）：外框 = 线型(操作)+色(谁)；内条堆 = 本次碰过的画布框（框色，见 .hnode-bar） */
 #${HISTORY_BAR_ID} .hhb-tick {
-  flex: none; position: relative; width: var(--hhb-tw, 9px); height: 23px; padding: 2px 1px; margin: 0;
+  flex: none; position: relative; width: var(--hhb-tw, 9px); height: 27px; padding: 2px 0; margin: 0; /* 3a修（2026-10-13）：横向 padding 1px→0，内条贴外框内侧，消除「色块挤占」造成的框粗细错觉 */
   box-sizing: border-box; display: flex; flex-direction: column;
-  border: 1.5px solid var(--hhb-c, #5aa0d8); border-style: solid; border-radius: 4.5px;
+  border: 2px solid color-mix(in oklab, var(--hhb-c, #5aa0d8) 60%, transparent); border-style: solid; border-radius: 4.5px; /* 3a修：统一 2px（原 明2.5/密1.5） */ /* 第8条（2026-10-13）：border-color 半透明 → 发光描边（原实色 = 实心框观感） */
   background: rgba(255,255,255,.025); cursor: pointer;
-  box-shadow: 0 1.5px 4px rgba(0,0,0,.45);
+  /* 第8条（2026-10-13）：常态外光晕加强（固定 10px / 65%，与树同口径） */
+  box-shadow: 0 1.5px 4px rgba(0,0,0,.45), 0 0 10px color-mix(in oklab, var(--hhb-c, #5aa0d8) 65%, transparent);
   transition: transform .14s, box-shadow .14s, filter .14s;
 }
-/* 密档降级：列宽小时收细外框与内边距，保证内条可见 */
-#${HISTORY_BAR_ID} .hhb-tick[data-tight] { border-width: 1px; padding: 1px 0; border-radius: 3px; }
+/* 密档降级：列宽小时只收内边距；3a修：不再改 border-width（否则与明档跳变 1px） */
+#${HISTORY_BAR_ID} .hhb-tick[data-tight] { padding: 1px 0; border-radius: 3px; }
 #${HISTORY_BAR_ID} .hhb-tick:hover {
   transform: translateY(-1.5px); filter: brightness(1.12);
-  box-shadow: 0 1.5px 4px rgba(0,0,0,.55), 0 0 12px color-mix(in oklab, var(--hhb-c, #5aa0d8) 45%, transparent);
+  box-shadow: 0 1.5px 4px rgba(0,0,0,.55), 0 0 12px color-mix(in oklab, var(--hhb-c, #5aa0d8) 80%, transparent);
 }
-#${HISTORY_BAR_ID} .hhb-tick.hhb-tick-bulge { width: calc(var(--hhb-tw, 9px) + 3px); }
+/* 合并加粗：3a修（2026-10-13）3.5→2.5px（保留合并可辨，收窄与单次 2px 的差距）；密档不再另行降级（统一 2.5px） */
+#${HISTORY_BAR_ID} .hhb-tick.hhb-tick-bulge { width: var(--hhb-tw-bulge, calc(var(--hhb-tw, 9px) + 10px)); border-width: 2.5px; box-shadow: 0 1.5px 4px rgba(0,0,0,.5), 0 0 12px color-mix(in oklab, var(--hhb-c, #5aa0d8) 85%, transparent); } /* 第8条：合并光晕更亮 */
 #${HISTORY_BAR_ID} .hhb-tick .hhb-runs {
+  display: none; /* P8：×N 默认隐藏，滑过节点才显示（定位不变） */
   position: absolute; top: -5px; right: -6px; font-size: 8.5px; font-weight: 700;
   color: #0d1014; background: #dfe8f2; border-radius: 5px; padding: 0 3px; line-height: 11px;
   box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none;
 }
+#${HISTORY_BAR_ID} .hhb-tick:hover .hhb-runs { display: inline-block; }
 #${HISTORY_BAR_ID} .hhb-tick-sel { box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
 #${HISTORY_BAR_ID} .hhb-tick[data-legacy] { opacity: .55; }
 #${HISTORY_BAR_ID} .hhb-tick[data-legacy]::after {
@@ -2643,19 +3005,32 @@ function historyBarStyleEnsure() {
 }
 #${HISTORY_BAR_ID} .hhb-bub-time { color:#9fb3c8; }
 #${HISTORY_BAR_ID} .hhb-bub-legacy { color:#9aa0a8; font-size:10px; }
-/* 单击刻度的缩略图浮层（默认隐藏；移开自动关） */
-#${HISTORY_BAR_ID} .hhb-shots { display:none; }
-#${HISTORY_BAR_ID} .hhb-shots-on { display:block; margin-top:6px; }
-/* 铺满弹层宽度（单图图吃满；多图横滑） */
-#${HISTORY_BAR_ID} .hhb-shots-body { width:100%; max-width:none; }
+/* 单击刻度的缩略图浮层（2026-10-13 第2a：由弹层内固定行改为浮层；浮在被点刻度上方；同刻度再点关） */
+#${HISTORY_BAR_ID} .hhb-shots {
+  position:absolute; z-index:6; display:none;
+  pointer-events:auto; /* 必须收回指针事件，否则图不可点/不可滚 */
+  /* 与树 .htr-shots 同口径：同款面板皮肤（渐变底 + 内描边 + 阴影 + 内边距/圆角） */
+  width:auto; max-width: min(560px, 88vw); /* 浮层限宽（同树 .htr-shots），不铺满以免遮画布 */
+  background: linear-gradient(180deg, rgba(38,44,54,.94) 0%, rgba(27,32,40,.95) 100%);
+  border: 0; border-radius: 13px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.075),
+    inset 0 0 0 1px rgba(255,255,255,.05),
+    0 10px 30px rgba(0,0,0,.5),
+    0 2px 6px rgba(0,0,0,.4);
+  backdrop-filter: blur(6px);
+  padding:7px 10px 8px;
+}
+#${HISTORY_BAR_ID} .hhb-shots-on { display:block; }
 #${HISTORY_BAR_ID} .hhb-shots-ph { color:#9fb3c8; font-size:11px; padding:4px 2px; }
 #${HISTORY_BAR_ID} .hhb-thumb { width:100%; border-radius:8px; background:#3a414b; color:#aab4c0; display:flex; align-items:center; justify-content:center; font-size:12px; overflow:hidden; }
 #${HISTORY_BAR_ID} .hhb-thumb-has { background:transparent; }
 #${HISTORY_BAR_ID} .hhb-thumb-multi { width:100%; }
 #${HISTORY_BAR_ID} .hhb-thumb-img { width:100%; height:auto; max-height:220px; object-fit:contain; border-radius:8px; display:block; cursor:zoom-in; background:#3a414b; }
-#${HISTORY_BAR_ID} .hhb-thumb-strip { display:flex; gap:4px; flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; scrollbar-width:none; padding-bottom:2px; }
+#${HISTORY_BAR_ID} .hhb-shots .hhb-thumb-img.single { width:100%; max-width:520px; height:auto; max-height:220px; object-fit:contain; } /* 浮层内单图自适应（同树 .htr-shots-img.single） */
+#${HISTORY_BAR_ID} .hhb-shots .hhb-thumb-img.multi { flex:none; height:58px; width:auto; } /* 浮层内多图小条（同树 .htr-shots-img.multi） */
+#${HISTORY_BAR_ID} .hhb-thumb-strip { display:flex; gap:4px; flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; scrollbar-width:none; padding-bottom:2px; max-width:100%; }
 #${HISTORY_BAR_ID} .hhb-thumb-strip::-webkit-scrollbar { display:none; }
-#${HISTORY_BAR_ID} .hhb-thumb-strip .hhb-thumb-img { flex:none; width:auto; height:58px; max-height:none; }
 #${HISTORY_BAR_ID} .hhb-seq { font-weight:600; }
 #${HISTORY_BAR_ID} .hhb-row { display:flex; align-items:center; gap:4px; color:#9fb3c8; font-size:11px; }
 #${HISTORY_BAR_ID} .hhb-dot { width:7px; height:7px; border-radius:50%; flex:none; background:#9aa0a8; }
@@ -2678,6 +3053,12 @@ function historyBarStyleEnsure() {
 #${HISTORY_LIGHTBOX_ID} .hhb-lb-cap { color:#cfd8e3; font-size:12px; max-width:90vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #${HISTORY_LIGHTBOX_ID} .hhb-lb-x { position:absolute; top:10px; right:14px; background:transparent; border:0; color:#cfd8e3; font-size:20px; cursor:pointer; line-height:1; padding:0 4px; }
 #${HISTORY_LIGHTBOX_ID} .hhb-lb-x:hover { color:#fff; }
+/* 2b（2026-10-13）：同提交内多图左右翻页（单图 [hidden] 隐藏） */
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-nav { position:absolute; top:50%; transform:translateY(-50%); width:38px; height:38px; border-radius:50%; background:rgba(18,22,28,.72); border:1px solid rgba(255,255,255,.24); color:#e6edf5; font-size:22px; line-height:1; cursor:pointer; }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-nav:hover { background:rgba(38,44,54,.92); }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-prev { left:14px; }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-next { right:14px; }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-nav[hidden] { display:none; }
 #${HISTORY_CONFIRM_ID} {
   position: fixed; z-index: 10003; min-width: 220px; max-width: min(420px, calc(100vw - 16px));
   background: rgba(28,32,39,.98); color: #fff;
@@ -3032,10 +3413,7 @@ function historyTickStateClear() {
     clearTimeout(historyTickClickTimer);
     historyTickClickTimer = null;
   }
-  if (historyShotsCloseTimer) {
-    clearTimeout(historyShotsCloseTimer);
-    historyShotsCloseTimer = null;
-  }
+  historyBarShotsHide(); // 第2a：浮层（同刻度再点关，已无定时器）
   historyRollbackConfirmClose();
 }
 
@@ -3083,18 +3461,72 @@ function historyViewUrl(qs) {
 }
 
 // 全屏浮层看原图（点任意处或 ✕ 关闭）。样式与历史条弹层同族（深色、圆角，z-index 更高）。
-function historyOpenLightbox(fullUrl, caption) {
+// 2b（2026-10-13）：可选 opts={list:[{fullUrl,label}], index} → 同提交内多图左右翻页（箭头 + ←/→ 键；单图隐藏箭头）。
+let historyLightboxItems = null; // 当前全屏多图清单（仅长度 ≥2 时非 null）
+let historyLightboxIndex = 0;
+let historyLightboxKeyBound = false; // 键盘监听只绑一次（以浮层是否存在为开关）
+function historyLightboxShowAt(i) {
+  const box = document.getElementById(HISTORY_LIGHTBOX_ID);
+  const list = historyLightboxItems;
+  if (!box || !list || !list.length) return;
+  const n = list.length;
+  const idx = ((i % n) + n) % n; // 循环翻页
+  historyLightboxIndex = idx;
+  const it = list[idx] || {};
+  const img = box.querySelector("img");
+  const cap = box.querySelector(".hhb-lb-cap");
+  if (img) { img.src = it.fullUrl || ""; img.alt = it.label ? String(it.label) : ""; }
+  if (cap) cap.textContent = it.label ? String(it.label) : "";
+}
+function historyLightboxKey(e) {
+  if (!document.getElementById(HISTORY_LIGHTBOX_ID)) return;
+  if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    historyLightboxShowAt(historyLightboxIndex - 1);
+  } else if (e.key === "ArrowRight") {
+    e.preventDefault();
+    historyLightboxShowAt(historyLightboxIndex + 1);
+  }
+}
+function historyOpenLightbox(fullUrl, caption, opts) {
   if (!fullUrl) return;
   historyLightboxClose();
   historyBarStyleEnsure();
+  const list = opts && Array.isArray(opts.list) ? opts.list.filter((x) => x && x.fullUrl) : null;
+  historyLightboxItems = list && list.length > 1 ? list : null;
+  const want = opts && opts.index != null ? Number(opts.index) : 0;
+  historyLightboxIndex =
+    historyLightboxItems && isFinite(want) && want >= 0 && want < historyLightboxItems.length ? want : 0;
+  const cur = historyLightboxItems ? historyLightboxItems[historyLightboxIndex] : { fullUrl, label: caption };
   const box = document.createElement("div");
   box.id = HISTORY_LIGHTBOX_ID;
   const img = document.createElement("img");
-  img.src = fullUrl;
-  img.alt = caption ? String(caption) : "";
+  img.src = cur.fullUrl;
+  img.alt = cur.label ? String(cur.label) : "";
   const cap = document.createElement("div");
   cap.className = "hhb-lb-cap";
-  cap.textContent = caption ? String(caption) : "";
+  cap.textContent = cur.label ? String(cur.label) : "";
+  const prev = document.createElement("button");
+  prev.type = "button";
+  prev.className = "hhb-lb-nav hhb-lb-prev";
+  prev.textContent = "‹";
+  prev.title = "上一张（←）";
+  prev.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyLightboxShowAt(historyLightboxIndex - 1);
+  });
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "hhb-lb-nav hhb-lb-next";
+  next.textContent = "›";
+  next.title = "下一张（→）";
+  next.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyLightboxShowAt(historyLightboxIndex + 1);
+  });
+  if (!historyLightboxItems) { prev.hidden = true; next.hidden = true; } // 单图：隐藏箭头
   const x = document.createElement("button");
   x.type = "button";
   x.className = "hhb-lb-x";
@@ -3104,19 +3536,25 @@ function historyOpenLightbox(fullUrl, caption) {
     ev.stopPropagation();
     historyLightboxClose();
   });
-  box.append(img, cap, x);
-  // 点任意处关闭（✕ 已 stopPropagation，不会重复触发）
+  box.append(img, cap, prev, next, x);
+  // 点任意处关闭（✕ / 箭头已 stopPropagation，不会重复触发）
   box.addEventListener("click", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
     historyLightboxClose();
   });
   document.body.appendChild(box);
+  if (!historyLightboxKeyBound) {
+    document.addEventListener("keydown", historyLightboxKey);
+    historyLightboxKeyBound = true;
+  }
 }
 
 function historyLightboxClose() {
   const el = document.getElementById(HISTORY_LIGHTBOX_ID);
   if (el && el.parentElement) el.parentElement.removeChild(el);
+  historyLightboxItems = null;
+  historyLightboxIndex = 0;
 }
 
 // 回填缩略图（数据源＝ list 条目已合并好的 images，纯本地渲染，无 fetch）。
@@ -3225,8 +3663,8 @@ function historyNodeStyleEnsure() {
   style.id = ID;
   style.textContent = `
 .hnode-bars { display:flex; flex-direction:column; gap:1.5px; align-items:stretch; justify-content:center; flex:1 1 auto; min-height:0; }
-.hnode-bar { display:block; flex:1 1 0; min-height:2px; border-radius:1px; background:${HNODE_BAR_DIM}; }
-.hnode-bar.hnode-bar-on { background:var(--hnode-bc, #5aa0d8); filter:brightness(1.15); box-shadow:0 0 5px var(--hnode-bc, transparent); }
+.hnode-bar { display:block; flex:1 1 0; min-height:2px; border-radius:2px; background:${HNODE_BAR_DIM}; } /* 3b（2026-10-13）：内条圆角 1px→2px */
+.hnode-bar.hnode-bar-on { background:var(--hnode-bc, #5aa0d8); filter:brightness(1.08); } /* 3a修（2026-10-13）：去掉内条 5px 光晕 + 降亮度 1.15→1.08，外框始终是视觉主线（原亮条盖过外框） */
 `;
   document.head.appendChild(style);
 }
@@ -3308,7 +3746,7 @@ function historyBarTickClick(ev, tick, ent, ctx) {
   historyTickClickTimer = setTimeout(() => {
     historyTickClickTimer = null;
     historyTickSelect(tick, ent, ctx);
-    historyBarShotsToggle(tick, ent, ctx); // 单击：展开该提交的缩略图
+    historyBarShotsToggle(tick, ent); // 单击：展开该提交的缩略图浮层（第2a：同刻度再点关）
   }, HISTORY_TICK_DBL_MS);
 }
 
@@ -3381,50 +3819,80 @@ function historyBarBubbleHide() {
   if (b && b.parentElement) b.parentElement.removeChild(b);
 }
 
-// ── 单击缩略图浮层（用现有 historyFillThumb 渲染；鼠标移开自动关）────
-function historyBarShotsToggle(tick, ent, ctx) {
-  const shots = ctx && ctx.shots ? ctx.shots : null;
-  if (!shots) return;
-  if (historyShotsCloseTimer) {
-    clearTimeout(historyShotsCloseTimer);
-    historyShotsCloseTimer = null;
-  }
-  const body = ctx.shotsBody || shots.querySelector(".hhb-shots-body");
-  if (body) body.textContent = "";
-  shots.classList.add("hhb-shots-on");
+// ── 单击刻度缩略图浮层（第2a：对齐树口径——浮在被点刻度上方 / 同刻度再点关 / 多图横滚 / 点图进全屏可翻页）──
+function historyBarShotsToggle(tick, ent) {
+  const host = historyBarEl;
+  if (!host || !tick) return;
+  const same = historyBarShotsTick === tick;
+  historyBarShotsHide();
+  if (same) return; // 再点同一刻度 → 关
+  historyBarShotsTick = tick;
+  const box = document.createElement("div");
+  box.className = "hhb-shots hhb-shots-on";
   // 数据源＝ list 条目已合并好的 images（不再碰 /history）
   const images = ent && Array.isArray(ent.images) ? ent.images : [];
-  if (!images.length) {
-    const ph0 = document.createElement("div");
-    ph0.className = "hhb-shots-ph";
-    ph0.textContent = "这次提交没有关联出图";
-    if (body) body.appendChild(ph0);
-    return;
+  const imgs = historyImagesToUrls(images);
+  if (!imgs.length) {
+    const ph = document.createElement("div");
+    ph.className = "hhb-shots-ph";
+    ph.textContent = "这次提交没有关联出图";
+    box.appendChild(ph);
+  } else {
+    const single = imgs.length === 1;
+    const strip = document.createElement("div");
+    strip.className = "hhb-thumb-strip";
+    for (const it of imgs) {
+      const img = document.createElement("img");
+      img.className = "hhb-thumb-img " + (single ? "single" : "multi");
+      img.src = it.thumbUrl;
+      img.alt = it.label;
+      img.loading = "eager"; // 点开即看（同 P4 口径）
+      img.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation(); // 点图只开原图，不触发刻度选中
+        // 带本提交图清单 → 全屏内左右翻页（单图时箭头自动隐藏）
+        historyOpenLightbox(it.fullUrl, it.label, { list: imgs, index: imgs.indexOf(it) });
+      });
+      strip.appendChild(img);
+    }
+    box.appendChild(strip);
+    // 多图横滚：滚轮作用在浮层内部可滚条（同树）
+    box.addEventListener(
+      "wheel",
+      (ev) => {
+        if (strip.scrollWidth <= strip.clientWidth) return;
+        const d = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+        if (d > 0 && strip.scrollLeft + strip.clientWidth >= strip.scrollWidth - 1) return;
+        if (d < 0 && strip.scrollLeft <= 0) return;
+        ev.preventDefault();
+        strip.scrollLeft += d;
+      },
+      { passive: false }
+    );
   }
-  // 复用 P4 的缩略图渲染（historyFillThumb：images → 缩略/原图 URL + lightbox 点击）
-  const thumb = document.createElement("div");
-  thumb.className = "hhb-thumb";
-  thumb.textContent = historySeqLabel(ent);
-  if (body) body.appendChild(thumb);
-  historyFillThumb(historyBarRequestId, thumb, images);
-}
-
-// 鼠标移开弹层 → 延迟关（弹层自身 hover 不关；进入弹层则取消关闭）
-function historyBarShotsHideSoon() {
-  if (historyShotsCloseTimer) clearTimeout(historyShotsCloseTimer);
-  historyShotsCloseTimer = setTimeout(() => {
-    historyShotsCloseTimer = null;
-    historyBarShotsHide();
-  }, 180);
+  host.appendChild(box);
+  // 定位（同树口径）：永远在被点刻度上方，空间不足也放上方；水平钳在弹层内
+  try {
+    const hr = host.getBoundingClientRect();
+    const tr = tick.getBoundingClientRect();
+    const bw = box.offsetWidth;
+    const bh = box.offsetHeight;
+    // 弹层带 scale(k)：本层内绝对定位，rect 差值已含 k，写回本地坐标前除以 k（同 .hhb-bubble）
+    const k = historyBarFollowK();
+    const barW = host.offsetWidth || hr.width;
+    let left = (tr.left + tr.width / 2 - hr.left) / k - bw / 2;
+    left = Math.max(6, Math.min(left, Math.max(6, barW - bw - 6)));
+    const top = (tr.top - hr.top) / k - bh - 8;
+    box.style.left = Math.round(left) + "px";
+    box.style.top = Math.round(top) + "px";
+  } catch { /* 定位失败也显示（左上角），不影响预览语义 */ }
 }
 
 function historyBarShotsHide() {
+  historyBarShotsTick = null; // 第2a：关闭即解除「当前刻度」绑定
   if (!historyBarEl) return;
-  const shots = historyBarEl.querySelector(".hhb-shots");
-  if (!shots) return;
-  shots.classList.remove("hhb-shots-on");
-  const body = shots.querySelector(".hhb-shots-body");
-  if (body) body.textContent = "";
+  const b = historyBarEl.querySelector(".hhb-shots");
+  if (b && b.parentElement) b.parentElement.removeChild(b);
 }
 
 // ── 双击确认框（复用 P3-G1 historyRollbackExecute）─────────────────
@@ -3569,9 +4037,10 @@ async function historyBarLoad(reqId, ctx, countEl) {
     // 宽度自适应（定稿卡数值）：少时加宽（≤44）、多时定宽（≥11）+ 横滚；刻度随之缩窄。
     const n = shown.length;
     const availW = axis.clientWidth || 0;
-    const colW = Math.min(72, Math.max(11, availW / n));
-    let tw = Math.min(11, Math.max(3, colW * 0.45));
-    tw = Math.min(tw, colW * 0.85);
+    const colW = Math.min(72, Math.max(22, availW / n)); // 第8条（2026-10-13）：下限 11→22（面板可横滚 → 密档不压缩 colW，靠溢出滚动）
+    let tw = Math.min(24, Math.max(5, colW * 0.5)); // 第8条：单块更瘦（系数 0.72→0.5，下限 4→5）
+    const twBulge = Math.min(tw + 10, colW - 3); // 第8条：多块更宽（+8→+10，封顶 colW-2→colW-3）→ 单/多差拉大
+    tw = Math.min(tw, colW * 0.86);
     const gap = Math.max(2, colW - tw);
     axis.style.gap = gap + "px";
     if (ctx) ctx.colW = colW;
@@ -3579,6 +4048,7 @@ async function historyBarLoad(reqId, ctx, countEl) {
     for (const ent of shown) {
       const tick = historyBarTickMake(reqId, ent, ctx);
       tick.style.setProperty("--hhb-tw", tw + "px");
+      tick.style.setProperty("--hhb-tw-bulge", twBulge + "px"); // 第7条：多块宽（已 clamp colW-2）
       axis.appendChild(tick);
     }
     // 定位到最新（左旧右新 + 打开滚到最右）
@@ -3691,26 +4161,7 @@ function historyBarOpen(group) {
   // 轴下两端时间（fetch 后回填）
   const times = document.createElement("div");
   times.className = "hhb-times";
-  // 单击刻度的缩略图浮层（默认隐藏，交互触发）
-  const shots = document.createElement("div");
-  shots.className = "hhb-shots";
-  const shotsBody = document.createElement("div");
-  shotsBody.className = "hhb-shots-body";
-  shots.appendChild(shotsBody);
-  // 多图横滚：滚轮作用在内部可滚条（.hhb-thumb-strip）；单图/不溢出 → 放行
-  shotsBody.addEventListener(
-    "wheel",
-    (ev) => {
-      const sc = shotsBody.querySelector(".hhb-thumb-strip");
-      if (!sc || sc.scrollWidth <= sc.clientWidth) return;
-      const d = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
-      if (d > 0 && sc.scrollLeft + sc.clientWidth >= sc.scrollWidth - 1) return;
-      if (d < 0 && sc.scrollLeft <= 0) return;
-      ev.preventDefault();
-      sc.scrollLeft += d;
-    },
-    { passive: false }
-  );
+  // 单击刻度的缩略图浮层：第2a 起改为「每次点开时新建浮层」（同树 .htr-shots），不再占弹层内的行位
   // 底部：回到这一版（P3-G1 真功能）+ 弹层内提示行
   const foot = document.createElement("div");
   foot.className = "hhb-foot";
@@ -3736,21 +4187,14 @@ function historyBarOpen(group) {
     void historySaveClick();
   });
   foot.append(roll, saveBtn, tip);
-  bar.append(title, axisWrap, times, shots, foot);
+  bar.append(title, axisWrap, times, foot);
   document.body.appendChild(bar); // position:fixed 自行定位，挂 body 避免容器裁剪
-  // 鼠标离开弹层 → 缩略图浮层延迟关；进入弹层则取消关闭（浮层本身 hover 不关，移出才算）
-  bar.addEventListener("mouseenter", () => {
-    if (historyShotsCloseTimer) {
-      clearTimeout(historyShotsCloseTimer);
-      historyShotsCloseTimer = null;
-    }
-  });
-  bar.addEventListener("mouseleave", () => historyBarShotsHideSoon());
+  // 第2a：已移除「鼠标移出 180ms 自动关」（浮层关闭改由「再点同一刻度」判定，同树）
   // P6-2：定位改为「跟随画布」——底边中心对准框顶，随 ds.scale 缩放（clamp 到 [MIN, MAX]）。
   // 起 rAF 循环：打开期间每帧比对视图态，变了才重算锚点/transform；locate 由 historyBarFollowApply 落到 style。
   historyBarFollowStart();
   // 打开时才 fetch；竞态哨兵在途响应作废
-  const ctx = { axis, times, shots, shotsBody };
+  const ctx = { axis, times };
   const reqId = ++historyBarRequestId;
   void historyBarLoad(reqId, ctx, count);
 }
@@ -3827,6 +4271,11 @@ function historyOnCanvasMouseDown(e) {
   }
   if (!group) {
     if (historyBarEl) historyBarClose(); // 点空白 → 收起
+    return;
+  }
+  // 第4条（2026-10-13）：同一框再点 = 关（切换）；已开别的框 / 未开 → 开。
+  if (historyBarEl && historyBarGroup === group) {
+    historyBarClose();
     return;
   }
   historyBarOpen(group); // P6-1：锚定改为「框矩形顶部上方」，由 historyBarOpen 内部用 historyGroupRect/convertOffsetToCanvas 算；取不到框 → 回退视口中心
@@ -4393,6 +4842,7 @@ let historyTreeGeom = null; // 最近一次渲染几何 {colW,laneH,W,H}（预�
 let historyTreeOpen = false; // 展开态（内存镜像；持久化走 historyTreeState*）
 let historyTreeReqId = 0; // 竞态哨兵：重渲染/收起后递增，在途旧响应作废
 let historyTreeEntries = []; // 最近一次成功 fetch 的 entries（resize 重画连线用，不 refetch）
+let historyTreeDragEndAt = -1e9; // 最近一次「带位移拖拽」结束时刻（远过去=无；节点 click 与拖拽消歧用，见 historyTreeNodeClick）
 
 // —— 收纳状态存取（键结构同 historyHeadKey；pageKey 取不到 → 不持久化，按收纳默认）——
 function historyTreeLsKey() {
@@ -4461,12 +4911,13 @@ function historyTreeStyleEnsure() {
   padding: 6px 10px;
 }
 #${HISTORY_TREE_ID}.htr-open .htr-panel { display: block; }
-/* 泳道画布：横向滚动（隐藏滚动条），高度自适应（行数决定，JS 设 —— 上限 176）；内部 .lanes 按算法尺寸绝对定位 */
+/* 泳道画布：双向滚动（隐藏滚动条），视口高封顶（JS 设 —— 上限 200），内容高由全量泳道行数决定；内部 .lanes 取内容全尺寸 */
 #${HISTORY_TREE_ID} .tcanvas {
-  position: relative; overflow-x: auto; overflow-y: hidden;
+  position: relative; overflow: auto;
   scrollbar-width: none; cursor: grab;
 }
 #${HISTORY_TREE_ID} .tcanvas::-webkit-scrollbar { display: none; }
+#${HISTORY_TREE_ID} .tcanvas.htr-dragging { cursor: grabbing; }
 #${HISTORY_TREE_ID} .lanes { position: relative; height: 100%; }
 /* 泳道基准线：每条显示泳道一根 1px 微亮横线 */
 #${HISTORY_TREE_ID} .htr-laneaxis {
@@ -4477,24 +4928,29 @@ function historyTreeStyleEnsure() {
 #${HISTORY_TREE_ID} .node {
   position: absolute; transform: translate(-50%, -50%);
   display: flex; flex-direction: column; align-items: stretch;
-  width: var(--nw, 14px); min-width: 8px; min-height: 14px;
-  padding: 2px 1.5px; margin: 0; box-sizing: border-box;
-  border: 1.5px solid var(--htr-c, #5aa0d8); border-style: solid; border-radius: 4.5px;
-  background: rgba(255,255,255,.025); cursor: pointer;
+  width: var(--nw, 10px); min-width: 6px; min-height: 22px; /* 2026-10-12：节点加高 18→22（laneH 36 不变 → 行内仍留 ≥14px 间隙） */
+  padding: 2px 0; margin: 0; box-sizing: border-box; /* 3a修（2026-10-13）：横向 padding 1.5px→0，内条出血贴外框内侧 */
+  border: 2px solid color-mix(in oklab, var(--htr-c, #5aa0d8) 60%, transparent); border-style: solid; border-radius: 4.5px; /* 3a修：统一 2px，与框节点同口径 */ /* 第8条：border-color 半透明 → 发光描边 */
+  background: rgba(255,255,255,.025); cursor: pointer; z-index: 1; /* 连线层之下（.htr-edges z-index:0） */
+  /* 第8条（2026-10-13）：常态外光晕加强（固定 10px / 65%，与框同口径） */
+  box-shadow: 0 0 10px color-mix(in oklab, var(--htr-c, #5aa0d8) 65%, transparent);
 }
-/* 密档降级（同框口径） */
-#${HISTORY_TREE_ID} .node[data-tight] { border-width: 1px; padding: 1px 0; border-radius: 3px; }
+/* 密档降级（同框口径）；3a修：不再改 border-width */
+#${HISTORY_TREE_ID} .node[data-tight] { padding: 1px 0; border-radius: 3px; }
 /* 合并提交加粗（外框加粗 + 强光晕，同框口径） */
 #${HISTORY_TREE_ID} .node.htr-tick-bulge {
+  width: var(--nw-bulge, calc(var(--nw, 10px) + 10px)); /* 第8条：多块宽由 JS 算好（min(nw+10, colW-3)），永不超格 */
   border-width: 2.5px;
-  box-shadow: 0 0 9px color-mix(in oklab, var(--htr-c, #5aa0d8) 60%, transparent);
+  box-shadow: 0 0 12px color-mix(in oklab, var(--htr-c, #5aa0d8) 85%, transparent); /* 第8条：合并光晕更亮 */
 }
 /* ×N 徽标（同框口径） */
 #${HISTORY_TREE_ID} .htr-runs {
+  display: none; /* P8：×N 默认隐藏，滑过节点才显示（定位不变） */
   position: absolute; top: -6px; right: -8px; font-size: 8.5px; font-weight: 700;
   color: #0d1014; background: #dfe8f2; border-radius: 5px; padding: 0 3px; line-height: 11px;
   box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none;
 }
+#${HISTORY_TREE_ID} .node:hover .htr-runs { display: inline-block; }
 #${HISTORY_TREE_ID} .node:hover { filter: brightness(1.25); }
 #${HISTORY_TREE_ID} .htr-tick-sel { outline: 2px solid rgba(255,255,255,.9); outline-offset: 2px; border-radius: 4px; }
 /* HEAD 高亮：节点下小金点 */
@@ -4506,8 +4962,11 @@ function historyTreeStyleEnsure() {
 #${HISTORY_TREE_ID} .node[data-legacy] .hnode-bars { opacity: .55; }
 /* 父子连线层：渲染后按真实位置补画（SVG），只描边不填充 */
 #${HISTORY_TREE_ID} .htr-edges {
-  position: absolute; inset: 0; pointer-events: none;
-  stroke: rgba(150,172,198,.28); stroke-width: 1.3;
+  /* 2026-10-12 修（H0 根因）：<svg> 是替换元素，缺省视口 300×150；只写 inset:0 不撑开（width 命中 intrinsic 300px），
+     超出 300px 的连线被 SVG 根 overflow:hidden 裁掉。显式 width/height:100% 让视口随 .lanes 内容尺寸。 */
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none; z-index: 0; /* P8：连线置底，不再穿框/盖节点 */
+  stroke: rgba(196,214,236,.72); stroke-width: 2.2; /* 2026-10-12：对比度 .55→.72、线宽 1.8→2.2（H3 对症） */
   stroke-linecap: round; stroke-linejoin: round; fill: none;
 }
 /* 两端渐隐（同框口径） */
@@ -4537,23 +4996,31 @@ function historyTreeStyleEnsure() {
 /* 单击节点的缩略图浮层（默认隐藏；双击=回跳；点空白/移出关） */
 #${HISTORY_TREE_ID} .htr-shots {
   position: absolute; z-index: 6; display: none;
-  background: rgba(18,22,28,.98); border: 1px solid rgba(255,255,255,.22);
-  border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.55);
-  padding: 8px 10px; max-width: min(560px, 88vw);
+  pointer-events: auto; /* P8：树根为 pointer-events:none；浮层必须收回指针事件，否则图不可点/不可滚/hover 不触发 */
+  /* P8：与框预览 .hhb-shots 同口径——同款面板皮肤（渐变底 + 内描边 + 阴影 + 内边距/圆角） */
+  background: linear-gradient(180deg, rgba(38,44,54,.94) 0%, rgba(27,32,40,.95) 100%);
+  border: 0; border-radius: 13px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.075),
+    inset 0 0 0 1px rgba(255,255,255,.05),
+    0 10px 30px rgba(0,0,0,.5),
+    0 2px 6px rgba(0,0,0,.4);
+  backdrop-filter: blur(6px);
+  padding: 7px 10px 8px; max-width: min(560px, 88vw); /* 树浮层保持限宽，不铺满以免遮画布 */
 }
 #${HISTORY_TREE_ID} .htr-shots.htr-shots-on { display: block; }
-#${HISTORY_TREE_ID} .htr-shots-ph { color: #9fb3c8; font-size: 11px; padding: 2px; white-space: nowrap; }
+#${HISTORY_TREE_ID} .htr-shots-ph { color: #9fb3c8; font-size: 11px; padding: 4px 2px; } /* 同 .hhb-shots-ph */
 #${HISTORY_TREE_ID} .htr-shots-strip {
   display: flex; gap: 4px; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden;
   scrollbar-width: none; padding-bottom: 2px;
 }
 #${HISTORY_TREE_ID} .htr-shots-strip::-webkit-scrollbar { display: none; }
 #${HISTORY_TREE_ID} .htr-shots-img {
-  display: block; flex: none; border-radius: 7px; background: #3a414b;
+  display: block; flex: none; border-radius: 8px; background: #3a414b; /* 圆角 7→8，同 .hhb-thumb-img */
   cursor: zoom-in;
 }
-#${HISTORY_TREE_ID} .htr-shots-img.single { width: 100%; max-width: 520px; height: auto; max-height: 220px; object-fit: contain; }
-#${HISTORY_TREE_ID} .htr-shots-img.multi { height: 58px; width: auto; }
+#${HISTORY_TREE_ID} .htr-shots-img.single { width: 100%; max-width: 520px; height: auto; max-height: 220px; object-fit: contain; } /* 限宽树浮层内单图自适应；同 .hhb-thumb-img 观感 */
+#${HISTORY_TREE_ID} .htr-shots-img.multi { height: 58px; width: auto; } /* 同 .hhb-thumb-strip .hhb-thumb-img */
 `;
   document.head.appendChild(style);
   historyNodeStyleEnsure(); // 统一母题内条堆（两视图共用）
@@ -4563,8 +5030,8 @@ function historyTreeStyleEnsure() {
 // CSP 下桥内不能 import ESM，故此处必须内联；严禁改为 import。
 // 输入：entries（已按 seq 升序），每项至少 {seq, parent}。输出：
 //   { lanes:[{lane,headSeq,sleeping}], nodes:[{seq,lane,row}], rows:number, sleepingCount:number }
-// row = -1 → 折叠隐藏。确定性：同输入两次 deepEqual（不依赖遍历顺序；同 parent 多 child 时 seq 最小者先接手）。
-const LANES_MAX_ROWS = 4; // 最多显示 4 条泳道（定稿卡）
+// row = lane（2026-10-12 去折叠：全量显示，不再出现 row=-1）。
+// 确定性：同输入两次 deepEqual（不依赖遍历顺序；同 parent 多 child 时 seq 最小者先接手）。
 function commitGraphLanes(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
     return { lanes: [], nodes: [], rows: 0, sleepingCount: 0 };
@@ -4594,31 +5061,23 @@ function commitGraphLanes(entries) {
     nodeLane.push(lane);
   }
   const laneCount = active.length;
-  // (2) 休眠判定 + 选显示集
-  const order = [];
-  for (let L = 0; L < laneCount; L += 1) order.push(L);
-  order.sort((a, b) => active[b] - active[a] || a - b); // headSeq 降序，同值按 lane 升序
-  const display = order.slice(0, LANES_MAX_ROWS);
-  const shown = new Array(laneCount).fill(false);
-  for (const L of display) shown[L] = true;
-  // (3) 紧凑重映射（显示集按 lane 升序 → row 0,1,2...）
-  const rowOf = new Array(laneCount).fill(-1);
-  const displayAsc = display.slice().sort((a, b) => a - b);
-  for (let r = 0; r < displayAsc.length; r += 1) rowOf[displayAsc[r]] = r;
+  // (2) 全量显示（2026-10-12：取消 LANES_MAX_ROWS 折叠）——所有泳道全部显示：
+  //     row = lane、rows = laneCount、sleepingCount 恒 0（lanes[].sleeping 恒 false）。
+  //     泳道多时由 .tcanvas 拖拽/滚动查看（见 2c）。逻辑与 app/lib/commit-graph-lanes.mjs 逐条一致。
   const nodes = [];
   for (let i = 0; i < entries.length; i += 1) {
     const e = entries[i] || {};
     const lane = nodeLane[i];
-    nodes.push({ seq: e.seq, lane, row: rowOf[lane] });
+    nodes.push({ seq: e.seq, lane, row: lane });
   }
   const lanes = [];
   for (let L = 0; L < laneCount; L += 1) {
-    lanes.push({ lane: L, headSeq: active[L], sleeping: !shown[L] });
+    lanes.push({ lane: L, headSeq: active[L], sleeping: false });
   }
-  return { lanes, nodes, rows: displayAsc.length, sleepingCount: laneCount - displayAsc.length };
+  return { lanes, nodes, rows: laneCount, sleepingCount: 0 };
 }
 
-// 计数：N 节点；M 分支（parent 被 ≥2 个节点指向的 parent 数）；K 泳道（总泳道数）；折叠数走 .htr-sleep。
+// 计数：N 节点；M 分支（parent 被 ≥2 个节点指向的 parent 数）；K 泳道（总泳道数，全量显示、无折叠）。
 function historyTreeUpdateCounts(entries) {
   if (!historyTreeCountEl) return;
   const cnt = new Map();
@@ -4634,8 +5093,8 @@ function historyTreeUpdateCounts(entries) {
     entries.length + " 节点 · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
 }
 
-// 树渲染（泳道式）：entries → commitGraphLanes → 泳道定位（X=seq 轴，Y=泳道行）→ 只渲染 row>=0。
-// 返回 {nodeEls, graph}：nodeEls 供连线测量，graph 供连线/折叠条使用。
+// 树渲染（泳道式）：entries → commitGraphLanes → 泳道定位（X=seq 轴，Y=泳道行）→ 全量渲染（去折叠后无 row<0）。
+// 返回 {nodeEls, graph}：nodeEls 供连线测量，graph 供连线使用。
 function historyTreeRenderTree(entries) {
   const tree = historyTreeTreeEl;
   if (!tree) return { nodeEls: new Map(), graph: null };
@@ -4667,17 +5126,20 @@ function historyTreeRenderTree(entries) {
   shownNodes.forEach((nd, i) => rankOf.set(nd.seq, i));
   const n = shownNodes.length || 1;
   const availW = (historyTreeCanvasEl && historyTreeCanvasEl.clientWidth) || 320;
-  const colW = Math.max(11, Math.min(34, (availW - 28) / n)); // 中等间距：定稿口径上限 34
-  const laneH = 40; // 泳道行高（4 行 ≤ 176px 画布高）
-  const NW = 14; // 节点默认宽（色条宽）
-  const nw = Math.min(NW, colW * 0.8);
+  const colW = Math.max(16, Math.min(56, (availW - 24) / n)); // 第8条（2026-10-13）：下限 9→16（面板可横滚 → 密档不压缩 colW）
+  const laneH = 36; // 泳道行高（节点加高到 22 → 相邻行仍留 ≥14px 间隙，laneH 不变）
+  const nw = Math.max(5, Math.min(colW - 3, colW * 0.45)); // 第8条：单提交更瘦（系数 0.55→0.45，封顶 colW-2→colW-3）
+  const nwBulge = Math.min(nw + 10, colW - 3); // 第8条：多块更宽（+8→+10，封顶 colW-3）→ 单/多差拉大
   // 内容宽只由内容决定（n * colW），绝不被容器宽绑架（去 maxSeq*colW / availW-4，防右侧假留白）
   const W = n * colW;
-  const H = Math.max(46, Math.min(176, graph.rows * laneH + 6)); // 高度自适应（行数定，上限 176）
-  historyTreeGeom = { colW, laneH, W, H };
+  // 2026-10-12：内容高 = 全量泳道（rows=laneCount）；视口（.tcanvas）高封顶 ≤200，多的靠拖/滚查看。
+  // .lanes 取内容全高 → 连线层（height:100%）不被截，SVG 也不再被 300×150 缺省视口裁。
+  const contentH = Math.max(46, graph.rows * laneH + 6);
+  const H = Math.min(200, contentH); // 视口高上限 200（面板不占满屏）
+  historyTreeGeom = { colW, laneH, W, H: contentH };
   tree.style.width = W + "px";
-  tree.style.height = H + "px";
-  if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 面板高度随内容（封顶）
+  tree.style.height = contentH + "px";
+  if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 视口高封顶（内容可拖/滚）
   // 全局框列表：扫 entries 取 blocks[].name 并集（首次出现序）；空 → 每节点退化为单根色条
   const globalBlocks = [];
   const blockSeen = new Set();
@@ -4704,7 +5166,7 @@ function historyTreeRenderTree(entries) {
   const nodeEls = new Map(); // seq → 节点元素（连线测量用）
   const head = historyHeadGet();
   for (const nd of graph.nodes) {
-    if (!nd || nd.row < 0) continue; // 折叠泳道不渲染
+    if (!nd || nd.row < 0) continue; // 去折叠后不会出现（保留兜底）
     const ent = bySeq.get(nd.seq);
     if (!ent) continue;
     const legacy = !(ent && Array.isArray(ent.blockNames));
@@ -4725,6 +5187,7 @@ function historyTreeRenderTree(entries) {
     node.style.left = ((rk == null ? 0 : rk) + 0.5) * colW + "px";
     node.style.top = nd.row * laneH + laneH / 2 + 3 + "px";
     node.style.setProperty("--nw", nw + "px");
+    node.style.setProperty("--nw-bulge", nwBulge + "px"); // 第7条：多块宽（已 clamp colW-2）
     if (colW < 14) node.dataset.tight = "1"; // 密档降级
     // 统一母题内条堆：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰
     node.appendChild(historyBarsBuild(globalBlocks, hitSet, liveColors, singleBar));
@@ -4742,7 +5205,7 @@ function historyTreeRenderTree(entries) {
     tree.appendChild(node);
     nodeEls.set(nd.seq, node);
   }
-  // 休眠折叠条：显示 +N 休眠分支（本期只显示+计数；展开折叠分支列为后续）
+  // 休眠折叠条：去折叠后 sleepingCount 恒 0 → 恒不展开（保留元素与分支，不再出现 +N 文案）
   if (sleepEl) {
     if (graph.sleepingCount > 0) {
       sleepEl.textContent = "+" + graph.sleepingCount + " 休眠分支";
@@ -4821,7 +5284,9 @@ function historyTreeEnsure() {
   tcanvas.addEventListener(
     "wheel",
     (ev) => {
-      if (tcanvas.scrollWidth <= tcanvas.clientWidth) return; // 不可滚 → 放行
+      // 2026-10-12：纵向可滚且是纵向滚（|ΔY|≥|ΔX|）→ 放行原生纵向滚动（泳道多时看下方）
+      if (tcanvas.scrollHeight > tcanvas.clientHeight && Math.abs(ev.deltaY) >= Math.abs(ev.deltaX)) return;
+      if (tcanvas.scrollWidth <= tcanvas.clientWidth) return; // 不可横滚 → 放行
       const d = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
       if (d > 0 && tcanvas.scrollLeft + tcanvas.clientWidth >= tcanvas.scrollWidth - 1) return;
       if (d < 0 && tcanvas.scrollLeft <= 0) return;
@@ -4832,6 +5297,39 @@ function historyTreeEnsure() {
     { passive: false }
   );
   tcanvas.addEventListener("scroll", () => historyTreeUpdateFade());
+  // 拖拽平移（2026-10-12 · 2c）：按住任意处（含节点）横/纵拖动 → 反向平移 scrollLeft/Top。
+  // 与节点 click 消歧：位移 > DRAG_SLOP 才判为拖拽；位移极小仍走 click（见 historyTreeNodeClick）。
+  let drag = null;
+  const DRAG_SLOP = 3;
+  tcanvas.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0) return;
+    historyTreeDragEndAt = -1e9; // 新手势开始 → 清消歧态
+    drag = { x: ev.clientX, y: ev.clientY, l: tcanvas.scrollLeft, t: tcanvas.scrollTop, moved: false };
+  });
+  window.addEventListener("mousemove", (ev) => {
+    if (!drag) return;
+    const dx = ev.clientX - drag.x;
+    const dy = ev.clientY - drag.y;
+    if (!drag.moved) {
+      if (Math.abs(dx) + Math.abs(dy) <= DRAG_SLOP) return; // 位移极小 → 仍算 click
+      drag.moved = true;
+      tcanvas.classList.add("htr-dragging");
+    }
+    ev.preventDefault();
+    tcanvas.scrollLeft = drag.l - dx;
+    tcanvas.scrollTop = drag.t - dy;
+    historyTreeUpdateFade();
+  });
+  const endDrag = () => {
+    if (!drag) return;
+    if (drag.moved) {
+      historyTreeDragEndAt = Date.now(); // 已拖拽 → 紧随的 click 作废
+      tcanvas.classList.remove("htr-dragging");
+    }
+    drag = null;
+  };
+  window.addEventListener("mouseup", endDrag);
+  window.addEventListener("blur", endDrag);
   root.append(collapsed, panel);
   document.body.appendChild(root);
   historyTreeEl = root;
@@ -4934,9 +5432,8 @@ function historyTreeBubbleShow(tick, ent) {
     const bh = b.offsetHeight;
     let left = tr.left + tr.width / 2 - rr.left - bw / 2;
     left = Math.max(0, Math.min(left, Math.max(0, rr.width - bw))); // 水平钳在容器内
-    // 树贴底：默认气泡在刻度上方；上方放不下 → 落刻度下方（树面板内部兜底）
+    // 树贴底：气泡一律向上（下方必出视口/被裁）；树容器无 overflow 裁剪，向上溢出不裁，显示在容器上方。
     let top = tr.top - rr.top - bh - 6;
-    if (top < 4) top = tr.bottom - rr.top + 6;
     b.style.left = left.toFixed(1) + "px";
     b.style.top = top.toFixed(1) + "px";
   } catch {
@@ -4951,9 +5448,11 @@ function historyTreeBubbleHide() {
   if (b && b.parentElement) b.parentElement.removeChild(b);
 }
 
-// 单击/双击消歧（同框弹层口径）：单击 → 缩略图浮层；双击 → 回跳确认。
+// 单击/双击消歧（同框弹层口径）：单击 → 选中 + 缩略图浮层；双击 → 回跳确认。
 // 消歧窗口复用 HISTORY_TICK_DBL_MS（240ms）。
 function historyTreeNodeClick(ev, tick, ent) {
+  // 2026-10-12：拖拽平移（2c）后的 click 不算点击（同一次手势 mouseup→click；仅拦紧随的 300ms 内）
+  if (Date.now() - historyTreeDragEndAt < 300) return;
   ev.preventDefault();
   ev.stopPropagation();
   if (historyTreeClickTimer) {
@@ -4966,15 +5465,33 @@ function historyTreeNodeClick(ev, tick, ent) {
   }
   historyTreeClickTimer = setTimeout(() => {
     historyTreeClickTimer = null;
+    historyTreeSelect(tick, ent); // P8：单击先选中（同框 historyTickSelect 口径）
     historyTreeShotsToggle(tick, ent);
   }, HISTORY_TICK_DBL_MS);
 }
 
+// 单击选中（同框 historyTickSelect 口径；无轴，选中态自清树内 .node）。
+function historyTreeSelect(tick, ent) {
+  if (historyRollback.busy) return;
+  const file = ent && ent.file ? String(ent.file) : null;
+  const seq = ent && ent.seq != null ? ent.seq : null;
+  historyRollbackBtnReset();
+  historyBarSelection = { file, seq };
+  if (historyTreeTreeEl) {
+    historyTreeTreeEl.querySelectorAll(".node.htr-tick-sel").forEach((t) => t.classList.remove("htr-tick-sel"));
+  }
+  if (tick) tick.classList.add("htr-tick-sel");
+}
+
 // 单击节点 → 其提交的缩略图浮层（复用 historyImagesToUrls + lightbox）。
+// 2a（2026-10-13）：不再「鼠标移出自动关」；同一节点再点 → 关；点别的节点 → 切换。
 function historyTreeShotsToggle(tick, ent) {
   const host = historyTreeEl;
   if (!host || !tick) return;
+  const same = historyTreeShotsTick === tick;
   historyTreeShotsHide();
+  if (same) return; // 再点同一节点 → 关
+  historyTreeShotsTick = tick;
   const box = document.createElement("div");
   box.className = "htr-shots htr-shots-on";
   const images = ent && Array.isArray(ent.images) ? ent.images : [];
@@ -4997,7 +5514,8 @@ function historyTreeShotsToggle(tick, ent) {
       img.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        historyOpenLightbox(it.fullUrl, it.label);
+        // 2b：带本提交图清单 → 全屏内左右翻页（单图时箭头自动隐藏）
+        historyOpenLightbox(it.fullUrl, it.label, { list: imgs, index: imgs.indexOf(it) });
       });
       strip.appendChild(img);
     }
@@ -5017,7 +5535,7 @@ function historyTreeShotsToggle(tick, ent) {
     );
   }
   host.appendChild(box);
-  // 定位：默认节点上方；越顶 → 落下方；水平钳在容器内
+  // 定位：第2a（2026-10-13）——永远在被点节点上方（去掉「越顶→落下方」分支）；水平钳在容器内
   try {
     const hr = host.getBoundingClientRect();
     const tr = tick.getBoundingClientRect();
@@ -5025,14 +5543,14 @@ function historyTreeShotsToggle(tick, ent) {
     const bh = box.offsetHeight;
     let left = tr.left + tr.width / 2 - hr.left - bw / 2;
     left = Math.max(6, Math.min(left, (hr.width || bw) - bw - 6));
-    let top = tr.top - hr.top - bh - 8;
-    if (tr.top - bh - 8 < 4) top = tr.bottom - hr.top + 8;
+    const top = tr.top - hr.top - bh - 8;
     box.style.left = Math.round(left) + "px";
     box.style.top = Math.round(top) + "px";
   } catch { /* 定位失败也显示（左上角），不影响预览语义 */ }
 }
 
 function historyTreeShotsHide() {
+  historyTreeShotsTick = null; // 2a：关闭即解除「当前节点」绑定
   if (!historyTreeEl) return;
   const b = historyTreeEl.querySelector(".htr-shots");
   if (b && b.parentElement) b.parentElement.removeChild(b);
@@ -5084,6 +5602,19 @@ function historyTreeDrawEdges(nodeEls, graph) {
     if (!tr || (!tr.width && !tr.height)) return; // 已收起 / 不可见：不画
     let d = "";
     let faded = "";
+    // P8：端点从节点中心裁剪到节点外框边缘（线与节点间留缝，不再穿框/被填充盖住）。
+    // rect: {l,t,r,b}（相对 tree）；从 (cx,cy) 朝 (tx,ty) 方向求与外框边界的交点。
+    const trimToEdge = (rect, cx, cy, tx, ty) => {
+      const dx = tx - cx;
+      const dy = ty - cy;
+      let t = 1;
+      if (dx > 1e-6) t = Math.min(t, (rect.r - cx) / dx);
+      else if (dx < -1e-6) t = Math.min(t, (rect.l - cx) / dx);
+      if (dy > 1e-6) t = Math.min(t, (rect.b - cy) / dy);
+      else if (dy < -1e-6) t = Math.min(t, (rect.t - cy) / dy);
+      if (!isFinite(t) || t < 0) t = 0;
+      return { x: cx + dx * t, y: cy + dy * t };
+    };
     for (const ent of historyTreeEntries) {
       const seq = ent && ent.seq;
       if (seq == null) continue;
@@ -5123,10 +5654,18 @@ function historyTreeDrawEdges(nodeEls, graph) {
         continue;
       }
       if (!cr.width || !pr.width) continue;
-      const x1 = pr.left + pr.width / 2 - tr.left;
-      const y1 = pr.top + pr.height / 2 - tr.top;
-      const x2 = cr.left + cr.width / 2 - tr.left;
-      const y2 = cr.top + cr.height / 2 - tr.top;
+      const pcx = pr.left + pr.width / 2 - tr.left;
+      const pcy = pr.top + pr.height / 2 - tr.top;
+      const ccx = cr.left + cr.width / 2 - tr.left;
+      const ccy = cr.top + cr.height / 2 - tr.top;
+      const pRect = { l: pr.left - tr.left, r: pr.right - tr.left, t: pr.top - tr.top, b: pr.bottom - tr.top };
+      const cRect = { l: cr.left - tr.left, r: cr.right - tr.left, t: cr.top - tr.top, b: cr.bottom - tr.top };
+      const s = trimToEdge(pRect, pcx, pcy, ccx, ccy);
+      const e = trimToEdge(cRect, ccx, ccy, pcx, pcy);
+      const x1 = s.x;
+      const y1 = s.y;
+      const x2 = e.x;
+      const y2 = e.y;
       if (pRow === cRow || Math.abs(y2 - y1) < 0.5) {
         // 同泳道 → 水平直线
         d += "M" + x1.toFixed(1) + " " + y1.toFixed(1) + "L" + x2.toFixed(1) + " " + y2.toFixed(1);
@@ -5150,9 +5689,10 @@ function historyTreeDrawEdges(nodeEls, graph) {
 // 执行期间把变更来源标为 "agent"；装载类窗口另标 "system"（见 beginSystemWindow）。
 // v2（2026-10-08）追加 canvas.copilot（开关自身也是写类；拦截豁免见下）。
 const WRITE_OPS = new Set([
-  "canvas.loadWorkflowFile", "canvas.openWorkflow",
+  "canvas.loadWorkflowFile", "canvas.openWorkflow", "canvas.activateWorkflow",
   "canvas.setWidget", "canvas.addNode", "canvas.removeNode",
   "canvas.connect", "canvas.disconnect", "canvas.setNodeMode",
+  "canvas.addGroup", "canvas.setGroup", "canvas.removeGroup",
   "canvas.save", "canvas.undo", "canvas.patch", "canvas.organize",
   "canvas.queue", "canvas.duplicate", "canvas.visual", "canvas.copilot",
 ]);
@@ -5161,6 +5701,10 @@ const WRITE_OPS = new Set([
 // 写类 op 在「当前活动页副驾驶未开」时统一拒绝（{ok:false, error:"copilot_off", detail:指引}）。
 // 判定实时取当前状态：关了立即恢复受限；开了立即放行。豁免名单及理由（逐条，任务书要求）：
 //   · canvas.openWorkflow —— 「打开」（切前台看布）：无副驾驶画布上仅允许的两类动作之一。
+//   · canvas.activateWorkflow —— 「切标签」（把已打开的目标页切前台）：同属「打开看布」类，对齐
+//                            canvas.openWorkflow——无副驾驶的画布也应允许把它切到前台来看；写权限
+//                            仍由后续写 op 自己把关（本 op 装载目标标签自己的 activeState、不向图
+//                            注入新变更——与 canvas.openWorkflow 同属「打开看布」，故豁免）。
 //   · canvas.duplicate    —— 「复制」：另一类允许动作；v2 默认工作方式就是先复制副本再干活。
 //   · canvas.save         —— 「落盘」：v2 副本流程第 2 步（复制 → 落盘 → 开副本副驾驶 → 操作，
 //                            顺序固定——落盘先于开启发生）；且落盘不注入新图变更（把已有内容
@@ -5175,6 +5719,7 @@ const WRITE_OPS = new Set([
 // 也不标 agent 变更来源；装载窗口的变更由 beginSystemWindow 记 "system"（与 loadWorkflowFile 同）。
 const COPILOT_WRITE_EXEMPT = new Set([
   "canvas.openWorkflow",
+  "canvas.activateWorkflow",
   "canvas.duplicate",
   "canvas.save",
   "canvas.copilot",

@@ -5,7 +5,7 @@
 // 用法：node tools/check-bridge-syntax.mjs <path/to/bridge.js>
 import fs from "node:fs";
 
-const p = process.argv[2] || "app/bridge/js/hana-bridge-10121817.js";
+const p = process.argv[2] || "app/bridge/js/hana-bridge-14015734.js";
 let s;
 try {
   s = fs.readFileSync(p, "utf8");

@@ -97,8 +97,8 @@ except ValueError:
 
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
-# 2026-10-12（UI 定稿落地）：对齐新活动桥 hana-bridge-10121817（W2 框视觉 + W3 泳道式树）。
-BRIDGE_BUILD_TAG = "2026-10-12 hana-bridge-10121817"
+# 2026-10-14（提交树 hover 气泡一律向上）：对齐新活动桥 hana-bridge-14015734。
+BRIDGE_BUILD_TAG = "2026-10-13 hana-bridge-14015734"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -150,6 +150,11 @@ def _age_sec(entry, now):
 
 def _is_fresh(entry, now, ttl):
     return _age_sec(entry, now) <= ttl
+
+
+def _live_pick(ss):
+    """多活页时选「最近上报」者（seenAt 最新）——避免投进 TTL 内但实际已死/被节流的页。"""
+    return max(ss, key=lambda s: (_frontends.get(s) or {}).get("seenAt") or 0) if ss else None
 
 
 def _load_token():
@@ -221,6 +226,13 @@ def _note_frontend(sid, data, kind):
             entry["nodeCount"] = prev.get("nodeCount")
     else:
         entry["nodeCount"] = prev.get("nodeCount")
+    # openWorkflows（A 档 S1 2026-10-13）：本页「全量打开工作流」——随 /hana_bridge/state 上报。
+    # 仅当本次上报带 list 时更新；hello / 旧上报不带（或非 list）＝ 沿用 prev（不冲刷，
+    # 对齐 copilot/nodeCount 既有约定）。清洗后为 list；判不出（从未上报）＝ 保持缺省（消费侧省略）。
+    if isinstance(data.get("openWorkflows"), list):
+        entry["openWorkflows"] = _open_workflows_brief(data.get("openWorkflows"))
+    else:
+        entry["openWorkflows"] = prev.get("openWorkflows")
     _frontends[sid] = entry
     _frontend["sid"] = sid
 
@@ -229,14 +241,20 @@ def _pages_brief():
     """错误响应里的页面简表（诊断用；带 stale 标记）。"""
     now = time.time()
     ttl = _frontend_ttl_sec()
-    return [
-        {
+    rows = []
+    for k, v in _frontends.items():
+        row = {
             "sid": (k or "")[:8],
             "workflow": v.get("workflow"),
             "stale": _age_sec(v, now) > ttl,
         }
-        for k, v in _frontends.items()
-    ]
+        # openCount（A 档 S1 2026-10-13）：该页打开的 Tab 数——定向失败/歧义报错时一眼判
+        # 「是不是同页多开、名字撞车」；从未上报过 = 省略（对齐既有「判不出就省略」）。
+        ow = v.get("openWorkflows")
+        if isinstance(ow, list):
+            row["openCount"] = len(ow)
+        rows.append(row)
+    return rows
 
 
 # T3-4（2026-10-10）：页身份判定（读侧可辨；判不准则省略，绝不乱标）。
@@ -290,6 +308,11 @@ def _pages_payload():
         empty = _page_empty(v.get("nodeCount"))
         if empty is not None:
             page["empty"] = empty
+        # openWorkflows（A 档 S1 2026-10-13）：该页全量打开工作流数组；
+        # 从未上报过 = 省略该键（不塞 None/[]，判不出就不猜）。
+        ow = v.get("openWorkflows")
+        if isinstance(ow, list):
+            page["openWorkflows"] = ow
         pages.append(page)
     pages.sort(key=lambda p: p["ageSec"])
     return {
@@ -324,6 +347,63 @@ def _copilot_brief(raw):
     if isinstance(updated, bool) or not isinstance(updated, (int, float)):
         updated = 0
     return {"enabled": bool(raw.get("enabled")), "pageKey": page_key, "updatedAt": updated}
+
+
+def _open_workflows_brief(raw):
+    """前端上报的「本页全量打开工作流」列表（A 档 S1 2026-10-13；桥 openWorkflowsInfo() 形状）。
+    每项只留白名单字段：{name, path, key, active, dirty}；非 dict 项丢弃（乱数据不猜）。
+    取不到名字 → name=None（消费侧如实当「未命名」）。"""
+    out = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name")
+        name = name.strip() if isinstance(name, str) and name.strip() else None
+        dirty = it.get("dirty")
+        out.append(
+            {
+                "name": name,
+                "path": it.get("path"),
+                "key": it.get("key"),
+                "active": bool(it.get("active")),
+                "dirty": dirty if isinstance(dirty, bool) else None,
+            }
+        )
+    return out
+
+
+def _norm_wf_name(val):
+    """工作流名归一化（多标签寻址口径，2026-10-13）：去空白、反斜杠转正斜杠、去 .json 后缀、小写。"""
+    s = str(val or "").strip().replace("\\", "/").lower()
+    if s.endswith(".json"):
+        s = s[:-5].rstrip()
+    return s
+
+
+def _match_open_workflows(entry, want_wf):
+    """在单页 openWorkflows 里找命中项（多标签寻址，2026-10-13；缺口3）。
+    命中口径：name / path 归一化后相等，或末端文件名相等（容忍后缀与目录差异）。
+    返回 [ow, ...]；该页 openWorkflows 缺省 / 非法 → 返回 None（消费侧退回单值 workflow 逻辑）。"""
+    ow = (entry or {}).get("openWorkflows")
+    if not isinstance(ow, list):
+        return None
+    wn = _norm_wf_name(want_wf)
+    if not wn:
+        return []
+    want_tail = wn.rsplit("/", 1)[-1]
+    hits = []
+    for it in ow:
+        if not isinstance(it, dict):
+            continue
+        cands = (_norm_wf_name(it.get("name")), _norm_wf_name(it.get("path")))
+        if wn in cands:
+            hits.append(it)
+            continue
+        for c in cands:
+            if c and c.rsplit("/", 1)[-1] == want_tail:
+                hits.append(it)
+                break
+    return hits
 
 
 def _state_payload():
@@ -410,17 +490,48 @@ if _ROUTES is not None:
                 sid = None  # 无命中/歧义（多个活命中）→ 维持「不猜」语义
         routed = None
         if want_wf:
-            hits_live = [
-                s
-                for s, v in _frontends.items()
-                if (v.get("workflow") or "") == want_wf and _is_fresh(v, now, ttl)
-            ]
-            hits_stale = [
-                s
-                for s, v in _frontends.items()
-                if (v.get("workflow") or "") == want_wf and not _is_fresh(v, now, ttl)
-            ]
+            # 多标签寻址（缺口3，2026-10-13）：除前台标签名外，同时扫该页 openWorkflows；
+            # 一页内多个命中取 active 的当「前台命中」，全非 active ＝「仅后台命中」。
+            # activateWorkflow 特殊——它的目的就是切后台标签，故允许定向到仅后台命中页
+            # （否则它自己会被判「仅后台命中」而拒绝，形成鸡生蛋）。
+            allow_bg = op == "canvas.activateWorkflow"
+            hits_live = []
+            hits_stale = []
+            hits_bg = []
+            for s, v in _frontends.items():
+                fg = v.get("workflow") or ""
+                fg_hit = fg == want_wf
+                ow_hits = _match_open_workflows(v, want_wf)  # None ＝ 该页从未上报（退回单值逻辑）
+                active_hit = any(bool(it.get("active")) for it in (ow_hits or []))
+                if not (fg_hit or ow_hits):
+                    continue
+                if not _is_fresh(v, now, ttl):  # 过期页仍跳过
+                    hits_stale.append(s)
+                    continue
+                # allow_bg 真（activateWorkflow）时任一命中项都算可定向，归 live；
+                # 此时 hits_bg 分支不再触发，不会同时进两处。
+                if fg_hit or active_hit or allow_bg:
+                    hits_live.append(s)
+                    continue
+                matches = []
+                for it in ow_hits:
+                    nm = it.get("name") or it.get("path")
+                    if nm and nm not in matches:
+                        matches.append(nm)
+                hits_bg.append({"sid": (s or "")[:8], "foreground": fg or None, "matches": matches})
             if not hits_live:
+                if hits_bg:
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": "target_not_foreground",
+                            "detail": "「%s」在某页已打开但不在前台（前台为「%s」）；请先切到该标签（canvas.activateWorkflow）或让用户点回前台"
+                            % (want_wf, hits_bg[0].get("foreground") or "未命名"),
+                            "pages": _pages_brief(),
+                            "candidates": hits_bg,
+                        },
+                        status=409,
+                    )
                 if hits_stale:
                     return web.json_response(
                         {
@@ -440,7 +551,7 @@ if _ROUTES is not None:
                     },
                     status=409,
                 )
-            sid = hits_live[0]
+            sid = _live_pick(hits_live)
             routed = {"workflow": want_wf, "matched": len(hits_live)}
             if hits_stale:
                 routed["staleSkipped"] = len(hits_stale)
