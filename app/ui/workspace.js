@@ -9,7 +9,7 @@ import { hana } from "./assets/sdk.js";
 const $ = (id) => document.getElementById(id);
 const els = {
   bar: $("ws-bar"), barText: $("ws-bar-text"), barAction: $("ws-bar-action"), barAction2: $("ws-bar-action2"),
-  barReload: $("ws-bar-reload"), handoffBtn: $("ws-handoff"),
+  handoffBtn: $("ws-handoff"),
   loading: $("ws-loading"), frameWrap: $("ws-frame-wrap"), frame: $("ws-frame"),
   boot: $("view-booting"), bootNote: $("boot-note"), bootMeta: $("boot-meta"),
   bootRawWrap: $("boot-raw-wrap"), bootRaw: $("boot-raw"),
@@ -502,8 +502,8 @@ function showView(name) {
   els.err.classList.toggle("show", name === "error");
   els.offline.classList.toggle("show", name === "offline");
   els.frameWrap.classList.toggle("show", name === "ready");
-  // 「重载工作区」悬浮按钮：仅 ready 态显示（2026-10-09 自顶栏移出）
-  if (els.barReload) els.barReload.style.display = name === "ready" ? "inline-block" : "none";
+  // 「重载工作区」悬浮按钮已于 2026-10-12 迁入宿主左侧栏（panel.html #p-reload-ws）；
+  // 本页不再有该按钮，改由桥 op frame.reload（shellOp）统一驱动 requestFrameReload。
   // 「放入 hui 画布」悬浮按钮：仅「窗口态 + ready」显示（2026-10-09 画布移交）
   if (els.handoffBtn) els.handoffBtn.style.display = (name === "ready" && IS_NATIVE_WINDOW) ? "inline-block" : "none";
   if (name !== "ready") { els.loading.classList.remove("show"); }
@@ -752,6 +752,17 @@ async function stopBackend() {
 
 // 服务不可达时的覆盖层（盖住 iframe，不让用户直接看到中继的 ECONNREFUSED JSON）
 let svcRequestedAt = 0;
+
+// 启动等待起点（两侧共享契约，与 app/ui/assets/panel-status.js 逐字一致，2026-10-14）：
+// 服务端权威优先（proc.startedAt，跨页一致、中继重启可恢复），本地起点仅作「点击瞬间到快照刷新之间」的兜底。
+function svcWaitStart(proc, localStart) {
+  if (proc && proc.starting === true && proc.startedAt) {
+    const t = Date.parse(proc.startedAt);
+    if (Number.isFinite(t)) return t;      // 服务端权威（跨页一致）
+  }
+  return localStart || 0;                   // 本地兜底
+}
+
 function showOffline(st) {
   const relay = (st && st.relay) || null;
   const env = relay ? relay.env : null;
@@ -764,9 +775,13 @@ function showOffline(st) {
   if (proc && proc.startedAt) bits.push(`上次由本 App 拉起：${String(proc.startedAt).replace("T", " ").slice(0, 19)}`);
   if (proc && proc.lastError) bits.push(`上次错误：${proc.lastError}`);
   els.offMeta.textContent = bits.join(" · ");
-  // 「已等待 XX 秒」独立成行（accent 色、13.5px，一眼可见）；无等待时隐藏
-  if (svcRequestedAt) {
-    els.offWait.textContent = `已等待 ${Math.round((Date.now() - svcRequestedAt) / 1000)} 秒`;
+  // 「已等待 XX 秒」独立成行（accent 色、13.5px，一眼可见）；无等待时隐藏。
+  // 2026-10-14 两侧同源：起点改用 svcWaitStart（服务端 proc.startedAt 优先），显示条件并入服务端 starting
+  // —— 从左侧面板点启动时本覆盖层也显示计时；主句与左栏 panel-status.js 逐字一致。
+  // ⚠ svcRequestedAt 的「重载闸门」语义（下方 statusTick ~L1104）与此处显示用途无关，勿动判定用途。
+  const waitStart = svcWaitStart(proc, svcRequestedAt);
+  if (svcRequestedAt || (proc && proc.starting === true)) {
+    els.offWait.textContent = `已等待 ${Math.max(0, Math.round((Date.now() - waitStart) / 1000))} 秒`;
     els.offWait.hidden = false;
   } else {
     els.offWait.hidden = true;
@@ -1349,8 +1364,9 @@ $("btn-svc-start").addEventListener("click", () => { void startBackend(); });
 $("btn-svc-guide").addEventListener("click", () => { guideShow(1); });
 $("btn-svc-reload").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
 $("btn-reload2").addEventListener("click", () => { try { location.reload(); } catch { /* 忽略 */ } });
-$("ws-bar-reload").addEventListener("click", () => { requestFrameReload("manual"); }); // 悬浮重载按钮（ready 态右上角）：走统一重载入口 requestFrameReload（2026-10-08 P5）
 $("ws-handoff").addEventListener("click", () => { void handoffPush(); }); // 「放入 hui 画布」：仅窗口态显示（2026-10-09 画布移交）
+// 2026-10-12：「重载工作区」原为 #ws-bar-reload 悬浮按钮的 click 监听，已随按钮迁至宿主左侧栏；
+// 本页仅保留 requestFrameReload 函数本身（供壳页桥 op frame.reload 调用）。
 els.frame.addEventListener("load", () => {
   frameLoaded = true;
   frameInstance = null; // 修订 1.2：iframe 新文档，上一实例身份作废（等新桥重新宣告）

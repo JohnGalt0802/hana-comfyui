@@ -90,6 +90,9 @@ details.fold[open] > summary .arrow { transform: rotate(90deg); }
 details.fold[open] .mon-temp { display: none; }
 /* note 区里的轻量快捷操作按钮（启动失败 → 重启中继） */
 button.mini { width: auto; padding: 3px 12px; font-size: 11px; }
+/* 启动等待计时（2026-10-14）：与壳页 workspace.html 的 .panel .wait 视觉统一（accent/加粗/等宽数字）；
+   紧邻「启动服务」按钮、独立成行，非等待态 hidden 不占位（零视觉噪声）。 */
+.wait { font-size: 13px; font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; margin: 6px 0; }
 </style>
 </head>
 <body>
@@ -142,7 +145,13 @@ button.mini { width: auto; padding: 3px 12px; font-size: 11px; }
     <button id="p-start" class="primary" title="按本机探测到的安装根拉起 ComfyUI（由计划任务以当前用户身份起，独立于 Hana 存活）">启动服务</button>
     <button id="p-stop" class="danger" title="终止 8188 上的 ComfyUI 进程（正在跑的任务会中断）">停止服务</button>
   </div>
+  <!-- 启动等待计时（2026-10-14）：紧邻「启动服务」按钮、不展开任何折叠区也可见；文本由 panel-status.js 写入，
+       与工作区壳页覆盖层同源同句（svcWaitStart，服务端 proc.startedAt 优先）。非等待态 hidden 不占位。 -->
+  <div id="p-wait" class="wait" hidden></div>
   <button id="p-retry" style="margin-top:6px" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>
+  <!-- 重载工作区（2026-10-12）：自工作区画布右上角悬浮按钮迁来 —— panel 与工作区是两个页面实例，
+       够不到工作区的内层 iframe；点击只发信号（POST /comfyui-hana/shell/reload），由工作区壳页执行 frame.reload。 -->
+  <button id="p-reload-ws" style="margin-top:6px" title="重新加载工作区内层 ComfyUI 页面（等价 Ctrl+R；ComfyUI 草稿默认自动恢复）">重载工作区</button>
   <div class="note" id="p-note" style="display:none"></div>
   <div id="p-note-actions" style="display:none;margin-top:6px">
     <button id="p-note-retry" class="mini" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>

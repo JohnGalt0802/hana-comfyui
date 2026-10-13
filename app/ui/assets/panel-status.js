@@ -230,21 +230,25 @@ function render(st) {
   const reachable = !!(backend && backend.reachable) && !relayDown; // 保守：中继不可达时后端可达性不可信
   const proc = backend && backend.proc ? backend.proc : null;
   const startBtn = $("p-start"), stopBtn = $("p-stop");
+  // 启动等待：本左栏等待态（svcStarting）∪ 服务端权威启动中（proc.starting）——
+  // 后者覆盖「从壳页点启动」，使本左栏也显示秒表（2026-10-14 两侧同源）。
+  const waiting = svcStarting || !!(proc && proc.starting === true);
+  const waitStart = svcWaitStart(proc, svcStartAt); // 同源起点（服务端 startedAt 优先）
   // 启动等待收尾（2026-10-08 三态扩展）：
   //  · 观测到 reachable（且中继在线）→ 就绪收尾；
   //  · 中继不可达 → 结束等待（无法确认），文案改「已受理，待中继恢复确认」；
   //  · 服务端权威失败（lastStartResult.ok=false 且晚于本次等待起点）→ 失败收尾，不等 120s。
-  const justReady = svcStarting && reachable;
+  const justReady = waiting && reachable;
   if (justReady) endSvcStart();
-  else if (svcStarting && relayDown) {
+  else if (waiting && relayDown) {
     endSvcStart();
     svcNoteMsg = "已受理，待中继恢复确认。";
     svcNoteRelay = true;
     showSvcRetry();
-  } else if (svcStarting && proc && !relayDown) {
+  } else if (waiting && proc && !relayDown) {
     const lr = proc.lastStartResult;
     const lrAt = lr && lr.at ? Date.parse(lr.at) : NaN;
-    if (lr && lr.ok === false && Number.isFinite(lrAt) && lrAt >= svcStartAt - 2000) {
+    if (lr && lr.ok === false && Number.isFinite(lrAt) && lrAt >= waitStart - 2000) {
       svcFail("启动失败：" + (lr.error || "服务端报告启动未成功"));
     }
   }
@@ -289,8 +293,9 @@ function render(st) {
   // p-note：仅操作反馈（启动等待/失败/已运行/停止结果等即时消息）；无消息 → 清空并隐藏
   if (justReady) {
     setNote("ComfyUI 服务已就绪。");
-  } else if (svcStarting) {
-    // 等待就绪中：note 由秒表维护（renderSvcWaitNote），此处不覆盖
+    setWait("");
+  } else if (waiting) {
+    // 等待就绪中：秒表由 renderSvcWaitNote 维护（写 #p-wait），此处不覆盖
   } else if (svcNoteMsg) {
     setNote(svcNoteMsg);
   } else if (relayDown) {
@@ -303,6 +308,12 @@ function render(st) {
   const errText = (boot.error && boot.error.userText) || st.relayError || (backend && !backend.reachable ? backend.lastError : "");
   const procErr = proc && proc.lastError ? `服务：${proc.lastError}` : "";
   $("p-err").textContent = [errText ? `${(boot.error && boot.error.code) || "err"}：${errText}` : "", procErr].filter(Boolean).join("\n");
+  // 秒表 tick 生命周期（复用既有 1s interval，不新增常驻定时器）：等待中确保运行、否则停掉并清空计时行。
+  // reachable 排除收尾帧（justReady 已 endSvcStart，但同帧 proc.starting 可能仍为 true）。
+  const waitingNow = !reachable && (svcStarting || !!(proc && proc.starting === true));
+  syncSvcWaitTimer(waitingNow);
+  if (waitingNow) renderSvcWaitNote();
+  else setWait("");
   applySignal();
 }
 
@@ -449,8 +460,39 @@ let svcStartAt = 0;
 let svcWaitTimer = null;
 let svcNoteMsg = "";      // 粘性提示（启动失败等）：非空时优先于常规状态文本
 let svcNoteRelay = false; // 该粘性提示是「中继不可达」收尾文案（2026-10-08）：中继恢复后自动撤下
+let svcWaitFailStart = 0; // 已对哪个起点报过超时/失败（防服务端仍在途时反复重报）
 const SVC_START_TIMEOUT_MS = 120_000;
 const SVC_START_NOTE = "已请求启动 ComfyUI 服务，等待就绪（首次约 30～90 秒）…";
+
+// 启动等待起点（两侧共享契约，与 workspace.js 逐字一致，2026-10-14）：
+// 服务端权威优先（proc.startedAt，跨页一致、中继重启可恢复），本地起点仅作「点击瞬间到快照刷新之间」的兜底。
+function svcWaitStart(proc, localStart) {
+  if (proc && proc.starting === true && proc.startedAt) {
+    const t = Date.parse(proc.startedAt);
+    if (Number.isFinite(t)) return t;      // 服务端权威（跨页一致）
+  }
+  return localStart || 0;                   // 本地兜底
+}
+
+// 等待计时行（#p-wait）：等待期显示即占位，非等待期 hidden 不占位
+function setWait(text) {
+  const el = $("p-wait");
+  if (!el) return;
+  const t = text ? String(text) : "";
+  el.textContent = t;
+  el.hidden = !t;
+}
+
+// 秒表 tick 生命周期：需要等待（本地态 ∪ 服务端 starting）且未跑时启动；不再需要时停掉。
+// 复用既有 1s interval，不新增常驻定时器（本文件 setInterval 计数不变）。
+function syncSvcWaitTimer(need) {
+  if (need) {
+    if (!svcWaitTimer) svcWaitTimer = setInterval(() => { svcWaitTick(); }, 1000);
+  } else if (svcWaitTimer) {
+    clearInterval(svcWaitTimer);
+    svcWaitTimer = null;
+  }
+}
 
 function setSvcBusy(on, label) {
   svcBusy = on;
@@ -463,10 +505,12 @@ function showSvcRetry() { $("p-note-actions").style.display = ""; }
 function hideSvcRetry() { $("p-note-actions").style.display = "none"; }
 
 function renderSvcWaitNote() {
-  const secs = Math.max(0, Math.round((Date.now() - svcStartAt) / 1000));
   // 叠加服务端权威字段（2026-10-08）：proc.starting=true 说明启动确在途，等待可继续放心
   const proc = lastStatus && lastStatus.relay && lastStatus.relay.backend ? lastStatus.relay.backend.proc : null;
-  setNote(`${SVC_START_NOTE}\n已等待 ${secs} 秒${proc && proc.starting === true ? "（服务端标记：启动中）" : ""}`);
+  const startAt = svcWaitStart(proc, svcStartAt); // 起点同源：服务端 startedAt 优先，本地兜底
+  // 主句与壳页覆盖层（workspace.js showOffline）逐字一致
+  setWait(`已等待 ${Math.max(0, Math.round((Date.now() - startAt) / 1000))} 秒`);
+  setNote(`${SVC_START_NOTE}${proc && proc.starting === true ? "\n（服务端标记：启动中）" : ""}`);
 }
 
 function endSvcStart() {
@@ -485,15 +529,21 @@ function svcFail(msg) {
 }
 
 function svcWaitTick() {
-  if (!svcStarting) return;
-  if (Date.now() - svcStartAt >= SVC_START_TIMEOUT_MS) {
-    // 超时文案按态区分（2026-10-08，P5 三态）
-    const st = lastStatus || {};
-    const relayDown = st.relayError != null;
-    const proc = st.relay && st.relay.backend ? st.relay.backend.proc : null;
-    if (relayDown) svcFail("启动超时：已等待 120 秒，中继不可达，无法确认服务状态（可尝试「重启中继」）。");
-    else if (proc && proc.starting === true) svcFail("启动超时：已等待 120 秒，服务端仍标记「启动中」（稍后可用状态复查）。");
-    else svcFail("启动超时：已等待 120 秒，服务仍未就绪。");
+  const st = lastStatus || {};
+  const proc = st.relay && st.relay.backend ? st.relay.backend.proc : null;
+  const waiting = svcStarting || !!(proc && proc.starting === true); // 显示条件（与 render 一致）
+  if (!waiting) { syncSvcWaitTimer(false); return; }
+  const startAt = svcWaitStart(proc, svcStartAt); // 超时也按同源起点算（服务端 startedAt 优先）
+  if (startAt && Date.now() - startAt >= SVC_START_TIMEOUT_MS) {
+    // 超时文案按态区分（2026-10-08，P5 三态）；同一起点只报一次（服务端仍在途时不重报）
+    if (svcWaitFailStart !== startAt) {
+      svcWaitFailStart = startAt;
+      const relayDown = st.relayError != null;
+      if (relayDown) svcFail("启动超时：已等待 120 秒，中继不可达，无法确认服务状态（可尝试「重启中继」）。");
+      else if (proc && proc.starting === true) svcFail("启动超时：已等待 120 秒，服务端仍标记「启动中」（稍后可用状态复查）。");
+      else svcFail("启动超时：已等待 120 秒，服务仍未就绪。");
+    }
+    syncSvcWaitTimer(false);
     return;
   }
   renderSvcWaitNote();
@@ -504,6 +554,7 @@ async function startService() {
   svcBusy = true;
   svcStarting = true;
   svcStartAt = Date.now();
+  svcWaitFailStart = 0;
   svcNoteMsg = "";
   svcNoteRelay = false;
   hideSvcRetry();
@@ -511,8 +562,7 @@ async function startService() {
   startBtn.disabled = true;
   startBtn.textContent = "启动中…";
   renderSvcWaitNote();
-  if (svcWaitTimer) clearInterval(svcWaitTimer);
-  svcWaitTimer = setInterval(() => { svcWaitTick(); }, 1000);
+  syncSvcWaitTimer(true);
   let failMsg = "";
   try {
     const r = await hana.api.fetch("/comfyui-hana/backend/start", {
@@ -777,6 +827,45 @@ async function silentUpdateCheck() {
     if (d && d.ok !== false && d.isGit !== false) noteUpdInfo(d);
   } catch { /* 静默：更新检查失败不打扰 */ }
 }
+
+// ── 重载工作区（2026-10-12）────────────────────────────────────────
+// 面板与整页工作区是两个页面实例：panel 够不到工作区的内层 ComfyUI iframe。
+// 通道：POST /comfyui-hana/shell/reload → app 把 { op:"frame.reload" } 塞进壳页桥队列
+// → 工作区壳页 shellTick() 轮询（shell/poll）取到并执行（workspace.js shellOp frame.reload
+// → requestFrameReload）。与 /comfyui-hana/release 同口径、同凭据（hana.api.fetch）。
+// 壳页不在线时如实报错，不硬凑。
+let reloadingWs = false;
+async function reloadWorkspace() {
+  if (reloadingWs) return;
+  reloadingWs = true;
+  const btn = $("p-reload-ws");
+  btn.disabled = true;
+  btn.textContent = "重载中…";
+  let msg = "已请求重载工作区。";
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/shell/reload", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const j = await r.json().catch(() => null);
+    if (!(r.ok && j && j.ok)) {
+      const err = (j && (j.error || j.reason)) || `HTTP ${r.status}`;
+      msg = j && j.error === "shell-not-alive" ? "工作区当前未打开，无法重载。" : "重载失败：" + err;
+      btn.textContent = "重载失败";
+    } else {
+      btn.textContent = "已请求 ✓";
+    }
+  } catch (e) {
+    msg = "重载失败：" + String((e && e.message) || e);
+    btn.textContent = "重载失败";
+  } finally {
+    setNote(msg);
+    reloadingWs = false;
+    setTimeout(() => { btn.disabled = false; btn.textContent = "重载工作区"; }, 1800);
+  }
+}
+$("p-reload-ws").addEventListener("click", () => { void reloadWorkspace(); });
 
 // ── 交互 ──────────────────────────────────────────────────────────────────
 async function restartRelay() {
