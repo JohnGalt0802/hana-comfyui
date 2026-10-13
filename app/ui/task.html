@@ -6,38 +6,87 @@
 <title>ComfyUI 任务</title>
 <style>
 :root {
-  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
-  --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --text: #2b2b2b; --text-muted: #8a8a8a; --accent: #537d96;
+  --bg-soft: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --seg-idle: rgba(127,127,127,.18);
   --ok: #2e7d32; --bad: #c62828; --warn: #b07a1e;
 }
 body.t-dark {
-  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
-  --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --text: #d8d8d8; --text-muted: #8f8f8f; --accent: #7fa8c0;
+  --bg-soft: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --seg-idle: rgba(255,255,255,.16);
   --ok: #6fbf73; --bad: #e57373; --warn: #d9a94e;
 }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 10px 12px; background: transparent; color: var(--text); font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
-.tk-hdr { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-.tk-title { font-size: 14px; font-weight: 700; }
+body {
+  margin: 0; padding: 10px 12px; background: transparent; color: var(--text);
+  font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.tk-hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.tk-title { font-size: 14px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tk-elapsed { margin-left: auto; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .chip { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); white-space: nowrap; }
 .chip.run { background: rgba(83,125,150,.2); color: var(--accent); }
 .chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
 .chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
 .chip.warn { background: rgba(176,122,30,.18); color: var(--warn); }
-.tk-meta { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.tk-bar { height: 6px; background: rgba(127,127,127,.12); border-radius: 999px; overflow: hidden; margin: 8px 0 6px; }
-.tk-bar > div { height: 100%; border-radius: 999px; background: var(--accent); transition: width .3s; }
-.tk-bar.indet > div { width: 40% !important; animation: tk-slide 1.4s ease-in-out infinite; }
-@keyframes tk-slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
-.tk-row { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--text-muted); padding: 1px 0; }
-.tk-row .v { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
-.tk-out { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; margin-top: 8px; }
-.tk-thumb { position: relative; border: 0.5px solid var(--border); border-radius: 8px; overflow: hidden; background: rgba(127,127,127,.06); min-height: 72px; display: flex; align-items: center; justify-content: center; }
-.tk-thumb img { width: 100%; height: 96px; object-fit: cover; display: block; }
+
+/* 元信息：一行紧凑数字组 */
+.tk-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.tk-meta .m { display: inline-flex; align-items: baseline; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--bg-soft); font-size: 10.5px; color: var(--text-muted); white-space: nowrap; }
+.tk-meta .m b { font-size: 11.5px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+
+.tk-bar { height: 4px; background: var(--seg-idle); border-radius: 999px; overflow: hidden; margin: 0 0 6px; }
+.tk-bar > div { height: 100%; border-radius: 999px; background: var(--accent); transition: width .35s ease; }
+.tk-bar.indet > div { width: 38% !important; animation: tk-slide 1.4s ease-in-out infinite; }
+@keyframes tk-slide { 0% { margin-left: -38%; } 100% { margin-left: 100%; } }
+
+/* 节点时间轴 */
+.tk-tl { display: flex; gap: 3px; margin: 0 0 5px; }
+.tk-seg { flex: 1 1 0; height: 4px; border-radius: 2px; background: var(--seg-idle); transition: background .25s ease, opacity .25s ease; }
+.tk-seg.done { background: var(--accent); }
+.tk-seg.cur {
+  background: linear-gradient(90deg, var(--accent), #d6e8f2, var(--accent));
+  background-size: 200% 100%;
+  animation: tk-flow 1.2s linear infinite, tk-breathe 1.2s ease-in-out infinite;
+}
+.tk-seg.tail { background: linear-gradient(90deg, var(--seg-idle), rgba(127,127,127,0)); }
+.tk-seg.bad { background: var(--bad); }
+@keyframes tk-flow { 0% { background-position: 0 0; } 100% { background-position: -200% 0; } }
+@keyframes tk-breathe { 0%,100% { opacity: .7; } 50% { opacity: 1; } }
+.tk-tl-cap { font-size: 10.5px; color: var(--text-muted); margin: 0 0 2px; min-height: 0; font-variant-numeric: tabular-nums; }
+
+/* 实时预览 */
+.tk-pv { margin: 6px 0 2px; }
+.tk-pv-wrap { position: relative; border: 0.5px solid var(--border); border-radius: 10px; background: var(--bg-soft); overflow: hidden; display: flex; align-items: center; justify-content: center; min-height: 72px; cursor: zoom-in; }
+.tk-pv-img { display: block; max-width: 100%; max-height: 300px; object-fit: contain; }
+/* 胶片点选回放（缩略帧条） */
+.tk-pv-bar { display: flex; align-items: center; gap: 4px; margin-top: 6px; overflow-x: auto; scrollbar-width: thin; }
+.tk-film { flex: 0 0 auto; width: 34px; height: 34px; padding: 0; border: 1px solid transparent; border-radius: 6px; background: var(--bg-soft); overflow: hidden; cursor: pointer; opacity: .6; transition: opacity .2s, border-color .2s; }
+.tk-film img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.tk-film:hover { opacity: .9; }
+.tk-film.on { opacity: 1; border-color: var(--accent); }
+
+/* 产物缩略图：columns 保自然宽高比（长条竖排、方图成排） */
+.tk-out { columns: 170px 2; column-gap: 6px; margin-top: 8px; }
+.tk-thumb { position: relative; display: block; width: 100%; break-inside: avoid; margin: 0 0 6px; padding: 0; border: 0.5px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg-soft); cursor: zoom-in; }
+.tk-thumb img { display: block; width: 100%; height: auto; object-fit: contain; }
 .tk-thumb .name { position: absolute; left: 0; right: 0; bottom: 0; font-size: 9.5px; padding: 2px 5px; color: #eee; background: linear-gradient(transparent, rgba(0,0,0,.65)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tk-thumb .ph { font-size: 10px; color: var(--text-muted); padding: 8px; text-align: center; word-break: break-all; }
+.tk-thumb .ph { display: block; font-size: 10px; color: var(--text-muted); padding: 10px 8px; text-align: center; word-break: break-all; }
+.tk-thumb.miss img { display: none; }
+.tk-thumb.miss::after { content: "预览不可用"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--text-muted); background: var(--bg-soft); }
+
 .tk-err { margin-top: 8px; font-size: 11.5px; color: var(--bad); white-space: pre-wrap; word-break: break-all; }
+.tk-hint { margin-top: 4px; font-size: 11px; color: var(--text-muted); }
 .tk-note { color: var(--text-muted); font-size: 11.5px; margin-top: 8px; white-space: pre-wrap; }
+.tk-foot { color: var(--text-muted); font-size: 11px; margin-top: 8px; }
+
+/* 卡内 lightbox（纯前端，不依赖宿主权限） */
+#tk-lb { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 14px; background: rgba(0,0,0,.82); cursor: zoom-out; }
+#tk-lb[hidden] { display: none; }
+#tk-lb img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; }
+#tk-lb .tk-lb-hint { position: absolute; left: 0; right: 0; bottom: 10px; text-align: center; color: rgba(255,255,255,.6); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -45,6 +94,7 @@ body { margin: 0; padding: 10px 12px; background: transparent; color: var(--text
     <div class="tk-hdr"><span class="tk-title">ComfyUI 任务</span><span class="chip" id="tk-state">读取中…</span></div>
     <div class="tk-note">正在读取任务状态…</div>
   </div>
+  <div id="tk-lb" hidden><img alt="预览"><div class="tk-lb-hint">点击任意处关闭</div></div>
   <script type="module" src="./assets/task.js"></script>
 </body>
 </html>
