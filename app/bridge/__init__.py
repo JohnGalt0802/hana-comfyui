@@ -111,7 +111,8 @@ except ValueError:
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
 # 2026-10-14（提交树与历史框对齐：缩略图统一 + 树补存档）：对齐新活动桥 hana-bridge-14120534。
 # 2026-10-14（提交树跨泳道分叉线改非对称控制点/更早分叉）：对齐新活动桥 hana-bridge-14130045。
-BRIDGE_BUILD_TAG = "2026-10-14 hana-bridge-15001613"
+# 2026-10-15（提交历史框/树跟随 ComfyUI 明暗主题：中性色走 CSS 变量，深色档=原值）：对齐新活动桥 hana-bridge-15021810。
+BRIDGE_BUILD_TAG = "2026-10-15 hana-bridge-15021810"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}

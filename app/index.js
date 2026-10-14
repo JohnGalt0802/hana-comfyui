@@ -36,7 +36,7 @@ const APP_ID = "comfyui-hana";
 //   2026-10-09：卡片功能恢复——任务卡（task.html，submit/queue 回执 details.card）与环境检查卡
 //     （envcheck.html，卡按钮路由 /comfyui-hana/backend/{envcheck,clear,wait} 一并恢复）；
 //     流内卡走工具回执通道，不注册 contributes.cards（卡片中心零新增）。
-const APP_VERSION = "0.13.0";
+const APP_VERSION = "0.13.1";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）

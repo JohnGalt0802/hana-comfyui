@@ -98,6 +98,7 @@
   - **预览图降分辨率 + 磁盘缓存**（`bridge/thumbs.py` + `/hana_bridge/thumb`）：2.7MB → 39KB、二次命中 5ms；
   - **首次进入引导**：工作区就绪后自动弹「提交历史框 & 提交树」说明页一次（跟随工作区明暗、带「不再提示」），标记持久化在 app-data（`/comfyui-hana/intro`）；
   - **启动等待页 UI 重做**：主标记呼吸环 + 计时主角 + 三步轨（中继→服务→前端），连接方式收进「高级」。
+- **提交历史 UI 跟随主题（v0.13.1 补，2026-10-15）**：提交历史框 / 提交树 / 节点内条的**中性色**改为跟随 ComfyUI 明暗（纯 CSS：`:root` = 浅色默认、`:root.dark-theme` = 深色覆盖；ComfyUI 把明暗类名挂在根元素，桥同源即得，无需 JS 判定）。**语义色不变**（谁提交=蓝/紫、HEAD 橙点、功能区框色——这些是事实，不随主题漂）。深色观感零回归（原硬编码值原样搬入深色档）。
 - **语义层完善批（v0.12 新增，2026-10-09）**：
   - **source=file 文件源通道**：读（`get`/`check`/`outline`/`trace`/`summary`/`diff`）与写（`patch` 事务：全成/零写盘/自动 `.bak`/`dryRun`/`verify`；组操作 `addGroup`/`setGroup`/`removeGroup`；`cloneNodes` 克隆子图）均支持文件路径；
   - **lib 补强**：`check` 扩容（`MISSING_REQUIRED` + `DOMAIN_DIV16`/`STEPS_RANGE`/`SAVE_NAME`/`DENOISE_RANGE`，rules 可裁剪）、`outline` `detail=nodes` 下钻、`trace` `multi` 多级链、邻接选择器（`#id/down`、`#id/up:N`）、符号行 + `semanticRev`、`diff` 两文件语义图 diff；
