@@ -27,6 +27,7 @@ desktop.ini
 # 工作现场 / 模板收集 / 一次性脚本（本地资产，不随仓库分发）
 _temp/
 _workflow-backups/
+_backup/
 qwen21-templates/
 comfyui-skills/
 comfyui-skill-bundle/

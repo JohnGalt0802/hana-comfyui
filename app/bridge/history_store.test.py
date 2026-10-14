@@ -1268,5 +1268,369 @@ class TestBlockNames(TempRootTestCase):
         self.assertNotIn("blockNames", before)
 
 
+class TestMigrateHistory(TempRootTestCase):
+    """2026-10-14：改名迁移（修「未保存画布保存后提交历史全丢」）。
+
+    场景：未保存画布用临时名累积提交 → 另存改正式名 → 读历史的键变新名 → 命中空
+    目录 → 「全丢」。修法：改名时把旧名目录迁移/并入新名目录。
+    """
+
+    # 仅 seed 变化 → 同 sig（会被合并）
+    G_BASE = {"nodes": [
+        {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 20}},
+        {"id": 2, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512}},
+    ], "links": []}
+    G_SEED2 = {"nodes": [
+        {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 999, "steps": 20}},
+        {"id": 2, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512}},
+    ], "links": []}
+    # steps 变 → 不同 sig（会被新建节点）
+    G_STEPS = {"nodes": [
+        {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 30}},
+        {"id": 2, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512}},
+    ], "links": []}
+
+    def hist_dir(self, name):
+        return os.path.join(self.root, "workflows", ".history", hs.sanitize_workflow_name(name))
+
+    def index_lines(self, name):
+        path = os.path.join(self.hist_dir(name), hs.INDEX_FILE_NAME)
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(x) for x in fh.read().splitlines()]
+
+    def names(self, name):
+        return sorted(n for n in os.listdir(self.hist_dir(name)) if n != hs.INDEX_FILE_NAME)
+
+    # ① from 不存在
+    def test_src_missing_noop(self):
+        out = hs.migrate_history("不存在的名", "另一个名", self.root)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(out["moved"], 0)
+        self.assertEqual(out["merged"], 0)
+        self.assertEqual(out["note"], "src_missing")
+        # 无事发生：目标目录也没被创建
+        self.assertFalse(os.path.exists(self.hist_dir("另一个名")))
+
+    # ④ from == to（含净化后同名 / 都空）
+    def test_same_name_noop(self):
+        for a, b in (("画布", "画布"), ("a/b", "ab"), ("", "   "), ("...", ""), (None, None)):
+            out = hs.migrate_history(a, b, self.root)
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(out["moved"], 0)
+            self.assertEqual(out["merged"], 0)
+            self.assertEqual(out["note"], "same")
+
+    def test_missing_user_dir_500(self):
+        for bad in ("", "   ", None, 3):
+            self.assertEqual(hs.migrate_history("a", "b", bad)["status"], 500)
+
+    # ② 目标不存在 → 整体搬移（seq/文件名原样，目录改挂新名）
+    def test_target_missing_moves_whole_dir(self):
+        r1 = self.commit({"workflow": "临时 画布", "graph": self.G_BASE, "promptId": "aaaa1111"})
+        r2 = self.commit({"workflow": "临时 画布", "graph": self.G_STEPS, "promptId": "bbbb2222"})
+        hs.attach_images("临时 画布", self.root, "aaaa1111", [{"filename": "a.png"}])
+        before = self.names("临时 画布")
+
+        out = hs.migrate_history("临时 画布", "正式 画布", self.root)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(out["note"], "renamed")
+        self.assertEqual(out["moved"], 2)  # 主行数
+        self.assertEqual(out["merged"], 0)
+        # 源目录已不存在；目标目录拿到全部文件（含 sidecar），名字一字不改
+        self.assertFalse(os.path.exists(self.hist_dir("临时 画布")))
+        self.assertEqual(self.names("正式 画布"), before)
+        self.assertIn("0001-aaaa1111.json" + hs.IMAGES_SUFFIX, before)
+        # 索引行 seq/parent 原样（整体搬移不重编号）
+        lines = self.index_lines("正式 画布")
+        self.assertEqual([x["seq"] for x in lines], [1, 2])
+        self.assertIsNone(lines[0]["parent"])
+        self.assertEqual(lines[1]["parent"], r1["seq"])
+        self.assertEqual(lines[1]["file"], r2["file"])
+        listed = hs.list_commits("正式 画布", self.root)
+        self.assertEqual(len(listed["entries"]), 2)
+        self.assertEqual(listed["entries"][0]["images"], [{"filename": "a.png", "subfolder": "", "type": "output"}])
+
+    # ③ 目标已存在 → 合并（seq 重编号 + parent/mergeInto 偏移 + 快照同步改名）
+    def test_merge_offsets_seq_parent_and_renames_files(self):
+        # 目标（正式名）已有 #1
+        self.commit({"workflow": "正式 画布", "graph": self.G_BASE, "promptId": "tgt1aaaa"})
+        # 源（临时名）：主行 #1 + 合并行 #2（mergeInto 1）+ 主行 #3（parent 1）
+        self.commit({"workflow": "临时 画布", "graph": self.G_BASE, "promptId": "src1aaaa"})
+        m = self.commit({"workflow": "临时 画布", "graph": self.G_SEED2, "promptId": "src2bbbb"})
+        self.assertTrue(m["merged"])
+        self.commit({"workflow": "临时 画布", "graph": self.G_STEPS, "promptId": "src3cccc"})
+        hs.attach_images("临时 画布", self.root, "src1aaaa", [{"filename": "a.png"}])
+        src_seq = [x["seq"] for x in self.index_lines("临时 画布")]
+        self.assertEqual(src_seq, [1, 2, 3])
+
+        out = hs.migrate_history("临时 画布", "正式 画布", self.root)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(out["moved"], 2)   # 两条主行
+        self.assertEqual(out["merged"], 3)  # 追加到目标索引的行数（含 mergeInto 行）
+        self.assertNotIn("note", out)
+        self.assertFalse(os.path.exists(self.hist_dir("临时 画布")), "合并后源目录应删除")
+
+        # offset = next_seq(目标) = 2 → 源 seq 1/2/3 → 3/4/5
+        lines = self.index_lines("正式 画布")
+        self.assertEqual([x["seq"] for x in lines], [1, 3, 4, 5])
+        self.assertEqual(lines[1]["parent"], None)          # 源 #1 无 parent
+        self.assertEqual(lines[2]["mergeInto"], 3)          # 源 #2 的 mergeInto 1 → 3
+        self.assertEqual(lines[3]["parent"], 3)             # 源 #3 的 parent 1 → 3
+        self.assertEqual(lines[1]["file"], "0003-src1aaaa.json")
+        self.assertEqual(lines[3]["file"], "0005-src3cccc.json")
+        # 快照 + sidecar 同步改名移入；目标原有文件保留
+        self.assertEqual(
+            self.names("正式 画布"),
+            ["0001-tgt1aaaa.json", "0003-src1aaaa.json", "0003-src1aaaa.json" + hs.IMAGES_SUFFIX, "0005-src3cccc.json"],
+        )
+
+        # 读回自洽：3 条主行；src1 节点含 src1+src2 两个 run 与产物图
+        listed = hs.list_commits("正式 画布", self.root)
+        self.assertEqual([x["seq"] for x in listed["entries"]], [1, 3, 5])
+        runs = listed["entries"][1]["runs"]
+        self.assertEqual([r["promptId"] for r in runs], ["src1aaaa", "src2bbbb"])
+        self.assertEqual(listed["entries"][1]["images"], [{"filename": "a.png", "subfolder": "", "type": "output"}])
+
+    # ③b 重名冲突 → 跳过该行并在 note 记数（不抛异常、不丢目标数据）
+    def test_merge_file_conflict_skipped_with_note(self):
+        self.commit({"workflow": "正式 画布", "graph": self.G_BASE, "promptId": "tgt1aaaa"})
+        self.commit({"workflow": "正式 画布", "graph": self.G_STEPS, "promptId": "tgt2bbbb"})
+        self.commit({"workflow": "临时 画布", "graph": self.G_BASE, "promptId": "aaaa1111"})
+        # 源 #1 快照 0001-aaaa1111.json 合并后应叫 0004-aaaa1111.json（目标 2 条 → offset 3）；
+        # 先占住这个名 → 冲突
+        with open(os.path.join(self.hist_dir("正式 画布"), "0004-aaaa1111.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+
+        out = hs.migrate_history("临时 画布", "正式 画布", self.root)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["moved"], 1)
+        self.assertEqual(out["merged"], 0)
+        self.assertEqual(out["note"], "conflicts:1")
+        # 目标索引未被追加；冲突文件保持原内容
+        self.assertEqual([x["seq"] for x in self.index_lines("正式 画布")], [1, 2])
+        with open(os.path.join(self.hist_dir("正式 画布"), "0004-aaaa1111.json"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "{}")
+
+    # 索引坏行容错（对齐 parse_index 口径）：坏行不进 entries，好行照常迁移（合并路径）
+    def test_bad_lines_tolerated(self):
+        self.commit({"workflow": "正式 画布", "graph": self.G_STEPS, "promptId": "tgt1aaaa"})
+        self.commit({"workflow": "临时 画布", "graph": self.G_BASE, "promptId": "aaaa1111"})
+        path = os.path.join(self.hist_dir("临时 画布"), hs.INDEX_FILE_NAME)
+        with open(path, "a", encoding="utf-8", newline="") as fh:
+            fh.write("这不是 JSON\n")
+            fh.write("[1,2,3]\n")
+        out = hs.migrate_history("临时 画布", "正式 画布", self.root)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["moved"], 1)
+        self.assertEqual(out["merged"], 1)  # 坏行被丢弃，不污染目标索引
+        # 目标索引可被 parse_index 正常读回（无坏行）；目标 1 条 → offset 2 → 源 #1 → 3
+        self.assertEqual([x["seq"] for x in self.index_lines("正式 画布")], [1, 3])
+        self.assertFalse(os.path.exists(self.hist_dir("临时 画布")))
+
+    def test_no_real_history_dir_touched(self):
+        # 全部落盘限定在 self.root 的 tempfile 临时目录内
+        self.assertNotIn("user", os.path.abspath(self.root))
+
+
+class TestHistoryKey(TempRootTestCase):
+    """2026-10-14：历史主键改画布身份 id —— history_key / claims（新结构）/ 文件系统事实判据。
+
+    claims 新结构：{ "<id>": { "<identity>": "primary" | "<sideId>" } }；
+    identity = TEMP_IDENTITY（临时）/ 相对 path（正式）/ name（兜底）。
+    核心判据基于**文件系统事实**（旧文件还在不在），不用会变的值判断变没变。
+    全部落 tempfile，不碰真实 .history。
+    """
+
+    UUID = "11111111-2222-4333-8444-555555555555"
+    UUID2 = "99999999-8888-4777-8666-555555555555"
+    G_BASE = {"nodes": [{"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1}}], "links": []}
+
+    def claims_path(self):
+        return os.path.join(self.root, "workflows", ".history", hs.CLAIMS_FILE_NAME)
+
+    def read_claims(self):
+        with open(self.claims_path(), encoding="utf-8") as fh:
+            return json.loads(fh.read())
+
+    def make_file(self, rel):
+        """在 user_dir 下真实建一个画布文件（驱动 missing 的文件系统判定）。"""
+        abspath = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(abspath), exist_ok=True)
+        with open(abspath, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        return abspath
+
+    # ① 有 id → 键 = id；首次认领登记 primary（新 claims 结构）
+    def test_valid_id_yields_id_key(self):
+        self.assertEqual(hs.history_key("画布A", self.UUID, self.root), self.UUID)
+        self.assertEqual(self.read_claims()[self.UUID], {"画布A": "primary"})
+
+    # ② 同 id 同 identity → 同键（幂等，不新增条目）
+    def test_same_id_same_identity_same_key(self):
+        k1 = hs.history_key("画布A", self.UUID, self.root)
+        k2 = hs.history_key("画布A", self.UUID, self.root)
+        self.assertEqual(k1, k2)
+        self.assertEqual(k1, self.UUID)
+        self.assertEqual(self.read_claims()[self.UUID], {"画布A": "primary"})
+
+    # ③ 【核心验收】单张改名跟随：同 id，path 旧→新（真建/删文件）→ 两次键相同
+    def test_single_rename_follows(self):
+        old = "workflows/旧名.json"
+        new = "workflows/新名.json"
+        # 旧文件真实存在 → 首次认领（键 = id，primary）
+        self.make_file(old)
+        k1 = hs.history_key("旧名", self.UUID, self.root, old)
+        self.assertEqual(k1, self.UUID)
+        self.assertEqual(self.read_claims()[self.UUID], {old: "primary"})
+        # 改名：删旧文件 + 建新文件（文件系统事实：旧文件消失、新文件在）
+        os.remove(os.path.join(self.root, old))
+        self.make_file(new)
+        k2 = hs.history_key("新名", self.UUID, self.root, new)
+        # 恰一个正式 path 消失 → 跟随：键不变
+        self.assertEqual(k2, k1)
+        # claims 里 primary 已挪到新 path（旧 path 删除）
+        rec = self.read_claims()[self.UUID]
+        self.assertEqual(rec, {new: "primary"})
+        # 再次调用幂等
+        self.assertEqual(hs.history_key("新名", self.UUID, self.root, new), k1)
+
+    # ④ 【核心验收】临时 → 正式：同键（升级，不 mint）
+    def test_temp_upgrade_follows(self):
+        k1 = hs.history_key("临时画布", self.UUID, self.root, temporary=True)
+        self.assertEqual(k1, self.UUID)
+        self.assertEqual(self.read_claims()[self.UUID], {hs.TEMP_IDENTITY: "primary"})
+        # 落地为正式 path → 键不变，primary 挪到正式 identity（TEMP 条目删除）
+        k2 = hs.history_key("正式画布", self.UUID, self.root, "workflows/正式画布.json")
+        self.assertEqual(k2, k1)
+        self.assertEqual(self.read_claims()[self.UUID], {"workflows/正式画布.json": "primary"})
+        # 后续正式态再调 → 仍 = id
+        self.assertEqual(hs.history_key("正式画布", self.UUID, self.root, "workflows/正式画布.json"), self.UUID)
+
+    # ⑤ 【核心验收】两张 live path（两文件都真实存在）→ 第二次 mint，幂等
+    def test_two_live_paths_mint(self):
+        pa = "workflows/画布A.json"
+        pb = "workflows/画布B.json"
+        self.make_file(pa)
+        self.make_file(pb)  # 两个文件都真实存在（非改名，而是两张独立画布）
+        k1 = hs.history_key("画布A", self.UUID, self.root, pa)
+        self.assertEqual(k1, self.UUID)
+        side = hs.history_key("画布B", self.UUID, self.root, pb)
+        self.assertNotEqual(side, k1)
+        self.assertTrue(hs.is_valid_uuid(side))
+        # 幂等：同 side 再调 → 同 sideId
+        self.assertEqual(hs.history_key("画布B", self.UUID, self.root, pb), side)
+        # claims 记录：A=primary、B=sideId
+        self.assertEqual(self.read_claims()[self.UUID], {pa: "primary", pb: side})
+
+    # ⑥ 【核心验收】两次临时（名不同）→ 同键 = id
+    def test_temp_name_change_same_key(self):
+        k1 = hs.history_key("临时名甲", self.UUID, self.root, temporary=True)
+        k2 = hs.history_key("临时名乙", self.UUID, self.root, temporary=True)
+        self.assertEqual(k1, k2)
+        self.assertEqual(k1, self.UUID)
+        self.assertEqual(self.read_claims()[self.UUID], {hs.TEMP_IDENTITY: "primary"})
+
+    # ⑦ 【核心验收】无 id → 名键（老行为，一字不改）
+    def test_no_id_legacy(self):
+        for bad in (None, "", "   ", "not-a-uuid", "12345678", 3):
+            self.assertEqual(hs.history_key("我的 画布", bad, self.root), hs.sanitize_workflow_name("我的 画布"))
+        # 无 id 不写 claims
+        self.assertFalse(os.path.exists(self.claims_path()))
+
+    # ⑧ id 键目录不存在 → 回退名键（兼容重排前/后）
+    def test_resolve_falls_back_to_name_dir(self):
+        name_dir = hs.history_dir(self.root, "画布A")
+        os.makedirs(name_dir)
+        # id 目录不存在、名目录在 → 回退名目录
+        self.assertEqual(hs.resolve_history_dir(self.root, "画布A", self.UUID), name_dir)
+        # 两者都不存在 → 返回 id 键目录（新写入按 id 落盘）
+        id_dir = hs.history_dir(self.root, self.UUID)
+        self.assertEqual(hs.resolve_history_dir(self.root, "画布B", self.UUID2), hs.history_dir(self.root, self.UUID2))
+        # id 目录存在 → 优先 id（即便名目录也在）
+        os.makedirs(id_dir)
+        self.assertEqual(hs.resolve_history_dir(self.root, "画布A", self.UUID), id_dir)
+        # 无 id → 名目录（老行为）
+        self.assertEqual(hs.resolve_history_dir(self.root, "画布A", None), name_dir)
+
+    # ⑨ claims 损坏 → 回退 id 键不炸（不覆盖损坏文件）
+    def test_corrupt_claims_falls_back_to_id_key(self):
+        os.makedirs(os.path.dirname(self.claims_path()), exist_ok=True)
+        with open(self.claims_path(), "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        self.assertEqual(hs.history_key("画布A", self.UUID, self.root), self.UUID)
+        with open(self.claims_path(), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "{ not json")
+        # 非对象 JSON → 同样回退
+        with open(self.claims_path(), "w", encoding="utf-8") as fh:
+            fh.write("[1,2,3]")
+        self.assertEqual(hs.history_key("画布A", self.UUID, self.root), self.UUID)
+
+    # ⑩ 旧 claims 结构（{owner,paths}）→ 重置为空表，不炸；重新走新算法
+    def test_legacy_claims_structure_reset(self):
+        os.makedirs(os.path.dirname(self.claims_path()), exist_ok=True)
+        with open(self.claims_path(), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({self.UUID: {"owner": "画布A", "paths": {"画布A": "iso"}}}))
+        # 视为空表 → 首次认领
+        self.assertEqual(hs.history_key("画布A", self.UUID, self.root), self.UUID)
+        self.assertEqual(self.read_claims()[self.UUID], {"画布A": "primary"})
+
+    # ⑪ .meta.json 写入（id 键目录）
+    def test_meta_file_written_for_id_dir(self):
+        out = hs.commit({"workflow": "画布A", "graph": self.G_BASE, "promptId": "p1"}, self.root, self.UUID)
+        self.assertTrue(out["ok"])
+        self.assertEqual(os.path.basename(out["dir"]), self.UUID)
+        meta_path = os.path.join(out["dir"], hs.META_FILE_NAME)
+        self.assertTrue(os.path.isfile(meta_path))
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = json.loads(fh.read())
+        self.assertEqual(meta["id"], self.UUID)
+        self.assertEqual(meta["name"], "画布A")
+        self.assertIn("updatedAt", meta)
+        # 名键老目录不写 .meta.json
+        out2 = hs.commit({"workflow": "无 id 画布", "graph": self.G_BASE, "promptId": "p2"}, self.root)
+        self.assertFalse(os.path.exists(os.path.join(out2["dir"], hs.META_FILE_NAME)))
+
+    # ⑫ 向后兼容：workflow_id 缺省 → 落名键目录（与改前完全一致）
+    def test_default_no_workflow_id_writes_name_dir(self):
+        out = hs.commit({"workflow": "我的 画布", "graph": self.G_BASE, "promptId": "p1"}, self.root)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["dir"], hs.history_dir(self.root, "我的 画布"))
+        self.assertFalse(os.path.exists(self.claims_path()))
+        self.assertTrue(os.path.isfile(os.path.join(out["dir"], hs.INDEX_FILE_NAME)))
+
+    # ⑬ 多张同时消失（不止一个 missing）→ 不跟随（按首次/mint 处理，不丢数据）
+    def test_multiple_missing_no_follow(self):
+        pa = "workflows/A.json"
+        pb = "workflows/B.json"
+        self.make_file(pa)
+        self.make_file(pb)
+        hs.history_key("A", self.UUID, self.root, pa)          # primary
+        side = hs.history_key("B", self.UUID, self.root, pb)   # sideId
+        # 两个文件都消失，再来一个新 path → 不跟随（避免误判），按 mint 处理
+        os.remove(os.path.join(self.root, pa))
+        os.remove(os.path.join(self.root, pb))
+        k = hs.history_key("C", self.UUID, self.root, "workflows/C.json")
+        self.assertNotEqual(k, self.UUID)
+        self.assertNotEqual(k, side)
+        self.assertTrue(hs.is_valid_uuid(k))
+
+    # ⑭ resolve_history_dir 内部用新 history_key（改名后仍解析到同一 id 目录）
+    def test_resolve_dir_follows_rename(self):
+        old = "workflows/旧名.json"
+        new = "workflows/新名.json"
+        self.make_file(old)
+        d1 = hs.resolve_history_dir(self.root, "旧名", self.UUID, path=old)
+        os.makedirs(d1, exist_ok=True)  # 历史目录已落 id 键
+        os.remove(os.path.join(self.root, old))
+        self.make_file(new)
+        d2 = hs.resolve_history_dir(self.root, "新名", self.UUID, path=new)
+        self.assertEqual(d1, d2)
+        self.assertEqual(os.path.basename(d1), self.UUID)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

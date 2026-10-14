@@ -30,6 +30,7 @@ import json
 import math
 import os
 import re
+import uuid
 
 # ── 常量（对齐 canvas-history.mjs 的导出口径）──────────────────────────────
 # 快照结构版本（字段增删时递增，供将来迁移判断）——P5 换代：1 → 2
@@ -388,7 +389,11 @@ def sanitize_workflow_name(name):
 
 # ── 2. 目录 ─────────────────────────────────────────────────────────────────
 def history_dir(user_dir, workflow_name):
-    """历史目录绝对路径：<user_dir>/workflows/.history/<净化后的名字>。"""
+    """历史目录绝对路径：<user_dir>/workflows/.history/<净化后的键>。
+
+    2026-10-14 起参数含义由「工作流名」扩为「历史键」：既可是画布身份 id（uuid），
+    也可是净化后的工作流名（老行为）。本函数语义不变（净化 + 拼接）。
+    """
     return os.path.abspath(
         os.path.join(
             "" if user_dir is None else str(user_dir),
@@ -397,6 +402,243 @@ def history_dir(user_dir, workflow_name):
             sanitize_workflow_name(workflow_name),
         )
     )
+
+
+# ── 2.1 画布身份 id 主键（2026-10-14：历史主键改画布身份）────────────────────
+# 背景：历史目录原按工作流**显示名**为键 → 改名/另存致键漂移（曾致数据丢失）。
+# 现改为按画布身份 id（前端 JSON 顶层 uuid）为键：rename 保 id → 历史自动跟随。
+# 共享 id 的多张画布（文件级同源派生）用 claims 登记表 mint sideId「各算各的」。
+# 全部状态限定在 <user_dir>/workflows/.history/ 内：.claims.json + <键目录>/.meta.json。
+
+# 合法 uuid（8-4-4-4-12 十六进制）；非 uuid（老 legacyId / 名）一律走名键。
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# claims 登记表 / 目录元数据文件名
+CLAIMS_FILE_NAME = ".claims.json"
+META_FILE_NAME = ".meta.json"
+
+
+def is_valid_uuid(v):
+    """是否合法 uuid 字符串（去首尾空白后整串匹配 8-4-4-4-12 十六进制）。"""
+    return isinstance(v, str) and bool(_UUID_RE.match(v.strip()))
+
+
+def _claims_path(user_dir):
+    """claims 登记表绝对路径：<user_dir>/workflows/.history/.claims.json。"""
+    return os.path.abspath(
+        os.path.join(
+            "" if user_dir is None else str(user_dir),
+            "workflows",
+            ".history",
+            CLAIMS_FILE_NAME,
+        )
+    )
+
+
+def _read_claims(user_dir):
+    """读 claims 登记表。返回 (claims, ok)：
+      · 文件缺失 → ({}, True)（首次写会新建）；
+      · 内容损坏（坏 JSON / 非对象）→ ({}, False)（调用方回退纯 id 键，**不覆盖原文件**）。
+    """
+    path = _claims_path(user_dir)
+    if not os.path.isfile(path):
+        return {}, True
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.loads(fh.read())
+    except (OSError, ValueError):
+        return {}, False
+    if not isinstance(obj, dict):
+        return {}, False
+    return obj, True
+
+
+def _write_claims(user_dir, claims):
+    """原子写 claims（同目录 .tmp → os.replace）。目录不存在则递归创建；失败静默（best-effort）。"""
+    path = _claims_path(user_dir)
+    text = json.dumps(claims, ensure_ascii=False, separators=(",", ":"))
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+# 临时画布（未落盘）的哨兵身份：不受其显示名变化影响（2026-10-14 致命修正）。
+TEMP_IDENTITY = "__temp__"
+
+
+def _identity_of(name, path, temporary):
+    """identity 归一化（mint 判据，**不用显示名当身份**）：
+      · temporary（未落盘画布）→ 哨兵 TEMP_IDENTITY（改名不影响）；
+      · 已落地文件有相对路径 → path（strip 后）；
+      · 兜底 → name（无 path 的老调用，属已知边界）。
+    """
+    if temporary:
+        return TEMP_IDENTITY
+    if isinstance(path, str) and path.strip():
+        return path.strip()
+    return name if isinstance(name, str) else ""
+
+
+def _identity_is_path_like(identity):
+    """identity 是否「像文件路径」（含 / \\ 或以 .json 结尾）——只有这类才参与 missing 判定。"""
+    if not isinstance(identity, str) or not identity:
+        return False
+    return ("/" in identity) or ("\\" in identity) or identity.lower().endswith(".json")
+
+
+def _identity_file_exists(user_dir, identity):
+    """identity 对应的画布文件是否**真实存在**（判据基于文件系统事实，而非会变的值）。
+
+      · identity 像路径（含 / \\ 或 .json 结尾）→ os.path.isfile(os.path.join(user_dir, identity))；
+      · 否则（TEMP 哨兵 / 名兜底）→ True（名不参与 missing，避免误判）。
+    读文件失败（异常）→ True（保守：宁可不判「消失」，也不误 mint）。
+    """
+    if not _identity_is_path_like(identity):
+        return True
+    try:
+        return os.path.isfile(os.path.join(user_dir, identity))
+    except OSError:
+        return True
+
+
+def _resolve_val(wid, val):
+    """claims 值 → 实际历史键："primary" → id 本身；合法 uuid → 该 uuid（sideId）；其余 → id。"""
+    if val == "primary":
+        return wid
+    if isinstance(val, str) and is_valid_uuid(val):
+        return val.strip()
+    return wid
+
+
+def history_key(name, workflow_id=None, user_dir=None, path=None, temporary=None):
+    """解析历史目录**键**：有效 uuid → id 键（查 claims 决定，含 mint）；无 id → 名键（老行为）。
+
+    参数：
+      name        —— 工作流显示名（无 id 时净化后作键；有 id 时仅作 identity 兜底）。
+      workflow_id —— 画布身份 id（前端 JSON 顶层 uuid）；非法/缺失 → 走名键。
+      user_dir    —— ComfyUI 用户目录（claims 落盘处；缺失 → 纯 id 键）。
+      path        —— 可选：画布文件相对路径（identity 优先用它）。
+      temporary   —— 可选 bool：画布未落盘（临时画布）→ identity 归入 TEMP 哨兵。
+
+    claims 结构（<user_dir>/workflows/.history/.claims.json）：
+      { "<id>": { "<identity>": "primary" | "<sideId>" } }
+      identity = TEMP_IDENTITY（临时）/ 相对 path（正式）/ name（兜底）；
+      值 "primary" → 键 = id 本身；值 sideId → 键 = 该 sideId。
+
+    判据基于**文件系统事实**（旧文件还在不在），不用「会变的值」（name/path）判断变没变：
+      ① 命中 identity → 幂等返回其键；
+      ② 临时(TEMP) → 正式(path)：升级（键不变，只把 TEMP 的键挪给新 identity）；
+      ③ 恰一个正式 path 消失（旧文件被 move 走）→ 单张改名 → 跟随（键不变）；
+      ④ 首次认领 → 登记 primary，键 = id；
+      ⑤ 两张独立（各自文件都在）→ mint sideId，键 = sideId（各算各的）。
+    旧 claims 结构（{owner,paths}）兼容：claims 实际从未生成过，读到即重置为空表（不炸）。
+    claims 损坏/缺失 → 回退纯 id 键（不覆盖损坏文件）。
+    """
+    if not is_valid_uuid(workflow_id):
+        return sanitize_workflow_name(name)
+    wid = workflow_id.strip()
+    if not isinstance(user_dir, str) or not user_dir.strip():
+        return wid  # 无 user_dir 无从查 claims → 纯 id 键
+    identity = _identity_of(name, path, temporary)
+    claims, ok = _read_claims(user_dir)
+    if not ok:
+        return wid  # claims 损坏 → 回退纯 id 键（不覆盖原文件）
+    rec = claims.get(wid)
+    rec = dict(rec) if isinstance(rec, dict) else {}
+    # 旧结构兼容（{owner,paths}）：直接重置为最简空表（claims 实际从未生成过）
+    if "owner" in rec or "paths" in rec:
+        rec = {}
+
+    # ① 命中（幂等）：该 identity 已登记 → 返回其键
+    if identity in rec:
+        return _resolve_val(wid, rec[identity])
+
+    # ② 临时 → 正式：升级（键不变，把 TEMP 的键挪给正式 identity）
+    if TEMP_IDENTITY in rec and identity != TEMP_IDENTITY:
+        key = rec.pop(TEMP_IDENTITY)
+        rec[identity] = key
+        claims[wid] = rec
+        _write_claims(user_dir, claims)
+        return _resolve_val(wid, key)
+
+    # ③ 恰一个正式 path 消失 → 单张改名 → 跟随（键不变）
+    missing = [k for k in rec if k != TEMP_IDENTITY and not _identity_file_exists(user_dir, k)]
+    if len(missing) == 1:
+        key = rec.pop(missing[0])
+        rec[identity] = key
+        claims[wid] = rec
+        _write_claims(user_dir, claims)
+        return _resolve_val(wid, key)
+
+    # ④ 首次认领：登记 primary，键 = id
+    if not rec:
+        rec[identity] = "primary"
+        claims[wid] = rec
+        _write_claims(user_dir, claims)
+        return wid
+
+    # ⑤ 两张独立（各自文件都在）→ mint：为该 identity 分配 sideId
+    side = str(uuid.uuid4())
+    rec[identity] = side
+    claims[wid] = rec
+    _write_claims(user_dir, claims)
+    return side
+
+
+def resolve_history_dir(user_dir, name, workflow_id=None, path=None, temporary=None):
+    """解析某工作流历史目录的**实际路径**（先 id 键后名键回退，兼容重排前/后）。
+
+      · 有有效 id：id 键目录存在 → 用它；否则名键目录存在 → 回退用它；
+        都不存在 → 返回 id 键目录（新建/写入按 id 落盘）。
+      · 无 id：返回名键目录（老行为，一字不改）。
+    2026-10-14：path/temporary → identity 归一化入参（见 history_key / _identity_of）。
+    """
+    name_dir = history_dir(user_dir, name)
+    if not is_valid_uuid(workflow_id):
+        return name_dir
+    id_dir = history_dir(user_dir, history_key(name, workflow_id, user_dir, path, temporary))
+    if os.path.isdir(id_dir):
+        return id_dir
+    if os.path.isdir(name_dir):
+        return name_dir
+    return id_dir
+
+
+def _write_meta_file(dir_path, workflow_id, name, path=None):
+    """在 id 键目录写人可读的 .meta.json：{id, name, path?, updatedAt}（原子写）。
+    仅当 workflow_id 是合法 uuid 时写（名键老目录不写）；失败静默。
+    """
+    if not is_valid_uuid(workflow_id):
+        return
+    obj = {
+        "id": workflow_id.strip(),
+        "name": "" if name is None else str(name),
+        "updatedAt": _to_iso(None),
+    }
+    if isinstance(path, str) and path.strip():
+        obj["path"] = path.strip()
+    meta_path = os.path.join(dir_path, META_FILE_NAME)
+    tmp = meta_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+        os.replace(tmp, meta_path)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ── 3. 文件名 ───────────────────────────────────────────────────────────────
@@ -662,7 +904,7 @@ def _last_node_seq(entries):
 
 
 # ── 10. 提交落盘 ────────────────────────────────────────────────────────────
-def commit(body, user_dir):
+def commit(body, user_dir, workflow_id=None, path=None, temporary=None):
     """处理一次提交上报：写快照 + 追加索引行。返回带 status 的结果对象，由路由拆出 HTTP 码。
 
     流程对齐 JS handleHistoryCommit（含顺序）：缺字段 400 → 读索引 → next_seq →
@@ -676,6 +918,11 @@ def commit(body, user_dir):
     合并判定（仅 kind=="run"）：headSeq 可读、且其快照 graph 的归一化签名（忽略 seed 类 widget）
     与本轮 graph 相同 → 追加一行 mergeInto 标记行（**不改已写行、不写新快照**），
     返回 {merged:True, targetSeq:headSeq}；否则新建节点（parent=headSeq、delta=compute_delta(headGraph, graph)）。
+
+    2026-10-14：新增可选 workflow_id（画布身份 id，uuid）。给定 → 历史目录键走 id
+    （resolve_history_dir，先 id 后名回退），并写目录 .meta.json；缺省 → 完全走原名键（老行为）。
+    同日新增可选 path（画布文件相对路径）/ temporary（bool，未落盘画布）→ identity 归一化
+    （见 _identity_of）：临时画布不受显示名变化影响，落地后 owner 升级、键仍 = id。
     """
     b = body if isinstance(body, dict) else {}
     workflow = b.get("workflow") if isinstance(b.get("workflow"), str) else ""
@@ -697,7 +944,7 @@ def commit(body, user_dir):
 
     prompt_id = b.get("promptId")
     prompt_id = None if prompt_id is None else str(prompt_id)
-    dir_path = history_dir(user_dir, workflow)
+    dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
     index_path = os.path.join(dir_path, INDEX_FILE_NAME)
 
     # 读已有索引（不存在当空处理；容错解析交给 parse_index）
@@ -735,6 +982,7 @@ def commit(body, user_dir):
             )
             try:
                 os.makedirs(dir_path, exist_ok=True)
+                _write_meta_file(dir_path, workflow_id, workflow)
                 with open(index_path, "a", encoding="utf-8", newline="") as fh:
                     fh.write(merge_line + "\n")
             except OSError as exc:
@@ -755,14 +1003,18 @@ def commit(body, user_dir):
         parent=head_seq,
         head_graph=head_graph,
         sig=sig,
+        workflow_id=workflow_id,
+        workflow_name=workflow,
     )
 
 
 def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, source="unknown",
-                 blocks=None, kind="run", parent=None, head_graph=None, sig=None):
+                 blocks=None, kind="run", parent=None, head_graph=None, sig=None,
+                 workflow_id=None, workflow_name=None):
     """新建一个提交节点：算 delta → 写快照 → 追加索引主行。
     commit 的「新建」分支与 save_commit 共用（kind/promptId/parent/delta 由调用方给定）。
     返回 {ok, status, merged:False, seq, file, dir}；体积超限 → 413（不写盘、不建目录）。
+    2026-10-14：可选 workflow_id/workflow_name → 目录落盘后写 .meta.json（仅 id 键目录）。
     """
     seq = next_seq(entries)
     file_name = snapshot_file_name(seq, prompt_id)
@@ -809,6 +1061,7 @@ def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, 
     # 目录不存在就递归创建（在体积防护之后，超限不落任何盘上痕迹）
     try:
         os.makedirs(dir_path, exist_ok=True)
+        _write_meta_file(dir_path, workflow_id, workflow_name)
     except OSError as exc:
         return {"ok": False, "status": 500, "error": "创建历史目录失败：%s" % exc}
 
@@ -843,10 +1096,12 @@ def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, 
     return {"ok": True, "status": 200, "merged": False, "seq": seq, "file": file_name, "dir": dir_path}
 
 
-def save_commit(body, user_dir):
+def save_commit(body, user_dir, workflow_id=None, path=None, temporary=None):
     """P5b：存档当前画布 —— 永远**新建**一个 kind="save" 节点（无 promptId、不参与合并判定）。
     请求体: { workflow, graph, at?, source? }（无 promptId）。返回 {ok, status, seq, file, dir}。
     复用 _create_node；delta 相对 head（索引末条）算，parent=head。
+    2026-10-14：新增可选 workflow_id → 键走 id（resolve_history_dir，先 id 后名回退）；缺省走原名键。
+    同日新增可选 path / temporary → identity 归一化（见 history_key / _identity_of）。
     """
     b = body if isinstance(body, dict) else {}
     workflow = b.get("workflow") if isinstance(b.get("workflow"), str) else ""
@@ -862,7 +1117,7 @@ def save_commit(body, user_dir):
     if src is None:
         src = "user"
 
-    dir_path = history_dir(user_dir, workflow)
+    dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
     index_path = os.path.join(dir_path, INDEX_FILE_NAME)
     entries = []
     try:
@@ -888,7 +1143,184 @@ def save_commit(body, user_dir):
         parent=head_seq,
         head_graph=head_graph,
         sig=graph_sig_ignoring_seed(b.get("graph")),
+        workflow_id=workflow_id,
+        workflow_name=workflow,
     )
+
+
+# ── 10.4 改名迁移（2026-10-14：修「未保存画布保存后提交历史全丢」）──────────
+# 根因：历史按工作流**显示名**做目录键。未保存画布用临时名累积提交，另存（改名）后
+# 名字变正式名 → 读历史的键变成新名 → 命中空目录 → 表现为「全丢」（旧数据仍躺在旧名
+# 目录里）。修法：改名时把旧名目录的历史迁移/并入新名目录。见
+# docs/方案-修复历史保存后丢失-20261014.md §3.1。全部操作限定在
+# <user_dir>/workflows/.history/ 目录树内。
+def _shift_seq_in_name(file_name, new_seq):
+    """快照文件名首段（seq，%04d）替换为新 seq；形态异常（无 `-` 分段 / 含路径）→ None。"""
+    if not isinstance(file_name, str) or file_name != os.path.basename(file_name):
+        return None
+    cut = file_name.find("-")
+    if cut <= 0:
+        return None
+    return str(new_seq).zfill(4) + file_name[cut:]
+
+
+def migrate_history(from_name, to_name, user_dir):
+    """改名迁移：把 <from> 的历史目录内容并入 <to> 的历史目录。
+
+    返回 {ok, status, moved, merged, note?}（由路由拆 status）：
+      · moved  = 源**主行**数（无 mergeInto 的节点行；与整体搬移口径一致）；
+      · merged = 实际追加到目标索引的行数（含 mergeInto 标记行）；
+      · note   = "same"（净化后同名，无事）/ "src_missing"（源目录不存在，无事）/
+                 "renamed"（目标不存在 → 整体搬移）/ 省略（合并成功）/ "conflicts:N"（有
+                 文件重名冲突被跳过，见下）。
+
+    规则：
+      · from/to 净化后同名（含都空 → untitled）→ {ok:True, status:200, moved:0, merged:0, note:"same"}。
+      · 源目录不存在 → {ok:True, status:200, moved:0, merged:0, note:"src_missing"}。
+      · 目标目录不存在 → os.rename(src_dir, dst_dir) 整体搬移（同盘最快，seq 保持原样不变）。
+      · 目标已存在 → **合并**：
+          - offset = next_seq(目标 entries)（新 seq = 旧 seq + offset）；
+          - 逐条源行：seq += offset；parent 非 null 且 ≥1 → parent += offset；
+            mergeInto 非 null → mergeInto += offset（保持父子引用自洽）；
+          - 源快照 <seq>-id.json 与 <seq>-id.json.images.json sidecar 按新 seq 改名后
+            移入目标目录（os.replace，同卷 rename）；
+          - 追加改写后的行到目标 index.jsonl（一次写入，追加语义）；
+          - 合并完成后删除源目录（内容已全部并入）。
+      · 幂等/容错：坏行按 parse_index 口径容错（不进 entries）；文件重名冲突（理论上 seq
+        已偏移不会撞）或源文件缺失 → 跳过该行并在 note 记 "conflicts:N"；源目录里索引未
+        引用的余留文件（不冲突时）一并移入，不删数据。
+    """
+    if not isinstance(user_dir, str) or not user_dir.strip():
+        return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
+
+    # 净化后同名 → 无事（含都空 → untitled）
+    if sanitize_workflow_name(from_name) == sanitize_workflow_name(to_name):
+        return {"ok": True, "status": 200, "moved": 0, "merged": 0, "note": "same"}
+
+    src_dir = history_dir(user_dir, from_name)
+    dst_dir = history_dir(user_dir, to_name)
+    if not os.path.isdir(src_dir):
+        return {"ok": True, "status": 200, "moved": 0, "merged": 0, "note": "src_missing"}
+
+    src_index = os.path.join(src_dir, INDEX_FILE_NAME)
+
+    # 读源索引（无索引当空；容错解析交给 parse_index）
+    src_entries = []
+    if os.path.isfile(src_index):
+        try:
+            with open(src_index, "r", encoding="utf-8") as fh:
+                src_entries = parse_index(fh.read())["entries"]
+        except OSError as exc:
+            return {"ok": False, "status": 500, "error": "读取源索引失败：%s" % exc}
+    src_mains = [e for e in src_entries if e.get("mergeInto") is None]
+
+    # 目标目录不存在 → 整体搬移（同盘 rename 最快；文件名/seq 原样保留）
+    if not os.path.isdir(dst_dir):
+        try:
+            os.rename(src_dir, dst_dir)
+        except OSError as exc:
+            return {"ok": False, "status": 500, "error": "整体搬移失败：%s" % exc}
+        return {"ok": True, "status": 200, "moved": len(src_mains), "merged": 0, "note": "renamed"}
+
+    # 目标已存在 → 合并
+    dst_index = os.path.join(dst_dir, INDEX_FILE_NAME)
+    dst_entries = []
+    if os.path.isfile(dst_index):
+        try:
+            with open(dst_index, "r", encoding="utf-8") as fh:
+                dst_entries = parse_index(fh.read())["entries"]
+        except OSError as exc:
+            return {"ok": False, "status": 500, "error": "读取目标索引失败：%s" % exc}
+    offset = next_seq(dst_entries)  # 起点：目标的下一条空位（源 seq 整体后移 offset）
+
+    out_lines = []
+    conflicts = 0
+    for e in src_entries:
+        new_seq = _to_int(e.get("seq"), 0) + offset
+        row = dict(e)
+        row["seq"] = new_seq
+        # parent：非 null 且 ≥1 → 同步偏移（保持父子引用自洽）
+        p = _norm_parent(e.get("parent"))
+        if p is not None and p >= 1:
+            row["parent"] = p + offset
+        # mergeInto：非 null → 同步偏移（合并行指回偏移后的目标主行）
+        m = _norm_parent(e.get("mergeInto"))
+        if m is not None:
+            row["mergeInto"] = m + offset
+
+        # 快照文件（只有主行带 file；mergeInto 行不携带快照）
+        raw_file = e.get("file")
+        if isinstance(raw_file, str) and raw_file.strip():
+            old_name = raw_file.strip()
+            new_name = _shift_seq_in_name(old_name, new_seq)
+            src_file = os.path.join(src_dir, old_name) if new_name else ""
+            dst_file = os.path.join(dst_dir, new_name) if new_name else ""
+            if new_name is None or not os.path.isfile(src_file) or os.path.exists(dst_file):
+                conflicts += 1  # 形态异常 / 源文件缺失 / 重名冲突 → 跳过该行
+                continue
+            try:
+                os.replace(src_file, dst_file)
+            except OSError:
+                conflicts += 1
+                continue
+            # .images.json sidecar 与主快照同名 → 同步改名移入
+            old_side = _sidecar_file_name(old_name)
+            if old_side and os.path.isfile(os.path.join(src_dir, old_side)):
+                new_side = _sidecar_file_name(new_name)
+                dst_side = os.path.join(dst_dir, new_side)
+                if os.path.exists(dst_side):
+                    conflicts += 1
+                else:
+                    try:
+                        os.replace(os.path.join(src_dir, old_side), dst_side)
+                    except OSError:
+                        pass  # sidecar 迁移失败不阻断合并（产物图列表可重建）
+            row["file"] = new_name
+        out_lines.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+
+    # 追加改写后的行（追加写，禁止读全文重写整份索引）
+    if out_lines:
+        try:
+            with open(dst_index, "a", encoding="utf-8", newline="") as fh:
+                fh.write("\n".join(out_lines) + "\n")
+        except OSError as exc:
+            return {
+                "ok": False,
+                "status": 500,
+                "error": "追加目标索引失败：%s" % exc,
+                "moved": len(src_mains),
+                "merged": 0,
+            }
+
+    # 源目录里索引未引用的余留文件（弃用快照等）：不冲突就一并移入（不丢数据）
+    try:
+        leftover = os.listdir(src_dir)
+    except OSError:
+        leftover = []
+    for name in leftover:
+        if name == INDEX_FILE_NAME:
+            continue
+        src_p = os.path.join(src_dir, name)
+        dst_p = os.path.join(dst_dir, name)
+        if not os.path.isfile(src_p) or os.path.exists(dst_p):
+            continue
+        try:
+            os.replace(src_p, dst_p)
+        except OSError:
+            pass
+
+    # 内容已全部并入 → 删源索引 + 源目录（删不干净不算失败）
+    try:
+        if os.path.isfile(src_index):
+            os.remove(src_index)
+        os.rmdir(src_dir)
+    except OSError:
+        pass
+
+    out = {"ok": True, "status": 200, "moved": len(src_mains), "merged": len(out_lines)}
+    if conflicts:
+        out["note"] = "conflicts:%d" % conflicts
+    return out
 
 
 # ── 10.5 框视角：一条提交 → 碰过的框（P6，只读计算，不落盘）────────────────
@@ -934,8 +1366,11 @@ def _block_names_for_entry(entry):
 
 
 # ── 11. 查询 ────────────────────────────────────────────────────────────────
-def list_commits(workflow, user_dir):
+def list_commits(workflow, user_dir, workflow_id=None, path=None, temporary=None):
     """读某工作流的索引。目录不存在 → 空 entries（ok=True）；索引坏行只计数不抛异常。
+
+    2026-10-14：新增可选 workflow_id → 目录键走 id（resolve_history_dir，先 id 后名回退）；
+    缺省 → 完全走原名键（老行为）。同日新增可选 path / temporary → identity 归一化。
 
     P5b：折叠 mergeInto 行 + 新字段。每条主行 entry **只读合并**（不写回索引磁盘）：
       · parent/kind/sig/delta —— 由 normalize_entry 缺省补全（旧条目兼容）
@@ -947,7 +1382,7 @@ def list_commits(workflow, user_dir):
     """
     if not isinstance(user_dir, str) or not user_dir.strip():
         return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
-    dir_path = history_dir(user_dir, workflow)
+    dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
     index_path = os.path.join(dir_path, INDEX_FILE_NAME)
     if not os.path.isdir(dir_path):
         return {"ok": True, "status": 200, "entries": [], "badLines": 0}
@@ -986,19 +1421,21 @@ def list_commits(workflow, user_dir):
 
 
 # ── 12. 快照全文读取（P3-G1：回跳用）───────────────────────────────────────
-def read_snapshot(workflow, user_dir, seq=None, file_name=None):
+def read_snapshot(workflow, user_dir, seq=None, file_name=None, workflow_id=None, path=None, temporary=None):
     """读一份提交快照的完整 JSON（含 graph 本体）。返回带 status 的结果对象，由路由拆出 HTTP 码。
 
     定位：file 优先（直接点名，回跳前端走这条）；否则用 seq 从索引解析出 file（history-list
     只有摘要、无 graph 本体，本函数是回跳拿完整快照的入口）。
     file 只接受纯文件名（拒绝任何含路径分隔的值，防穿越）；索引缺失/无该条 → 404。
     失败码：400 参数缺失/非法；404 快照不存在；500 读取/解析失败（含坏 JSON）。
+    2026-10-14：新增可选 workflow_id → 目录键走 id（先 id 后名回退）；缺省走原名键。
+    同日新增可选 path / temporary → identity 归一化（见 history_key）。
     """
     if not isinstance(user_dir, str) or not user_dir.strip():
         return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
     if not isinstance(workflow, str) or not workflow.strip():
         return {"ok": False, "status": 400, "error": "需要 workflow（工作流名）"}
-    dir_path = history_dir(user_dir, workflow)
+    dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
     fname = None
     if file_name is not None and str(file_name).strip():
         fname = str(file_name).strip()
@@ -1169,15 +1606,18 @@ def _entry_snapshot_file(entry):
     return fname
 
 
-def read_images_for(workflow, user_dir, prompt_id):
-    """内部用：读某工作流某 promptId 所属 run 的产物图 list；无 sidecar / 无该 promptId → []。"""
+def read_images_for(workflow, user_dir, prompt_id, workflow_id=None, path=None, temporary=None):
+    """内部用：读某工作流某 promptId 所属 run 的产物图 list；无 sidecar / 无该 promptId → []。
+    2026-10-14：新增可选 workflow_id → 目录键走 id（先 id 后名回退）；缺省走原名键。
+    同日新增可选 path / temporary → identity 归一化。
+    """
     if not isinstance(workflow, str) or not workflow.strip():
         return []
     if not isinstance(user_dir, str) or not user_dir.strip():
         return []
     if prompt_id is None or not str(prompt_id):
         return []
-    dir_path = history_dir(user_dir, workflow)
+    dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
     index_path = os.path.join(dir_path, INDEX_FILE_NAME)
     if not os.path.isfile(index_path):
         return []
@@ -1236,7 +1676,7 @@ def _node_runs(entry, sidecar_runs, merge_rows):
     return ordered
 
 
-def attach_images(workflow, user_dir, prompt_id, images, at=None):
+def attach_images(workflow, user_dir, prompt_id, images, at=None, workflow_id=None, path=None, temporary=None):
     """把一次出图的产物文件名持久化到 sidecar（P4 修；P5b 升级为 runs）。
 
     校验 workflow / promptId / images（非空数组，每项含 filename）→ 非法 400；
@@ -1245,6 +1685,8 @@ def attach_images(workflow, user_dir, prompt_id, images, at=None):
     读旧 sidecar（含旧形态归一）→ 按 promptId 找该 run → 去重合并 images；无则新建 run；
     原子写回（.tmp → os.replace）。
     返回 {ok, status, file, count}；file = sidecar 文件名，count = 该 run 累计张数。
+    2026-10-14：新增可选 workflow_id → 目录键走 id（先 id 后名回退）；缺省走原名键。
+    同日新增可选 path / temporary → identity 归一化。
     """
     wf = workflow.strip() if isinstance(workflow, str) else ""
     if not wf:
@@ -1263,7 +1705,7 @@ def attach_images(workflow, user_dir, prompt_id, images, at=None):
     if not isinstance(user_dir, str) or not user_dir.strip():
         return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
 
-    dir_path = history_dir(user_dir, wf)
+    dir_path = resolve_history_dir(user_dir, wf, workflow_id, path=path, temporary=temporary)
     index_path = os.path.join(dir_path, INDEX_FILE_NAME)
     entries = []
     try:

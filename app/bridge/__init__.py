@@ -64,12 +64,14 @@ try:
     from .history_store import list_commits as _history_list_commits
     from .history_store import read_snapshot as _history_read_snapshot
     from .history_store import attach_images as _history_attach_images
+    from .history_store import migrate_history as _history_migrate
 except Exception as _exc:  # P1-C1：history_store 纯标准库，正常不会失败；防御性保护
     _history_commit = None
     _history_save_commit = None
     _history_list_commits = None
     _history_read_snapshot = None
     _history_attach_images = None
+    _history_migrate = None
     _HISTORY_IMPORT_ERR = _exc
 else:
     _HISTORY_IMPORT_ERR = None
@@ -97,8 +99,9 @@ except ValueError:
 
 # 桥构建标识（与 js 侧 BUILD_TAG 同源口径；2026-09-28 起取代此前的陈旧占位标签）。
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
-# 2026-10-14（提交树 hover 气泡一律向上）：对齐新活动桥 hana-bridge-14015734。
-BRIDGE_BUILD_TAG = "2026-10-13 hana-bridge-14015734"
+# 2026-10-14（提交树与历史框对齐：缩略图统一 + 树补存档）：对齐新活动桥 hana-bridge-14120534。
+# 2026-10-14（提交树跨泳道分叉线改非对称控制点/更早分叉）：对齐新活动桥 hana-bridge-14130045。
+BRIDGE_BUILD_TAG = "2026-10-14 hana-bridge-14194557"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -726,13 +729,18 @@ if _ROUTES is not None:
     # 而 /call 校验 token 是因为它是中继→外部的入口，桥 js 拿不到 token（全仓无 token 引用）。
     @_ROUTES.post("/hana_bridge/history-commit")
     async def _hana_history_commit(request):
-        """提交一次画布快照落盘。请求体: { workflow, promptId?, graph, at?, source? }"""
+        """提交一次画布快照落盘。请求体: { workflow, workflowId?, promptId?, graph, at?, source? }"""
         try:
             user_dir = _history_user_dir()
         except RuntimeError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
         body = await _json(request)
-        out = _history_commit(body, user_dir)
+        # 2026-10-14：画布身份 id（可空）→ 历史目录主键走 id；缺失走原名键（向后兼容）。
+        workflow_id = str((body or {}).get("workflowId") or "").strip() or None
+        # 同日：identity 归一化入参 —— 已落地文件相对路径 / 临时画布标志（bool）。
+        workflow_path = str((body or {}).get("workflowPath") or "").strip() or None
+        workflow_temporary = bool((body or {}).get("workflowTemporary"))
+        out = _history_commit(body, user_dir, workflow_id, path=workflow_path, temporary=workflow_temporary)
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
@@ -740,39 +748,69 @@ if _ROUTES is not None:
     # 信任模型同其它 history-* 端点（P1-D1）：8188 同源、本机-only，不校验 token。
     @_ROUTES.post("/hana_bridge/history-save")
     async def _hana_history_save(request):
-        """存档当前画布（不运行）。请求体: { workflow, graph, at?, source? }"""
+        """存档当前画布（不运行）。请求体: { workflow, workflowId?, graph, at?, source? }"""
         try:
             user_dir = _history_user_dir()
         except RuntimeError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
         body = await _json(request)
-        out = _history_save_commit(body, user_dir)
+        # 2026-10-14：同一 id 主键口径；workflowId 缺失 → 原名键（向后兼容）。
+        workflow_id = str((body or {}).get("workflowId") or "").strip() or None
+        workflow_path = str((body or {}).get("workflowPath") or "").strip() or None
+        workflow_temporary = bool((body or {}).get("workflowTemporary"))
+        out = _history_save_commit(body, user_dir, workflow_id, path=workflow_path, temporary=workflow_temporary)
+        status = out.pop("status", 200 if out.get("ok") else 500)
+        return web.json_response(out, status=status)
+
+    # 2026-10-14：改名迁移 —— 修「未保存画布保存后提交历史全丢」（见
+    # docs/方案-修复历史保存后丢失-20261014.md §3.2）。逻辑全在 history_store.migrate_history。
+    @_ROUTES.post("/hana_bridge/history-migrate")
+    async def _hana_history_migrate(request):
+        """改名迁移历史目录。请求体 { from, to }（工作流显示名）。
+        信任模型同其它 history-*（P1-D1）：8188 同源、本机-only，不校验 token。"""
+        try:
+            user_dir = _history_user_dir()
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        body = await _json(request)
+        frm = str((body or {}).get("from") or "").strip()
+        to = str((body or {}).get("to") or "").strip()
+        if not frm or not to:
+            return web.json_response({"ok": False, "error": "missing_from_or_to"}, status=400)
+        out = _history_migrate(frm, to, user_dir)
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
     @_ROUTES.post("/hana_bridge/history-attach-images")
     async def _hana_history_attach_images(request):
         """P4 修：把一次出图的产物文件名持久化到 sidecar（UI 直接读磁盘，不再碰 /history）。
-        请求体: { workflow, promptId, images:[{filename,subfolder?,type?}], at? }
+        请求体: { workflow, workflowId?, promptId, images:[{filename,subfolder?,type?}], at? }
         信任模型同其它 history-* 端点（P1-D1）：8188 同源、本机-only，不校验 token。"""
         try:
             user_dir = _history_user_dir()
         except RuntimeError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
         body = await _json(request)
+        # 2026-10-14：同一 id 主键口径；workflowId 缺失 → 原名键（向后兼容）。
+        workflow_id = str((body or {}).get("workflowId") or "").strip() or None
+        workflow_path = str((body or {}).get("workflowPath") or "").strip() or None
+        workflow_temporary = bool((body or {}).get("workflowTemporary"))
         out = _history_attach_images(
             body.get("workflow"),
             user_dir,
             body.get("promptId"),
             body.get("images"),
             at=body.get("at"),
+            workflow_id=workflow_id,
+            path=workflow_path,
+            temporary=workflow_temporary,
         )
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
     @_ROUTES.get("/hana_bridge/history-list")
     async def _hana_history_list(request):
-        """查某工作流的提交索引。query: ?workflow=<名>；缺参数 400。
+        """查某工作流的提交索引。query: ?workflow=<名>&workflowId=<uuid>；缺 workflow 400。
         信任模型同 history-commit（P1-D1）：8188 同源、本机-only，不校验 token。"""
         try:
             user_dir = _history_user_dir()
@@ -781,14 +819,19 @@ if _ROUTES is not None:
         workflow = str(request.query.get("workflow") or "").strip()
         if not workflow:
             return web.json_response({"ok": False, "error": "missing_workflow"}, status=400)
-        out = _history_list_commits(workflow, user_dir)
+        # 2026-10-14：画布身份 id（可空）→ 主键走 id；缺失走原名键（向后兼容）。
+        workflow_id = str(request.query.get("workflowId") or "").strip() or None
+        workflow_path = str(request.query.get("workflowPath") or "").strip() or None
+        _t = str(request.query.get("workflowTemporary") or "").strip().lower()
+        workflow_temporary = _t in ("1", "true")
+        out = _history_list_commits(workflow, user_dir, workflow_id, path=workflow_path, temporary=workflow_temporary)
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
     @_ROUTES.get("/hana_bridge/history-snapshot")
     async def _hana_history_snapshot(request):
         """P3-G1：读某条提交快照的完整 JSON（含 graph 本体，回跳用）。
-        query: ?workflow=<名>&seq=<n> 或 ?workflow=<名>&file=<文件名>（file 优先）。
+        query: ?workflow=<名>&workflowId=<uuid>&seq=<n> 或 ?workflow=<名>&file=<文件名>（file 优先）。
         信任模型同 history-list / history-commit（P1-D1）：8188 同源、本机-only，不校验 token。"""
         try:
             user_dir = _history_user_dir()
@@ -797,6 +840,11 @@ if _ROUTES is not None:
         workflow = str(request.query.get("workflow") or "").strip()
         if not workflow:
             return web.json_response({"ok": False, "error": "missing_workflow"}, status=400)
+        # 2026-10-14：画布身份 id（可空）→ 主键走 id；缺失走原名键（向后兼容）。
+        workflow_id = str(request.query.get("workflowId") or "").strip() or None
+        workflow_path = str(request.query.get("workflowPath") or "").strip() or None
+        _t = str(request.query.get("workflowTemporary") or "").strip().lower()
+        workflow_temporary = _t in ("1", "true")
         seq_raw = str(request.query.get("seq") or "").strip()
         file_raw = str(request.query.get("file") or "").strip()
         if not seq_raw and not file_raw:
@@ -806,12 +854,15 @@ if _ROUTES is not None:
             user_dir,
             seq=(int(seq_raw) if seq_raw.isdigit() else seq_raw),
             file_name=(file_raw or None),
+            workflow_id=workflow_id,
+            path=workflow_path,
+            temporary=workflow_temporary,
         )
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
     LOG.info(
-        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-save / history-attach-images / history-list / history-snapshot），"
+        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-save / history-attach-images / history-list / history-snapshot / history-migrate），"
         "token 就绪，超时 %gs",
         CALL_TIMEOUT_SEC,
     )
