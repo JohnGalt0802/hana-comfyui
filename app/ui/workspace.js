@@ -11,11 +11,12 @@ const els = {
   bar: $("ws-bar"), barText: $("ws-bar-text"), barAction: $("ws-bar-action"), barAction2: $("ws-bar-action2"),
   handoffBtn: $("ws-handoff"),
   loading: $("ws-loading"), frameWrap: $("ws-frame-wrap"), frame: $("ws-frame"),
-  boot: $("view-booting"), bootNote: $("boot-note"), bootMeta: $("boot-meta"),
+  boot: $("view-booting"), bootNote: $("boot-note"), bootMeta: $("boot-meta"), bootMark: $("boot-mark"),
   bootRawWrap: $("boot-raw-wrap"), bootRaw: $("boot-raw"),
-  err: $("view-error"), errNote: $("err-note"), errMeta: $("err-meta"),
+  err: $("view-error"), errNote: $("err-note"), errMeta: $("err-meta"), errMark: $("err-mark"),
   errRawWrap: $("err-raw-wrap"), errRaw: $("err-raw"),
   offline: $("view-offline"), offNote: $("off-note"), offWait: $("off-wait"), offMeta: $("off-meta"),
+  offMark: $("off-mark"),
 };
 
 const MODE_KEY = "comfyui-hana.workspace.urlMode";
@@ -495,7 +496,46 @@ function stopComfySync() {
 // ── 视图切换 ──────────────────────────────────────────────────────────────
 // 2026-10-09：「重载工作区」自顶栏移出为 #ws-body 右上角悬浮按钮；ready 态不再常显工具条
 // （无操作消息即收起，与其余态一致），原 showReadyBar / currentView 随之移除。
+// 2026-10-14：启动等待页重做——新增主标记状态与三步轨（中继 → 服务 → 前端）驱动。
 let barHasMessage = false;   // 顶栏当前展示的是否为操作消息（顶栏只在有消息时显示）
+
+// 主标记状态："" 旋转中 · "idle" 停转（未运行）· "done" 已完成 · "err" 错误
+function setMark(el, state) {
+  if (!el) return;
+  el.className = "mark" + (state ? " " + state : "");
+}
+
+// 三步轨：marks = [中继, 服务, 前端]，取值 ""（未到）| "on"（进行中）| "done" | "err"。
+// prefix 区分三套视图：booting="" · offline="off-" · error="err-"。
+// 连线点亮规则：前一步 done 则其后连线 done（与设计稿一致）。
+function setSteps(prefix, marks) {
+  const cells = [
+    [`${prefix}step-relay`, `${prefix}step-relay-lb`, `${prefix}step-track1`],
+    [`${prefix}step-svc`, `${prefix}step-svc-lb`, `${prefix}step-track2`],
+    [`${prefix}step-front`, `${prefix}step-front-lb`, null],
+  ];
+  cells.forEach(([beadId, lbId, trackId], i) => {
+    const m = marks[i] || "";
+    const bead = $(beadId);
+    if (bead) bead.className = "bead" + (m === "on" || m === "done" || m === "err" ? " " + m : "");
+    const lb = $(lbId);
+    if (lb) lb.className = "lb" + (m === "on" ? " on" : m === "done" ? " done" : m === "err" ? " err" : "");
+    if (trackId) {
+      const tr = $(trackId);
+      if (tr) tr.className = "track" + (m === "done" ? " done" : "");
+    }
+  });
+}
+
+// 「高级 ▾」展开/收起（默认收起）：按钮文案随状态切换
+function bindAdv(btnId, bodyId) {
+  const btn = $(btnId), body = $(bodyId);
+  if (!btn || !body) return;
+  btn.addEventListener("click", () => {
+    const show = body.classList.toggle("show");
+    btn.textContent = show ? "高级 ▴" : "高级 ▾";
+  });
+}
 
 function showView(name) {
   els.boot.classList.toggle("show", name === "booting");
@@ -506,8 +546,13 @@ function showView(name) {
   // 本页不再有该按钮，改由桥 op frame.reload（shellOp）统一驱动 requestFrameReload。
   // 「放入 hui 画布」悬浮按钮：仅「窗口态 + ready」显示（2026-10-09 画布移交）
   if (els.handoffBtn) els.handoffBtn.style.display = (name === "ready" && IS_NATIVE_WINDOW) ? "inline-block" : "none";
+  // ready 前的前端加载：ws-loading 遮罩自带「前端」步进行中，无需另设
   if (name !== "ready") { els.loading.classList.remove("show"); }
   else if (!frameLoaded) els.loading.classList.add("show");
+  // 进入 ready：两套等待计时统一归零（booting/offline 均已离场）
+  if (name === "ready") { bootWaitStart = 0; offWaitStart = 0; renderWaits(); }
+  // error 态：主标记与步骤轨为「中继」错误（静态文案仍由 tick 填充）
+  if (name === "error") { setMark(els.errMark, "err"); setSteps("err-", ["err", "", ""]); }
   // 顶栏缺省态：无操作消息则收起（有消息保留）；ready 态不再常显工具条（2026-10-09）
   if (!barHasMessage) els.bar.classList.remove("show");
 }
@@ -753,6 +798,33 @@ async function stopBackend() {
 // 服务不可达时的覆盖层（盖住 iframe，不让用户直接看到中继的 ECONNREFUSED JSON）
 let svcRequestedAt = 0;
 
+// ── 等待计时（视觉主角）─────────────────────────────────────────────────
+// 渲染拆为「已等待 / N / 秒」三段（N 为 30px 细体 accent，tabular-nums）；
+// 本块只负责按 1s 渲染与显隐，**起点与显示条件一律沿用下文 svcWaitStart 口径**（不改计算）。
+// offWaitStart：offline 覆盖层的起点（0 = 不显示）；bootWaitStart：booting 态本地起点。
+let offWaitStart = 0;
+let bootWaitStart = 0;
+function waitHtml(sec) {
+  return `<span class="lead">已等待</span><span class="n">${sec}</span><span class="u">秒</span>`;
+}
+function renderWaits() {
+  const now = Date.now();
+  const apply = (el, startAt) => {
+    if (!el) return;
+    if (startAt) {
+      el.innerHTML = waitHtml(Math.max(0, Math.round((now - startAt) / 1000)));
+      el.hidden = false;
+    } else {
+      el.hidden = true;
+      el.textContent = "";
+    }
+  };
+  apply(els.offWait, offWaitStart);
+  apply($("boot-wait"), bootWaitStart);
+}
+// 每秒一拍：把秒数推到新值（tab 隐藏时也不额外开销）；无起点时整段隐去
+setInterval(renderWaits, 1000);
+
 // 启动等待起点（两侧共享契约，与 app/ui/assets/panel-status.js 逐字一致，2026-10-14）：
 // 服务端权威优先（proc.startedAt，跨页一致、中继重启可恢复），本地起点仅作「点击瞬间到快照刷新之间」的兜底。
 function svcWaitStart(proc, localStart) {
@@ -775,20 +847,21 @@ function showOffline(st) {
   if (proc && proc.startedAt) bits.push(`上次由本 App 拉起：${String(proc.startedAt).replace("T", " ").slice(0, 19)}`);
   if (proc && proc.lastError) bits.push(`上次错误：${proc.lastError}`);
   els.offMeta.textContent = bits.join(" · ");
-  // 「已等待 XX 秒」独立成行（accent 色、13.5px，一眼可见）；无等待时隐藏。
-  // 2026-10-14 两侧同源：起点改用 svcWaitStart（服务端 proc.startedAt 优先），显示条件并入服务端 starting
-  // —— 从左侧面板点启动时本覆盖层也显示计时；主句与左栏 panel-status.js 逐字一致。
-  // ⚠ svcRequestedAt 的「重载闸门」语义（下方 statusTick ~L1104）与此处显示用途无关，勿动判定用途。
-  const waitStart = svcWaitStart(proc, svcRequestedAt);
-  if (svcRequestedAt || (proc && proc.starting === true)) {
-    els.offWait.textContent = `已等待 ${Math.max(0, Math.round((Date.now() - waitStart) / 1000))} 秒`;
-    els.offWait.hidden = false;
-  } else {
-    els.offWait.hidden = true;
-    els.offWait.textContent = "";
-  }
+  // 等待口径同源（一字不改）：起点 svcWaitStart(proc, svcRequestedAt)，显示条件 svcRequestedAt || proc.starting；
+  // 2026-10-14 新布局：该秒数即「计时主角」（off-wait，每秒刷新，与左栏 panel-status.js 同源）。
+  // ⚠ svcRequestedAt 的「重载闸门」语义（下方 statusTick）与此处显示用途无关，勿动判定用途。
+  const waiting = !!(svcRequestedAt || (proc && proc.starting === true));
+  offWaitStart = waiting ? svcWaitStart(proc, svcRequestedAt) : 0;
+  // 主句 / 主标记 / 三步轨（offline：中继已完成 → 服务进行中；未启动 → 服务红）
+  els.offNote.textContent = waiting ? "正在启动 ComfyUI 服务…" : "ComfyUI 服务未运行";
+  setMark(els.offMark, waiting ? "" : "idle");
+  setSteps("off-", ["done", waiting ? "on" : "err", ""]);
+  const hint = $("off-hint");
+  if (hint) hint.textContent = waiting
+    ? "首次启动约 30～90 秒（依赖导入），启动完成后自动进入"
+    : "本机 127.0.0.1:8188 上没有服务在跑；服务由计划任务拉起，独立于 Hana 存活";
+  renderWaits();
   if (!els.offline.classList.contains("show")) {
-    els.offNote.textContent = "点「启动服务」开始；首次启动约 30～90 秒（依赖导入）。";
     showView("offline");
   }
 }
@@ -865,6 +938,9 @@ function describeBoot(boot) {
 }
 
 // ── 主流程 ────────────────────────────────────────────────────────────────
+// booting 态步骤轨保守映射（2026-10-14，工具单硬约束 5）：
+//   phase=idle/stopped → 中继步进行中；phase=starting → 中继完成、服务步进行中；
+//   phase 未知（兼容过渡）→ 中继完成、服务步进行中。`#ws-loading` 遮罩自带「前端」步。
 async function tick() {
   let boot;
   try {
@@ -875,6 +951,8 @@ async function tick() {
     els.errMeta.textContent = "";
     els.errRawWrap.style.display = "";
     els.errRaw.textContent = String(e && e.stack || e);
+    bootWaitStart = 0;
+    renderWaits();
     return;
   }
 
@@ -893,6 +971,7 @@ async function tick() {
     }
     if (built.error) console.warn("[comfyui-hana] 代理路径构造失败：", built.error);
     showView("ready");
+    void introCheck(); // 说明页弹层：服务就绪点检查一次（内部幂等，同页会话只弹一次；失败静默）
     if (frameRuntimeId !== boot.runtimeId) {
       frameRuntimeId = boot.runtimeId;
       frameLoaded = false;
@@ -913,6 +992,8 @@ async function tick() {
     }
     startStatusPolling();
     stopBootPolling();
+    bootWaitStart = 0; // 进入 ready：启动等待结束
+    renderWaits();
     return;
   }
 
@@ -924,12 +1005,21 @@ async function tick() {
     els.errMeta.textContent = describeBoot(boot) + (boot.error ? ` · code=${boot.error.code}` : "");
     els.errRawWrap.style.display = "";
     els.errRaw.textContent = JSON.stringify(boot, null, 2);
+    bootWaitStart = 0; // 中继错误：启动等待结束
+    renderWaits();
   } else {
     showView("booting");
     els.bootNote.textContent = boot.note || "正在启动……";
     els.bootMeta.textContent = describeBoot(boot);
     els.bootRawWrap.style.display = "";
     els.bootRaw.textContent = JSON.stringify(boot, null, 2);
+    // 步骤轨 + 主标记按 phase 驱动（idle/stopped：等中继；其怹：中继已完成、服务进行中）
+    setMark(els.bootMark, "");
+    if (boot.phase === "idle" || boot.phase === "stopped") setSteps("", ["on", "", ""]);
+    else setSteps("", ["done", "on", ""]);
+    // 启动等待计时（视觉主角）：本布连续 booting 的本地起点；离开 booting 时清零
+    if (!bootWaitStart) bootWaitStart = Date.now();
+    renderWaits();
   }
 }
 
@@ -1131,7 +1221,7 @@ async function statusTick() {
         setBar(null); // 清掉「已请求启动…」等操作提示
         offlineSince = 0; // 本轮离线窗口关闭
       }
-      if (svcRequestedAt) { svcRequestedAt = 0; $("off-note").textContent = ""; els.offWait.hidden = true; }
+      if (svcRequestedAt) { svcRequestedAt = 0; els.offNote.textContent = "ComfyUI 服务未运行"; offWaitStart = 0; renderWaits(); }
       // 服务运行中的常驻控制条已移除（2026-09-27）：服务控制只留左侧状态面板
       // 宿主主题变更提示条已移除（2026-10-11）：刷新动作由 scheduleThemeRefresh 自行完成，
       // 该提示不消失（重载的是内层 iframe、外层壳页不重载，标志位留在 true 上），属视觉噪声。
@@ -1355,10 +1445,62 @@ $("g-launch").addEventListener("click", () => { void guideLaunch(); });
 $("g-copy").addEventListener("click", () => { void guideCopyPrompt(); });
 $("guide-mask").addEventListener("click", (e) => { if (e.target === $("guide-mask")) guideHide(); });
 
+// ── 说明页弹层（首次进入工作区自动弹一次）──────────────────────────────────
+// 标记读写走本 App 自有路由 /comfyui-hana/intro（随 hana.api.fetch 自带 surface 凭据）；
+// 幂等：同一页会话只弹一次（introTried 在任何 await 前同步置位）；GET 失败/异常一律静默返回，不打扰用户。
+// 资源：同目录 ./intro.html（与 workspace.html 同在 App ui/ 路由下，相对寻址即可），src 带 ?theme= 跟随工作区明暗。
+let introTried = false;
+let introShown = false;
+
+async function introCheck() {
+  if (introTried) return;
+  introTried = true; // 幂等闸门：先置位再 await，重入直接出
+  let j = null;
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/intro", { cache: "no-store" });
+    if (!r || !r.ok) return; // GET 失败：静默不弹（不报错弹条）
+    j = await r.json();
+  } catch { return; } // 异常：静默不弹
+  if (!j || j.ok === false || j.seen === true) return;
+  const mask = $("intro-mask"), frame = $("intro-frame");
+  if (!mask || !frame) return;
+  frame.src = `./intro.html?theme=${hostThemeIsDark() ? "dark" : "light"}`;
+  mask.classList.add("show");
+  introShown = true;
+}
+
+function introHide() {
+  const mask = $("intro-mask");
+  if (mask) mask.classList.remove("show");
+  introShown = false;
+}
+
+// 点「我知道了」：POST {seen:true, optOut:<勾选态>} → 隐藏弹层（写失败只静默，不留错误弹条）
+async function introCommit() {
+  const box = $("intro-optout");
+  const optOut = !!(box && box.checked);
+  const frame = $("intro-frame");
+  if (frame) frame.src = "about:blank"; // 卸掉内层文档，避免隐藏后仍在后台存活
+  introHide();
+  try {
+    await hana.api.fetch("/comfyui-hana/intro", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seen: true, optOut }),
+    });
+  } catch { /* 静默：标记未写成则下次仍会弹，不打扰用户 */ }
+}
+
+if ($("intro-ok")) $("intro-ok").addEventListener("click", () => { void introCommit(); });
+
 bindModeSelect($("sel-mode"));
 bindModeSelect($("sel-mode2"));
-$("btn-retry").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.bootNote.textContent = "已请求启动，等待中继就绪……"; });
-$("btn-retry2").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.errNote.textContent = "已请求启动，等待中继就绪……"; });
+// 「高级 ▾」展开/收起（三态各一套；booting / error 内含连接方式下拉，offline 为说明文案）
+bindAdv("adv-boot", "adv-boot-body");
+bindAdv("adv-err", "adv-err-body");
+bindAdv("adv-off", "adv-off-body");
+$("btn-retry").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.bootNote.textContent = "已请求启动，等待中继就绪……"; bootWaitStart = Date.now(); renderWaits(); });
+$("btn-retry2").addEventListener("click", () => { void postRetryStart().catch(() => {}); els.errNote.textContent = "已请求启动，等待中继就绪……"; bootWaitStart = Date.now(); renderWaits(); });
 $("btn-reload-boot").addEventListener("click", () => { void tick(); });
 $("btn-svc-start").addEventListener("click", () => { void startBackend(); });
 $("btn-svc-guide").addEventListener("click", () => { guideShow(1); });

@@ -6,15 +6,20 @@
 <title>ComfyUI 工作区</title>
 <style>
 /* 主题：自包含两套色板（浅 / 深），跟随 hana.theme；不依赖宿主 CSS 变量 */
+/* 2026-10-14 启动等待页 UI 重做：色板对齐设计稿（浅 / 深两套，deep 沿用 body.t-dark 类名约定）*/
 :root {
-  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
-  --bg-page: #f7f3eb; --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
-  --ok: #2e7d32; --bad: #c62828; --warn-bg: rgba(198,40,40,.1); --warn-border: rgba(198,40,40,.35);
+  --text: #2c2c2c; --text-muted: #8f8c86; --faint: #b9b5ad;
+  --accent: #4e7a92; --accent-soft: rgba(78,122,146,.14);
+  --bg-page: #f6f2ea; --bg-card: rgba(255,255,255,.7); --bg-soft: rgba(0,0,0,.035);
+  --border: rgba(0,0,0,.10);
+  --ok: #3f8a52; --bad: #c0564c; --warn-bg: rgba(192,86,76,.1); --warn-border: rgba(192,86,76,.35);
 }
 body.t-dark {
-  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
-  --bg-page: #1b1e24; --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
-  --ok: #6fbf73; --bad: #e57373; --warn-bg: rgba(229,115,115,.12); --warn-border: rgba(229,115,115,.4);
+  --text: #dfe3e9; --text-muted: #8b929c; --faint: #5f6772;
+  --accent: #84adc6; --accent-soft: rgba(132,173,198,.16);
+  --bg-page: #191c22; --bg-card: rgba(255,255,255,.05); --bg-soft: rgba(255,255,255,.05);
+  --border: rgba(255,255,255,.11);
+  --ok: #6fb87f; --bad: #e07d72; --warn-bg: rgba(224,125,114,.12); --warn-border: rgba(224,125,114,.4);
 }
 * { box-sizing: border-box; }
 html, body { width: 100%; height: 100%; }
@@ -70,8 +75,8 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 #ws-frame-wrap.show { display: block; }
 #ws-frame { width: 100%; height: 100%; border: 0; display: block; background: var(--bg-page); }
 #ws-loading {
-  position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
-  gap: 10px; color: var(--text-muted); background: var(--bg-page); z-index: 2;
+  position: absolute; inset: 0; display: none; padding: 26px 22px 44px; overflow: auto; z-index: 2;
+  background: radial-gradient(120% 80% at 50% 0%, var(--accent-soft), transparent 60%) var(--bg-page);
 }
 #ws-loading.show { display: flex; }
 .spinner {
@@ -80,41 +85,105 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* 三态视图：booting / error */
-.view { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px; overflow: auto; }
+/* ── 三态视图：booting / offline / error（2026-10-14 视觉重做）──────────────
+   内容驱动高度的居中列：主标记 → 小字标题 → 状态主句 → 计时主角 → 三步轨
+   （中继 → 服务 → 前端）→ 提示 → 动作 →「高级」（内含连接方式下拉）。
+   整页 iframe：.view 铺满 + overflow:auto；列用 margin:auto 居中（小窗口不裁切）。 */
+.view {
+  position: absolute; inset: 0; display: none; padding: 26px 22px 44px; overflow: auto;
+  /* 底色不透明（线性色层压于渐变之下）：offline 态需盖住 iframe */
+  background: radial-gradient(120% 80% at 50% 0%, var(--accent-soft), transparent 60%) var(--bg-page);
+}
 .view.show { display: flex; }
-/* 服务未运行：盖住 iframe（不透明），避免把中继的 ECONNREFUSED JSON 直接抩给用户 */
-#view-offline { background: var(--bg-page); z-index: 3; }
-.panel {
-  width: min(560px, 100%); background: var(--bg-card); border: 0.5px solid var(--border);
-  border-radius: 14px; padding: 20px 22px;
+/* 服务未运行：盖住 iframe（不透明背景 + 高层级），避免把中继的 ECONNREFUSED JSON 直接丢给用户 */
+#view-offline { z-index: 3; }
+.col {
+  margin: auto; display: flex; flex-direction: column; align-items: center; text-align: center;
+  width: min(400px, 100%);
 }
-.panel h1 { margin: 0 0 4px; font-size: 17px; font-weight: 700; }
-.panel .sub { color: var(--text-muted); font-size: 12px; margin-bottom: 14px; }
-.panel .note { margin: 10px 0 14px; line-height: 1.7; }
-.panel .meta { color: var(--text-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
-/* 启动等待计时：独立于 meta 小字，accent 色 + 略大字号，一眼可见 */
-.panel .wait {
-  margin: 0 0 10px; font-size: 13.5px; font-weight: 600; letter-spacing: .01em;
-  color: var(--accent); font-variant-numeric: tabular-nums;
+
+/* 主标记：细环 + 呼吸晕 + 旋转弧 + 中心点脉冲 */
+.mark { position: relative; width: 62px; height: 62px; margin-bottom: 20px; }
+.mark .halo {
+  position: absolute; inset: -13px; border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-soft), transparent 68%);
+  animation: breathe 3.4s ease-in-out infinite;
 }
-.panel .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.panel button {
-  font-size: 12px; padding: 6px 14px; border-radius: 8px; cursor: pointer;
-  border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent);
+.mark .ring { position: absolute; inset: 0; border-radius: 50%; border: 2px solid var(--border); }
+.mark .arc {
+  position: absolute; inset: 0; border-radius: 50%; border: 2px solid transparent;
+  border-top-color: var(--accent); border-right-color: var(--accent); animation: spin 1.1s linear infinite;
 }
-.panel button:hover { background: var(--accent); color: #fff; }
-.panel button.primary { border-color: var(--accent); }
-.panel select {
-  font-size: 12px; padding: 4px 8px; border-radius: 8px; color: var(--text);
-  border: 0.5px solid var(--border); background: var(--bg-page);
+.mark .dot-core {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 5px var(--accent-soft); animation: pulse 2.2s ease-in-out infinite;
 }
-.panel details { margin-top: 14px; font-size: 11.5px; color: var(--text-muted); }
-.panel details summary { cursor: pointer; color: var(--text-muted); }
-.panel pre {
-  white-space: pre-wrap; word-break: break-all; background: rgba(127,127,127,.08);
+/* 停转 / 变色：未运行（idle）、已完成（done）、错误（err） */
+.mark.idle .arc { animation: none; opacity: 0; }
+.mark.idle .dot-core { background: var(--text-muted); box-shadow: 0 0 0 5px var(--bg-soft); animation: none; }
+.mark.done .arc { animation: none; border-color: transparent; border-top-color: var(--ok); border-right-color: var(--ok); transform: rotate(45deg); }
+.mark.done .dot-core { background: var(--ok); box-shadow: 0 0 0 5px rgba(63,138,82,.16); animation: none; }
+.mark.err .arc { animation: none; border-color: transparent; border-top-color: var(--bad); border-right-color: var(--bad); transform: rotate(45deg); }
+.mark.err .dot-core { background: var(--bad); box-shadow: 0 0 0 5px rgba(192,86,76,.16); animation: none; }
+
+.title { font-size: 12.5px; letter-spacing: .02em; color: var(--text-muted); margin-bottom: 6px; }
+.status { font-size: 15.5px; font-weight: 600; line-height: 1.5; min-height: 23px; }
+/* 计时：视觉主角（30px 细体 accent、tabular-nums） */
+.timer {
+  margin-top: 13px; display: flex; align-items: baseline; gap: 5px; color: var(--accent);
+  font-variant-numeric: tabular-nums; transition: opacity .25s;
+}
+.timer[hidden] { display: none; } /* 必须：作者样式 display:flex 会压过 UA 的 [hidden]{display:none} */
+.timer .lead { font-size: 12.5px; font-weight: 500; opacity: .8; }
+.timer .n { font-size: 30px; font-weight: 300; letter-spacing: -.02em; line-height: 1; }
+.timer .u { font-size: 12.5px; font-weight: 500; opacity: .8; }
+
+/* 三步轨：圆点 + 连接线；当前步呼吸波纹，完成变绿，错误变红 */
+.steps { margin-top: 22px; display: flex; align-items: flex-start; justify-content: center; width: 100%; }
+.step { display: flex; flex-direction: column; align-items: center; gap: 7px; width: 72px; }
+.bead { width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--faint); position: relative; transition: .3s; }
+.bead.on { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.bead.on::after { content: ""; position: absolute; inset: -2px; border-radius: 50%; border: 2px solid var(--accent); animation: ripple 1.9s ease-out infinite; }
+.bead.done { border-color: var(--ok); background: var(--ok); }
+.bead.err { border-color: var(--bad); background: var(--bad); }
+.lb { font-size: 10.5px; color: var(--faint); letter-spacing: .02em; transition: .3s; white-space: nowrap; }
+.lb.on { color: var(--accent); font-weight: 600; }
+.lb.done { color: var(--text-muted); }
+.lb.err { color: var(--bad); }
+.track { height: 2px; flex: 1; max-width: 34px; background: var(--border); border-radius: 2px; margin: 5px -4px 0; transition: .3s; }
+.track.done { background: var(--ok); opacity: .55; }
+
+.hint { margin-top: 20px; font-size: 11.5px; color: var(--faint); line-height: 1.6; min-height: 18px; }
+.meta { margin-top: 8px; font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; word-break: break-word; }
+.actions { margin-top: 20px; display: flex; gap: 10px; align-items: center; justify-content: center; flex-wrap: wrap; }
+/* 幽灵按钮（主按钮 accent 描边） */
+.gbtn {
+  font: inherit; font-size: 12px; padding: 6px 15px; border-radius: 9px; cursor: pointer;
+  border: .5px solid var(--border); background: var(--bg-card); color: var(--text-muted); transition: .18s;
+}
+.gbtn:hover { color: var(--accent); border-color: var(--accent); }
+.gbtn.pri { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 55%, transparent); }
+.gbtn.pri:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* 「高级 ▾」：默认收起，展开露出连接方式下拉 */
+.adv { margin-top: 15px; font-size: 11px; color: var(--faint); cursor: pointer; user-select: none; letter-spacing: .02em; }
+.adv:hover { color: var(--text-muted); }
+.adv-body { margin-top: 10px; display: none; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-muted); justify-content: center; flex-wrap: wrap; }
+.adv-body.show { display: flex; }
+.adv-body select {
+  font-size: 11.5px; padding: 4px 9px; border-radius: 8px; color: var(--text);
+  border: .5px solid var(--border); background: var(--bg-page); outline: none;
+}
+.col details { margin-top: 14px; font-size: 11.5px; color: var(--text-muted); width: 100%; text-align: left; }
+.col details summary { cursor: pointer; }
+.col pre {
+  white-space: pre-wrap; word-break: break-all; background: var(--bg-soft);
   border-radius: 8px; padding: 8px 10px; margin: 8px 0 0; max-height: 220px; overflow: auto;
 }
+
+@keyframes breathe { 0%, 100% { opacity: .55; transform: scale(.94); } 50% { opacity: 1; transform: scale(1.05); } }
+@keyframes pulse { 0%, 100% { transform: translate(-50%, -50%) scale(.82); opacity: .75; } 50% { transform: translate(-50%, -50%) scale(1); opacity: 1; } }
+@keyframes ripple { 0% { transform: scale(1); opacity: .7; } 100% { transform: scale(2.4); opacity: 0; } }
 .chip { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); }
 .chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
 .chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
@@ -138,6 +207,17 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
 .tgt .m { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
 .tgt.rec .m b { color: var(--accent); }
 .tgt-custom { width: 100%; text-align: left; padding: 8px 11px; border: 0.5px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-muted); }
+
+/* ── 说明页弹层（结构照抄 #guide-mask：遮罩 + .modal；仅新增，不动上方规则） ── */
+#intro-mask { position: fixed; inset: 0; background: rgba(0,0,0,.42); display: none; align-items: center; justify-content: center; z-index: 60; padding: 20px; }
+#intro-mask.show { display: flex; }
+#intro-mask .modal { width: min(720px, 92vw); max-height: 86vh; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+#intro-frame { width: 100%; height: 70vh; max-height: calc(86vh - 76px); border: 0.5px solid var(--border); border-radius: 10px; background: var(--bg-card); display: block; }
+#intro-actions { display: flex; align-items: center; gap: 10px; }
+#intro-actions .spacer { flex: 1; }
+#intro-actions label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); cursor: pointer; }
+#intro-actions input { accent-color: var(--accent); flex: none; }
+#intro-ok { font-size: 12.5px; padding: 7px 16px; border-radius: 8px; cursor: pointer; border: 0.5px solid var(--accent); background: var(--accent); color: #fff; }
 </style>
 </head>
 <body>
@@ -152,23 +232,55 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
   </div>
   <div id="ws-bar"><span id="ws-bar-text"></span><span class="spacer"></span><button id="ws-bar-action" style="display:none"></button><button id="ws-bar-action2" style="display:none"></button></div>
   <div id="ws-body">
-    <div id="ws-loading"><span class="spinner"></span><span>正在加载 ComfyUI 前端……</span></div>
+    <!-- 前端加载遮罩（ready 后 / 帧重载）：视觉对齐设计稿「加载前端」态（三步轨：前端进行中） -->
+    <div id="ws-loading">
+      <div class="col">
+        <div class="mark">
+          <div class="halo"></div><div class="ring"></div><div class="arc"></div><div class="dot-core"></div>
+        </div>
+        <div class="title">ComfyUI 工作区</div>
+        <div class="status">正在加载 ComfyUI 前端…</div>
+        <div class="steps">
+          <div class="step"><div class="bead done"></div><div class="lb done">中继</div></div>
+          <div class="track done"></div>
+          <div class="step"><div class="bead done"></div><div class="lb done">服务</div></div>
+          <div class="track done"></div>
+          <div class="step"><div class="bead on"></div><div class="lb on">前端</div></div>
+        </div>
+        <div class="hint">前端资源较大，首次加载稍慢；加载完成后自动进入</div>
+      </div>
+    </div>
     <!-- 2026-10-12：原「重载工作区」悬浮按钮已迁入宿主左侧栏（panel.html #p-reload-ws →
          POST /comfyui-hana/shell/reload → 壳页 shellOp frame.reload）。 -->
     <!-- 「放入 hui 画布」悬浮按钮：仅窗口态（外开窗口）ready 时由 workspace.js 显示（2026-10-09 画布移交） -->
     <button id="ws-handoff" title="把当前画布保存并移交到 Hana 主工作区（工作区卡自动接住）">放入 hui 画布</button>
     <div id="ws-frame-wrap"><iframe id="ws-frame" title="ComfyUI"></iframe></div>
 
+    <!-- ── 启动等待（booting）：等中继 / 等服务 / 等前端 ─────────────────── -->
     <div class="view show" id="view-booting">
-      <div class="panel">
-        <h1>ComfyUI 工作区</h1>
-        <div class="sub">正在连接本机 ComfyUI（127.0.0.1:8188）· 中继由本 App 受管拉起</div>
-        <div class="row"><span class="spinner"></span><span id="boot-note">正在读取状态……</span></div>
-        <div class="note meta" id="boot-meta"></div>
-        <div class="row">
-          <button class="primary" id="btn-retry" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不启动 ComfyUI 服务本身">重启中继</button>
-          <button id="btn-reload-boot">刷新状态</button>
-          <span class="meta">连接方式</span>
+      <div class="col">
+        <div class="mark" id="boot-mark">
+          <div class="halo"></div><div class="ring"></div><div class="arc"></div><div class="dot-core"></div>
+        </div>
+        <div class="title">ComfyUI 工作区</div>
+        <div class="status" id="boot-note">正在启动 ComfyUI 服务…</div>
+        <div id="boot-wait" class="timer" hidden></div>
+        <div class="steps" id="boot-steps">
+          <div class="step"><div class="bead" id="step-relay"></div><div class="lb" id="step-relay-lb">中继</div></div>
+          <div class="track" id="step-track1"></div>
+          <div class="step"><div class="bead" id="step-svc"></div><div class="lb" id="step-svc-lb">服务</div></div>
+          <div class="track" id="step-track2"></div>
+          <div class="step"><div class="bead" id="step-front"></div><div class="lb" id="step-front-lb">前端</div></div>
+        </div>
+        <div class="hint" id="boot-hint">首次启动约 30～90 秒（依赖导入），启动完成后自动进入</div>
+        <div class="meta" id="boot-meta"></div>
+        <div class="actions">
+          <button class="gbtn pri" id="btn-retry" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不启动 ComfyUI 服务本身">重启中继</button>
+          <button class="gbtn" id="btn-reload-boot">刷新状态</button>
+        </div>
+        <div class="adv" id="adv-boot">高级 ▾</div>
+        <div class="adv-body" id="adv-boot-body">
+          <span>连接方式</span>
           <select id="sel-mode">
             <option value="direct">直连 127.0.0.1:8188（推荐）</option>
             <option value="auto">自动（直连 → 代理路径逐级回落）</option>
@@ -180,31 +292,61 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
       </div>
     </div>
 
+    <!-- ── 服务未运行（offline）：盖住 iframe ────────────────────────── -->
     <div class="view" id="view-offline">
-      <div class="panel">
-        <h1>ComfyUI 服务未运行</h1>
-        <div class="sub">中继已就绪，但 127.0.0.1:8188 上没有 ComfyUI 在跑。服务由计划任务拉起，独立于 Hana 存活。</div>
-        <div class="note" id="off-note">点「启动服务」开始；首次启动约 30～90 秒（依赖导入）。</div>
-        <div class="row">
-          <button class="primary" id="btn-svc-start">启动服务</button>
-          <button class="primary" id="btn-svc-guide" style="display:none">安装引导</button>
-          <button id="btn-svc-reload">刷新工作区</button>
+      <div class="col">
+        <div class="mark idle" id="off-mark">
+          <div class="halo"></div><div class="ring"></div><div class="arc"></div><div class="dot-core"></div>
         </div>
-        <div id="off-wait" class="wait" hidden></div>
-        <div class="note meta" id="off-meta"></div>
+        <div class="title">ComfyUI 工作区</div>
+        <div class="status" id="off-note">ComfyUI 服务未运行</div>
+        <!-- 计时主角：已等待 N 秒（口径由 workspace.js 计算，拆为数字/单位两段；与左栏 panel-status.js 同源） -->
+        <div id="off-wait" class="timer" hidden></div>
+        <div class="steps" id="off-steps">
+          <div class="step"><div class="bead" id="off-step-relay"></div><div class="lb" id="off-step-relay-lb">中继</div></div>
+          <div class="track" id="off-step-track1"></div>
+          <div class="step"><div class="bead" id="off-step-svc"></div><div class="lb" id="off-step-svc-lb">服务</div></div>
+          <div class="track" id="off-step-track2"></div>
+          <div class="step"><div class="bead" id="off-step-front"></div><div class="lb" id="off-step-front-lb">前端</div></div>
+        </div>
+        <div class="hint" id="off-hint">本机 127.0.0.1:8188 上没有服务在跑；服务由计划任务拉起，独立于 Hana 存活</div>
+        <div class="meta" id="off-meta"></div>
+        <div class="actions">
+          <button class="gbtn pri" id="btn-svc-start">启动服务</button>
+          <button class="gbtn pri" id="btn-svc-guide" style="display:none">安装引导</button>
+          <button class="gbtn" id="btn-svc-reload">刷新工作区</button>
+        </div>
+        <div class="adv" id="adv-off">高级 ▾</div>
+        <div class="adv-body" id="adv-off-body">
+          <span>中继与服务均由本 App 受管；诊断细节见左栏状态面板。</span>
+        </div>
       </div>
     </div>
 
+    <!-- ── 中继未就绪（error）────────────────────────────────── -->
     <div class="view" id="view-error">
-      <div class="panel">
-        <h1>ComfyUI 工作区 · 中继未就绪</h1>
-        <div class="sub">本页会在中继恢复后自动进入工作区；也可手动重试。</div>
-        <div class="note" id="err-note">—</div>
-        <div class="note meta" id="err-meta"></div>
-        <div class="row">
-          <button class="primary" id="btn-retry2" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不启动 ComfyUI 服务本身">重启中继</button>
-          <button id="btn-reload2">刷新页面</button>
-          <span class="meta">连接方式</span>
+      <div class="col">
+        <div class="mark err" id="err-mark">
+          <div class="halo"></div><div class="ring"></div><div class="arc"></div><div class="dot-core"></div>
+        </div>
+        <div class="title">ComfyUI 工作区</div>
+        <div class="status" id="err-note">—</div>
+        <div class="steps" id="err-steps">
+          <div class="step"><div class="bead err" id="err-step-relay"></div><div class="lb err" id="err-step-relay-lb">中继</div></div>
+          <div class="track" id="err-step-track1"></div>
+          <div class="step"><div class="bead" id="err-step-svc"></div><div class="lb" id="err-step-svc-lb">服务</div></div>
+          <div class="track" id="err-step-track2"></div>
+          <div class="step"><div class="bead" id="err-step-front"></div><div class="lb" id="err-step-front-lb">前端</div></div>
+        </div>
+        <div class="hint">本页会在中继恢复后自动进入工作区；也可手动重试</div>
+        <div class="meta" id="err-meta"></div>
+        <div class="actions">
+          <button class="gbtn pri" id="btn-retry2" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不启动 ComfyUI 服务本身">重启中继</button>
+          <button class="gbtn" id="btn-reload2">刷新页面</button>
+        </div>
+        <div class="adv" id="adv-err">高级 ▾</div>
+        <div class="adv-body" id="adv-err-body">
+          <span>连接方式</span>
           <select id="sel-mode2">
             <option value="direct">直连 127.0.0.1:8188（推荐）</option>
             <option value="auto">自动（直连 → 代理路径逐级回落）</option>
@@ -247,6 +389,18 @@ body { margin: 0; background: var(--bg-page); color: var(--text); font: 13px/1.5
       <h2 id="g-done-title">已发起</h2>
       <p class="sub" id="g-done-note"></p>
       <div class="opts"><button class="primary" id="g-close">好</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- 说明页弹层（首次进入工作区自动弹一次；内容为同目录 ./intro.html，见 workspace.js introCheck） -->
+<div id="intro-mask">
+  <div class="modal">
+    <iframe id="intro-frame" src="about:blank" title="使用说明"></iframe>
+    <div id="intro-actions">
+      <label><input type="checkbox" id="intro-optout" checked>不再提示</label>
+      <span class="spacer"></span>
+      <button type="button" id="intro-ok">我知道了</button>
     </div>
   </div>
 </div>

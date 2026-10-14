@@ -1,4 +1,4 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.12
+# Hana-ComfyUI（v2 App，开发仓）· v0.13
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
@@ -90,6 +90,14 @@
   读文件 → UI→API 转换 → inputs 注入 → `/prompt` 提交全在中继完成，绕开宿主 `sdk.runtime.fetch` 隧道的
   请求 1 MiB / 响应 4 MiB 硬限；4MiB+ 工作流可直接提交（inline 对象形态走原链路）。共享逻辑 `lib/workflow-tools.mjs`（app/中继同源）；
   方案 `docs/大工作流提交修复-20260929.md`；测试 `tools/m13-checks/test-submit-file.mjs`（中继级 13/13 + 宿主段 E2E 通过，2026-09-29）。
+- **提交历史系统（v0.13 新增，2026-10-13~14）**：
+  - **主键改画布身份 id**：历史目录键独立于显示名，改名/移动不丢（mint 判据锚定文件系统事实；`history-migrate` 端点 + 存量重排工具）；
+  - **提交历史框**（画布底部）：横轴刻度形态——外框色=谁提交（蓝 user / 紫 agent）、线型=操作（实线 run / 虚线存档）、内条堆=本次碰过的画布分区（各自框色）、宽块=合并提交、金点=HEAD；单击缩略图浮层 / 双击确认回跳 / 悬停气泡；
+  - **提交树**：横向泳道（X=时间、Y=分支）+ 拓扑连线；连线不交叉（泳道 G 算法）、跨泳道固定过渡段 + 直线（两端与直线相切）；紧凑 / 时序两视角切换；
+  - **agent 提交标紫框**：桥内 `historyCommitSource` 标志——Agent 经 `canvas.queue` 提交标 `source=agent`（紫），用户原生点运行仍为 user（蓝）；人机共驾的归属在历史里可辨；
+  - **预览图降分辨率 + 磁盘缓存**（`bridge/thumbs.py` + `/hana_bridge/thumb`）：2.7MB → 39KB、二次命中 5ms；
+  - **首次进入引导**：工作区就绪后自动弹「提交历史框 & 提交树」说明页一次（跟随工作区明暗、带「不再提示」），标记持久化在 app-data（`/comfyui-hana/intro`）；
+  - **启动等待页 UI 重做**：主标记呼吸环 + 计时主角 + 三步轨（中继→服务→前端），连接方式收进「高级」。
 - **语义层完善批（v0.12 新增，2026-10-09）**：
   - **source=file 文件源通道**：读（`get`/`check`/`outline`/`trace`/`summary`/`diff`）与写（`patch` 事务：全成/零写盘/自动 `.bak`/`dryRun`/`verify`；组操作 `addGroup`/`setGroup`/`removeGroup`；`cloneNodes` 克隆子图）均支持文件路径；
   - **lib 补强**：`check` 扩容（`MISSING_REQUIRED` + `DOMAIN_DIV16`/`STEPS_RANGE`/`SAVE_NAME`/`DENOISE_RANGE`，rules 可裁剪）、`outline` `detail=nodes` 下钻、`trace` `multi` 多级链、邻接选择器（`#id/down`、`#id/up:N`）、符号行 + `semanticRev`、`diff` 两文件语义图 diff；

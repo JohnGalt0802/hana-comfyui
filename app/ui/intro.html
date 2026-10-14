@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>提交历史框 &amp; 提交树 · 怎么看</title>
+<link rel="stylesheet" href="./assets/hana-card-style.css">
+<style>
+  /* 主题：自包含两套色板（浅 / 深），深色由 URL 参数 ?theme=dark 触发（body.t-dark）；
+     变量命名沿用工作区约定，供 hana-card-style 的 token 链读取。 */
+  :root {
+    --bg-page: #f6f2ea; --bg-card: rgba(255,255,255,.7);
+    --text: #2c2c2c; --text-light: #58615b; --text-muted: #8f8c86;
+    --border: rgba(0,0,0,.10);
+    --accent: #4e7a92; --accent-soft: rgba(78,122,146,.14);
+    --sidebar-bg: #eef0e9;
+    color-scheme: light;
+  }
+  body.t-dark {
+    --bg-page: #191c22; --bg-card: rgba(255,255,255,.05);
+    --text: #dfe3e9; --text-light: #a8b0ba; --text-muted: #8b929c;
+    --border: rgba(255,255,255,.11);
+    --accent: #84adc6; --accent-soft: rgba(132,173,198,.16);
+    --sidebar-bg: #22262e;
+    color-scheme: dark;
+  }
+  html, body { min-height: 100%; }
+  body.hs-page { background: var(--bg-page); }
+
+  /* 局部色全部由宿主主题 token 派生 —— 浅/深主题各自成立；
+     只有「语义色」（谁提交=蓝紫、功能区色）保持固定，因为它们必须对应画布里的真实颜色。 */
+  .hs-page{
+    --hx-panel:color-mix(in srgb, var(--hs-ink) 4%, var(--hs-bg));
+    --hx-cell:color-mix(in srgb, var(--hs-ink) 8%, var(--hs-bg));
+    --hx-line:color-mix(in srgb, var(--hs-ink) 22%, transparent);
+    --hx-lane:color-mix(in srgb, var(--hs-ink) 9%, transparent);
+    --hx-track:color-mix(in srgb, var(--hs-ink) 40%, transparent);
+    --hx-user:#5aa0d8;   /* 语义色：人提交 */
+    --hx-agent:#b189e0;  /* 语义色：agent 提交 */
+    --hx-head:#e8a93c;   /* 语义色：最新一版 */
+  }
+
+  /* ── 面板（承载刻度/树的意象容器） ── */
+  .hx-stage{ background:var(--hx-panel); border:1px solid var(--hs-line); border-radius:14px;
+    padding:22px 20px 18px; }
+  .hx-stage-cap{ display:flex; align-items:baseline; justify-content:space-between;
+    gap:12px; margin-bottom:16px; }
+  .hx-stage-cap b{ font:600 13px/1.3 var(--hs-sans, sans-serif); color:var(--hs-ink); letter-spacing:.02em; }
+  .hx-stage-cap span{ font:400 11.5px/1.3 var(--hs-sans, sans-serif); color:var(--hs-muted); }
+
+  /* ── 刻度（外框=谁+操作；内部彩条=动过的功能区） ── */
+  .hx-tick{ position:relative; flex:none;
+    width:16px; height:46px; padding:2.5px; box-sizing:border-box;
+    display:flex; flex-direction:column; border-radius:6px;
+    border:1.6px solid; background:var(--hx-cell);
+    transition:transform .16s, box-shadow .16s; }
+  .hx-tick.is-user{ border-color:color-mix(in srgb, var(--hx-user) 82%, transparent);
+    box-shadow:0 1px 3px color-mix(in srgb, var(--hx-user) 20%, transparent); }
+  .hx-tick.is-agent{ border-color:color-mix(in srgb, var(--hx-agent) 82%, transparent);
+    box-shadow:0 1px 3px color-mix(in srgb, var(--hx-agent) 20%, transparent); }
+  .hx-tick.is-merge{ width:28px; border-width:2px; }
+  .hx-tick.is-save{ border-style:dashed; }
+  .hx-tick.is-sel{ box-shadow:0 0 0 2px var(--hs-ink); }
+  .hx-tick.is-head::after{ content:""; position:absolute; right:-3.5px; bottom:-3.5px;
+    width:7px; height:7px; border-radius:50%; background:var(--hx-head);
+    box-shadow:0 0 0 1.6px var(--hx-panel); }
+
+  .hx-bars{ display:flex; flex-direction:column; gap:2px; flex:1 1 auto; justify-content:center; }
+  .hx-bars i{ display:block; flex:1 1 0; min-height:2px; border-radius:1.5px;
+    background:var(--hx-track); }
+  .hx-bars i.on{ background:var(--b); }
+
+  .hx-axis{ display:flex; align-items:center; gap:9px; padding:6px 2px; }
+  .hx-flow{ display:flex; align-items:center; justify-content:space-between;
+    margin-top:12px; font:400 11.5px/1 var(--hs-sans, sans-serif); color:var(--hs-muted); }
+  .hx-hint{ margin:14px 0 0; font:400 12.5px/1.62 var(--hs-sans, sans-serif); color:var(--hs-sub); }
+  .hx-hint b{ color:var(--hs-ink); font-weight:600; }
+
+  /* 提交历史框：左图右字 */
+  .hx-bar2{ display:grid; grid-template-columns: 1.28fr 1fr; gap:24px; align-items:center; }
+  .hx-bar2-txt{ display:grid; gap:11px; }
+  .hx-bar2-txt .hx-hint{ margin:0 0 2px; }
+  .hx-keys{ list-style:none; margin:0; padding:0; display:grid; gap:9px; }
+  .hx-keys li{ display:grid; grid-template-columns:auto 1fr; gap:9px; align-items:baseline;
+    font:400 12.5px/1.5 var(--hs-sans, sans-serif); color:var(--hs-sub); }
+  .hx-keys .hx-key{ font:600 11.5px/1.5 var(--hs-sans, sans-serif); color:var(--hs-ink);
+    white-space:nowrap; letter-spacing:.01em; }
+
+  /* ── 提交树：横向泳道（X=时间向右, Y=分支向下） ── */
+  .hx-tree{ position:relative; width:406px; height:124px; margin:0 auto; }
+  .hx-tree .hx-edges{ position:absolute; left:0; top:0; overflow:visible; }
+  .hx-edge-g{ stroke:var(--hx-line); stroke-width:2.2; stroke-linecap:round; stroke-linejoin:round; fill:none; }
+  .hx-lane{ position:absolute; left:0; width:406px; height:1px; background:var(--hx-lane); }
+  .hx-lanelabel{ position:absolute; font:600 11px/1 var(--hs-sans, sans-serif);
+    color:var(--hs-muted); letter-spacing:.04em; }
+  .hx-node{ position:absolute; transform:translate(-50%,-50%);
+    display:flex; flex-direction:column; width:16px; min-height:40px;
+    padding:2.5px; box-sizing:border-box; border-radius:6px; border:1.6px solid;
+    background:var(--hx-cell); }
+  .hx-node.is-user{ border-color:color-mix(in srgb, var(--hx-user) 82%, transparent);
+    box-shadow:0 1px 3px color-mix(in srgb, var(--hx-user) 20%, transparent); }
+  .hx-node.is-agent{ border-color:color-mix(in srgb, var(--hx-agent) 82%, transparent);
+    box-shadow:0 1px 3px color-mix(in srgb, var(--hx-agent) 20%, transparent); }
+  .hx-node.is-merge{ width:28px; border-width:2px; }
+  .hx-node.is-head::after{ content:""; position:absolute; right:-3.5px; bottom:-3.5px;
+    width:7px; height:7px; border-radius:50%; background:var(--hx-head);
+    box-shadow:0 0 0 1.6px var(--hx-panel); }
+
+  .hx-legend{ display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:15px;
+    font:400 11.5px/1.5 var(--hs-sans, sans-serif); color:var(--hs-sub); }
+  .hx-legend span{ display:inline-flex; align-items:center; gap:6px; }
+  .hx-chip{ width:11px; height:11px; border-radius:3px; flex:none; }
+
+  /* ── 「怎么读」图例 ── */
+  .hx-read{ list-style:none; margin:0; padding:0; display:grid; gap:18px; }
+  .hx-read li{ display:grid; grid-template-columns:auto 1fr; align-items:center; gap:16px; }
+  .hx-pair{ display:flex; gap:6px; padding:2px 4px; }
+  .hx-pair .hx-tick{ width:15px; height:42px; }
+  .hx-read b{ display:block; font:600 13px/1.4 var(--hs-sans, sans-serif);
+    color:var(--hs-ink); margin-bottom:3px; }
+  .hx-read em{ font-style:normal; font:400 12.5px/1.55 var(--hs-sans, sans-serif); color:var(--hs-sub); }
+</style>
+</head>
+<body class="hs-page">
+<main class="hs-shell">
+
+  <header>
+    <p class="hs-eyebrow">Hana-ComfyUI · 提交历史</p>
+    <h1 class="hs-title">你做的每一步，都留了痕</h1>
+    <p class="hs-lead">每提交一次，画布底下就多一格。那条横在底部的，叫<b>提交历史框</b>；能展开铺成一片的，叫<b>提交树</b>——它们是同一段历史的两种看法：一个按时间排开，一个按血脉分层。</p>
+  </header>
+
+  <section class="hs-section" aria-labelledby="hx-bar-heading">
+    <div class="hs-section-head">
+      <h2 class="hs-heading" id="hx-bar-heading">提交历史框</h2>
+      <span class="hs-caption">按时间，从左到右</span>
+    </div>
+    <div class="hx-bar2">
+      <div class="hx-stage">
+        <div class="hx-stage-cap">
+          <b>一格 = 一次提交</b>
+          <span>越靠右越新</span>
+        </div>
+        <div class="hx-axis" aria-hidden="true">
+          <span class="hx-tick is-user"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+          <span class="hx-tick is-user"><span class="hx-bars"><i></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+          <span class="hx-tick is-user is-sel"><span class="hx-bars"><i></i><i></i><i class="on" style="--b:#a1309b"></i><i class="on" style="--b:#5a6470"></i></span></span>
+          <span class="hx-tick is-user"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+          <span class="hx-tick is-agent"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i class="on" style="--b:#b58b2a"></i><i class="on" style="--b:#a1309b"></i><i></i></span></span>
+          <span class="hx-tick is-agent is-merge"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+          <span class="hx-tick is-user is-head"><span class="hx-bars"><i></i><i></i><i></i><i class="on" style="--b:#5a6470"></i></span></span>
+        </div>
+        <div class="hx-flow">
+          <span>← 较早</span>
+          <span>较晚 →</span>
+        </div>
+      </div>
+      <div class="hx-bar2-txt">
+        <p class="hx-hint">每格都是一次提交，越靠右越新。格子里的小彩条，就是这一次动过的画布功能区。</p>
+        <ul class="hx-keys">
+          <li><b class="hx-key">单击</b><span>看这一版长什么样（缩略图）</span></li>
+          <li><b class="hx-key">双击</b><span>回到这一版</span></li>
+          <li><b class="hx-key">白圈</b><span>当前选中的那格</span></li>
+          <li><b class="hx-key">橙点</b><span>最新一版</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="hs-section" aria-labelledby="hx-tree-heading">
+    <div class="hs-section-head">
+      <h2 class="hs-heading" id="hx-tree-heading">提交树</h2>
+      <span class="hs-caption">横轴是时间，纵轴是分支</span>
+    </div>
+    <div class="hx-stage">
+      <div class="hx-stage-cap">
+        <b>从哪分出去、各自走了多远，一眼看清</b>
+        <span>回跳后再提交，就长出新枝</span>
+      </div>
+      <div class="hx-tree" role="img"
+           aria-label="提交树示意：主线自左向右推进，中途分出下方一条支线；蓝框为人提交、紫框为 agent 提交，格内彩条为动过的功能区">
+        <!-- 泳道基准线 -->
+        <span class="hx-lane" style="top:34px"></span>
+        <span class="hx-lane" style="top:90px"></span>
+        <span class="hx-lanelabel" style="left:0;top:28px">你</span>
+        <span class="hx-lanelabel" style="left:0;top:84px">agent</span>
+
+        <!-- 连线层：中性主题线；跨泳道=固定过渡(贝塞尔)+直线；端点落在节点外框边缘 -->
+        <svg class="hx-edges" width="406" height="124" aria-hidden="true">
+          <g class="hx-edge-g">
+            <!-- 主线（泳道0）：逐对相连，端点在节点边缘 -->
+            <line x1="78" y1="34" x2="114" y2="34"/>
+            <line x1="130" y1="34" x2="166" y2="34"/>
+            <line x1="182" y1="34" x2="218" y2="34"/>
+            <line x1="234" y1="34" x2="270" y2="34"/>
+            <line x1="286" y1="34" x2="322" y2="34"/>
+            <line x1="338" y1="34" x2="374" y2="34"/>
+            <!-- 支线（泳道1） -->
+            <line x1="234" y1="90" x2="270" y2="90"/>
+            <line x1="286" y1="90" x2="316" y2="90"/>
+            <!-- 分叉：n3 → 支线首节点，固定过渡段(T) + 直线 -->
+            <path d="M182 34 C194.96 34 194.96 90 207.92 90 L218 90"/>
+          </g>
+        </svg>
+
+        <!-- 泳道0（你）：主线 7 节点 -->
+        <span class="hx-node is-user" style="left:70px;top:34px"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+        <span class="hx-node is-user" style="left:122px;top:34px"><span class="hx-bars"><i></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+        <span class="hx-node is-user" style="left:174px;top:34px"><span class="hx-bars"><i></i><i></i><i class="on" style="--b:#a1309b"></i><i></i></span></span>
+        <span class="hx-node is-user" style="left:226px;top:34px"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+        <span class="hx-node is-user" style="left:278px;top:34px"><span class="hx-bars"><i></i><i class="on" style="--b:#b58b2a"></i><i class="on" style="--b:#a1309b"></i><i></i></span></span>
+        <span class="hx-node is-user" style="left:330px;top:34px"><span class="hx-bars"><i></i><i></i><i></i><i class="on" style="--b:#5a6470"></i></span></span>
+        <span class="hx-node is-user is-head" style="left:382px;top:34px"><span class="hx-bars"><i></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+
+        <!-- 泳道1（agent）：从 n3 分出的支线 -->
+        <span class="hx-node is-agent" style="left:226px;top:90px"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i class="on" style="--b:#b58b2a"></i><i class="on" style="--b:#a1309b"></i><i></i></span></span>
+        <span class="hx-node is-agent" style="left:278px;top:90px"><span class="hx-bars"><i></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+        <span class="hx-node is-agent is-merge" style="left:330px;top:90px"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+      </div>
+      <p class="hx-hint">横着看是时间，竖着看是分支。上排这条主线一路是你（<b>蓝框</b>）；中途从某个节点分下去的那条，是 agent 替你跑出来的（<b>紫框</b>）。分叉处那条线先拐一个小小的弯，再走直线到分出去的节点——跟画布里看到的一致。</p>
+    </div>
+  </section>
+
+  <section class="hs-section" aria-labelledby="hx-read-heading">
+    <div class="hs-section-head">
+      <h2 class="hs-heading" id="hx-read-heading">怎么读</h2>
+      <span class="hs-caption">四样东西，决定一格的样子</span>
+    </div>
+    <div class="hx-stage">
+      <ul class="hx-read">
+        <li>
+          <span class="hx-pair">
+            <span class="hx-tick is-user"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+            <span class="hx-tick is-agent"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+          </span>
+          <span class="hx-read-txt">
+            <b>外框颜色 · 谁提交的</b>
+            <em>蓝＝你自己点的；紫＝agent 替你跑的。人和机器的笔迹，分开记。</em>
+          </span>
+        </li>
+        <li>
+          <span class="hx-pair">
+            <span class="hx-tick is-user"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+            <span class="hx-tick is-user is-save"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+          </span>
+          <span class="hx-read-txt">
+            <b>外框线型 · 做了什么</b>
+            <em>实线＝提交运行；虚线＝存档（只记下这一版，不跑）。</em>
+          </span>
+        </li>
+        <li>
+          <span class="hx-pair">
+            <span class="hx-tick is-user"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i class="on" style="--b:#b58b2a"></i><i></i><i></i></span></span>
+            <span class="hx-tick is-user"><span class="hx-bars"><i></i><i></i><i class="on" style="--b:#a1309b"></i><i class="on" style="--b:#5a6470"></i></span></span>
+          </span>
+          <span class="hx-read-txt">
+            <b>内部彩条 · 动了哪些功能区</b>
+            <em>每个功能区有各自的颜色（就是画布里你给分组设的框色）：亮起＝这次动过它，灰＝没动。</em>
+          </span>
+        </li>
+        <li>
+          <span class="hx-pair">
+            <span class="hx-tick is-user"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+            <span class="hx-tick is-user is-merge"><span class="hx-bars"><i class="on" style="--b:#3f789e"></i><i></i><i></i><i></i></span></span>
+          </span>
+          <span class="hx-read-txt">
+            <b>宽度 · 是否合并</b>
+            <em>画布没改就再跑一次，不新开格——并进上一格，用宽块表示。</em>
+          </span>
+        </li>
+      </ul>
+      <div class="hx-legend">
+        <span><i class="hx-chip" style="background:#3f789e"></i>1. Models</span>
+        <span><i class="hx-chip" style="background:#b58b2a"></i>2. Prompt &amp; size</span>
+        <span><i class="hx-chip" style="background:#a1309b"></i>3. Prompt enhancer</span>
+        <span><i class="hx-chip" style="background:#5a6470"></i>4. Sample</span>
+      </div>
+    </div>
+  </section>
+
+  <p class="hs-footer">这是 hui 提交历史的读法速览。彩条的颜色跟着画布走——你改分组的框色，历史里也跟着变。<br>圆角使用 corner-shape: squircle；不支持的浏览器回退为普通圆角，功能不受影响。</p>
+
+</main>
+<script>
+  if (new URLSearchParams(location.search).get('theme') === 'dark') {
+    document.body.classList.add('t-dark');
+  }
+</script>
+</body>
+</html>

@@ -12,6 +12,7 @@
 //   GET  /_relay/metrics           主机指标（GPU / CPU / 内存；GPU 走 nvidia-smi 定时缓存）
 //   GET  /_relay/drives            安装位置候选（各盘剩余空间/可写性 + 推荐 <盘>:\ComfyUI）
 //   GET/POST /_relay/custom-roots  App 推送的自定义安装位置（POST 需 controlKey）
+//   GET/POST /_relay/preview-config 出图实时预览配置（{enabled, method}；POST 需 controlKey）
 //   POST /_relay/fs/stat           文件 stat（本机路径；{path}）
 //   POST /_relay/fs/read           读取文本/二进制（{path, encoding, maxBytes}，上限 8 MiB）
 //   POST /_relay/fs/write          写入文本（{path, text}，上限 16 MiB；原子写 .tmp→rename；app 沙箱外的落盘代做）
@@ -82,6 +83,8 @@ const CPU_SAMPLE_MS = 1_500;       // CPU 采样节拍（按间隔算 delta，�
 const UPLOAD_MAX_BYTES = 64 * 1024 * 1024;
 const SUBMIT_FILE_MAX_BYTES = 64 * 1024 * 1024;  // submit-file 工作流读入上限（理智保护）
 const JSON_BODY_MAX_BYTES = 256 * 1024;
+const PREVIEW_MAX_FRAMES = 16;             // 预览帧环形上限（条/记录）
+const PREVIEW_MAX_FRAME_BYTES = 512 * 1024; // 单帧上限（超过即丢弃，防内存膨胀）
 const TRACKED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
 // 逐跳头（RFC 7230）：不向下游/上游透传
 const HOP_BY_HOP = new Set([
@@ -476,6 +479,17 @@ const ENV_PROBE_TTL_MS = 15_000;
 const envProbe = { at: 0, result: null };
 let customRoots = []; // App 推送的自定义安装位置（优先于常见路径检查）
 
+// 出图实时预览配置（内存 + 落盘；POST /_relay/preview-config 推送，见 previewCfgPath）。
+// 默认关闭：关闭时提交不带 extra_data，行为与既有完全一致（零开销）。
+let previewCfg = { enabled: false, method: null }; // method: "latent2rgb" | "taesd" | null
+
+// 归一化预览配置：method 仅接受两级档位，非法值→关。enabled 且 method 为空则视为关。
+function normalizePreviewCfg(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const method = src.method === "latent2rgb" || src.method === "taesd" ? src.method : null;
+  return { enabled: src.enabled === true && !!method, method };
+}
+
 // 受管 runtime 的环境被宿主重写过（USERPROFILE/HOME 可能指向 app 的 .runtime-tmp），
 // os.homedir() 在那里拿到的不是真实用户目录。逐级回退并排除污染路径。
 function realHome() {
@@ -747,6 +761,28 @@ function saveBackendState() {
     writeFileSync(backendStatePath(), JSON.stringify({ ...backendProc, savedAt: new Date().toISOString() }, null, 2), "utf8");
   } catch (e) {
     warn(`backend-state 写入失败：${(e && e.message) || e}`);
+  }
+}
+
+// 预览配置落盘（与 backend-state 同目录：runtime 日志目录 / standalone 的 cwd）
+function previewCfgPath() {
+  const dir = logFilePath ? dirname(logFilePath) : process.cwd();
+  return join(dir, "preview-config.json");
+}
+
+function loadPreviewCfg() {
+  try {
+    const raw = JSON.parse(readFileSync(previewCfgPath(), "utf8"));
+    previewCfg = normalizePreviewCfg(raw);
+  } catch { /* 首次运行没有配置文件，正常（默认关闭） */ }
+}
+
+function savePreviewCfg() {
+  try {
+    mkdirSync(dirname(previewCfgPath()), { recursive: true });
+    writeFileSync(previewCfgPath(), JSON.stringify({ ...previewCfg, savedAt: new Date().toISOString() }, null, 2), "utf8");
+  } catch (e) {
+    warn(`preview-config 写入失败（仅内存生效）：${(e && e.message) || e}`);
   }
 }
 
@@ -1787,6 +1823,8 @@ function promptRec(id) {
       outputs: [],
       error: null,
       events: [],
+      previewFrames: [],      // 最近预览帧（环形，≤ PREVIEW_MAX_FRAMES；元素为**裸 base64**，不含 data: 前缀）
+      previewUpdatedAt: null, // 最后一帧到达时间（ms）
     };
     promptStore.set(id, r);
     prunePrompts();
@@ -1932,6 +1970,72 @@ function handleBackendEvent(text) {
   }
 }
 
+// ── 二进制预览帧解析（ComfyUI /ws）────────────────────────────────────────
+// 帧格式（读 server.py / protocol.py 坐实，非 msgpack）：
+//   [4B 大端 int32 事件类型] + payload
+//   事件 4 = PREVIEW_IMAGE_WITH_METADATA：payload = [4B 大端 int32 元数据长度] + [元数据 JSON(UTF-8)] + [图像字节]
+//   事件 1 = PREVIEW_IMAGE（旧）：payload = [4B 大端 int32 图像类型号（1=JPEG, 2=PNG）] + [图像字节]
+//     ——实测帧头 `00000001 00000001 ffd8ffe0`（server.py send_image() 会先写 type_num）
+// 归属：优先取元数据 prompt_id；取不到时用“唯一 running 记录”兜底。帧以**裸 base64** 存（卡片侧拼 data:image/jpeg;base64,）。
+function pickPreviewOwner(promptId) {
+  if (typeof promptId === "string" && promptId) {
+    const r = promptStore.get(promptId);
+    if (r) return r;
+    return promptRec(promptId); // 帧先于 execution_start 到达时也能建记录
+  }
+  // 兜底：仅当存在唯一 running 记录时才归属（多个 running 时无法判定，丢弃）
+  let found = null;
+  for (const rec of promptStore.values()) {
+    if (rec.state !== "running") continue;
+    if (found) return null;
+    found = rec;
+  }
+  return found;
+}
+
+function pushPreviewFrame(rec, image) {
+  if (!image || image.length === 0) return;
+  if (image.length > PREVIEW_MAX_FRAME_BYTES) return; // 单帧超限→丢弃（内存防线）
+  rec.previewFrames.push(image.toString("base64"));
+  if (rec.previewFrames.length > PREVIEW_MAX_FRAMES) rec.previewFrames.shift(); // 环形：超了丢最旧
+  rec.previewUpdatedAt = Date.now();
+}
+
+async function handleBackendBinary(data) {
+  let buf = null;
+  if (Buffer.isBuffer(data)) buf = data;
+  else if (data instanceof ArrayBuffer) buf = Buffer.from(data);
+  else if (typeof Blob !== "undefined" && data instanceof Blob) buf = Buffer.from(await data.arrayBuffer());
+  else if (ArrayBuffer.isView(data)) buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (!buf || buf.length < 4) return;
+
+  const type = buf.readUInt32BE(0);
+  let image = null;
+  let promptId = null;
+  if (type === 4) { // PREVIEW_IMAGE_WITH_METADATA
+    if (buf.length < 8) return;
+    const mLen = buf.readUInt32BE(4);
+    const metaStart = 8;
+    const imgStart = metaStart + mLen;
+    if (mLen > 0 && imgStart <= buf.length) {
+      try {
+        const meta = JSON.parse(buf.subarray(metaStart, imgStart).toString("utf8"));
+        if (meta && typeof meta.prompt_id === "string") promptId = meta.prompt_id;
+      } catch { /* 元数据解析失败：走 running 兜底 */ }
+    }
+    if (imgStart > buf.length) return;
+    image = buf.subarray(imgStart);
+  } else if (type === 1) { // PREVIEW_IMAGE（旧格式：[图像类型号 4B] + 图像字节）
+    image = buf.subarray(8);
+  } else {
+    return; // 其它类型（含 TEXT=3）：忽略
+  }
+
+  const rec = pickPreviewOwner(promptId);
+  if (!rec) return; // 拿不到归属→丢弃
+  pushPreviewFrame(rec, image);
+}
+
 function startBackendEvents() {
   if (typeof WebSocket !== "function") {
     wsEvents.lastError = "global WebSocket unavailable";
@@ -1956,12 +2060,16 @@ function startBackendEvents() {
         log("已订阅后端 /ws（进度事件缓存就绪）");
       }
     });
-    ws.addEventListener("message", (ev) => {
+    ws.addEventListener("message", async (ev) => {
       wsEvents.lastEventAt = Date.now();
-      const data = typeof ev.data === "string" ? ev.data : "";
-      if (data) {
-        try { handleBackendEvent(data); } catch { /* 单条消息解析失败不影响订阅 */ }
+      if (typeof ev.data === "string") {
+        if (ev.data) {
+          try { handleBackendEvent(ev.data); } catch { /* 单条消息解析失败不影响订阅 */ }
+        }
+        return;
       }
+      // 二进制：预览帧（Node 全局 WebSocket 默认给 Blob；实测见 docs/施工-出图实时预览-20261013.md）
+      try { await handleBackendBinary(ev.data); } catch { /* 单帧失败不影响订阅 */ }
     });
     ws.addEventListener("close", () => {
       wsEvents.connected = false;
@@ -1983,7 +2091,7 @@ function startBackendEvents() {
   connect();
 }
 
-function promptRecordOut(r) {
+function promptRecordOut(r, { full = true } = {}) {
   return {
     promptId: r.promptId,
     state: r.state,
@@ -1998,6 +2106,12 @@ function promptRecordOut(r) {
     outputs: r.outputs,
     error: r.error,
     events: r.events.slice(-20),
+    // 裸 base64（不含 data: 前缀），卡片侧拼 data:image/jpeg;base64,
+    // full=true（单条查询）：全量帧，供卡片回放；full=false（列表）：只带末帧，避免 active+recent 轮询体量炸裂
+    previewFrames: full
+      ? r.previewFrames.slice(-PREVIEW_MAX_FRAMES)
+      : r.previewFrames.slice(-1),
+    previewUpdatedAt: r.previewUpdatedAt,
   };
 }
 
@@ -2005,7 +2119,7 @@ function promptsPayload() {
   const active = [];
   const recent = [];
   for (const r of promptStore.values()) {
-    const out = promptRecordOut(r);
+    const out = promptRecordOut(r, { full: false });
     if (r.state === "running" || r.state === "unknown") active.push(out);
     else recent.push(out);
   }
@@ -2545,6 +2659,8 @@ async function handleSubmitFile(req, res) {
   // 5) 提交后端（client_id 与 /ws 订阅一致，见 config.clientId）
   const promptReq = { prompt, client_id: (config && config.clientId) || "comfyui-relay" };
   if (body.front === true) promptReq.front = true;
+  // 实时预览：仅在开且档位有效时带 extra_data（关着时不加，行为与既有完全一致、零开销）
+  if (previewCfg.enabled && previewCfg.method) promptReq.extra_data = { preview_method: previewCfg.method };
   let up;
   try {
     up = await fetch(`http://${backend.host}:${backend.port}/prompt`, {
@@ -2708,6 +2824,30 @@ const server = http.createServer((req, res) => {
         } catch (e) {
           jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) });
         }
+      })();
+      return;
+    }
+    jsonOut(res, 405, { error: "method not allowed" }, req.method);
+    return;
+  }
+  if (pathOnly === "/_relay/preview-config") {
+    // 出图实时预览配置（管理端点，需 x-comfy-relay-key）：{ enabled, method }
+    if (req.method === "GET" || req.method === "HEAD") {
+      jsonOut(res, 200, { ok: true, ...previewCfg }, req.method);
+      return;
+    }
+    if (req.method === "POST") {
+      if (!controlOk(req)) {
+        jsonOut(res, 403, { error: "comfy-relay: control key required" });
+        return;
+      }
+      void (async () => {
+        let body;
+        try { body = await readBodyJson(req); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+        previewCfg = normalizePreviewCfg(body);
+        savePreviewCfg(); // 落盘（runtime 日志目录 / standalone cwd；失败仅告警、内存仍生效）
+        log(`preview-config 更新：enabled=${previewCfg.enabled} method=${previewCfg.method || "null"}`);
+        jsonOut(res, 200, { ok: true, ...previewCfg }, req.method);
       })();
       return;
     }
@@ -3074,6 +3214,7 @@ async function main() {
     if (initLogFile(config.logFile)) log(`日志落盘：${config.logFile}`);
   }
   loadBackendState(); // 服务进程状态（上次由哪个入口拉起、日志位置）跨中继重启保留
+  loadPreviewCfg();    // 出图实时预览配置（落盘回读；默认关）
   if (!config.controlKey && config.mode === "managed") {
     warn("受管模式未配置 controlKey：/_relay 管理端点将开放（应由 App 配置）");
   }

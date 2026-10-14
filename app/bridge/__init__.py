@@ -76,6 +76,16 @@ except Exception as _exc:  # P1-C1：history_store 纯标准库，正常不会�
 else:
     _HISTORY_IMPORT_ERR = None
 
+try:
+    from .thumbs import make_thumb as _make_thumb
+    from .thumbs import ThumbError as _thumb_err_cls
+except Exception as _exc:  # 防御性保护；thumbs.py 仅依赖标准库 + PIL
+    _make_thumb = None
+    _thumb_err_cls = None
+    _THUMB_IMPORT_ERR = _exc
+else:
+    _THUMB_IMPORT_ERR = None
+
 WEB_DIRECTORY = "./js"
 
 # 本包只提供前端扩展与路由，不含节点类。但 ComfyUI 的自定义节点加载器要求模块提供
@@ -101,7 +111,7 @@ except ValueError:
 # 信息口：/hana_bridge/diag 的 file.hasBuildTag / file.buildTag。
 # 2026-10-14（提交树与历史框对齐：缩略图统一 + 树补存档）：对齐新活动桥 hana-bridge-14120534。
 # 2026-10-14（提交树跨泳道分叉线改非对称控制点/更早分叉）：对齐新活动桥 hana-bridge-14130045。
-BRIDGE_BUILD_TAG = "2026-10-14 hana-bridge-14194557"
+BRIDGE_BUILD_TAG = "2026-10-14 hana-bridge-15001613"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -861,8 +871,54 @@ if _ROUTES is not None:
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
+    # 2026-10-14：缩图 + 磁盘缓存端点（见 docs/方案-预览图降分辨率与缓存-20261014.md §2）。
+    # ComfyUI 的 /view?preview= 只压格式+质量、不改分辨率（2K 原图 → webp;75 仍 213KB）
+    # 且无缓存头；本端点降分辨率并按 hash 稳定缓存 → 可长缓存、二次零下载。
+    # 信任模型同 history-*（P1-D1）：8188 同源、本机-only，不校验 token；只读、不改原图。
+    @_ROUTES.get("/hana_bridge/thumb")
+    async def _hana_thumb(request):
+        """缩图 + 磁盘缓存端点。query: filename, subfolder(可空), type(默认 output), w(默认720), q(默认72)。"""
+        if _make_thumb is None:
+            return web.json_response(
+                {"ok": False, "error": "thumbs_unavailable: %s" % _THUMB_IMPORT_ERR}, status=500
+            )
+        filename = str(request.query.get("filename") or "").strip()
+        if not filename:
+            return web.json_response({"ok": False, "error": "missing_filename"}, status=400)
+        subfolder = str(request.query.get("subfolder") or "").strip()
+        type_ = str(request.query.get("type") or "output").strip() or "output"
+        try:
+            w = int(request.query.get("w") or 720)
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "invalid_width"}, status=400)
+        try:
+            q = int(request.query.get("q") or 72)
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "invalid_quality"}, status=400)
+        w = max(16, min(4096, w))  # clamp 到 16..4096
+        q = max(1, min(100, q))  # clamp 到 1..100
+        # 缓存目录复用同一 user_dir 来源（<user_dir>/.thumb-cache/）。
+        try:
+            user_dir = _history_user_dir()
+        except RuntimeError:
+            user_dir = None  # 取不到 user_dir 时退化为不缓存（仍返回缩图）
+        try:
+            body, content_type, _hit = _make_thumb(
+                filename, subfolder, type_, width=w, quality=q, user_dir=user_dir
+            )
+        except _thumb_err_cls as exc:
+            return web.json_response({"ok": False, "error": exc.error}, status=exc.status)
+        except Exception as exc:  # 兜底：任何未预期异常都收敛成 500 JSON
+            LOG.warning("hana_bridge: thumb 异常：%s", exc)
+            return web.json_response({"ok": False, "error": "thumb_failed: %s" % exc}, status=500)
+        return web.Response(
+            body=body,
+            content_type=content_type,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
     LOG.info(
-        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-save / history-attach-images / history-list / history-snapshot / history-migrate），"
+        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-save / history-attach-images / history-list / history-snapshot / history-migrate / thumb），"
         "token 就绪，超时 %gs",
         CALL_TIMEOUT_SEC,
     )

@@ -104,6 +104,31 @@ label.chk input { accent-color: var(--accent); }
   </div>
 
   <div class="sec">
+    <h2>出图实时预览</h2>
+    <label class="chk"><input type="checkbox" id="s-preview-enabled"> 开启出图实时预览</label>
+    <p class="note">默认关闭。开启后生成过程中会回传一张 512 的小图，用来看生成走向，<b>不替代成品</b>。</p>
+
+    <div id="s-preview-tier-wrap" style="display:none">
+      <label class="chk"><input type="radio" name="s-preview-tier" value="basic"> 基础档 · <code>latent2rgb</code>：免下载，画面较粗糙</label>
+      <label class="chk"><input type="radio" name="s-preview-tier" value="hd"> 高清档 · <code>taesd</code>：需下载约 15 MB 预览模型，画面接近成品</label>
+
+      <div id="s-preview-hd" style="display:none">
+        <div class="row top"><span class="k">模型目标路径</span><span class="v" id="s-preview-model-dir">—</span></div>
+        <p class="note" id="s-preview-model-note">
+          高清档需要解码器 <code>taeqi2_1_decoder.pth</code> 落到上面的目录。<b>本 App 不能自行下载</b>，
+          请点「请 Agent 下载」，由 agent 用 hana-downloader 取到该目录。装好前高清档不会有预览图。
+        </p>
+        <div class="ed">
+          <button class="primary" id="s-preview-agent-get">请 Agent 下载</button>
+          <button id="s-preview-copy">复制下载指引</button>
+        </div>
+        <div class="msg" id="s-preview-model-msg"></div>
+      </div>
+    </div>
+    <div class="msg" id="s-preview-save-msg"></div>
+  </div>
+
+  <div class="sec">
     <h2>连接（只读）</h2>
     <div class="row"><span class="k">ComfyUI 后端</span><span class="v" id="s-backend">127.0.0.1:8188</span></div>
     <div class="row"><span class="k">后端状态</span><span class="v" id="s-reachable">读取中…</span></div>

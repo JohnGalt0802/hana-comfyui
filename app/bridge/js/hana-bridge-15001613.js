@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-14 hana-bridge-14194557";
+const BUILD_TAG = "2026-10-14 hana-bridge-15001613";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -120,6 +120,11 @@ let changes = [];
 // 执行期间）/ "system"（装载 / 重配置的异步窗口内）。只增字段，不改 rev 递增语义
 // （app 侧 settle 的强证据依赖它）；工具层过滤留待后续，本期只做桥侧标记。
 let changeSource = "user";
+
+// ── 提交来源（2026-10-14）─────────────────────────────────────────────────
+// 与 changeSource（画布变更来源）分开 —— 本标志标记「谁发起了这次运行」，只服务提交历史上报。
+// canvas.queue（Agent 工具执行）置 "agent"；用户点运行 / Ctrl+Enter 走前端原生 → 保持 "user"。
+let historyCommitSource = "user";
 
 // 系统窗：从装载发起（loadGraphData）到 promise settle（或兜底超时）之前，变更记 "system"。
 // 兜底给足（大图 configure 可能远超 6s 回传口径；60s 仅防「promise 永不落地」）。
@@ -1851,10 +1856,17 @@ const OPS = {
         throw err;
       }
     };
+    // 提交来源（2026-10-14）：本次运行由 Agent 工具发起 → 置 "agent"，供常驻包装上报时读取。
+    // 时序自证：orig = api.queuePrompt（= setup 装的常驻包装）→ 临时替换为捕获包装 →
+    // app.queuePrompt → 捕获包装调 orig（常驻包装）→ 常驻包装读 historyCommitSource（此刻="agent"）
+    // 上报 → 才回到本 finally 复位。故上报发生在复位之前 ✅。
+    const prevCommitSource = historyCommitSource;   // 保存现场（防嵌套）
+    historyCommitSource = "agent";
     try {
       await app.queuePrompt(front ? -1 : 0, 1);
     } finally {
       api.queuePrompt = orig;
+      historyCommitSource = prevCommitSource;       // 还原
     }
     if (capErr) {
       throw new Error("提交被拒：" + String(capErr).slice(0, 400));
@@ -2680,7 +2692,7 @@ function installQueuePromptCapture() {
         } catch (err) {
           console.warn(LOG_TAG, "提交快照块归属计算失败（不影响上报）", err);
         }
-        void reportHistoryCommit({ graph, promptId, blocks });
+        void reportHistoryCommit({ graph, promptId, blocks, source: historyCommitSource });
       }
     } catch (err) {
       console.warn(LOG_TAG, "提交历史上报失败（不影响提交）", err);
@@ -3556,8 +3568,10 @@ function historyImagesToUrls(images) {
       "&subfolder=" + encodeURIComponent(im.subfolder || "") +
       "&type=" + encodeURIComponent(im.type || "output");
     out.push({
-      thumbUrl: historyViewUrl(qs + "&preview=webp;75"), // 缩略：后端就地转 webp
-      fullUrl: historyViewUrl(qs), // 原图：不带 preview
+      thumbUrl: historyThumbUrl(im, 720, 72), // 缩图端点：480/720px webp（显示尺寸不变、分辨率降）
+      thumbFallbackUrl: historyViewUrl(qs + "&preview=webp;75"), // 端点未生效（404）时回退旧口径
+      fullUrl: historyThumbUrl(im, 1600, 80), // lightbox：1600px 足够高清，省 2.7MB→~200KB
+      fullFallbackUrl: historyViewUrl(qs), // 回退原图
       label: String(im.filename),
     });
   }
@@ -3573,6 +3587,16 @@ function historyViewUrl(qs) {
   } catch {
     /* 退回相对路径 */
   }
+  return p;
+}
+
+// 缩图端点 URL（桥内 py 端点，降分辨率 + 长缓存）；api.apiURL 补前缀，与 historyViewUrl 同口径。
+function historyThumbUrl(im, w, q) {
+  const p = "/hana_bridge/thumb?filename=" + encodeURIComponent(im.filename) +
+    "&subfolder=" + encodeURIComponent(im.subfolder || "") +
+    "&type=" + encodeURIComponent(im.type || "output") +
+    "&w=" + (w | 0) + "&q=" + (q | 0);
+  try { if (api && typeof api.apiURL === "function") return api.apiURL(p); } catch { /* 退回相对路径 */ }
   return p;
 }
 
@@ -3592,7 +3616,11 @@ function historyLightboxShowAt(i) {
   const it = list[idx] || {};
   const img = box.querySelector("img");
   const cap = box.querySelector(".hhb-lb-cap");
-  if (img) { img.src = it.fullUrl || ""; img.alt = it.label ? String(it.label) : ""; }
+  if (img) {
+    img.onerror = () => { if (img.dataset.fb) return; img.dataset.fb = "1"; img.src = it.fullFallbackUrl || it.fullUrl; };
+    img.src = it.fullUrl || "";
+    img.alt = it.label ? String(it.label) : "";
+  }
   if (cap) cap.textContent = it.label ? String(it.label) : "";
   const pageEl = box.querySelector(".hhb-lb-page");
   if (pageEl) pageEl.textContent = (list && list.length > 1) ? (idx + 1) + " / " + list.length : "";
@@ -3623,6 +3651,8 @@ function historyOpenLightbox(fullUrl, caption, opts) {
   const box = document.createElement("div");
   box.id = HISTORY_LIGHTBOX_ID;
   const img = document.createElement("img");
+  // 缩图端点未生效（404/500）→ 一次性回退原图（dataset.fb 防死循环）
+  img.onerror = () => { if (img.dataset.fb) return; img.dataset.fb = "1"; img.src = cur.fullFallbackUrl || cur.fullUrl; };
   img.src = cur.fullUrl;
   img.alt = cur.label ? String(cur.label) : "";
   const cap = document.createElement("div");
@@ -3712,6 +3742,8 @@ function historyFillThumb(reqId, thumb, images) {
     img.className = "hhb-thumb-img";
     img.src = it.thumbUrl;
     img.alt = it.label;
+    // 缩图端点未生效（404/500）→ 一次性回退旧口径 preview=webp;75（dataset.fb 防死循环）
+    img.onerror = () => { if (img.dataset.fb) return; img.dataset.fb = "1"; img.src = it.thumbFallbackUrl || it.thumbUrl; };
     // 弹层「点开即看」：缩略图用 eager（lazy 会让点开的图延迟出现；同源小 webp 无性能顾虑）
     img.loading = "eager";
     img.addEventListener("click", (ev) => {
@@ -3988,6 +4020,8 @@ function historyBarShotsToggle(tick, ent) {
       img.src = it.thumbUrl;
       img.alt = it.label;
       img.loading = "eager"; // 点开即看（同 P4 口径）
+      // 缩图端点未生效（404/500）→ 一次性回退旧口径（dataset.fb 防死循环）
+      img.onerror = () => { if (img.dataset.fb) return; img.dataset.fb = "1"; img.src = it.thumbFallbackUrl || it.thumbUrl; };
       img.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation(); // 点图只开原图，不触发刻度选中
@@ -5154,6 +5188,16 @@ function historyTreeStyleEnsure() {
   /* 第8条（2026-10-13）：常态外光晕加强（固定 10px / 65%，与框同口径） */
   box-shadow: 0 0 10px color-mix(in oklab, var(--htr-c, #5aa0d8) 65%, transparent);
 }
+/* 2026-10-14：透明扩大热区——节点本体很窄（≈12px），周围大片是 .tcanvas 的 grab；
+   ::before 撑一块透明命中区，cursor 继承 .node 的 pointer → 热区内都是点击小手。
+   视觉零变化（无背景）；拖拽不受影响（mousedown 在 tcanvas 上，位移>3px 才算拖动）。 */
+#${HISTORY_TREE_ID} .node::before {
+  content: "";
+  position: absolute; left: 50%; top: 50%;
+  width: var(--htr-hot-w, 100%); height: var(--htr-hot-h, 100%);
+  transform: translate(-50%, -50%);
+  border-radius: 6px;
+}
 /* 密档降级（同框口径）；3a修：不再改 border-width */
 #${HISTORY_TREE_ID} .node[data-tight] { padding: 1px 0; border-radius: 3px; }
 /* 合并提交加粗（外框加粗 + 强光晕，同框口径） */
@@ -5250,50 +5294,60 @@ function historyTreeStyleEnsure() {
 // 输入：entries（已按 seq 升序），每项至少 {seq, parent}。输出：
 //   { lanes:[{lane,headSeq,sleeping}], nodes:[{seq,lane,row}], rows:number, sleepingCount:number }
 // row = lane（2026-10-12 去折叠：全量显示，不再出现 row=-1）。
+// G 算法（2026-10-14）：新分支插到父泳道正下方（消交叉）。
 // 确定性：同输入两次 deepEqual（不依赖遍历顺序；同 parent 多 child 时 seq 最小者先接手）。
 function commitGraphLanes(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
     return { lanes: [], nodes: [], rows: 0, sleepingCount: 0 };
   }
-  // (1) 泳道分配（单遍，seq 升序）
-  const active = []; // active[L] = 该泳道悬挂末端 seq；只增不回收
-  const nodeLane = []; // 与 entries 同序的泳道号
+  // (1) 泳道分配（单遍，seq 升序）——泳道对象数组，物理顺序即行序（lanes[0] 在最上）
+  const lanes = []; // { head: seq|null, seqs: [] }；只增不回收
+  const objOf = new Map(); // seq -> 泳道对象（该 seq 所在泳道）
+  const nodeLane = []; // 与 entries 同序的「泳道对象」
   for (let i = 0; i < entries.length; i += 1) {
     const e = entries[i] || {};
     const seq = e.seq;
     const p = e.parent;
-    let lane = -1;
+    let target = null;
+    // ① 延续：找 head === p 的泳道
     // parent 必须是 < seq 的整数；孤儿 / parent>=seq / 非整数 / 缺失 一律视同根
     if (Number.isInteger(p) && p < seq) {
-      for (let L = 0; L < active.length; L += 1) {
-        if (active[L] === p) {
-          lane = L;
+      for (const lane of lanes) {
+        if (lane.head === p) {
+          target = lane;
           break;
         }
       }
     }
-    if (lane < 0) {
-      lane = active.length;
-      active.push(null);
+    // ② 新分支：插到父泳道正下方；父泳道不存在 → append
+    if (!target) {
+      const pObj = Number.isInteger(p) && p < seq ? objOf.get(p) : null;
+      if (pObj) {
+        const pos = lanes.indexOf(pObj) + 1;
+        target = { head: null, seqs: [] };
+        lanes.splice(pos, 0, target);
+      } else {
+        target = { head: null, seqs: [] };
+        lanes.push(target);
+      }
     }
-    active[lane] = seq;
-    nodeLane.push(lane);
+    target.head = seq;
+    target.seqs.push(seq);
+    objOf.set(seq, target);
+    nodeLane.push(target);
   }
-  const laneCount = active.length;
   // (2) 全量显示（2026-10-12：取消 LANES_MAX_ROWS 折叠）——所有泳道全部显示：
   //     row = lane、rows = laneCount、sleepingCount 恒 0（lanes[].sleeping 恒 false）。
   //     泳道多时由 .tcanvas 拖拽/滚动查看（见 2c）。逻辑与 app/lib/commit-graph-lanes.mjs 逐条一致。
+  const laneIndex = new Map();
+  lanes.forEach((lane, idx) => laneIndex.set(lane, idx));
   const nodes = [];
   for (let i = 0; i < entries.length; i += 1) {
-    const e = entries[i] || {};
-    const lane = nodeLane[i];
-    nodes.push({ seq: e.seq, lane, row: lane });
+    const lane = laneIndex.get(nodeLane[i]);
+    nodes.push({ seq: entries[i].seq, lane, row: lane });
   }
-  const lanes = [];
-  for (let L = 0; L < laneCount; L += 1) {
-    lanes.push({ lane: L, headSeq: active[L], sleeping: false });
-  }
-  return { lanes, nodes, rows: laneCount, sleepingCount: 0 };
+  const outLanes = lanes.map((lane, idx) => ({ lane: idx, headSeq: lane.head, sleeping: false }));
+  return { lanes: outLanes, nodes, rows: lanes.length, sleepingCount: 0 };
 }
 
 // 计数：N 节点；M 分支（parent 被 ≥2 个节点指向的 parent 数）；K 泳道（总泳道数，全量显示、无折叠）。
@@ -5436,6 +5490,13 @@ function historyTreeRenderTree(entries) {
     node.style.top = nd.row * laneH + laneH / 2 + 3 + "px";
     node.style.setProperty("--nw", nw + "px");
     node.style.setProperty("--nw-bulge", nwBulge + "px"); // 第7条：多块宽（已 clamp colW-2）
+    // 2026-10-14：透明热区尺寸——横向节点+12 但封顶 colW-2（防相邻重叠），纵向留 8px 行间拖动带。
+    // ⚠️ 必须 clamp（下限+上限都夹）：max(baseW+12, colW-2) 在合并节点时 baseW 大会突破上限 → 盖到邻列。
+    const baseW = runsN > 1 ? nwBulge : nw;
+    const hotW = Math.max(8, Math.min(baseW + 12, colW - 2));
+    const hotH = Math.max(16, Math.min(laneH - 8, laneH));
+    node.style.setProperty("--htr-hot-w", hotW + "px");
+    node.style.setProperty("--htr-hot-h", hotH + "px");
     if (colW < 14) node.dataset.tight = "1"; // 密档降级
     // 统一母题内条堆：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰
     node.appendChild(historyBarsBuild(globalBlocks, hitSet, liveColors, singleBar));
@@ -5788,6 +5849,8 @@ function historyTreeShotsToggle(tick, ent) {
       img.src = it.thumbUrl;
       img.alt = it.label;
       img.loading = "eager";
+      // 缩图端点未生效（404/500）→ 一次性回退旧口径（dataset.fb 防死循环）
+      img.onerror = () => { if (img.dataset.fb) return; img.dataset.fb = "1"; img.src = it.thumbFallbackUrl || it.thumbUrl; };
       img.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();

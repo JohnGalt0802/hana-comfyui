@@ -210,6 +210,138 @@ $("s-allow-copilot").addEventListener("change", async () => {
   }
 });
 
+// ── 出图实时预览（2026-10-13：默认关 / 两级档位）──────────────────────────
+// 真相源在后端（preview-settings.json），生效值经中继下发。
+// 下载入口不是「点了就下」：app 侧无外网白名单 + 无 ComfyUI 目录写权，/preview-model/download
+// 恒回 needAgent；UI 只展示指引，由用户点「请 Agent 下载」把请求回传给会话。
+let previewEnabled = false;
+let previewTier = "basic";
+let previewModelInfo = null; // {filename, targetDir, sources, note}
+
+function renderPreview() {
+  $("s-preview-tier-wrap").style.display = previewEnabled ? "" : "none";
+  const radios = document.querySelectorAll('input[name="s-preview-tier"]');
+  radios.forEach((r) => { r.checked = r.value === previewTier; r.disabled = !previewEnabled; });
+  const hd = previewEnabled && previewTier === "hd";
+  $("s-preview-hd").style.display = hd ? "" : "none";
+  if (hd) void loadPreviewModel();
+}
+
+async function loadPreview() {
+  try {
+    const { data } = await apiJson("/comfyui-hana/preview-settings");
+    if (data && data.ok) {
+      previewEnabled = !!data.enabled;
+      previewTier = data.tier === "hd" ? "hd" : "basic";
+      $("s-preview-enabled").checked = previewEnabled;
+    }
+  } catch { /* 忽略 */ }
+  renderPreview();
+}
+
+async function postPreview(body) {
+  return apiJson("/comfyui-hana/preview-settings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+// 取模型获取指引（非下载执行）：targetDir / sources / note
+async function loadPreviewModel() {
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/preview-model/download", { method: "POST", cache: "no-store" });
+    const data = await r.json().catch(() => null);
+    if (data) previewModelInfo = data;
+    $("s-preview-model-dir").innerHTML = data && data.targetDir
+      ? `<code>${esc(data.targetDir)}</code>`
+      : '<span class="chip bad">未知（未检测到安装目录）</span>';
+  } catch (e) {
+    $("s-preview-model-dir").innerHTML = '<span class="chip bad">读取失败</span>';
+  }
+}
+
+function previewGuideText() {
+  const dir = (previewModelInfo && previewModelInfo.targetDir) || "<ComfyUI>/models/vae_approx";
+  const file = (previewModelInfo && previewModelInfo.filename) || "taeqi2_1_decoder.pth";
+  const srcs = (previewModelInfo && Array.isArray(previewModelInfo.sources)) ? previewModelInfo.sources : [];
+  const list = srcs.map((s) => `- ${s.name}: ${s.url}${s.caution ? `（${s.caution}）` : ""}`).join("\n");
+  return `请下载 ComfyUI 预览模型 ${file} 到 ${dir}\n优先镜像源：\n${list}`;
+}
+
+$("s-preview-enabled").addEventListener("change", async () => {
+  const want = $("s-preview-enabled").checked;
+  setMsg("s-preview-save-msg", "保存中…", "");
+  try {
+    const { data } = await postPreview({ enabled: want });
+    if (!data || !data.ok) {
+      $("s-preview-enabled").checked = !want;
+      setMsg("s-preview-save-msg", `保存失败：${(data && data.error) || "未知原因"}`, "bad");
+      return;
+    }
+    previewEnabled = !!data.enabled;
+    if (data.tier) previewTier = data.tier;
+    renderPreview();
+    setMsg("s-preview-save-msg", data.pushed ? "已生效" : `已存待生效${data.note ? `：${data.note}` : ""}`, data.pushed ? "ok" : "");
+  } catch (e) {
+    $("s-preview-enabled").checked = !want;
+    setMsg("s-preview-save-msg", `保存失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
+document.querySelectorAll('input[name="s-preview-tier"]').forEach((r) => {
+  r.addEventListener("change", async () => {
+    const want = r.value === "hd" ? "hd" : "basic";
+    setMsg("s-preview-save-msg", "保存中…", "");
+    try {
+      const { data } = await postPreview({ tier: want });
+      if (!data || !data.ok) {
+        setMsg("s-preview-save-msg", `保存失败：${(data && data.error) || "未知原因"}`, "bad");
+        renderPreview();
+        return;
+      }
+      if (data.tier) previewTier = data.tier;
+      renderPreview();
+      setMsg("s-preview-save-msg", data.pushed ? "已生效" : `已存待生效${data.note ? `：${data.note}` : ""}`, data.pushed ? "ok" : "");
+    } catch (e) {
+      setMsg("s-preview-save-msg", `保存失败：${String((e && e.message) || e)}`, "bad");
+      renderPreview();
+    }
+  });
+});
+
+// 「请 Agent 下载」：照 workspace.js 的通知机制——没有现成的 agent 通知能力，
+// 主路走 hana.emit 回传会话（仅 card slot 有效），失败/被拒时回落剪贴板复制指引。
+$("s-preview-agent-get").addEventListener("click", async () => {
+  if (!previewModelInfo) await loadPreviewModel();
+  const text = previewGuideText();
+  const dir = previewModelInfo && previewModelInfo.targetDir;
+  try {
+    const res = await hana.emit("preview-model-download-request", {
+      filename: (previewModelInfo && previewModelInfo.filename) || "taeqi2_1_decoder.pth",
+      targetDir: dir || null,
+      message: `请下载 ComfyUI 预览模型 ${(previewModelInfo && previewModelInfo.filename) || "taeqi2_1_decoder.pth"} 到 ${dir || "<ComfyUI>/models/vae_approx"}`,
+    });
+    if (res && res.delivered) { setMsg("s-preview-model-msg", "已发回会话，agent 收到后会开始下载。", "ok"); return; }
+    throw new Error("emit 未送达");
+  } catch {
+    try {
+      await hana.clipboard.writeText(text);
+      setMsg("s-preview-model-msg", "无法直接通知会话，下载指引已复制，粘给任意会话即可让 agent 代办。", "");
+    } catch {
+      setMsg("s-preview-model-msg", "无法通知会话，也无法复制。请手动转告 agent 下载指引。", "bad");
+    }
+  }
+});
+
+$("s-preview-copy").addEventListener("click", async () => {
+  if (!previewModelInfo) await loadPreviewModel();
+  try {
+    await hana.clipboard.writeText(previewGuideText());
+    setMsg("s-preview-model-msg", "下载指引已复制。", "ok");
+  } catch { setMsg("s-preview-model-msg", "复制失败。", "bad"); }
+});
+
 // ── 启动 ──────────────────────────────────────────────────────────────────
 async function main() {
   syncTheme();
@@ -220,6 +352,7 @@ async function main() {
   void loadAutoStart();
   void loadAllowWrite();
   void loadAllowCopilot();
+  void loadPreview();
   setInterval(() => { void poll(); }, 3000);
   setInterval(() => { void loadInstall(); }, 20000);
 }
