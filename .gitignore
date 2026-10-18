@@ -33,3 +33,8 @@ comfyui-skills/
 comfyui-skill-bundle/
 _build_wf.py
 
+
+# 工作现场临时物（2026-10-19）：草稿脚本 / 出图产物 / 临时工作流，不进仓库
+_scratch/
+outputs/
+workflows/
