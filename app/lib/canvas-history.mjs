@@ -257,13 +257,89 @@ function widgetsPart(node) {
   return out;
 }
 
+// ── 连线端点归一化（v2 签名 / delta 共用）────────────────────────────────
+// 快照 links 真实格式（2026-10-15 实测 394 份历史快照：**全部为数组数组**）：
+//   [[id, origin_id, origin_slot, target_id, target_slot, type], ...]
+// 对象数组格式（[{id, origin_id, origin_slot, target_id, target_slot, type}]）一并兼容。
+/** 单条 link → [originId, originSlot, targetId, targetSlot] 原始 4 元组；无法解析 → null。 */
+function linkEndpoint(link) {
+  if (isPlainObject(link)) {
+    const o = link.origin_id;
+    const t = link.target_id;
+    if (o === undefined || o === null || t === undefined || t === null) return null;
+    return [o, link.origin_slot, t, link.target_slot];
+  }
+  if (Array.isArray(link) && link.length >= 5) {
+    const o = link[1];
+    const t = link[3];
+    if (o === undefined || o === null || t === undefined || t === null) return null;
+    return [o, link[2], t, link[4]];
+  }
+  return null;
+}
+
+/** 端点 4 元组 → 规范化端点串 `originId:originSlot>targetId:targetSlot`（跨语言一致）。 */
+function endpointStr(ep) {
+  return `${canonValue(ep[0])}:${canonValue(ep[1])}>${canonValue(ep[2])}:${canonValue(ep[3])}`;
+}
+
+/** 签名的连线部分：全部端点串**排序**后以 "," 拼接（不用连线条数，端点对集合敏感）。 */
+function linksPart(graph) {
+  const g = isPlainObject(graph) ? graph : {};
+  const links = Array.isArray(g.links) ? g.links : [];
+  const parts = [];
+  for (const l of links) {
+    const ep = linkEndpoint(l);
+    if (!ep) continue;
+    parts.push(endpointStr(ep));
+  }
+  parts.sort();
+  return parts.join(",");
+}
+
+/** 槽位号归一化：null/undefined → null；整数值 → 整型；其余数值原样；非数值 → 字符串。 */
+function normSlot(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return Number.isInteger(v) ? v : v;
+  return v;
+}
+
+/** links → {端点串: 端点 4 元组}（首个同串为准）。 */
+function linksIndex(graph) {
+  const g = isPlainObject(graph) ? graph : {};
+  const links = Array.isArray(g.links) ? g.links : [];
+  const out = new Map();
+  for (const l of links) {
+    const ep = linkEndpoint(l);
+    if (!ep) continue;
+    const key = endpointStr(ep);
+    if (!out.has(key)) out.set(key, ep);
+  }
+  return out;
+}
+
+/** delta 的单侧端点：{type, slot}；type = 节点 type 名，取不到则用 id 兜底。 */
+function linkEnd(nodeId, slot, byId) {
+  const n = byId.get(canonValue(nodeId));
+  let type = isPlainObject(n) && n.type !== null && n.type !== undefined ? String(n.type) : null;
+  if (type === null || type === "") type = canonValue(nodeId);
+  return { type, slot: normSlot(slot) };
+}
+
+/** 端点 4 元组 → {from:{type,slot}, to:{type,slot}}。 */
+function linkDesc(ep, byId) {
+  return { from: linkEnd(ep[0], ep[1], byId), to: linkEnd(ep[2], ep[3], byId) };
+}
+
 /**
- * 归一化画布签名（忽略 seed 类 widget）。
- * 口径：按 `graph.nodes` 数组顺序，逐节点 `type + "|" + widget 段`，各节点段先 fnv1a，
- * 再以 "|" 串接整体 fnv1a，输出 8 位小写 hex。
- * 与桥 js `graphSignature()` 同族但**更简化**（不含 mode/title/位置/连线数；不含节点 id）。
+ * 归一化画布签名（忽略 seed 类 widget；v2 起纳入连线端点对）。
+ * 口径（v2）：节点部分 = 按 `graph.nodes` 数组顺序，逐节点 `type + "|" + widget 段`，各节点段先
+ * fnv1a，再以 "|" 串接；连线部分 = 全部端点串（`originId:originSlot>targetId:targetSlot`）
+ * 排序后以 "," 拼接；最终 `"v2:" + fnv1a(节点部分 + "#L#" + 连线部分)`，输出 8 位小写 hex。
+ * 与桥 js `graphSignature()` 同族但**更简化**（不含 mode/title/位置；不含节点 id）。
+ * 口径版本前缀：旧数据无 `v2:` 前缀 → 判为不可比 → 不合并（一次性代价）。
  * @param {object} graph UI 格式画布
- * @returns {string} 8 位 hex
+ * @returns {string} `v2:` + 8 位 hex
  */
 export function graphSigIgnoringSeed(graph) {
   const g = isPlainObject(graph) ? graph : {};
@@ -274,7 +350,7 @@ export function graphSigIgnoringSeed(graph) {
     const type = n.type == null ? "" : String(n.type);
     parts.push(fnv1aHex(`${type}|${widgetsPart(n)}`));
   }
-  return fnv1aHex(parts.join("|"));
+  return `v2:${fnv1aHex(parts.join("|") + "#L#" + linksPart(g))}`;
 }
 
 /** id → 节点（跳过无 id / 非对象）。 */
@@ -338,15 +414,23 @@ function cmpId(a, b) {
 }
 
 /**
- * 对比两画布（UI 格式），相对 prev 算三类变化。
+ * 对比两画布（UI 格式），相对 prev 算四类变化（节点三类 + 连线一类）。
  * @param {object} prevGraph 父画布（null/非法 → 返回 null）
  * @param {object} nextGraph 本画布
- * @returns {{changed:{id:*,title:string,fields:string[]}[], added:{id:*,title:string}[], removed:{id:*,title:string}[]}|null}
+ * @returns {{changed:{id:*,title:string,fields:string[]}[], added:{id:*,title:string}[], removed:{id:*,title:string}[], links:{added:{from:{type:string,slot:*},to:{type:string,slot:*}}[], removed:{from:{type:string,slot:*},to:{type:string,slot:*}}[]}}|null}
  */
 export function computeDelta(prevGraph, nextGraph) {
   if (!isPlainObject(prevGraph)) return null;
   const prev = indexNodesById(prevGraph);
   const next = indexNodesById(nextGraph);
+  const linkPrev = linksIndex(prevGraph);
+  const linkNext = linksIndex(nextGraph);
+  const linksAddedKeys = [];
+  const linksRemovedKeys = [];
+  for (const k of linkNext.keys()) if (!linkPrev.has(k)) linksAddedKeys.push(k);
+  for (const k of linkPrev.keys()) if (!linkNext.has(k)) linksRemovedKeys.push(k);
+  linksAddedKeys.sort();
+  linksRemovedKeys.sort();
   const added = [];
   const removed = [];
   for (const [id, n] of next) if (!prev.has(id)) added.push({ id: n.id, title: nodeTitle(n) });
@@ -365,7 +449,15 @@ export function computeDelta(prevGraph, nextGraph) {
   added.sort((x, y) => cmpId(x.id, y.id));
   removed.sort((x, y) => cmpId(x.id, y.id));
   changed.sort((x, y) => cmpId(x.id, y.id));
-  return { changed, added, removed };
+  return {
+    changed,
+    added,
+    removed,
+    links: {
+      added: linksAddedKeys.map((k) => linkDesc(linkNext.get(k), next)),
+      removed: linksRemovedKeys.map((k) => linkDesc(linkPrev.get(k), prev)),
+    },
+  };
 }
 
 /**

@@ -12,7 +12,7 @@
 //       泳道永不真正回收。G 算法（2026-10-14）：新泳道挤在父泳道下方 → 消交叉。
 //   (2) 全量显示（2026-10-12 去折叠）：不再按 headSeq 截断——row = lane、rows = laneCount、
 //       sleepingCount 恒 0（lanes[].sleeping 恒 false）；泳道多时由视图侧拖拽/滚动查看。
-//       ⚠️ 本文件与桥内内联版（app/bridge/js/hana-bridge-15021810.js 的 commitGraphLanes）
+//       ⚠️ 本文件与桥内内联版（app/bridge/js/hana-bridge-2610152337.js 的 commitGraphLanes）
 //       必须逐逻辑一致，改动请同改两处（含 commit-graph-lanes.test.mjs 断言）。
 
 export function commitGraphLanes(entries) {

@@ -571,9 +571,39 @@ class TestP5Purity(TempRootTestCase):
 
     def test_graph_sig_ignoring_seed_stable(self):
         sig = hs.graph_sig_ignoring_seed(self.SIG_GRAPH)
-        self.assertRegex(sig, r"^[0-9a-f]{8}$")
-        self.assertEqual(sig, "c1271398")  # 跨语言一致基准（JS 侧同值）
+        self.assertRegex(sig, r"^v2:[0-9a-f]{8}$")
+        self.assertEqual(sig, "v2:06abd57b")  # 跨语言一致基准（JS 侧同值）
         self.assertEqual(hs.graph_sig_ignoring_seed(self.SIG_GRAPH), sig)
+
+    def test_graph_sig_v2_links_sensitive_seed_insensitive(self):
+        """v2 语义：纯连线改动 → 签名变化；仅换 seed → 签名不变（与 JS §12 用例对应）。"""
+        import copy
+
+        base = self.SIG_GRAPH
+        base_sig = hs.graph_sig_ignoring_seed(base)
+        # 纯连线改动（节点 widget 未变）→ 端点变化改签名
+        relinked = copy.deepcopy(base)
+        relinked["links"] = [[1, 1, 0, 3, 0, "MODEL"]]
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(relinked), base_sig)
+        # 同条数换端点 → 仍变化（按端点对集合，不按条数）
+        swap = copy.deepcopy(base)
+        swap["links"] = [[1, 1, 1, 2, 1, "MODEL"]]
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(swap), base_sig)
+        # 连线顺序无关，多一条连线改签名
+        reordered = copy.deepcopy(base)
+        reordered["links"] = [[1, 1, 0, 2, 0, "MODEL"], [2, 2, 0, 3, 0, "LATENT"]]
+        reordered2 = copy.deepcopy(base)
+        reordered2["links"] = [[2, 2, 0, 3, 0, "LATENT"], [1, 1, 0, 2, 0, "MODEL"]]
+        self.assertEqual(hs.graph_sig_ignoring_seed(reordered2), hs.graph_sig_ignoring_seed(reordered))
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(reordered), base_sig)
+        # 对象数组格式与数组数组格式等价
+        obj_links = copy.deepcopy(base)
+        obj_links["links"] = [{"id": 1, "origin_id": 1, "origin_slot": 0, "target_id": 2, "target_slot": 0, "type": "MODEL"}]
+        self.assertEqual(hs.graph_sig_ignoring_seed(obj_links), base_sig)
+        # 仅换 seed → 签名不变（不回归）
+        seed_only = copy.deepcopy(base)
+        seed_only["nodes"][1]["widgets_values_named"]["seed"] = 999999
+        self.assertEqual(hs.graph_sig_ignoring_seed(seed_only), base_sig)
 
     def test_graph_sig_ignores_seed_sensitive_otherwise(self):
         import copy
@@ -607,6 +637,25 @@ class TestP5Purity(TempRootTestCase):
         nxt = {"nodes": [{"id": 1, "type": "A2", "widgets_values": ["a", "z"]}]}
         d = hs.compute_delta(prev, nxt)
         self.assertEqual(d["changed"], [{"id": 1, "title": "A2", "fields": ["type", "widget_1"]}])
+
+    def test_compute_delta_removed_links_resolve_endpoints_in_prev(self):
+        # 被删连线存在于 prev 图，端点 type 必须取自 prev（而非 next）——与 JS 侧同语义用例对应。
+        # (a) 端点节点在 next 中缺失 → 不得退化为 id 兜底
+        prev = {"nodes": [{"id": 1, "type": "A"}, {"id": 2, "type": "B"}],
+                "links": [[1, 1, 0, 2, 0, "X"]]}
+        nxt = {"nodes": [{"id": 1, "type": "A"}], "links": []}
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["links"]["added"], [])
+        self.assertEqual(d["links"]["removed"],
+                         [{"from": {"type": "A", "slot": 0}, "to": {"type": "B", "slot": 0}}])
+        # (b) 端点节点在 next 中 type 已变 → 不得用 next 的新 type
+        prev2 = {"nodes": [{"id": 1, "type": "A"}, {"id": 2, "type": "B"}],
+                 "links": [[1, 1, 0, 2, 0, "X"]]}
+        nxt2 = {"nodes": [{"id": 1, "type": "A"}, {"id": 2, "type": "B2"}], "links": []}
+        d2 = hs.compute_delta(prev2, nxt2)
+        self.assertEqual(d2["links"]["added"], [])
+        self.assertEqual(d2["links"]["removed"],
+                         [{"from": {"type": "A", "slot": 0}, "to": {"type": "B", "slot": 0}}])
 
     def test_compute_delta_none_for_invalid_prev(self):
         self.assertIsNone(hs.compute_delta(None, {}))
@@ -646,7 +695,7 @@ class TestP5Purity(TempRootTestCase):
             {"id": 1, "type": "PrimitiveInt", "widgets_values": [1024]},
             {"id": 2, "type": "KSampler", "widgets_values_named": {"seed": 123, "sampler_name": "euler", "steps": 20}},
         ]}
-        self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "cac7e860")
+        self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "v2:da8129a4")
 
 
 class TestP5bWiring(TempRootTestCase):

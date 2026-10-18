@@ -378,10 +378,10 @@ const SIG_GRAPH = {
   links: [[1, 1, 0, 2, 0, "MODEL"]],
 };
 
-test("graphSigIgnoringSeed：稳定 8 位 hex，且与固定期望一致", () => {
+test("graphSigIgnoringSeed：稳定 hex（v2 前缀 + 8 位），且与固定期望一致", () => {
   const sig = graphSigIgnoringSeed(SIG_GRAPH);
-  assert.match(sig, /^[0-9a-f]{8}$/);
-  assert.equal(sig, "c1271398"); // 跨语言一致基准（Python 侧同值）
+  assert.match(sig, /^v2:[0-9a-f]{8}$/);
+  assert.equal(sig, "v2:06abd57b"); // 跨语言一致基准（Python 侧同值）
   assert.equal(graphSigIgnoringSeed(SIG_GRAPH), sig); // 幂等
 });
 
@@ -396,6 +396,33 @@ test("graphSigIgnoringSeed：忽略 seed 类 widget，对非 seed 变化敏感",
   const noiseSeed = structuredClone(SIG_GRAPH);
   noiseSeed.nodes[1].widgets_values_named.noise_seed = 7;
   assert.equal(graphSigIgnoringSeed(noiseSeed), graphSigIgnoringSeed(base), "noise_seed 同样忽略");
+});
+
+test("graphSigIgnoringSeed：v2 纳入连线端点对（纯连线改动改签名）", () => {
+  const base = structuredClone(SIG_GRAPH);
+  // 纯连线改动（节点 widget 未变）→ 签名变化
+  const relinked = structuredClone(SIG_GRAPH);
+  relinked.links = [[1, 1, 0, 3, 0, "MODEL"]];
+  assert.notEqual(graphSigIgnoringSeed(relinked), graphSigIgnoringSeed(base), "端点变化应改签名");
+  // 删一条又加一条（条数不变，端点不同）→ 仍变化（不用条数）
+  const swap = structuredClone(SIG_GRAPH);
+  swap.links = [[1, 1, 1, 2, 1, "MODEL"]];
+  assert.notEqual(graphSigIgnoringSeed(swap), graphSigIgnoringSeed(base), "同条数换端点应改签名");
+  // 连线顺序无关（端点对集合）
+  const reordered = structuredClone(SIG_GRAPH);
+  reordered.links = [[1, 1, 0, 2, 0, "MODEL"], [2, 2, 0, 3, 0, "LATENT"]];
+  const reordered2 = structuredClone(SIG_GRAPH);
+  reordered2.links = [[2, 2, 0, 3, 0, "LATENT"], [1, 1, 0, 2, 0, "MODEL"]];
+  assert.equal(graphSigIgnoringSeed(reordered2), graphSigIgnoringSeed(reordered), "连线顺序不应改签名");
+  assert.notEqual(graphSigIgnoringSeed(reordered), graphSigIgnoringSeed(base), "多一条连线应改签名");
+  // 仅换 seed → 签名不变（不回归）
+  const seedOnly = structuredClone(SIG_GRAPH);
+  seedOnly.nodes[1].widgets_values_named.seed = 999999;
+  assert.equal(graphSigIgnoringSeed(seedOnly), graphSigIgnoringSeed(base), "仅换 seed 不应改签名");
+  // 对象数组格式与数组数组格式等价
+  const objLinks = structuredClone(SIG_GRAPH);
+  objLinks.links = [{ id: 1, origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0, type: "MODEL" }];
+  assert.equal(graphSigIgnoringSeed(objLinks), graphSigIgnoringSeed(base), "两种 links 格式应同串");
 });
 
 // ── 13. P5a：computeDelta ───────────────────────────────────────────────────
@@ -416,6 +443,54 @@ test("computeDelta：changed / added / removed 三类", () => {
   assert.deepEqual(d.changed, [{ id: 1, title: "甲", fields: ["steps"] }]);
   assert.deepEqual(d.added, [{ id: 3, title: "C" }]);
   assert.deepEqual(d.removed, [{ id: 2, title: "B" }]);
+  assert.deepEqual(d.links, { added: [], removed: [] });
+});
+
+test("computeDelta：links 维度（added / removed，改接 = removed+added）", () => {
+  const prev = {
+    nodes: [
+      { id: 1, type: "KSampler" },
+      { id: 2, type: "VAEDecode" },
+      { id: 3, type: "SaveImage" },
+    ],
+    links: [[1, 1, 0, 2, 0, "LATENT"], [2, 2, 0, 3, 0, "IMAGE"]],
+  };
+  const next = {
+    nodes: [
+      { id: 1, type: "KSampler" },
+      { id: 2, type: "VAEDecode" },
+      { id: 3, type: "SaveImage" },
+    ],
+    links: [[1, 1, 0, 2, 0, "LATENT"], [2, 2, 1, 3, 0, "IMAGE"]],
+  };
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.links, {
+    added: [{ from: { type: "VAEDecode", slot: 1 }, to: { type: "SaveImage", slot: 0 } }],
+    removed: [{ from: { type: "VAEDecode", slot: 0 }, to: { type: "SaveImage", slot: 0 } }],
+  });
+});
+
+test("computeDelta：links 端点取不到节点 type 时用 id 兜底", () => {
+  const prev = { nodes: [{ id: 1, type: "A" }], links: [] };
+  const next = { nodes: [{ id: 1, type: "A" }], links: [[1, 1, 0, 99, 0, "X"]] };
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.links.added, [{ from: { type: "A", slot: 0 }, to: { type: "99", slot: 0 } }]);
+});
+
+test("computeDelta：被删连线的端点 type 取自 prev（端点节点在 next 缺失）", () => {
+  const prev = { nodes: [{ id: 1, type: "A" }, { id: 2, type: "B" }], links: [[1, 1, 0, 2, 0, "X"]] };
+  const next = { nodes: [{ id: 1, type: "A" }], links: [] };
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.links.removed, [{ from: { type: "A", slot: 0 }, to: { type: "B", slot: 0 } }]);
+  assert.deepEqual(d.links.added, []);
+});
+
+test("computeDelta：被删连线的端点 type 取自 prev（端点节点在 next 中 type 已变）", () => {
+  const prev = { nodes: [{ id: 1, type: "A" }, { id: 2, type: "B" }], links: [[1, 1, 0, 2, 0, "X"]] };
+  const next = { nodes: [{ id: 1, type: "A" }, { id: 2, type: "B2" }], links: [] };
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.links.removed, [{ from: { type: "A", slot: 0 }, to: { type: "B", slot: 0 } }]);
+  assert.deepEqual(d.links.added, []);
 });
 
 test("computeDelta：type 变化计入 fields；title 缺失用 type；无 widgets 用 widget_<i>", () => {
@@ -423,6 +498,7 @@ test("computeDelta：type 变化计入 fields；title 缺失用 type；无 widge
   const next = { nodes: [{ id: 1, type: "A2", widgets_values: ["a", "z"] }] };
   const d = computeDelta(prev, next);
   assert.deepEqual(d.changed, [{ id: 1, title: "A2", fields: ["type", "widget_1"] }]);
+  assert.deepEqual(d.links, { added: [], removed: [] });
 });
 
 test("computeDelta：prevGraph 为 null/非法 → null", () => {
@@ -476,7 +552,7 @@ test("graphSigIgnoringSeed：跨语言 fixture 与 Python 侧同串", () => {
       { id: 2, type: "KSampler", widgets_values_named: { seed: 123, sampler_name: "euler", steps: 20 } },
     ],
   };
-  assert.equal(graphSigIgnoringSeed(fixture), "cac7e860");
+  assert.equal(graphSigIgnoringSeed(fixture), "v2:da8129a4");
 });
 
 // ── 17. P5a：组合（新字段落索引行 → 解析 → normalizeEntry 读回）───────────

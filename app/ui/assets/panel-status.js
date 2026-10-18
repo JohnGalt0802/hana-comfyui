@@ -211,25 +211,48 @@ function render(st) {
   $("p-phase").innerHTML = relayDown
     ? chip("中继不可达", "bad")
     : chip(PHASE_LABEL[boot.phase] || String(boot.phase || "?"), boot.phase === "ready" ? "ok" : (boot.phase === "error" ? "bad" : "warn"));
-  $("p-port").textContent = boot.service && boot.service.port ? String(boot.service.port) : "—";
   if (backend && !relayDown) {
     $("p-backend").innerHTML = backend.reachable ? chip("可达", "ok") : chip("服务未跑", "bad");
   } else {
     $("p-backend").textContent = "—";
   }
   const sys = backend && !relayDown && backend.system ? backend.system : null;
-  $("p-ver").textContent = sys && sys.comfyui_version
+  const verText = sys && sys.comfyui_version
     ? `${sys.comfyui_version}${sys.installed_frontend_version ? " · 前端 " + sys.installed_frontend_version : ""}`
-    : "—";
+    : "";
+  $("p-ver").textContent = verText || "—";
+  // 空值不占行（2026-10-16）：服务未跑时版本行、队列胶囊都隐藏，不留“—”占位
+  const verRow = $("row-ver");
+  if (verRow) verRow.hidden = !verText;
   const q = !relayDown && relay && relay.queue ? relay.queue : null;
-  $("p-queue").textContent = q ? `${q.running} 运行 / ${q.pending} 排队` : "—";
+  const qText = q ? `${q.running} 运行 · ${q.pending} 排队` : "";
+  const qEl = $("p-queue");
+  if (qEl) { qEl.textContent = qText; qEl.hidden = !qText; }
+
+  // ── 主状态句（2026-10-16）：把三态判定的结论用一句话写在最上面，
+  //    替代原先「五行流水账里自己找哪行是红的」。判定与下方 chip / 信号灯同源（同一份 st）。
+  const mainEl = $("p-main");
+  if (mainEl) {
+    let text = "读取中…", cls = "";
+    if (relayDown) { text = "中继不可达"; cls = "bad"; }
+    else if (boot.phase === "error") { text = "中继启动失败"; cls = "bad"; }
+    else if (boot.phase === "starting") { text = "中继启动中…"; cls = "warn"; }
+    else if (boot.phase === "idle" || boot.phase === "stopped") { text = "中继待启动"; cls = "warn"; }
+    else if (boot.phase !== "ready") { text = "中继状态未知"; cls = "warn"; }
+    else if (!(backend && backend.reachable)) { text = "ComfyUI 服务未运行"; cls = "bad"; }
+    else { text = "服务运行中"; cls = "ok"; }
+    mainEl.textContent = text;
+    mainEl.className = "sc-main" + (cls ? " " + cls : "");
+  }
 
   lastStatus = st; // 信号灯推导用
 
-  // 服务起停按钮：① 中继不可达 → 双收（先重启中继）② 服务未跑 → 「启动服务」③ 就绪 → 「停止服务」
+  // 服务起停（2026-10-16 合并为单按钮）：同一时刻服务只可能是「开着」或「关着」，
+  // 文案与语义随 reachable 切换：就绪 → 「停止服务」（danger）；未跑 → 「启动服务」（primary）；
+  // 中继不可达 → 按钮禁用（请求送不到中继），引导去「维护 → 重启中继」。
   const reachable = !!(backend && backend.reachable) && !relayDown; // 保守：中继不可达时后端可达性不可信
   const proc = backend && backend.proc ? backend.proc : null;
-  const startBtn = $("p-start"), stopBtn = $("p-stop");
+  const svcBtn = $("p-svc");
   // 启动等待：本左栏等待态（svcStarting）∪ 服务端权威启动中（proc.starting）——
   // 后者覆盖「从壳页点启动」，使本左栏也显示秒表（2026-10-14 两侧同源）。
   const waiting = svcStarting || !!(proc && proc.starting === true);
@@ -256,40 +279,55 @@ function render(st) {
   else if (!relayDown && svcNoteRelay) { svcNoteMsg = ""; svcNoteRelay = false; hideSvcRetry(); } // 中继已恢复：撤下「待中继恢复确认」
   if (!svcBusy) {
     if (relayDown) {
-      // ① 中继不可达：启动/停止都送不到中继 → 双收，由「重启中继」负责恢复
-      startBtn.style.display = "none";
-      stopBtn.style.display = "none";
-      startBtn.disabled = false;
-      startBtn.textContent = "启动服务";
-      startBtn.title = "中继不可达：先「重启中继」，再启动服务";
+      // 中继不可达：请求送不到中继 → 按钮禁用，由「维护 → 重启中继」负责恢复
+      svcBtn.disabled = true;
+      svcBtn.className = "primary";
+      svcBtn.textContent = "启动服务";
+      svcBtn.title = "中继不可达：请先在「维护」里重启中继";
     } else {
-      startBtn.style.display = reachable ? "none" : "";
-      stopBtn.style.display = reachable ? "" : "none";
-      stopBtn.disabled = false;
-      if (svcStarting && !reachable) { // 持久「启动中」：按钮保持禁用，待就绪/失败/超时收尾
-        startBtn.disabled = true;
-        startBtn.textContent = "启动中…";
+      svcBtn.disabled = false;
+      if (svcStarting && !reachable) { // 持久「启动中」：保持禁用，待就绪/失败/超时收尾
+        svcBtn.disabled = true;
+        svcBtn.className = "primary";
+        svcBtn.textContent = "启动中…";
+        svcBtn.title = "正在启动 ComfyUI 服务…";
+      } else if (reachable) {
+        // 就绪 → 这个按钮变成「停止」（同一位置同一按钮，不另占一行）
+        svcBtn.className = "danger";
+        svcBtn.textContent = "停止服务";
+        svcBtn.title = "终止 8188 上的 ComfyUI 进程（正在跑的任务会中断）";
       } else {
-        startBtn.disabled = false;
-        startBtn.textContent = "启动服务";
+        svcBtn.className = "primary";
+        svcBtn.textContent = "启动服务";
+        const hasInstall = !!(proc && (proc.install || proc.python || proc.mainPy));
+        svcBtn.title = hasInstall
+          ? `启动 ComfyUI：${proc.python || proc.mainPy || ""}`
+          : "按本机安装探测结果拉起 ComfyUI（由计划任务以当前用户身份起，独立于 Hana 存活）";
       }
-      const hasInstall = !!(proc && (proc.install || proc.python || proc.mainPy));
-      startBtn.title = hasInstall
-        ? `启动 ComfyUI：${proc.python || proc.mainPy || ""}`
-        : "按本机安装探测结果拉起 ComfyUI（由计划任务以当前用户身份起，独立于 Hana 存活）";
     }
   }
 
-  const svcBits = [];
+  // ── 诊断详情（2026-10-16）：安装根 / 进程 / 拉起时间逐行列出，不再挤成一行长句；
+  //    归入「维护」折叠区，默认不占版面。空值不占行。
+  const diagLines = [];
+  if (boot.note) diagLines.push(boot.note);
   if (proc) {
-    if (proc.install) svcBits.push(`安装根 ${proc.install}`);
-    if (reachable && Array.isArray(proc.pids) && proc.pids.length) svcBits.push(`监听进程 ${proc.pids.join(", ")}`);
+    if (proc.install) diagLines.push(`安装根 ${proc.install}`);
+    if (reachable && Array.isArray(proc.pids) && proc.pids.length) diagLines.push(`监听进程 ${proc.pids.join(", ")}`);
     const stamp = (iso) => String(iso).replace("T", " ").slice(0, 19);
-    if (proc.startedAt) svcBits.push(reachable ? `本 App 拉起于 ${stamp(proc.startedAt)}` : `上次由本 App 拉起：${stamp(proc.startedAt)}`);
-    if (!reachable && proc.lastStop && proc.lastStop.at) svcBits.push(`上次停止：${stamp(proc.lastStop.at)}`);
+    if (proc.startedAt) diagLines.push(reachable ? `本 App 拉起于 ${stamp(proc.startedAt)}` : `上次由本 App 拉起：${stamp(proc.startedAt)}`);
+    if (!reachable && proc.lastStop && proc.lastStop.at) diagLines.push(`上次停止：${stamp(proc.lastStop.at)}`);
   }
-  // 常规详情（boot.note + 安装根/监听进程/拉起时间等）→ 折叠区底部 p-detail（不再占按钮区）
-  $("p-detail").textContent = [boot.note || "", svcBits.join(" · ")].filter(Boolean).join("\n");
+  const detailEl = $("p-detail");
+  if (detailEl) {
+    detailEl.replaceChildren();
+    for (const line of diagLines) {
+      const d = document.createElement("div");
+      d.textContent = line;
+      d.title = line; // 长路径截断后悬停可看全
+      detailEl.appendChild(d);
+    }
+  }
   // p-note：仅操作反馈（启动等待/失败/已运行/停止结果等即时消息）；无消息 → 清空并隐藏
   if (justReady) {
     setNote("ComfyUI 服务已就绪。");
@@ -327,11 +365,13 @@ async function poll() {
       const snapAt = st && st.snapshotAt ? Date.parse(st.snapshotAt) : NaN;
       if (Number.isFinite(snapAt) && snapAt > sigOpt.at) sigOpt = null;
     }
+    lastStatusOkAt = Date.now(); // 自愈判定用：最近一次成功取数时刻
     render(st);
   } catch (e) {
     if (!svcStarting) setNote("状态读取失败：" + String((e && e.message) || e)); // 等待态由秒表维护，不覆盖
   }
 }
+let lastStatusOkAt = 0; // 最近一次 /comfyui-hana/status 成功取数时刻（2026-10-16 自愈用）
 
 // 快速轮询波：start/stop 请求结束后，在 0/0.8/1.6/3/5s 各拉一次状态（替换原先的单次 poll），
 // 让「停止→不可达」「启动中→就绪」的翻转尽快被捕捉。与 2s 常规轮询并行、互为补充。
@@ -437,16 +477,18 @@ async function metricsTick() {
   }
 }
 
-// ── 折叠区开合记忆（状态区/监视器均默认折叠；选择记忆到 localStorage，各工作区共享一份）──
+// ── 折叠区开合记忆（监视器/更新/维护默认折叠；选择记忆到 localStorage，各工作区共享一份）──
+// 2026-10-18：补 null 保护——版面调整后 id 可能被移除/改名，缺元素时静默跳过而不是抛错
+// （曾因此整份模块在顶层抛错 → 宿主左栏显示「App 面板加载失败」）。
 function bindFold(id, key, onToggle) {
   const el = $(id);
+  if (!el) return;
   try { el.open = localStorage.getItem(key) === "1"; } catch { /* 忽略 */ }
   el.addEventListener("toggle", () => {
     try { localStorage.setItem(key, el.open ? "1" : "0"); } catch { /* 忽略 */ }
     if (onToggle) onToggle();
   });
 }
-bindFold("fold-status", "comfyui-hana.panel.statusOpen");
 bindFold("fold-mon", "comfyui-hana.panel.monitorOpen", () => redrawAll()); // 展开/收起即重绘（隐藏期画布宽度不可靠）
 
 // ── 服务起停（启动/停止 8188 上的 ComfyUI 本体）─────────────────────────
@@ -496,9 +538,9 @@ function syncSvcWaitTimer(need) {
 
 function setSvcBusy(on, label) {
   svcBusy = on;
-  const btn = label && label.indexOf("停") === 0 ? $("p-stop") : $("p-start");
+  const btn = $("p-svc");
   if (on) { btn.disabled = true; btn.textContent = label || "处理中…"; }
-  else { btn.textContent = btn.id === "p-stop" ? "停止服务" : "启动服务"; pollBurst(); } // 起停请求收尾：快速轮询波
+  else { btn.disabled = false; pollBurst(); } // 起停请求收尾：文案由下一轮 render 按 reachable 重写；并快速轮询波
 }
 
 function showSvcRetry() { $("p-note-actions").style.display = ""; }
@@ -522,8 +564,9 @@ function svcFail(msg) {
   endSvcStart();
   svcNoteMsg = msg;
   setNote(msg);
-  const btn = $("p-start");
+  const btn = $("p-svc");
   btn.disabled = false;
+  btn.className = "primary";
   btn.textContent = "启动服务";
   showSvcRetry();
 }
@@ -558,7 +601,7 @@ async function startService() {
   svcNoteMsg = "";
   svcNoteRelay = false;
   hideSvcRetry();
-  const startBtn = $("p-start");
+  const startBtn = $("p-svc");
   startBtn.disabled = true;
   startBtn.textContent = "启动中…";
   renderSvcWaitNote();
@@ -677,7 +720,10 @@ function renderUpdateStatus(st) {
   $("u-state").innerHTML = st.running
     ? chip(`进行中 ${updStartedAt ? fmtAgo(Date.now() - updStartedAt) : ""}`.trim(), "warn")
     : (st.phase === "failed" ? chip("失败", "bad") : (st.phase === "done" ? chip("已完成", "ok") : chip(phaseText)));
-  if (st.before) $("u-local").textContent = st.after ? `${fmtVer(st.before)} → ${fmtVer(st.after)}` : fmtVer(st.before);
+  // 本地 / 远端 分两行（2026-10-16）：原先一行「本地 → 远端」在窄栏里横向溢出被截。
+  if (st.before) $("u-local").textContent = fmtVer(st.before);
+  const remoteEl = $("u-remote");
+  if (remoteEl) remoteEl.textContent = st.after ? fmtVer(st.after) : "—";
   const steps = (st.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}${s.detail ? `：${String(s.detail).split("\n").slice(-1)[0]}` : ""}`);
   // 日志尾给到 30 行：git pull / pip install 的输出更有参考价值
   $("u-log").textContent = [...steps, ...(st.logTail || []).slice(-30)].filter(Boolean).join("\n");
@@ -719,6 +765,8 @@ async function checkUpdate() {
     }
     $("u-local").textContent = fmtVer(d.local);
     noteUpdInfo(d); // 手动检查结果同步给信号灯
+    const remoteEl = $("u-remote");
+    if (remoteEl) remoteEl.textContent = d.remote ? fmtVer(d.remote) : "—";
     if (d.local && d.local.dirty) $("u-note").textContent = "本地有未提交改动，git 会拒绝拉取（不擅自 merge/reset）。";
     else if (d.upToDate) $("u-note").textContent = `已是最新（${d.local?.describe || ""}）。`;
     else $("u-note").textContent = `落后 ${d.behind} 个提交：${fmtVer(d.local)} → ${fmtVer(d.remote)}`;
@@ -883,8 +931,16 @@ async function restartRelay() {
 }
 $("p-retry").addEventListener("click", () => { void restartRelay(); });
 $("p-note-retry").addEventListener("click", () => { void restartRelay(); });
-$("p-start").addEventListener("click", () => { void startService(); });
-$("p-stop").addEventListener("click", () => { void stopService(); });
+$("p-svc").addEventListener("click", () => {
+  // 单按钮双职（2026-10-16）：按当前快照决定点下去是「启动」还是「停止」。
+  // 依据 lastStatus（最近一次成功快照）而非 DOM 文案，避免文案与真实状态错位。
+  const st = lastStatus || {};
+  const relayDown = st.relayError != null;
+  const backend = st.relay && st.relay.backend ? st.relay.backend : null;
+  const reachable = !!(backend && backend.reachable) && !relayDown;
+  if (reachable) void stopService();
+  else void startService();
+});
 $("m-release").addEventListener("click", () => { void releaseVram(); });
 $("u-check").addEventListener("click", () => { void checkUpdate(); });
 $("u-apply").addEventListener("click", () => { void applyUpdate(); });
@@ -914,8 +970,27 @@ async function main() {
   void updStatusTick(); // 初始显示当前版本 / 上次更新结果
   void silentUpdateCheck(); // 信号灯：启动静默查一次更新（失败不打扰）
   setInterval(() => { void silentUpdateCheck(); }, 10 * 60_000); // …此后每 10 分钟一次
-  document.addEventListener("visibilitychange", () => { // 页面由不可见转可见（回到工作区）：静默再查更新 + 重判主题
-    if (document.visibilityState === "visible") { void silentUpdateCheck(); syncTheme({ force: true }); }
+  // 自愈（2026-10-16）：宿主 park 不可见页面时 Chromium 会节流/暂停定时器，
+  // 期间发生的服务状态变化（如 10:47 那次后端短暂不可达→10:49 恢复）就永远不会被后续 poll
+  // 捕捉到，于是面板定格在红点 + 「中继 ?」，而 App 本体早已正常。
+  // 对策：页面重新可见、窗口重新获得焦点、页面从 bfcache 恢复——三种回到前台的时机都强制补一轮
+  // （状态 + 指标 + 更新状态 + 主题）；另加一道「陈旧兜底」：若距上次成功取数超过 STALE_MS 就补一轮，
+  // 这样即便某些宿主/浏览器不发 visibilitychange 也能自愈。
+  const STALE_MS = 6000;
+  // 记录「最近一次成功取数」的时刻（lastStatusOkAt 在 poll() 成功时回写）：
+  function revalidate(reason) {
+    void poll();
+    void metricsTick();
+    void updStatusTick();
+    syncTheme({ force: true });
+    if (reason) { try { console.debug("[comfyui-hana] 面板自愈重拉：", reason); } catch { /* 忽略 */ } }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") revalidate("visibility");
   });
+  window.addEventListener("focus", () => { if (Date.now() - lastStatusOkAt > STALE_MS) revalidate("focus-stale"); });
+  window.addEventListener("pageshow", (e) => { if (e && e.persisted) revalidate("bfcache"); });
+  // 陈旧兜底：定时器被节流时段会被拉长，这里只做「发现陈旧就补」，不做无条件重推。
+  setInterval(() => { if (Date.now() - lastStatusOkAt > STALE_MS) revalidate("stale-timer"); }, 2000);
 }
 void main();

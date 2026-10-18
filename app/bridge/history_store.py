@@ -156,11 +156,92 @@ def _widgets_part(node):
     return "".join(out)
 
 
+# ── 连线端点归一化（v2 签名 / delta 共用）──────────────────────────────────
+# 快照 links 真实格式（2026-10-15 实测 394 份历史快照：**全部为数组数组**）：
+#   [[id, origin_id, origin_slot, target_id, target_slot, type], ...]
+# 对象数组格式（[{id, origin_id, origin_slot, target_id, target_slot, type}]）一并兼容。
+def _link_endpoint(link):
+    """单条 link → (origin_id, origin_slot, target_id, target_slot) 原始 4 元组；无法解析 → None。"""
+    if isinstance(link, dict):
+        o, os_ = link.get("origin_id"), link.get("origin_slot")
+        t, ts = link.get("target_id"), link.get("target_slot")
+    elif isinstance(link, (list, tuple)) and len(link) >= 5:
+        o, os_, t, ts = link[1], link[2], link[3], link[4]
+    else:
+        return None
+    if o is None or t is None:
+        return None
+    return (o, os_, t, ts)
+
+
+def _endpoint_str(ep):
+    """端点 4 元组 → 规范化端点串 `originId:originSlot>targetId:targetSlot`（跨语言一致）。"""
+    return "%s:%s>%s:%s" % (_canon_value(ep[0]), _canon_value(ep[1]), _canon_value(ep[2]), _canon_value(ep[3]))
+
+
+def _links_part(graph):
+    """签名的连线部分：全部端点串**排序**后以 "," 拼接（不用连线条数，端点对集合敏感）。"""
+    g = graph if isinstance(graph, dict) else {}
+    links = g.get("links") if isinstance(g.get("links"), list) else []
+    parts = []
+    for l in links:
+        ep = _link_endpoint(l)
+        if ep is None:
+            continue
+        parts.append(_endpoint_str(ep))
+    parts.sort()
+    return ",".join(parts)
+
+
+def _norm_slot(v):
+    """槽位号归一化：None → None；整数值 → int；其余数值原样；非数值 → 字符串。"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return int(v) if float(v).is_integer() else v
+    return str(v)
+
+
+def _links_index(graph):
+    """links → {端点串: 端点 4 元组}（首个同串为准）。"""
+    g = graph if isinstance(graph, dict) else {}
+    links = g.get("links") if isinstance(g.get("links"), list) else []
+    out = {}
+    for l in links:
+        ep = _link_endpoint(l)
+        if ep is None:
+            continue
+        key = _endpoint_str(ep)
+        if key not in out:
+            out[key] = ep
+    return out
+
+
+def _link_end(node_id, slot, by_id):
+    """delta 的单侧端点：{type, slot}；type = 节点 type 名，取不到则用 id 兜底。"""
+    n = by_id.get(_canon_value(node_id))
+    typ = None
+    if isinstance(n, dict) and n.get("type") is not None:
+        typ = str(n.get("type"))
+    if typ is None or typ == "":
+        typ = _canon_value(node_id)
+    return {"type": typ, "slot": _norm_slot(slot)}
+
+
+def _link_desc(ep, by_id):
+    """端点 4 元组 → {from:{type,slot}, to:{type,slot}}。"""
+    return {"from": _link_end(ep[0], ep[1], by_id), "to": _link_end(ep[2], ep[3], by_id)}
+
+
 def graph_sig_ignoring_seed(graph):
-    """归一化画布签名（忽略 seed 类 widget）。
-    口径：按 graph.nodes 顺序，逐节点 type + "|" + widget 段，各节点段先 fnv1a，
-    再以 "|" 串接整体 fnv1a，输出 8 位小写 hex。
-    与桥 js graphSignature() 同族但更简化（不含 mode/title/位置/连线数；不含节点 id）。"""
+    """归一化画布签名（忽略 seed 类 widget；v2 起纳入连线端点对）。
+    口径（v2）：节点部分 = 按 graph.nodes 顺序，逐节点 type + "|" + widget 段，各节点段先
+    fnv1a，再以 "|" 串接；连线部分 = 全部端点串（`originId:originSlot>targetId:targetSlot`）
+    排序后以 "," 拼接；最终 `"v2:" + fnv1a(节点部分 + "#L#" + 连线部分)`，输出 8 位小写 hex。
+    与桥 js graphSignature() 同族但更简化（不含 mode/title/位置；不含节点 id）。
+    口径版本前缀：旧数据无 `v2:` 前缀 → 判为不可比 → 不合并（一次性代价）。"""
     g = graph if isinstance(graph, dict) else {}
     nodes = g.get("nodes") if isinstance(g.get("nodes"), list) else []
     parts = []
@@ -169,7 +250,7 @@ def graph_sig_ignoring_seed(graph):
             continue
         typ = "" if n.get("type") is None else str(n.get("type"))
         parts.append(_fnv1a_hex("%s|%s" % (typ, _widgets_part(n))))
-    return _fnv1a_hex("|".join(parts))
+    return "v2:" + _fnv1a_hex("|".join(parts) + "#L#" + _links_part(g))
 
 
 def _index_nodes_by_id(graph):
@@ -234,13 +315,27 @@ def _id_sort_key(v):
 
 
 def compute_delta(prev_graph, next_graph):
-    """对比两画布（UI 格式），相对 prev 算三类变化。
+    """对比两画布（UI 格式），相对 prev 算四类变化（节点三类 + 连线一类）。
     prev_graph 为 None/非法 → 返回 None。
-    返回 {"changed":[{id,title,fields}], "added":[{id,title}], "removed":[{id,title}]}。"""
+    返回 {"changed":[{id,title,fields}], "added":[{id,title}], "removed":[{id,title}],
+          "links":{"added":[{from:{type,slot},to:{type,slot}}], "removed":[...]}}。
+    连线身份 = 端点串 `originId:originSlot>targetId:targetSlot`；改接自然表达为 removed+added。"""
     if not isinstance(prev_graph, dict):
         return None
     prev = _index_nodes_by_id(prev_graph)
     nxt = _index_nodes_by_id(next_graph)
+    link_prev = _links_index(prev_graph)
+    link_next = _links_index(next_graph)
+    links_added = []
+    links_removed = []
+    for k in link_next:
+        if k not in link_prev:
+            links_added.append(k)
+    for k in link_prev:
+        if k not in link_next:
+            links_removed.append(k)
+    links_added.sort()
+    links_removed.sort()
     added = []
     removed = []
     changed = []
@@ -265,7 +360,15 @@ def compute_delta(prev_graph, next_graph):
     added.sort(key=lambda x: _id_sort_key(x["id"]))
     removed.sort(key=lambda x: _id_sort_key(x["id"]))
     changed.sort(key=lambda x: _id_sort_key(x["id"]))
-    return {"changed": changed, "added": added, "removed": removed}
+    return {
+        "changed": changed,
+        "added": added,
+        "removed": removed,
+        "links": {
+            "added": [_link_desc(link_next[k], nxt) for k in links_added],
+            "removed": [_link_desc(link_prev[k], prev) for k in links_removed],
+        },
+    }
 
 
 def should_merge_with_head(new_sig, head_sig):

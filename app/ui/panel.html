@@ -7,8 +7,9 @@
 <style>
 :root {
   color-scheme: light; /* iframe 画布底色由根元素 color-scheme 决定：不明写就恒为白 */
-  --text: #2b2b2b; --text-muted: #888; --accent: #537d96;
-  --bg-card: rgba(127,127,127,.06); --border: rgba(127,127,127,.2);
+  --text: #2b2b2b; --text-muted: #888; --text-dim: #6d6d6d; --accent: #537d96;
+  --bg-card: rgba(127,127,127,.06); --bg-sunken: rgba(127,127,127,.045);
+  --border: rgba(127,127,127,.2); --border-soft: rgba(127,127,127,.13);
   --ok: #2e7d32; --bad: #c62828; --gold: #b8860b;
 }
 /* 2026-10-11 修复：面板主题不跟随（整块白底）。
@@ -16,113 +17,200 @@
    body 上的 class 管不到；这里把 t-dark 同时挂到 :root（JS 同步切换 html 与 body）。 */
 :root.t-dark { color-scheme: dark; }
 body.t-dark {
-  --text: #d8d8d8; --text-muted: #8a8a8a; --accent: #7fa8c0;
-  --bg-card: rgba(255,255,255,.06); --border: rgba(255,255,255,.14);
+  --text: #d8d8d8; --text-muted: #8a8a8a; --text-dim: #9a9a9a; --accent: #7fa8c0;
+  --bg-card: rgba(255,255,255,.06); --bg-sunken: rgba(255,255,255,.055);
+  --border: rgba(255,255,255,.14); --border-soft: rgba(255,255,255,.09);
   --ok: #6fbf73; --bad: #e57373; --gold: #d4af37;
 }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 10px 12px; background: transparent; color: var(--text); font: 12px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
-h1 { font-size: 13px; font-weight: 700; margin: 0 0 8px; }
-.sect { margin-bottom: 10px; }
-.row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; border-bottom: 0.5px dashed var(--border); }
-.row:last-child { border-bottom: 0; }
+/* hidden 属性会被作者样式覆盖（.row 的 display:flex 优先级高于 UA 的 [hidden]{display:none}），
+   导致「空值不占行」失效（2026-10-16 实测踩坑）。这里显式提权。 */
+[hidden] { display: none !important; }
+body { margin: 0; padding: 10px 12px 16px; background: transparent; color: var(--text); font: 12px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+
+/* ── 通用行 ──────────────────────────────────────────────────────────────── */
+.row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 2.5px 0; }
+.row:not(:last-child) { border-bottom: 0.5px dashed var(--border-soft); }
+/* 版本行隐藏时，「后端」变成最后可见行 → 不应再拖一条虚线（:last-child 算上了隐藏元素）*/
+.row:has(+ #row-ver[hidden]) { border-bottom: 0; }
 .k { color: var(--text-muted); flex: 0 0 auto; }
-.v { text-align: right; word-break: break-all; font-variant-numeric: tabular-nums; }
-.chip { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); white-space: nowrap; }
+.v { text-align: right; word-break: break-word; font-variant-numeric: tabular-nums; min-width: 0; }
+.v.ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip { font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted); white-space: nowrap; }
 .chip.ok { background: rgba(46,125,50,.18); color: var(--ok); }
 .chip.bad { background: rgba(198,40,40,.16); color: var(--bad); }
 .chip.warn { background: rgba(180,120,30,.18); color: #9c6b1e; }
-button { font-size: 11.5px; padding: 4px 12px; border-radius: 7px; cursor: pointer; border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent); width: 100%; }
+body.t-dark .chip.warn { color: var(--gold); }
+
+button { font-size: 11.5px; padding: 4px 12px; border-radius: 7px; cursor: pointer; border: 0.5px solid var(--border); background: var(--bg-card); color: var(--accent); width: 100%; font-family: inherit; }
 button:hover { background: var(--accent); color: #fff; }
-.note { color: var(--text-muted); font-size: 11px; margin-top: 8px; line-height: 1.6; }
-.err { color: var(--bad); font-size: 11px; word-break: break-all; margin-top: 6px; }
-/* ── 主机指标区（GPU/CPU/内存；任务管理器风格曲线）── */
-.mon-sec { font-size: 12px; font-weight: 600; margin: 12px 0 8px; display: flex; align-items: center; gap: 8px; }
-.sec-spacer { flex: 1; }
-.gpu-release {
-  font-size: 11px; font-weight: 500; padding: 3px 12px; border-radius: 999px; cursor: pointer;
-  border: 0.5px solid var(--border); background: var(--bg-card); color: var(--bad);
-  transition: background .15s, color .15s, border-color .15s;
-}
-.gpu-release:hover { background: var(--bad); border-color: var(--bad); color: #fff; }
-.gpu-release.loading { opacity: .55; cursor: default; }
-/* ── 服务起停按钮组（启动 / 停止 ComfyUI 本体，不是中继）── */
-.btn-row { display: flex; gap: 6px; }
-.btn-row button { flex: 1; }
 button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
 button.primary:hover { filter: brightness(1.08); background: var(--accent); color: #fff; }
 button.danger { color: var(--bad); border-color: var(--bad); }
 button.danger:hover { background: var(--bad); border-color: var(--bad); color: #fff; }
 button[disabled] { opacity: .5; cursor: default; }
 button[disabled]:hover { background: var(--bg-card); color: var(--accent); }
-.chart-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-.chart-meta { width: 92px; flex-shrink: 0; }
-.chart-label { font-size: 10.5px; color: var(--text-muted); margin-bottom: 1px; }
-.chart-val { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
-.chart { flex: 1; height: 38px; min-width: 80px; display: block; }
-/* ── ComfyUI 更新区（版本检查 / 一键更新）── */
-.up-sec { margin: 10px 0 2px; }
-.up-head { font-size: 12px; font-weight: 600; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
-pre.uplog {
-  margin: 6px 0 0; padding: 6px 8px; border-radius: 7px; max-height: 120px; overflow: auto;
-  background: rgba(127,127,127,.08); font-size: 10.5px; line-height: 1.45;
-  white-space: pre-wrap; word-break: break-all; font-variant-numeric: tabular-nums;
+button.mini { width: auto; padding: 2px 9px; font-size: 11px; }
+.btn-row { display: flex; gap: 6px; }
+.btn-row button { flex: 1; }
+
+/* ── 状态卡（主区，一眼看清）──────────────────────────────────────────────── */
+.status-card {
+  border: 0.5px solid var(--border-soft); border-radius: 9px;
+  background: var(--bg-sunken); padding: 9px 10px 8px; margin-bottom: 8px;
 }
-pre.uplog:empty { display: none; }
-/* ── 折叠区（ComfyUI 状态 / 监视器）与本面板小部件 ── */
-details.fold { margin: 2px 0 10px; }
-details.fold > summary { list-style: none; cursor: pointer; user-select: none; }
-details.fold > summary::-webkit-details-marker { display: none; }
-details.fold > summary::marker { content: ""; }
-.fold-head { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; padding: 2px 0; }
-.fold-head:hover .fold-title { color: var(--accent); }
-.fold-title { font-size: 12.5px; font-weight: 700; }
-.fold-body { padding-top: 4px; }
-.arrow { margin-left: auto; color: var(--text-muted); font-size: 10px; line-height: 1; transition: transform .15s; }
-details.fold[open] > summary .arrow { transform: rotate(90deg); }
+.sc-head { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; }
+.sc-title { font-size: 12.5px; font-weight: 700; letter-spacing: .2px; }
+.sc-spacer { flex: 1; }
 /* 状态信号灯：灰=读取中，红=异常，绿=正常；金色 ✦=有更新 */
-.sig { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; line-height: 1; }
+.sig { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; line-height: 1; transition: background .2s; }
 .sig.ok { background: var(--ok); }
 .sig.bad { background: var(--bad); }
 .sig.update { width: auto; height: auto; background: transparent; color: var(--gold); text-shadow: 0 0 4px rgba(184,134,11,.45); font-family: "Segoe UI Symbol", "Segoe UI", sans-serif; }
-/* 监视器折叠后的一行温度（复用 v-temp 数据；展开时隐藏，图表行里已有温度） */
-.mon-temp { flex-basis: 100%; display: flex; align-items: baseline; gap: 6px; padding: 2px 0 0; }
+/* 主状态句（用大一点的语气说结论，替代五行流水账）*/
+.sc-line { display: flex; align-items: baseline; gap: 7px; margin-bottom: 6px; }
+.sc-main { font-size: 12.5px; font-weight: 600; line-height: 1.35; }
+.sc-main.bad { color: var(--bad); }
+.sc-main.warn { color: var(--gold); }
+.sc-main.ok { color: var(--ok); }
+.sc-sub { font-size: 11px; color: var(--text-muted); }
+
+/* ── 折叠区 ──────────────────────────────────────────────────────────────── */
+details.fold { margin: 0 0 8px; border-top: 0.5px solid var(--border-soft); padding-top: 6px; }
+details.fold > summary { list-style: none; cursor: pointer; user-select: none; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::marker { content: ""; }
+.fold-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 1px 0; }
+.fold-head:hover .fold-title { color: var(--accent); }
+.fold-title { font-size: 12px; font-weight: 600; }
+.fold-body { padding: 5px 0 1px; }
+.arrow { margin-left: auto; color: var(--text-muted); font-size: 10px; line-height: 1; transition: transform .15s; }
+details.fold[open] > summary .arrow { transform: rotate(90deg); }
+
+/* ── 详情表 ──────────────────────────────────────────────────────────────── */
+.sect { margin-bottom: 6px; }
+.sect:last-child { margin-bottom: 0; }
+
+/* ── 更新区 ──────────────────────────────────────────────────────────────── */
+/* 版本行改成两段式（本地 / 远端），避免「0.39.0-50-g1 → v0.41.0-16-gbab8」横向溢出 */
+.ver-pair { display: flex; flex-direction: column; gap: 1px; align-items: flex-end; min-width: 0; }
+.ver-pair .vp-line { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.ver-pair .vp-tag { color: var(--text-muted); font-size: 10.5px; margin-right: 4px; }
+pre.uplog {
+  margin: 6px 0 0; padding: 6px 8px; border-radius: 7px; max-height: 96px; overflow: auto;
+  background: rgba(127,127,127,.08); font-size: 10.5px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-word; font-variant-numeric: tabular-nums;
+}
+pre.uplog:empty { display: none; }
+/* 更新区默认收起日志：老日志不再常驻挤压版面 */
+.up-log-fold { margin-top: 6px; }
+.up-log-fold > summary { list-style: none; cursor: pointer; font-size: 11px; color: var(--text-muted); user-select: none; }
+.up-log-fold > summary::-webkit-details-marker { display: none; }
+.up-log-fold > summary::marker { content: ""; }
+.up-log-fold > summary:hover { color: var(--accent); }
+
+/* ── 监视器 ──────────────────────────────────────────────────────────────── */
+.mon-sec { font-size: 12px; font-weight: 600; margin: 4px 0 7px; display: flex; align-items: center; gap: 8px; }
+.sec-spacer { flex: 1; }
+.gpu-release {
+  font-size: 11px; font-weight: 500; padding: 2px 10px; border-radius: 999px; cursor: pointer;
+  border: 0.5px solid var(--border); background: var(--bg-card); color: var(--bad);
+  transition: background .15s, color .15s, border-color .15s; width: auto;
+}
+.gpu-release:hover { background: var(--bad); border-color: var(--bad); color: #fff; }
+.gpu-release.loading { opacity: .55; cursor: default; }
+.chart-row { display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }
+.chart-meta { width: 86px; flex-shrink: 0; }
+.chart-label { font-size: 10.5px; color: var(--text-muted); margin-bottom: 0; }
+.chart-val { font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.chart { flex: 1; height: 34px; min-width: 70px; display: block; }
+/* 折叠后一行速览（温度）*/
+.mon-temp { flex-basis: 100%; display: flex; align-items: baseline; gap: 6px; padding: 1px 0 0; }
 details.fold[open] .mon-temp { display: none; }
-/* note 区里的轻量快捷操作按钮（启动失败 → 重启中继） */
-button.mini { width: auto; padding: 3px 12px; font-size: 11px; }
-/* 启动等待计时（2026-10-14）：与壳页 workspace.html 的 .panel .wait 视觉统一（accent/加粗/等宽数字）；
-   紧邻「启动服务」按钮、独立成行，非等待态 hidden 不占位（零视觉噪声）。 */
-.wait { font-size: 13px; font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; margin: 6px 0; }
+
+/* ── 提示 / 错误 ─────────────────────────────────────────────────────────── */
+.note { color: var(--text-muted); font-size: 11px; margin-top: 6px; line-height: 1.55; }
+.note:empty { display: none; }
+.err { color: var(--bad); font-size: 11px; word-break: break-word; margin-top: 6px; }
+.err:empty { display: none; }
+/* 启动等待计时（2026-10-14）：accent/加粗/等宽数字；非等待态 hidden 不占位 */
+.wait { font-size: 13px; font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; margin: 6px 0 2px; }
+/* 底部动作区：三个动作不再各占一整行 */
+.acts { margin-top: 10px; }
+
+/* ── 诊断区（安装根 / 进程 / 拉起时间）默认收起 ───────────────────────────── */
+.diag { font-size: 10.5px; color: var(--text-dim); line-height: 1.6; }
+.diag div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
-  <details class="fold" id="fold-status">
-    <summary class="fold-head">
+  <!-- ── 主状态卡：一句话说清现在怎么样 ─────────────────────────────────── -->
+  <div class="status-card">
+    <div class="sc-head">
       <span class="sig" id="sig-dot" title="状态：读取中…"></span>
-      <span class="fold-title">ComfyUI 状态</span>
+      <span class="sc-title">ComfyUI</span>
+      <span class="sc-spacer"></span>
+      <span class="chip" id="p-queue" hidden>—</span>
+    </div>
+    <div class="sc-line">
+      <span class="sc-main" id="p-main">读取中…</span>
+    </div>
+    <div class="row"><span class="k">中继</span><span class="v" id="p-phase">读取中…</span></div>
+    <div class="row"><span class="k">后端</span><span class="v" id="p-backend">—</span></div>
+    <div class="row" id="row-ver" hidden><span class="k">版本</span><span class="v ellip" id="p-ver">—</span></div>
+  </div>
+
+  <!-- ── 动作区 ─────────────────────────────────────────────────────────── -->
+  <!-- 单按钮（2026-10-16 用户要求）：同一时刻服务只可能是「开着」或「关着」两种，
+       状态已由上方状态卡说清楚，不需要两个按钮各占位一半。按钮文案/语义随 reachable 切换。 -->
+  <div class="btn-row">
+    <button id="p-svc" class="primary" title="启动 ComfyUI">启动服务</button>
+  </div>
+  <!-- 启动等待计时（2026-10-14）：紧邻「启动服务」按钮、不展开任何折叠区也可见；文本由 panel-status.js 写入，
+       与工作区壳页覆盖层同源同句（svcWaitStart，服务端 proc.startedAt 优先）。非等待态 hidden 不占位。 -->
+  <div id="p-wait" class="wait" hidden></div>
+
+  <div class="acts">
+    <details class="fold" id="fold-maint">
+      <summary class="fold-head">
+        <span class="fold-title">维护</span>
+        <span class="arrow" aria-hidden="true">▸</span>
+      </summary>
+      <div class="fold-body">
+        <div class="btn-row">
+          <button id="p-reload-ws" title="重新加载工作区内层 ComfyUI 页面（等价 Ctrl+R；ComfyUI 草稿默认自动恢复）">重载工作区</button>
+          <button id="p-retry" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>
+        </div>
+        <div class="note" style="margin-top:7px">诊断细节</div>
+        <div class="diag" id="p-detail"></div>
+      </div>
+    </details>
+  </div>
+
+  <!-- ── 更新区（收起态：只显示结论）───────────────────────────────────── -->
+  <details class="fold" id="fold-up">
+    <summary class="fold-head">
+      <span class="fold-title">ComfyUI 更新</span>
+      <span class="chip" id="u-state">—</span>
       <span class="arrow" aria-hidden="true">▸</span>
     </summary>
     <div class="fold-body">
-      <div class="sect">
-        <div class="row"><span class="k">中继</span><span class="v" id="p-phase">读取中…</span></div>
-        <div class="row"><span class="k">服务端口</span><span class="v" id="p-port">—</span></div>
-        <div class="row"><span class="k">后端</span><span class="v" id="p-backend">—</span></div>
-        <div class="row"><span class="k">ComfyUI</span><span class="v" id="p-ver">—</span></div>
-        <div class="row"><span class="k">队列</span><span class="v" id="p-queue">—</span></div>
+      <div class="row"><span class="k">本地</span><span class="v ellip" id="u-local">—</span></div>
+      <div class="row"><span class="k">远端</span><span class="v ellip" id="u-remote">—</span></div>
+      <div class="btn-row" style="margin-top:7px">
+        <button id="u-check" title="git fetch 后与远端对比 commit（不做任何改动）">检查更新</button>
+        <button id="u-apply" class="primary" title="停服务 → git pull --ff-only → pip install -r requirements.txt（后台执行）">更新</button>
       </div>
-      <div class="up-sec">
-        <div class="up-head"><span>ComfyUI 更新</span><span class="sec-spacer"></span><span class="chip" id="u-state">—</span></div>
-        <div class="row"><span class="k">版本</span><span class="v" id="u-local">—</span></div>
-        <div class="btn-row" style="margin-top:6px">
-          <button id="u-check" title="git fetch 后与远端对比 commit（不做任何改动）">检查更新</button>
-          <button id="u-apply" class="primary" title="停服务 → git pull --ff-only → pip install -r requirements.txt（后台执行）">更新</button>
-        </div>
-        <div class="note" id="u-note"></div>
+      <div class="note" id="u-note"></div>
+      <!-- 日志默认收起：上次更新的输出不再常驻挤压版面 -->
+      <details class="up-log-fold" id="up-log-fold">
+        <summary>日志</summary>
         <pre class="uplog" id="u-log"></pre>
-      </div>
-      <div class="note" id="p-detail"></div>
+      </details>
     </div>
   </details>
+
+  <!-- ── 监视器 ──────────────────────────────────────────────────────────── -->
   <details class="fold" id="fold-mon">
     <summary class="fold-head">
       <span class="fold-title">监视器</span>
@@ -141,17 +229,6 @@ button.mini { width: auto; padding: 3px 12px; font-size: 11px; }
     </div>
   </details>
 
-  <div class="btn-row" style="margin-top:10px">
-    <button id="p-start" class="primary" title="按本机探测到的安装根拉起 ComfyUI（由计划任务以当前用户身份起，独立于 Hana 存活）">启动服务</button>
-    <button id="p-stop" class="danger" title="终止 8188 上的 ComfyUI 进程（正在跑的任务会中断）">停止服务</button>
-  </div>
-  <!-- 启动等待计时（2026-10-14）：紧邻「启动服务」按钮、不展开任何折叠区也可见；文本由 panel-status.js 写入，
-       与工作区壳页覆盖层同源同句（svcWaitStart，服务端 proc.startedAt 优先）。非等待态 hidden 不占位。 -->
-  <div id="p-wait" class="wait" hidden></div>
-  <button id="p-retry" style="margin-top:6px" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>
-  <!-- 重载工作区（2026-10-12）：自工作区画布右上角悬浮按钮迁来 —— panel 与工作区是两个页面实例，
-       够不到工作区的内层 iframe；点击只发信号（POST /comfyui-hana/shell/reload），由工作区壳页执行 frame.reload。 -->
-  <button id="p-reload-ws" style="margin-top:6px" title="重新加载工作区内层 ComfyUI 页面（等价 Ctrl+R；ComfyUI 草稿默认自动恢复）">重载工作区</button>
   <div class="note" id="p-note" style="display:none"></div>
   <div id="p-note-actions" style="display:none;margin-top:6px">
     <button id="p-note-retry" class="mini" title="只重启本 App 的中继（受管 runtime，随 Hana 生命周期），不影响 ComfyUI 服务本身">重启中继</button>

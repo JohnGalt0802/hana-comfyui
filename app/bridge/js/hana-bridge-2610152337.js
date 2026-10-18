@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-15 hana-bridge-15021810";
+const BUILD_TAG = "2026-10-15 hana-bridge-2610152337";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -3036,6 +3036,9 @@ let historyRollback = { armed: false, timer: null, busy: false };
 // P5b：存档动作状态（防重入）+ 当前弹层锚定的 group（存档后刷新弹层用）
 let historySaveBusy = false;
 let historyBarGroup = null;
+// 2026-10-15 缺口二（无 bundle 框时点节点开历史框）：当前弹层的「角色块视角」状态位。
+// 与 historyBarGroup 互斥：group 视角恒 null；角色块视角（无框点节点开出）记该角色块名 —— 供过滤与标题用。
+let historyBarRoleName = null;
 // P6-1：横轴三态交互状态（单击/双击消歧、缩略图浮层延迟关）
 let historyTickClickTimer = null; // 非空 = 已收到第一次单击，正在等消歧窗口结束
 let historyTreeClickTimer = null; // 树节点单击/双击消歧（同框口径）
@@ -3227,6 +3230,12 @@ function historyBarStyleEnsure() {
   box-shadow: 0 1px 3px var(--hhb-badge-shadow); pointer-events: none;
 }
 #${HISTORY_BAR_ID} .hhb-tick:hover .hhb-runs { display: inline-block; }
+/* 2026-10-15 缺口一：变动符号（节点 ＋n/－n、连线 ⇄n）—— 常显小徽标，挂刻度下方（×N 占上方） */
+#${HISTORY_BAR_ID} .hhb-delta {
+  position: absolute; top: auto; bottom: -6px; left: -6px; font-size: 8.5px; font-weight: 700; line-height: 11px;
+  color: var(--hhb-badge-fg); background: var(--hhb-badge-bg); border-radius: 5px; padding: 0 3px;
+  box-shadow: 0 1px 3px var(--hhb-badge-shadow); pointer-events: none; white-space: nowrap;
+}
 #${HISTORY_BAR_ID} .hhb-tick-sel { box-shadow: 0 0 0 2px var(--hhb-sel-ring); }
 #${HISTORY_BAR_ID} .hhb-tick[data-legacy] { opacity: .55; }
 #${HISTORY_BAR_ID} .hhb-tick[data-legacy]::after {
@@ -3332,6 +3341,7 @@ function historyBarClose() {
   }
   historyBarEl = null;
   historyBarGroup = null;
+  historyBarRoleName = null; // 缺口二：收起 → 角色块视角一并清
 }
 
 // 弹层内提示行（替代 alert）
@@ -3918,6 +3928,25 @@ function historyTickChangedNames(ent) {
   return out;
 }
 
+// ── 2026-10-15 缺口一：提交变动符号（刻度 / 树节点共用）────────────────────────
+// 语义：节点增删 → 「＋n」/「－n」；连线有变 → 「⇄n」；可组合（如「＋2 ⇄1」）。
+// 数据源 ent.delta（方案 §五 契约）：changed/added/removed（节点维度）+ links{added,removed}（连线维度）。
+// 退化：无 delta / 无任何变动 → 返回 ""（调用方不渲染）；旧条目无 delta.links → 不显示连线符号（自然退化，不报错）。
+function historyDeltaSymbolText(ent) {
+  const d = ent && ent.delta && typeof ent.delta === "object" ? ent.delta : null;
+  if (!d) return "";
+  const cnt = (v) => (Array.isArray(v) ? v.length : 0);
+  const addN = cnt(d.added);
+  const rmN = cnt(d.removed);
+  const lk = d.links && typeof d.links === "object" ? d.links : null; // 旧数据无此字段 → null
+  const lkN = lk ? cnt(lk.added) + cnt(lk.removed) : 0;
+  const parts = [];
+  if (addN) parts.push("＋" + addN);
+  if (rmN) parts.push("－" + rmN);
+  if (lkN) parts.push("⇄" + lkN);
+  return parts.join(" ");
+}
+
 // 色相分「谁」：agent → 暖紫；否则（user/unknown）→ 冷色。写成内联 CSS 变量（不新增样式规则）。
 function historyTickColor(source) {
   return String(source || "") === "agent" ? "#b189e0" : "#5aa0d8";
@@ -4015,6 +4044,14 @@ function historyBarTickMake(reqId, ent, ctx) {
     badge.textContent = "×" + runsN;
     tick.appendChild(badge);
   }
+  // 2026-10-15 缺口一：变动符号（节点 ＋n/－n + 连线 ⇄n）—— 挂刻度左上角（×N 占右上，互不打架）。
+  const deltaTxt = historyDeltaSymbolText(ent);
+  if (deltaTxt) {
+    const delta = document.createElement("span");
+    delta.className = "hhb-delta";
+    delta.textContent = deltaTxt;
+    tick.appendChild(delta);
+  }
   // P7：旧数据（无法细分到框）→ 打标记（淡化 + 右上小点；样式见 .hhb-tick[data-legacy]）
   if (legacyTick) tick.dataset.legacy = "1";
   tick.title = ""; // 用自绘气泡，不用原生 tooltip
@@ -4097,8 +4134,9 @@ function historyBarBubbleShow(tick, ent) {
     const maxL = Math.max(0, barW - bw); // 最右：气泡右边贴弹层右边
     left = Math.max(0, Math.min(left, maxL));
     // 默认在刻度上方；弹层顶放不下 → 落到刻度下方
-    let top = (tr.top - br.top) / k - bh - 6;
-    if (tr.top - bh * k - 6 < 4 && tr.bottom + 6 + bh * k < window.innerHeight - 4) top = (tr.bottom - br.top) / k + 6;
+    /* 再让 13px：让出右上 ×N 上标高度，避免最右键气泡遮住 */
+    let top = (tr.top - br.top) / k - bh - 19;
+    if (tr.top - bh * k - 19 < 4 && tr.bottom + 6 + bh * k < window.innerHeight - 4) top = (tr.bottom - br.top) / k + 6;
     b.style.left = left.toFixed(1) + "px";
     b.style.top = top.toFixed(1) + "px";
   } catch {
@@ -4328,7 +4366,9 @@ async function historyBarLoad(reqId, ctx, countEl) {
     // 口径：blockNames 为 null（旧数据，无法判定）→ 保留（不参与筛选）；为数组 → 保留当且仅当含当前框名。
     // 当前框名取不到（框不在图里 / 该框不成块 / 命名口径对不上）→ 退化为不过滤（宁多勿漏），console.warn。
     // 只影响渲染：不改 entries、不改 historyBarLatestEntry（比对基线）、不改选中态机制。
-    const curBlock = historyBlockNameOf(historyBarGroup);
+    // 缺口二：角色块视角优先取 historyBarRoleName（无 bundle 框点节点开出）；否则维持原 group 口径。
+    // 比对式不变 —— ent.blockNames 同时含 group 名与 role 名（普查 6），角色块名可直接比对。
+    const curBlock = historyBarRoleName || historyBlockNameOf(historyBarGroup);
     if (historyBarGroup && !curBlock) {
       console.warn(LOG_TAG, "提交历史框视角：当前框名未能判定，退化为不过滤（宁多勿漏）");
     }
@@ -4426,6 +4466,7 @@ function historyBarOpen(group) {
   bar.id = HISTORY_BAR_ID;
   historyBarEl = bar;
   historyBarGroup = group || null; // P5b：存档后重开弹层用（同 group 重载）
+  historyBarRoleName = null; // 缺口二：group 视角 → 清角色块视角（historyBarOpenRole 打开后回填）
   // 头部：<分组框名> · <N 次提交>（fetch 后回填）+ 构建号 + ✕
   const title = document.createElement("div");
   title.className = "hhb-title";
@@ -4531,7 +4572,96 @@ function historyBarOpen(group) {
   void historyBarLoad(reqId, ctx, count);
 }
 
-// 点击钩子（只读）：命中 group → 弹出/切换；点空白 → 收起。任何分支不改画布状态。
+// ── 2026-10-15 缺口二：无 bundle 框时点节点开「角色块」历史框 ─────────────────────
+// 轻封装 historyBarOpen(group = null)：先按无框打开（标题退工作流名、过滤退全量），再置角色块名。
+// 时序：historyBarLoad 的取数在 await 之后才读 historyBarRoleName，同轮同步赋值必先于响应到达 → 过滤/标题按角色块生效。
+function historyBarOpenRole(roleName) {
+  const nm = roleName == null ? "" : String(roleName);
+  if (!nm) return;
+  historyBarOpen(null); // 复用弹层构造（锚定取不到框 → 回退视口中心）
+  historyBarRoleName = nm; // 覆盖 historyBarOpen 的清零
+  const wf = historyBarEl ? historyBarEl.querySelector(".hhb-wf") : null;
+  if (wf) {
+    wf.textContent = "角色块：" + nm; // 标题与 group 视角对称（group 视角显示框名）
+    wf.title = wf.textContent;
+  }
+}
+
+// 节点 → 所属「角色块」名（缺口二用）：消费 graphBlocks 输出，**不改其本体**。
+// 口径：graphBlocks 里 source === "role" 且 nodeIds 含该节点 id 的块 → 取其 name；找不到 → null（调用方回落收起）。
+// 边界：graphBlocks 里 group 优先（落框内的节点只进 group 块），故「框内节点」此处返回 null ——
+//       但本函数只在「无 group 命中」时才走到（真有框时先走 group 分支），故不影响有框行为。
+function historyRoleBlockNameOfNode(node) {
+  if (!node) return null;
+  let blocks = null;
+  try {
+    const g = app && app.graph ? app.graph : null;
+    if (!g || typeof g.toJSON !== "function") return null;
+    blocks = graphBlocks(g.toJSON());
+  } catch (err) {
+    console.warn(LOG_TAG, "提交历史：节点所属角色块名读取失败（不影响画布）", err);
+    return null;
+  }
+  const nidS = node.id == null ? "" : String(node.id);
+  for (const b of Array.isArray(blocks) ? blocks : []) {
+    if (!b || b.source !== "role") continue;
+    const ids = Array.isArray(b.nodeIds) ? b.nodeIds : [];
+    for (const id of ids) {
+      if (String(id) === nidS) return b.name;
+    }
+  }
+  return null;
+}
+
+// 画布坐标 → 命中节点（缺口二用）。探测结论（2026-10-15，前端 1.55.14 打包产物核对）：
+//   · graph.getNodeOnPos(x, y, nodes?) → ✅ 存在（定义在 LGraph 上，与 getGroupOnPos 同处；
+//     体：nodesInRenderOrder(this) 倒序遍历 + node.isPointInside）；canvas 上无同名方法。
+//   · 故 graph 优先、canvas 次之（兼容未来版本挪位，同 getGroupOnPos 的写法）。
+//   · 都不可用/抛错 → 倒序遍历 graph._nodes + isPointInside 兜底，再退 pos/size 矩形命中。
+function historyNodeAtCanvasPos(x, y) {
+  const canvas = app && app.canvas;
+  const graph = (canvas && canvas.graph) || (app && app.graph) || null;
+  if (!canvas || !graph) return null;
+  if (typeof graph.getNodeOnPos === "function") {
+    try {
+      const n = graph.getNodeOnPos(x, y);
+      if (n) return n;
+    } catch {
+      /* 落到兜底 */
+    }
+  }
+  if (typeof canvas.getNodeOnPos === "function") {
+    try {
+      const n = canvas.getNodeOnPos(x, y);
+      if (n) return n;
+    } catch {
+      /* 落到兜底 */
+    }
+  }
+  // 兜底（同 group 兜底的倒序口径）：后添加者优先；isPointInside 首选 → pos/size 矩形次之
+  const nodes = Array.isArray(graph._nodes) ? graph._nodes : [];
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (!n) continue;
+    if (typeof n.isPointInside === "function") {
+      try {
+        if (n.isPointInside(x, y)) return n;
+      } catch {
+        /* 跳过该节点 */
+      }
+    }
+    const p = n.pos;
+    const s = n.size;
+    if (Array.isArray(p) && Array.isArray(s) && typeof p[0] === "number" && typeof p[1] === "number") {
+      const w = typeof s[0] === "number" ? s[0] : 0;
+      const h = typeof s[1] === "number" ? s[1] : 0;
+      if (x >= p[0] && x <= p[0] + w && y >= p[1] && y <= p[1] + h) return n;
+    }
+  }
+  return null;
+}
+
+// 点击钩子（只读）：命中 group → 弹出/切换；无 group 命中节点 → 按角色块开；点空白 → 收起。任何分支不改画布状态。
 function historyOnCanvasMouseDown(e) {
   if (!e) return;
   // 同一事件可能经多入口到达（实例重绑回调 / 自挂 capture 监听）→ 只处理一次（防重复弹层/重复 fetch）
@@ -4598,6 +4728,18 @@ function historyOnCanvasMouseDown(e) {
       if (hit) {
         group = g;
         break;
+      }
+    }
+  }
+  // 2026-10-15 缺口二：无 group 时，单击节点 → 取该节点所属角色块名 → 开该块的历史框。
+  // 有 group 时行为完全不变（优先 group，本分支只在 group 命中失败后才走）。
+  if (!group && off) {
+    const hitNode = historyNodeAtCanvasPos(off[0], off[1]);
+    if (hitNode) {
+      const roleName = historyRoleBlockNameOfNode(hitNode);
+      if (roleName) {
+        historyBarOpenRole(roleName); // 标题＝角色块名；过滤＝只显示碰过该块的提交
+        return;
       }
     }
   }
@@ -5164,8 +5306,10 @@ async function historySaveClick() {
 // 存档后刷新弹层：同 group 重开（复用 historyBarOpen 的「先拆旧再建新」+ 重新 load）。
 function historyBarReopen() {
   const g = historyBarGroup;
+  const rn = historyBarRoleName; // 缺口二：记住当前是「角色块视角」还是「group 视角」
   if (!historyBarEl) return;
-  historyBarOpen(g);
+  if (rn) historyBarOpenRole(rn);
+  else historyBarOpen(g);
 }
 
 // ── P7-树（2026-10-12）：画布底部可收纳「全局提交树」───────────────────────────
@@ -5397,6 +5541,12 @@ function historyTreeStyleEnsure() {
   box-shadow: 0 1px 3px var(--htr-badge-sh); pointer-events: none;
 }
 #${HISTORY_TREE_ID} .node:hover .htr-runs { display: inline-block; }
+/* 2026-10-15 缺口一：变动符号（节点 ＋n/－n、连线 ⇄n）—— 常显小徽标，挂节点下方（×N 占上方，同框口径） */
+#${HISTORY_TREE_ID} .htr-delta {
+  position: absolute; top: auto; bottom: -7px; left: -8px; font-size: 8.5px; font-weight: 700; line-height: 11px;
+  color: var(--htr-badge-fg); background: var(--htr-badge-bg); border-radius: 5px; padding: 0 3px;
+  box-shadow: 0 1px 3px var(--htr-badge-sh); pointer-events: none; white-space: nowrap;
+}
 #${HISTORY_TREE_ID} .node:hover { filter: brightness(1.25); }
 #${HISTORY_TREE_ID} .htr-tick-sel { outline: 2px solid var(--htr-sel-ring); outline-offset: 2px; border-radius: 4px; }
 /* HEAD 高亮：节点下小金点 */
@@ -5690,6 +5840,14 @@ function historyTreeRenderTree(entries) {
       badge.textContent = "×" + runsN;
       node.appendChild(badge);
     }
+    // 2026-10-15 缺口一：变动符号（节点 ＋n/－n + 连线 ⇄n）—— 同刻度口径，挂节点左上角。
+    const deltaTxt = historyDeltaSymbolText(ent);
+    if (deltaTxt) {
+      const delta = document.createElement("span");
+      delta.className = "htr-delta";
+      delta.textContent = deltaTxt;
+      node.appendChild(delta);
+    }
     // 悬停气泡 / 单击点选回跳（回跳链：historyBarSelection → historyRollbackConfirmOpen → historyRollbackExecute）
     node.addEventListener("mouseenter", () => historyTreeBubbleShow(node, ent));
     node.addEventListener("mouseleave", () => historyTreeBubbleHide());
@@ -5954,7 +6112,8 @@ function historyTreeBubbleShow(tick, ent) {
     let left = tr.left + tr.width / 2 - rr.left - bw / 2;
     left = Math.max(0, Math.min(left, Math.max(0, rr.width - bw))); // 水平钳在容器内
     // 树贴底：气泡一律向上（下方必出视口/被裁）；树容器无 overflow 裁剪，向上溢出不裁，显示在容器上方。
-    let top = tr.top - rr.top - bh - 6;
+    /* 再让 13px：让出右上 ×N 上标高度，避免最右键气泡遮住 */
+    let top = tr.top - rr.top - bh - 19;
     b.style.left = left.toFixed(1) + "px";
     b.style.top = top.toFixed(1) + "px";
   } catch {
