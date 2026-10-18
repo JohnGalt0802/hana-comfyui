@@ -1,9 +1,12 @@
-// ui/assets/task.js — ComfyUI 任务卡（2026-10-13 重做）
-// 改动面：① 删内部 ID（promptId / taskId）② 元信息压一行 ③ 节点时间轴（完成点亮 / 当前流动 / 未跑留灰）
-// ④ 实时预览区（previewFrames 最新帧 + 胶片点选回放）⑤ 产物缩略图按真实宽高比（contain + columns）
-// ⑥ 卡内 lightbox（纯前端，不用宿主权限）⑦ 失败态红段 + 断点节点 + 可行动提示
-// 保留：轮询 / 身份解析（cardId）/ 主题跟随（t-dark）/ 尺寸上报（reportSize）
-// 数据：GET /comfyui-hana/task?cardId=<卡实例 id>（轮询）；product 预览经代理路径 + surface 凭据段。
+// ui/assets/task.js — ComfyUI 任务卡（2026-10-18 重做：两阶段视图）
+// 设计要点：
+//   ① 跑图阶段（running/pending）= 「过程视图」：进度条 + 一句状态句 + 细节行 + 实时预览
+//   ② 出图阶段（completed，且有产物）= 「作品视图」：产物大图 + 动作按钮，过程元素全部退场
+//   ③ 失败态 = 状态句标红 + 断点信息 + 可行动提示
+//   ④ 撤掉：元信息胶囊行（并入状态句）、节点时间轴段条（与进度条重复）
+// 保留：轮询 / 身份解析自愈（cardId）/ 尺寸上报（reportSize）/ 卡内 lightbox
+// 主题（2026-10-18 改）：直接用宿主注入的主题变量，不再自判明暗
+// 数据：GET /comfyui-hana/task?cardId=<卡实例 id>（轮询）；产物预览经代理路径 + surface 凭据段。
 import { hana } from "./sdk.js";
 
 const root = document.getElementById("tk-root");
@@ -21,17 +24,83 @@ try { session = new URLSearchParams(location.search).get("appSurfaceSession") ||
 let timer = null;
 let tickTimer = null;
 let lastData = null;
+let lastStage = null;   // "process" | "result" | "bad" —— 阶段切换时重建骨架
 
-// ── 主题 ──
-function syncTheme() {
-  let snap = null;
-  try { snap = hana.theme?.getSnapshot?.() || null; } catch { snap = null; }
-  const label = String(snap?.theme || "");
-  let dark = snap?.appearance === "dark" || /dark|midnight|contrast|深|夜/i.test(label);
-  if (!snap?.appearance && (!label || label === "inherit")) {
-    dark = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
-  }
-  document.body.classList.toggle("t-dark", dark);
+// ── 主题（2026-10-18 终稿 v2）──
+// 宿主主题变量的注入**不是自动的**：SDK 里 followHostTheme(cssUrl) 只在
+// 收到 THEME_CHANGED 推送时才被调用（见 sdk.js 的消息分支）。
+// 因此卡片必须主动订阅一次，让宿主推一次主题 → 触发样式表注入；
+// 订闻回调本身无需做事（CSS 全用 var()，变量一到位颜色就对了）。
+// 教训：之前把 syncTheme/subscribe 全删了，结果变量没注入，文字全落到兵底值（发灰）。
+
+// 把当前主题样式表注入本卡片文档（与 sdk.js 的 applyHostThemeStylesheet 同口径）。
+let themeInjected = false;
+function injectThemeCss(cssUrl) {
+  if (!cssUrl || themeInjected) return;
+  themeInjected = true;
+  fetch(cssUrl, { credentials: "same-origin" })
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((css) => {
+      const head = document.head || document.documentElement;
+      if (!head) return;
+      let el = document.querySelector("style[data-hana-theme-style]");
+      if (!el) {
+        el = document.createElement("style");
+        el.setAttribute("data-hana-theme-style", "");
+        head.appendChild(el);
+      }
+      el.textContent = css;
+    })
+    .catch(() => { themeInjected = false; /* 交给订阅路径再试 */ });
+}
+
+// 自查探针（2026-10-18）：把主题判定依据写进 DOM，便于从外部读回。
+// 仅诊断用，不参与渲染；移除时删本函数 + main() 里的调用。
+function writeThemeProbe() {
+  try {
+    let snap = null;
+    try { snap = hana.theme?.getSnapshot?.() || null; } catch { snap = null; }
+    let param = "";
+    try { param = new URLSearchParams(location.search).get("hana-css") || ""; } catch { /* 忽略 */ }
+    const dark = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    const old = document.getElementById("tk-probe");
+    if (old) old.remove();
+    const st = document.createElement("div");
+    st.id = "tk-probe";
+    st.style.display = "none";
+    st.textContent = JSON.stringify({
+      matchDark: dark,
+      snapAppearance: (snap && snap.appearance) || null,
+      snapTheme: (snap && snap.theme) || null,
+      snapCss: (snap && snap.cssUrl) || null,
+      urlCss: param || null,
+      hasStyleTag: !!document.querySelector("style[data-hana-theme-style]"),
+    });
+    document.body.appendChild(st);
+  } catch { /* 忽略 */ }
+}
+
+function ensureHostTheme() {
+  // ① 订阅：宿主推 THEME_CHANGED 时带 cssUrl；subscribe 会同步回调一次当前快照。
+  // 回调内任何抛错都会打断 main()（曾导致卡片卡在“正在读取…”），故双层 try。
+  try {
+    hana.theme?.subscribe?.((snap) => {
+      try { if (snap && snap.cssUrl) injectThemeCss(snap.cssUrl); } catch { /* 不上抛 */ }
+    });
+  } catch { /* 订阅不可用 */ }
+
+  // ② 初始快照里就有 cssUrl → 立即注入（不等推送）
+  // ② 初始快照里就有 cssUrl → 立即注入（不等推送）
+  try {
+    const snap = hana.theme?.getSnapshot?.();
+    if (snap && snap.cssUrl) injectThemeCss(snap.cssUrl);
+  } catch { /* 忽略 */ }
+
+  // ③ 再兑底：URL 参数 hana-css（快照拿不到时的最后一条路）
+  try {
+    const p = new URLSearchParams(location.search).get("hana-css");
+    if (p) injectThemeCss(p);
+  } catch { /* 忽略 */ }
 }
 
 function esc(v) {
@@ -48,33 +117,60 @@ function fmtDur(ms) {
   return `${m}m${String(s % 60).padStart(2, "0")}s`;
 }
 
-function stateClass(jobState) {
-  if (jobState === "completed") return "ok";
-  if (jobState === "error" || jobState === "interrupted" || jobState === "canceled" || jobState === "timeout") return "bad";
-  if (jobState === "running" || jobState === "pending") return "run";
-  return "";
-}
 const isTerminal = (s) => ["completed", "error", "interrupted", "canceled", "timeout"].includes(s);
 const isActive = (s) => s === "running" || s === "pending";
+const isFailed = (s) => s === "error" || s === "interrupted" || s === "canceled" || s === "timeout";
 
 function thumbUrl(proxyPrefix, viewPath) {
   if (!proxyPrefix || !viewPath) return null;
   if (session) return `${proxyPrefix}_surface/${encodeURIComponent(session)}/${viewPath}`;
-  return `${proxyPrefix}${viewPath}`; // 无凭据段时可能 403（降级为占位）
+  return `${proxyPrefix}${viewPath}`;
 }
 
-// ── 节点名映射（尽力而为：拿不到就如实显示「节点 #N」，不瞎编）──
+// ── 状态句（整张卡的主角）────────────────────────────────────────────────
+// 把原来分散在「胶囊行 + 时间轴说明行」的信息压成两句：
+//   主句：现在在干什么（动词短语）
+//   细节：可量化事实（第 N/M 步 · 节点 x/y · 队列前 N）
+function stateLine(t) {
+  const st = t.state;
+  const p = t.progress;
+  const total = totalNodes(t);
+  const done = Math.trunc(num(t.nodesDone) || 0);
+
+  if (st === "completed") return { main: "已完成", detail: "" };
+  if (isFailed(st)) return { main: t.stateText || "任务失败", detail: "" };
+
+  if (st === "pending") {
+    const q = t.queuePosition;
+    return { main: "排队中", detail: q != null ? `队列第 ${q} 位` : "" };
+  }
+
+  // running：优先「采样中 · 第 N/M 步」
+  const step = p && num(p.value) != null && num(p.max) != null ? `${p.value}/${p.max}` : null;
+  const nodeName = t.currentNode != null ? nodeLabel(t.currentNode, t) : "";
+  let main = "运行中";
+  if (step) main = `采样中 · 第 ${step} 步`;
+  else if (nodeName) main = `${nodeName}`;
+
+  const bits = [];
+  if (step && nodeName) bits.push(nodeName);
+  if (total) bits.push(`节点 ${done}/${total}`);
+  else if (done) bits.push(`已跑 ${done} 个节点`);
+  return { main, detail: bits.join(" · ") };
+}
+
+// ── 节点名（拿不到就如实显示编号，不编）──
 function nodeLabel(id, t) {
-  if (id == null || id === "") return "—";
+  if (id == null || id === "") return "";
   const key = String(id);
   const map = (t && (t.nodeNames || t.nodeTitles || t.nodeLabels)) || null;
   if (map && typeof map === "object" && typeof map[key] === "string" && map[key].trim()) {
-    return `${map[key].trim()}（#${key}）`;
+    return map[key].trim();
   }
   return `节点 #${key}`;
 }
 
-// 总节点数：优先显式字段，其次从 label「（N 节点）」解析；拿不到返回 null（时间轴退化为「已跑 + 尾部留白」）
+// 总节点数：显式字段 → label「（N 节点）」→ null
 function totalNodes(t) {
   const direct = num(t.nodeCount) ?? num(t.totalNodes) ?? num(t.nodesTotal);
   if (direct && direct > 0) return Math.trunc(direct);
@@ -83,7 +179,7 @@ function totalNodes(t) {
   return null;
 }
 
-// ── 失败态：一句可行动提示（只在证据支持时点名原因）──
+// ── 失败态提示 ──
 function errorText(t) {
   const e = t.error;
   if (!e) return "";
@@ -93,139 +189,81 @@ function errorText(t) {
 function errorHint(t) {
   const msg = errorText(t);
   if (/allocat|out of memory|\boom\b|cuda.*memory|显存|内存不足/i.test(msg)) {
-    return "疑似显存不足：降低分辨率 / 批量（降倍率），或先释放显存（关掉其它占 GPU 的程序、清空 ComfyUI 队列）后重跑。";
+    return "疑似显存不足：降低分辨率或批量，或先释放显存（关掉其它占 GPU 的程序、清空队列）后重跑。";
   }
-  if (/interrupt|cancel|取消|中断/i.test(msg)) {
-    return "任务被中断 / 取消；如需继续请重新提交。";
-  }
+  if (/interrupt|cancel|取消|中断/i.test(msg)) return "任务被中断或取消；需继续请重新提交。";
   return "可到 ComfyUI 控制台看完整堆栈，修正后重新提交。";
 }
 
-// ── DOM 骨架（一次建立，之后按需局部更新，避免整块重绘闪烁）──
+// ── DOM 骨架：按阶段建不同的树 ───────────────────────────────────────────
 const el = {};
-function ensureSkeleton() {
-  if (el.title && el.title.isConnected) return;
+function ensureProcessShell() {
+  if (el.stage === "process" && el.title && el.title.isConnected) return;
+  el.stage = "process";
   root.innerHTML = `
-    <div class="tk-hdr">
+    <div class="tk-top">
+      <span class="tk-dot"></span>
       <span class="tk-title"></span>
-      <span class="tk-elapsed" data-tk-elapsed></span>
-      <span class="chip"></span>
+      <span class="tk-time"></span>
     </div>
-    <div class="tk-meta"></div>
-    <div class="tk-bar"><div></div></div>
-    <div class="tk-tl"></div>
-    <div class="tk-tl-cap"></div>
+    <div class="tk-bar"><i></i></div>
+    <div class="tk-state"></div>
+    <div class="tk-detail"></div>
     <div class="tk-pv">
       <div class="tk-pv-wrap"><img class="tk-pv-img" alt="实时预览"></div>
-      <div class="tk-pv-bar"></div>
     </div>
-    <div class="tk-out"></div>
     <div class="tk-err"></div>
-    <div class="tk-hint"></div>
-    <div class="tk-foot"></div>`;
+    <div class="tk-hint"></div>`;
+  el.dot = root.querySelector(".tk-dot");
   el.title = root.querySelector(".tk-title");
-  el.elapsed = root.querySelector(".tk-elapsed");
-  el.chip = root.querySelector(".chip");
-  el.meta = root.querySelector(".tk-meta");
+  el.time = root.querySelector(".tk-time");
   el.bar = root.querySelector(".tk-bar");
-  el.barFill = el.bar.querySelector("div");
-  el.tl = root.querySelector(".tk-tl");
-  el.cap = root.querySelector(".tk-tl-cap");
+  el.barFill = el.bar.querySelector("i");
+  el.state = root.querySelector(".tk-state");
+  el.detail = root.querySelector(".tk-detail");
   el.pv = root.querySelector(".tk-pv");
   el.pvWrap = root.querySelector(".tk-pv-wrap");
   el.pvImg = root.querySelector(".tk-pv-img");
-  el.pvBar = root.querySelector(".tk-pv-bar");
-  el.out = root.querySelector(".tk-out");
   el.err = root.querySelector(".tk-err");
   el.hint = root.querySelector(".tk-hint");
-  el.foot = root.querySelector(".tk-foot");
   el.pvWrap.addEventListener("click", () => { const s = el.pvImg.getAttribute("src"); if (s) openLightbox(s); });
-  segEls = []; thumbEls = []; stripEls = [];
-  lastSegSig = ""; lastOutKey = "";
+}
+
+function ensureResultShell() {
+  if (el.stage === "result" && el.title && el.title.isConnected) return;
+  el.stage = "result";
+  root.innerHTML = `
+    <div class="tk-top">
+      <span class="tk-dot"></span>
+      <span class="tk-title"></span>
+      <span class="tk-time"></span>
+    </div>
+    <div class="tk-out"></div>
+    <div class="tk-acts">
+      <button type="button" class="tk-btn pri" data-act="dir">打开目录</button>
+    </div>`;
+  el.dot = root.querySelector(".tk-dot");
+  el.title = root.querySelector(".tk-title");
+  el.time = root.querySelector(".tk-time");
+  el.out = root.querySelector(".tk-out");
+  el.acts = root.querySelector(".tk-acts");
+  thumbEls = []; lastOutKey = "";
 }
 
 function renderNote(text) {
-  el.title = null; // 骨架失效，下轮重建
-  root.innerHTML = `<div class="tk-hdr"><span class="tk-title">ComfyUI 任务</span><span class="chip">—</span></div><div class="tk-note">${esc(text)}</div>`;
+  el.stage = null; el.title = null;
+  root.innerHTML = `
+    <div class="tk-top">
+      <span class="tk-dot"></span>
+      <span class="tk-title">ComfyUI 任务</span>
+      <span class="tk-time"></span>
+    </div>
+    <div class="tk-note">${esc(text)}</div>`;
   reportSize(true);
 }
 
-// ── 时间轴 ──
-let segEls = [];
-let lastSegSig = "";
-function buildSegments(t, cls) {
-  const done = Math.max(0, Math.trunc(num(t.nodesDone) || 0));
-  const total = totalNodes(t);
-  const failed = cls === "bad";
-  const active = isActive(t.state);
-  const segs = [];
-  if (total && total > 0) {
-    let count = total;
-    let d = done;
-    if (count > 24) { d = Math.round((done / total) * 24); count = 24; } // 超长工作流按比例压到 24 段
-    for (let i = 0; i < count; i += 1) segs.push({ k: i < d ? "done" : "idle" });
-    if (failed) { if (d < count) segs[d].k = "bad"; else if (count) segs[count - 1].k = "bad"; }
-    else if (active) { if (d < count) segs[d].k = "cur"; else if (count) segs[count - 1].k = "cur"; }
-  } else {
-    for (let i = 0; i < done; i += 1) segs.push({ k: "done" });
-    if (failed) segs.push({ k: "bad" });
-    else if (active) segs.push({ k: "cur" });
-    for (let i = 0; i < 4; i += 1) segs.push({ k: "tail" }); // 末段留白＝剩余未知
-    if (!segs.length) segs.push({ k: "tail" });
-  }
-  return segs;
-}
-function renderTimeline(t, cls) {
-  const segs = buildSegments(t, cls);
-  const sig = segs.map((s) => s.k).join("");
-  if (sig !== lastSegSig) {
-    lastSegSig = sig;
-    if (segEls.length !== segs.length) {
-      el.tl.innerHTML = "";
-      segEls = segs.map(() => {
-        const d = document.createElement("div");
-        el.tl.appendChild(d);
-        return d;
-      });
-    }
-    segs.forEach((s, i) => { segEls[i].className = `tk-seg ${s.k}`; });
-  }
-  // 说明行
-  const parts = [];
-  const p = t.progress;
-  if (p && num(p.value) != null && num(p.max) != null) parts.push(`第 ${p.value}/${p.max} 步`);
-  const done = Math.trunc(num(t.nodesDone) || 0);
-  const total = totalNodes(t);
-  if (cls === "bad") {
-    parts.push(`断在 ${nodeLabel(t.currentNode != null ? t.currentNode : p && p.node, t)}`);
-    parts.push(total ? `已跑 ${done}/${total}` : `已跑 ${done}`);
-  } else {
-    if (!isTerminal(t.state)) parts.push(nodeLabel(t.currentNode, t));
-    if (total) parts.push(`已跑 ${done}/${total}`);
-    else if (done) parts.push(`已跑 ${done}`);
-  }
-  const text = parts.filter(Boolean).join(" · ");
-  if (el.cap.textContent !== text) el.cap.textContent = text;
-  el.cap.hidden = !text;
-}
-
-// ── 元信息一行 ──
-function chipNum(label, v) { return `<span class="m">${esc(label)}<b>${esc(v)}</b></span>`; }
-function renderMeta(t) {
-  const items = [];
-  if (t.queuePosition != null) items.push(chipNum("队列", `前 ${t.queuePosition}`));
-  const p = t.progress;
-  if (p && num(p.value) != null && num(p.max) != null) items.push(chipNum("步进", `${p.value}/${p.max}`));
-  const done = Math.trunc(num(t.nodesDone) || 0);
-  const total = totalNodes(t);
-  if (done || total) items.push(chipNum("已跑节点", total ? `${done}/${total}` : `${done}`));
-  const html = items.join("");
-  if (el.meta.innerHTML !== html) el.meta.innerHTML = html;
-  el.meta.hidden = !items.length;
-}
-
 // ── 进度条 ──
-function renderBar(t, cls) {
+function renderBar(t) {
   const p = t.progress;
   const total = totalNodes(t);
   const done = Math.trunc(num(t.nodesDone) || 0);
@@ -236,98 +274,97 @@ function renderBar(t, cls) {
   else if (isActive(t.state) && total && done) pct = clamp((done / total) * 100, 0, 100);
   else if (isActive(t.state)) indet = true;
   el.bar.className = `tk-bar${indet ? " indet" : ""}`;
-  el.barFill.style.width = `${indet ? 38 : pct}%`;
+  el.barFill.style.width = `${pct}%`;
 }
 
 // ── 实时预览（最新帧 + 胶片点选回放）──
-let stripEls = [];
-let follow = true;
-let selIndex = -1;
-let lastFrameKey = "";
+// ── 实时预览：只显示最新降噪帧（2026-10-18 按用户要求去掉采样帧回放小图条）──
+// 小图条只用于「出图后的同批成品图」，不再承担采样过程回放。
 const frameSrc = (f) => (/^data:/.test(f) ? f : `data:image/jpeg;base64,${f}`);
-function renderPreview(t, hasOutputs) {
+
+function renderPreview(t) {
   const raw = Array.isArray(t.previewFrames) ? t.previewFrames.filter((f) => typeof f === "string" && f) : [];
-  // 完成后让位给成品图；缺帧或空帧 → 整块隐藏（不留空框、不报错）
-  const show = raw.length > 0 && !(t.state === "completed" && hasOutputs);
+  const show = raw.length > 0;
   el.pv.hidden = !show;
-  if (!show) { lastFrameKey = ""; return; }
-  const frames = raw.slice(-16); // 环形最多 16，最新在后
-  const key = `${frames.length}|${frames[frames.length - 1].slice(-48)}`;
-  if (key !== lastFrameKey) {
-    lastFrameKey = key;
-    if (follow) selIndex = frames.length - 1;
-  }
-  if (selIndex < 0 || selIndex >= frames.length) { selIndex = frames.length - 1; follow = true; }
-
-  const src = frameSrc(frames[selIndex]);
-  if (el.pvImg.getAttribute("src") !== src) el.pvImg.src = src; // 只换 src，元素不重建 → 不闪
-
-  // 胶片（每个槽位按需换 src，元素常驻）
-  if (stripEls.length !== frames.length) {
-    el.pvBar.innerHTML = "";
-    stripEls = [];
-    for (let i = 0; i < frames.length; i += 1) {
-      const d = document.createElement("button");
-      d.type = "button";
-      d.className = "tk-film";
-      const im = document.createElement("img");
-      im.alt = `第 ${i + 1} 帧`;
-      d.appendChild(im);
-      d.title = `第 ${i + 1} 帧`;
-      d.addEventListener("click", () => { selIndex = i; follow = i === frames.length - 1; lastFrameKey = ""; if (lastData) render(lastData); });
-      el.pvBar.appendChild(d);
-      stripEls.push({ box: d, img: im });
-    }
-  }
-  frames.forEach((f, i) => {
-    const s = frameSrc(f);
-    if (stripEls[i] && stripEls[i].img.getAttribute("src") !== s) stripEls[i].img.src = s;
-  });
-  stripEls.forEach((s, i) => { s.box.className = `tk-film${i === selIndex ? " on" : ""}`; });
-  el.pvBar.classList.toggle("follow", follow);
+  if (!show) return;
+  const src = frameSrc(raw[raw.length - 1]);   // 永远取最新一帧
+  if (el.pvImg.getAttribute("src") !== src) el.pvImg.src = src;
 }
 
-// ── 产物缩略图（columns 保自然宽高比）──
+// ── 产物：一张大图 + 下方同批小图条（2026-10-18 定稿）──
+// 交互：点小图 -> 大图切到那张；点大图 -> 开 lightbox 放大到满屏。
+// 单张时不出小图条；一张不丢，小图条在卡宽内自动缩尺寸（不滚、不裁）。
+const OUT_GAP = 6;
 let thumbEls = [];
 let lastOutKey = "";
+let outUrls = [];      // 当前一批产物的 url 列表
+let outIndex = 0;      // 大图当前显示第几张
+
+function applyOutLayout(count) {
+  el.out.classList.toggle("single", count <= 1);
+  // 小图尺寸随张数递减：<=4 张 64px，5-8 张 52px，9+ 张 42px
+  const sz = count <= 4 ? 64 : count <= 8 ? 52 : 42;
+  el.out.style.setProperty("--thumb-size", `${sz}px`);
+}
+
+function selectOutput(i) {
+  if (!outUrls.length) return;
+  const idx = clamp(i, 0, outUrls.length - 1);
+  outIndex = idx;
+  if (el.bigImg) el.bigImg.src = outUrls[idx];
+  thumbEls.forEach((b, j) => b.classList.toggle("on", j === idx));
+}
+
 function renderOutputs(outputs, proxyPrefix) {
-  const shown = outputs.slice(0, 24);
-  const key = shown.map((o) => o.viewPath || o.filename || "").join("|");
-  if (key !== lastOutKey) {
-    lastOutKey = key;
-    el.out.innerHTML = "";
-    thumbEls = shown.map((o) => {
-      const url = thumbUrl(proxyPrefix, o.viewPath);
-      const label = o.filename || "";
-      const box = document.createElement("div");
-      box.className = "tk-thumb";
-      if (!url) {
-        const ph = document.createElement("div");
-        ph.className = "ph";
-        ph.textContent = `${label}\n（无预览路径）`;
-        box.appendChild(ph);
-      } else {
-        const img = document.createElement("img");
-        img.loading = "lazy";
-        img.alt = label;
-        img.addEventListener("error", () => box.classList.add("miss"));
-        img.src = url;
-        box.title = label;
-        box.addEventListener("click", () => openLightbox(url));
-        box.appendChild(img);
-      }
-      if (label) {
-        const n = document.createElement("div");
-        n.className = "name";
-        n.textContent = label;
-        box.appendChild(n);
-      }
-      el.out.appendChild(box);
-      return box;
+  const urls = outputs.map((o) => thumbUrl(proxyPrefix, o.viewPath)).filter(Boolean);
+  const labels = outputs.map((o) => o.filename || "");
+  const key = urls.join("|");
+  if (key === lastOutKey) return 0;   // 无变化不重建
+
+  lastOutKey = key;
+  outUrls = urls;
+  outIndex = 0;
+  el.out.innerHTML = "";
+  applyOutLayout(urls.length);
+  if (!urls.length) { thumbEls = []; return 0; }
+
+  // 大图
+  const big = document.createElement("div");
+  big.className = "tk-big";
+  const bigImg = document.createElement("img");
+  bigImg.alt = labels[0] || "产物";
+  bigImg.addEventListener("load", () => reportSize(true));
+  bigImg.src = urls[0];
+  big.appendChild(bigImg);
+  // 点大图：开 lightbox 看更大（取当前选中的那张）
+  big.addEventListener("click", () => openLightbox(outUrls[outIndex]));
+  el.bigImg = bigImg;
+  el.out.appendChild(big);
+
+  // 小图条（单张时不出）
+  if (urls.length > 1) {
+    const strip = document.createElement("div");
+    strip.className = "tk-strip";
+    thumbEls = urls.map((u, i) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `tk-mini${i === 0 ? " on" : ""}`;
+      b.title = labels[i] || `第 ${i + 1} 张`;
+      const im = document.createElement("img");
+      im.loading = "lazy";
+      im.alt = labels[i] || `第 ${i + 1} 张`;
+      im.src = u;
+      b.appendChild(im);
+      b.addEventListener("click", () => selectOutput(i));
+      strip.appendChild(b);
+      return b;
     });
+    el.out.appendChild(strip);
+  } else {
+    thumbEls = [];
   }
-  el.out.hidden = !shown.length;
-  return outputs.length - shown.length;
+  reportSize(true);
+  return 0;   // 全部展示，永不截断
 }
 
 // ── 卡内 lightbox ──
@@ -340,62 +377,159 @@ function closeLightbox() { if (lb) { lb.hidden = true; if (lbImg) lbImg.removeAt
 if (lb) lb.addEventListener("click", closeLightbox);
 try { window.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLightbox(); }); } catch { /* 忽略 */ }
 
-// ── 主渲染 ──
+// ── 主渲染：按阶段分派 ──
 function render(data) {
   lastData = data;
   if (!data || !data.ok) { renderNote(`读取失败：${data && data.error ? data.error : "未知错误"}`); return; }
   if (!data.found) {
-    renderNote(`未找到任务 record：${identity ? identity.value : "?"}\n（可能已超出本进程记忆；提交后短时间内可用，或改用 comfyui action=query/result）`);
+    renderNote(`未找到任务记录：${identity ? identity.value : "?"}\n（可能已超出本进程记忆；提交后短时间内可用，或改用 comfyui action=query/result）`);
     return;
   }
   const t = data.task;
-  const cls = stateClass(t.state);
-  ensureSkeleton();
+  const outputs = Array.isArray(t.outputs) ? t.outputs : [];
+  const failed = isFailed(t.state);
+  // 阶段判定：完成且有产物 → 作品视图；其余（含失败）→ 过程视图（失败在过程视图里标红）
+  const stage = (t.state === "completed" && outputs.length > 0) ? "result" : "process";
+
+  if (stage !== el.stage) {
+    if (stage === "result") ensureResultShell(); else ensureProcessShell();
+  }
+
+  if (stage === "result") {
+    el.dot.className = "tk-dot ok";
+    el.title.textContent = t.label || "ComfyUI 任务";
+    el.title.title = t.label || "";
+    el.time.textContent = fmtDur(t.elapsedMs);
+    const more = renderOutputs(outputs, data.proxyPrefix);
+    // 2026-10-18：不再截断，全部展示；more 恒为 0，保留分支以便未来需要时启用。
+    if (more > 0) {
+      if (!el.more) {
+        el.more = document.createElement("div");
+        el.more.className = "tk-detail";
+        el.more.style.marginTop = "6px";
+        el.out.parentNode.insertBefore(el.more, el.acts);
+      }
+      el.more.textContent = `另有 ${more} 张（用 comfyui action=result 取完整清单）`;
+    } else if (el.more) { el.more.remove(); el.more = null; }
+    bindActions(outputs, data.proxyPrefix);
+  } else {
+    el.dot.className = `tk-dot ${failed ? "bad" : "run"}`;
+    el.title.textContent = t.label || "ComfyUI 任务";
+    el.title.title = t.label || "";
+    const elapsedVal = isActive(t.state) && t.submittedAt ? Date.now() - t.submittedAt : t.elapsedMs;
+    el.time.textContent = fmtDur(elapsedVal);
+
+    renderBar(t);
+    const sl = stateLine(t);
+    el.state.innerHTML = failed
+      ? `<b style="color:var(--bad)">${esc(sl.main)}</b>`
+      : `<b>${esc(sl.main)}</b>`;
+    el.detail.textContent = sl.detail || "";
+
+    // 完成后无产物：预览仍可看（此时预览就是唯一结果）
+    renderPreview(t);
+
+    const errText = failed ? errorText(t) : "";
+    el.err.textContent = errText;
+    el.err.hidden = !errText;
+    el.hint.textContent = errText ? errorHint(t) : "";
+    el.hint.hidden = !errText;
+  }
 
   const terminal = isTerminal(t.state);
   if (terminal && !render._terminalReported) {
     render._terminalReported = true;
     [0, 1000, 2500].forEach((d) => setTimeout(() => reportSize(true), d));
   }
-
-  el.title.textContent = t.label || "ComfyUI 任务";
-  el.title.title = t.label || "";
-  el.chip.textContent = t.stateText || t.state;
-  el.chip.className = `chip ${cls}`;
-  const elapsedVal = isActive(t.state) && t.submittedAt ? Date.now() - t.submittedAt : t.elapsedMs;
-  el.elapsed.textContent = fmtDur(elapsedVal);
-
-  renderMeta(t);
-  renderBar(t, cls);
-  renderTimeline(t, cls);
-
-  const outputs = Array.isArray(t.outputs) ? t.outputs : [];
-  renderPreview(t, outputs.length > 0);
-  const moreCount = renderOutputs(outputs, data.proxyPrefix);
-
-  const errText = cls === "bad" ? errorText(t) : "";
-  el.err.textContent = errText;
-  el.err.hidden = !errText;
-  el.hint.textContent = errText ? errorHint(t) : "";
-  el.hint.hidden = !errText;
-
-  const foot = [];
-  foot.push(terminal ? "任务已结束。" : "自动刷新中…");
-  if (moreCount > 0) foot.push(`另有 ${moreCount} 个产物（用 comfyui action=result 取完整清单）。`);
-  el.foot.textContent = foot.join(" ");
-
   reportSize();
 }
 
+// 动作绑定（作品视图）
+// 「全部下载」：<a download> 逐个触发，不依赖宿主权限
+// 「打开目录」：卡片自己打不开本地目录（宿主 external.open 只放行 http(s)），
+//   改为请 App 后端代开——后端持有 app/runtime.execute，能 spawn explorer.exe。
+function bindActions(outputs, proxyPrefix) {
+  if (!el.acts || el.acts._bound) return;
+  el.acts._bound = true;
+  el.acts.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    if (btn.getAttribute("data-act") === "dir") void openDir(btn);
+  });
+}
+
+// 打开产物目录：走 App 自有路由（后端 spawn explorer.exe）。
+async function openDir(btn) {
+  const prev = btn.textContent;
+  btn.textContent = "打开中…";
+  btn.disabled = true;
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/open-output-dir", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j || j.ok !== true) {
+      throw new Error((j && j.error) || `HTTP ${r.status}`);
+    }
+    btn.textContent = prev;
+  } catch (err) {
+    // 失败：把目录路径复制到剪贴板作降级（仍不能开窗时至少拿得到路径）
+    const dir = lastData && typeof lastData.outputDir === "string" ? lastData.outputDir : "";
+    try { if (dir) await hana.clipboard.writeText(dir); } catch { /* 忽略 */ }
+    flashBtn(btn, dir ? "已复制路径" : "打开失败", dir || String((err && err.message) || err));
+    try { console.warn("[task] 打开目录失败：", err, dir); } catch { /* 忽略 */ }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function flashBtn(btn, text, title) {
+  const prev = btn.getAttribute("data-label") || btn.textContent;
+  btn.setAttribute("data-label", prev);
+  btn.textContent = text;
+  if (title) btn.title = title;
+  setTimeout(() => { btn.textContent = prev; }, 1800);
+}
+
 // ── 尺寸上报（宽度上报 + 高度随内容；启动期自愈收敛）──
+// 2026-10-18 修正：body 加了 overflow:hidden 之后，body.scrollHeight 被压成
+// 等于当前可视高度，内容变高它也不涨 → 上报高度永远偏小，卡片底部被裁。
+// 改为量 #tk-root 的边界盒（不受 body 裁剪影响）。
 var lastReportedH = 0;
+function contentHeight() {
+  let h = 0;
+  try {
+    const rootEl = document.getElementById('tk-root');
+    if (rootEl) {
+      const r = rootEl.getBoundingClientRect();
+      h = Math.ceil(r.height);
+    }
+  } catch { /* 忽略 */ }
+  if (!h) {
+    try {
+      const b = document.body;
+      if (b) h = Math.ceil(Math.max(b.scrollHeight, b.offsetHeight));
+    } catch { /* 忽略 */ }
+  }
+  // 加上 body 的上下 padding（11 + 13），让卡片恰好包住内容
+  try {
+    const cs = getComputedStyle(document.body);
+    h += (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+  } catch { /* 忽略 */ }
+  return h;
+}
 function reportSize(force) {
   try {
-    const h = Math.ceil(document.body ? document.body.scrollHeight : 0);
+    const h = contentHeight();
     if (!h || h < 40) return;
     if (!force && h === lastReportedH) return;
     lastReportedH = h;
-    try { hana.ui?.resize?.({ height: h, width: CARD_WIDTH }); } catch { /* 老宿主无此路 */ }
+    // 2026-10-18：只上报高度，不报宽度。
+    // 原来报 width:460 等于替宿主定卡宽，用户看到「卡片为什么这么宽」。
+    // 宽度交给宿主（preferredWidthPx / 布局），我们只管把高度贴到内容。
+    try { hana.ui?.resize?.({ height: h }); } catch { /* 老宿主无此路 */ }
     try { window.parent.postMessage({ type: "hana.card-resize", height: h }, "*"); } catch { /* 同上 */ }
   } catch { /* 忽略 */ }
 }
@@ -405,41 +539,40 @@ function reportSize(force) {
   reportSize(true);
   try { window.addEventListener("resize", () => { if (!adopted()) reportSize(true); }); } catch { /* 忽略 */ }
   let n = 0;
-  const timer2 = setInterval(() => {
+  const t2 = setInterval(() => {
     n += 1;
-    if (adopted()) { clearInterval(timer2); return; }
+    if (adopted()) { clearInterval(t2); return; }
     reportSize(true);
-    if (n >= 6) clearInterval(timer2);
+    if (n >= 6) clearInterval(t2);
   }, 1500);
 })();
 
-// ── 身份与轮询（自愈式：启动期错过握手也能自动恢复）──
-// 缺陷背景：宿主 event loop 严重卡顿时（实测 24~67s），注入 surface 上下文的握手消息
-// 可能迟到；旧逻辑只在启动轮询 12×150ms，错过就永久停在错误文案。现在改为：
-// ① poll 每轮自愈重试 ② 解析窗口拉长到 40×150ms ③ 订阅 onContextChanged 抢先 ④ re-show 补试。
+// ── 身份与轮询（自愈式）──
 let identity = null;
-let resolving = null;   // 进行中的解析（并发重试合并成一次，不叠加探测循环）
-let lastReshowAt = 0;   // re-show 连续触发合并
+let resolving = null;
+let lastReshowAt = 0;
 
+// 2026-10-18：原来这里是 40 × 150ms ≈ 6 秒的阻塞等待，
+// 拿不到 cardInstanceId 时首屏白等 6 秒（用户感知为「渲染极慢」）。
+// 改为：短快轮（最多 400ms），拿不到就走 latest=1 先出画面，
+// 同时 onContextChanged 订阅仍在后台等，一旦拿到就切精确匹配。
 async function resolveIdentity() {
   let q = null;
   try { q = new URLSearchParams(location.search); } catch { q = null; }
   const qid = q ? (q.get("id") || q.get("pid") || q.get("taskId") || "").trim() : "";
   if (qid) return { kind: "id", value: qid };
-  // 轮询上限 40 × 150ms ≈ 6s：覆盖宿主卡顿（原先 12×150ms≈1.8s 太短）。
-  for (let i = 0; i < 40; i += 1) {
-    if (identity) return identity;   // 订阅/其它路径已抢先拿到就不必再等
+  for (let i = 0; i < 4; i += 1) {
+    if (identity) return identity;
     let ctx = null;
     try { ctx = hana.surface?.getContext?.() || null; } catch { ctx = null; }
     if (ctx && typeof ctx.cardInstanceId === "string" && ctx.cardInstanceId.trim()) {
       return { kind: "cardId", value: ctx.cardInstanceId.trim() };
     }
-    await sleep(150);
+    if (i < 3) await sleep(100);
   }
   return null;
 }
 
-// 解析入口：轮询自愈 / 订阅 / re-show 共用同一逻辑；进行中的解析被复用，不重复起循环。
 function retryIdentity() {
   if (identity) return Promise.resolve(identity);
   if (!resolving) {
@@ -451,8 +584,6 @@ function retryIdentity() {
   return resolving;
 }
 
-// 双保险之一：订阅 surface 上下文变化（onContextChanged 会立即回调一次当前值）。
-// 订阅不可用 / 抛错时静默忽略 —— 正确性不押在订阅上，靠 poll 内的自愈轮询兜底。
 function subscribeContext() {
   try {
     hana.surface?.onContextChanged?.((ctx) => {
@@ -464,8 +595,6 @@ function subscribeContext() {
   } catch { /* 订阅不可用：交给自愈轮询 */ }
 }
 
-// 双保险之二：re-show 重试（宿主 park 后移回时 iframe 不重载，启动期的解析早已结束）。
-// 连续触发用 ~400ms 合并，只做一次性 setTimeout，不引入常驻定时器。
 function onReshow() {
   try {
     if (document.visibilityState && document.visibilityState !== "visible") return;
@@ -474,7 +603,7 @@ function onReshow() {
     if (now - lastReshowAt < 400) return;
     lastReshowAt = now;
     setTimeout(() => { void retryIdentity(); }, 0);
-  } catch { /* 事件不可用不影响主流程 */ }
+  } catch { /* 忽略 */ }
 }
 try {
   document.addEventListener("visibilitychange", onReshow);
@@ -482,36 +611,41 @@ try {
 } catch { /* 忽略 */ }
 
 const FETCH_TIMEOUT_MS = 15000;
-
-// 给单次取数加兜底：fetch 永久挂起时不至于让 await 永不返回（否则 pollInFlight 永不复位 → 卡片冻结）。
 function fetchWithTimeout(url, ms) {
   let to = null;
   const timeout = new Promise((_, reject) => {
     to = setTimeout(() => reject(Object.assign(new Error("timeout"), { __timeout: true })), ms);
   });
   const req = hana.api.fetch(url, { cache: "no-store" });
-  req.catch(() => {});   // 防 race 落败后 req 的 rejection 变成 unhandledrejection
+  req.catch(() => {});
   return Promise.race([req, timeout]).finally(() => { if (to) clearTimeout(to); });
 }
 
 let pollInFlight = false;
+let ctxMisses = 0;   // 连续拿不到上下文的轮数（超过阈值后改走 latest 兑底）
 async function poll() {
-  if (pollInFlight) return;   // 订阅/定时器可能同时唤起 poll：进行一次即可，避免叠加请求
+  if (pollInFlight) return;
   pollInFlight = true;
   try {
-    if (!identity) {
-      // 自愈：每轮都重新尝试解析。宿主卡顿期错过握手 → 恢复后这里自动接上，
-      // 卡片不再「一次失败就永久停在提示文案」。
-      identity = await retryIdentity();
-    }
-    if (!identity) {
+    if (!identity) identity = await retryIdentity();
+    // 兑底（2026-10-18）：拿不到 surface 上下文时不死等。
+    // 原因：宿主没注入 cardInstanceId（流内卡创建得过早/会话切换）→ getContext() 恒 null，
+    // 原逻辑会永久停在「正在等待卡片上下文…」。改为两轮后直接用 latest=1，
+    // 先显示最近一条任务（总比空白好），同时继续后台等上下文。
+    ctxMisses += 1;
+    let qs;
+    if (identity) {
+      qs = identity.kind === "cardId"
+        ? `cardId=${encodeURIComponent(identity.value)}`
+        : `id=${encodeURIComponent(identity.value)}`;
+      ctxMisses = 0;
+    } else if (ctxMisses >= 2) {
+      qs = "latest=1";
+    } else {
       renderNote("正在等待卡片上下文…");
       schedule(null);
       return;
     }
-    const qs = identity.kind === "cardId"
-      ? `cardId=${encodeURIComponent(identity.value)}`
-      : `id=${encodeURIComponent(identity.value)}`;
     try {
       const r = await fetchWithTimeout(`/comfyui-hana/task?${qs}`, FETCH_TIMEOUT_MS);
       const data = await r.json();
@@ -533,22 +667,35 @@ function schedule(data) {
   timer = setTimeout(() => { void poll(); }, next);
 }
 
+// 2026-10-18：兜底——任何未捕获异常都显示在卡上，不再白屏。
+// 背景：reload 后旧卡引用的 JS 失效、或某处静默抛错时，用户只看到一块空白。
+try {
+  window.addEventListener("error", (e) => {
+    try { renderNote(`卡片脚本出错：${(e && e.message) || "未知"}\n（可刷新页面重试）`); } catch { /* 忽略 */ }
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e && e.reason;
+    try { renderNote(`卡片异步出错：${(r && r.message) || r || "未知"}\n（可刷新页面重试）`); } catch { /* 忽略 */ }
+  });
+} catch { /* 忽略 */ }
+
 async function main() {
-  syncTheme();
-  try { hana.theme?.subscribe?.(() => syncTheme()); } catch { /* 忽略 */ }
+  // 首屏立刻给骨架，不等身份/网络——避免一片空白。
+  try { renderNote("正在读取任务状态…"); } catch { /* 忽略 */ }
+  ensureHostTheme();   // 主动订阅一次，逼迫宿主注入主题变量（否则 var() 全落兵底值）
+  writeThemeProbe();   // 自查探针：把判定依据写进 DOM
   try { await hana.ready(); } catch { /* 忽略 */ }
   if (typeof ResizeObserver !== "undefined") {
     try { new ResizeObserver(() => reportSize()).observe(root); } catch { /* 忽略 */ }
   }
-  // 秒级刷新的「耗时」（只改文本节点，不动整块 DOM）
   tickTimer = setInterval(() => {
     try {
       const t = lastData?.task;
-      if (!el.elapsed || !el.elapsed.isConnected || !t) return;
-      if (isActive(t.state) && t.submittedAt) el.elapsed.textContent = fmtDur(Date.now() - t.submittedAt);
+      if (!el.time || !el.time.isConnected || !t) return;
+      if (isActive(t.state) && t.submittedAt) el.time.textContent = fmtDur(Date.now() - t.submittedAt);
     } catch { /* 忽略 */ }
   }, 1000);
   subscribeContext();
-  void poll();   // 身份解析（含自愈重试）全部由 poll 负责
+  void poll();
 }
 void main();

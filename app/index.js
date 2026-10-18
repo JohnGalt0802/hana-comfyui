@@ -18,7 +18,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { defineApp } from "./sdk/app-contract/server-client.js";
 import { createHash, randomInt, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { projectGraph } from "./lib/canvas-project.mjs";
 import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
@@ -397,6 +397,10 @@ export default defineApp(async (sdk) => {
   // 画布写入授权（默认关）：agent 改的是人眼前的画布，不给默认放行。
   const allowWriteFile = join(dataDir, "allow-write.json");
 
+  // 任务记录持久化（2026-10-18）：state.jobs 是内存 Map，App reload 后清空，
+  // 旧卡按 cardId 反查不到 → 显示「未找到任务记录」。落盘已出结果的任务，启动时回填。
+  const jobsCacheFile = join(dataDir, "jobs-cache.json");
+
   // 副驾驶总闸（默认关，v2 2026-10-08）：允许 Agent 开启画布副驾驶——「人明确下令」的机制基座。
   // 边界：桥（js/py）读不到本设置，总闸只在 app 层生效；桥侧只兜底 copilot_off 写拦截。
   const allowCopilotFile = join(dataDir, "allow-copilot.json");
@@ -690,6 +694,101 @@ export default defineApp(async (sdk) => {
   }
 
   // ── 任务桥：跟踪 + 结算 ──────────────────────────────────────────────────
+  // ── 任务记录持久化（2026-10-18）────────────────────────────────────────
+  // 目的：App reload / 宿主重启后，旧卡仍能按 cardId 找回任务并显示结果。
+  // 只存「已有结果或已终态」的记录（进行中的任务 reload 后本来也追不动）。
+  // 预览帧不落盘（base64 太大），只留产物与状态。
+  let persistJobsTimer = null;
+
+  function jobsSnapshotForDisk() {
+    const out = [];
+    for (const j of state.jobs.values()) {
+      if (!j || !j.promptId) continue;
+      const hasOut = Array.isArray(j.outputs) && j.outputs.length > 0;
+      const terminal = TERMINAL_JOB.has(j.state);
+      if (!hasOut && !terminal) continue;
+      out.push({
+        promptId: j.promptId,
+        label: j.label,
+        clientLabel: j.clientLabel,
+        state: j.state,
+        submittedAt: j.submittedAt,
+        startedAt: j.startedAt,
+        finishedAt: j.finishedAt,
+        nodesDone: j.nodesDone,
+        outputs: j.outputs,
+        error: j.error,
+      });
+    }
+    // 只留最近 60 条，防止无限增长
+    out.sort((a, b) => (b.submittedAt || 0) - (a.submittedAt || 0));
+    return out.slice(0, 60);
+  }
+
+  function persistJobsNow() {
+    try {
+      const data = jobsSnapshotForDisk();
+      writeFileSync(jobsCacheFile, JSON.stringify(data), "utf8");
+    } catch (e) {
+      warn(`jobs-cache 写失败：${msgOf(e)}`);
+    }
+  }
+
+  function persistJobsSoon() {
+    if (persistJobsTimer) return;
+    persistJobsTimer = setTimeout(() => {
+      persistJobsTimer = null;
+      persistJobsNow();
+    }, 1200);
+    if (persistJobsTimer && typeof persistJobsTimer.unref === "function") persistJobsTimer.unref();
+  }
+
+  function loadJobsCache() {
+    try {
+      if (!existsSync(jobsCacheFile)) return 0;
+      const raw = readFileSync(jobsCacheFile, "utf8");
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return 0;
+      let n = 0;
+      for (const rec of arr) {
+        if (!rec || typeof rec.promptId !== "string" || !rec.promptId) continue;
+        if (state.jobs.has(rec.promptId)) continue;
+        const job = {
+          promptId: rec.promptId,
+          taskId: null,
+          label: rec.label || "ComfyUI 任务",
+          clientLabel: rec.clientLabel || rec.label || "ComfyUI 任务",
+          state: rec.state || "completed",
+          submittedAt: rec.submittedAt || Date.now(),
+          startedAt: rec.startedAt || null,
+          finishedAt: rec.finishedAt || null,
+          progress: null,
+          currentNode: null,
+          nodesDone: rec.nodesDone || 0,
+          outputs: Array.isArray(rec.outputs) ? rec.outputs : [],
+          previewFrames: [],
+          previewUpdatedAt: null,
+          error: rec.error || null,
+          cancelRequested: false,
+          historyFetched: true,
+          lastTaskUpdateAt: 0,
+          taskNote: null,
+          fromCache: true,
+        };
+        state.jobs.set(job.promptId, job);
+        n += 1;
+      }
+      if (n) log(`jobs-cache 回填 ${n} 条任务记录`);
+      return n;
+    } catch (e) {
+      warn(`jobs-cache 读失败：${msgOf(e)}`);
+      return 0;
+    }
+  }
+
+  // apply 一起来就回填（幂等）：让 reload 前的旧卡仍能查到任务。
+  try { loadJobsCache(); } catch { /* 回填失败不影响启动 */ }
+
   function newJob(promptId, label) {
     const job = {
       promptId,
@@ -713,6 +812,7 @@ export default defineApp(async (sdk) => {
       taskNote: null, // 桥降级原因
     };
     state.jobs.set(promptId, job);
+    persistJobsSoon();
     // 丢弃过老的已终态记录（最多保留 50 条）
     if (state.jobs.size > 50) {
       const terminal = [...state.jobs.values()].filter((j) => TERMINAL_JOB.has(j.state)).sort((a, b) => a.submittedAt - b.submittedAt);
@@ -792,6 +892,7 @@ export default defineApp(async (sdk) => {
     if (entry && Array.isArray(entry.outputs) && entry.outputs.length) job.outputs = entry.outputs;
     if (errorInfo) job.error = errorInfo;
     try { await enrichOutputs(job); } catch (e) { warn(`产物路径补充失败：${msgOf(e)}`); }
+    persistJobsSoon();   // 终态+产物已定，落盘供 reload 后旧卡查回
     if (job.taskId) {
       try {
         if (kind === "completed") {
@@ -1139,6 +1240,24 @@ export default defineApp(async (sdk) => {
   function proxyPrefix() {
     if (state.phase !== "ready" || !state.runtimeId) return null;
     return `/api/apps/${encodeURIComponent(APP_ID)}/routes/_runtime/${encodeURIComponent(state.runtimeId)}/`;
+  }
+
+  // ComfyUI 输出目录（2026-10-18）：给任务卡的「打开目录」用。
+  // 优先用快照里的安装根（relay.backend.proc.install）推 <install>/ComfyUI/output；
+  // 推不出就退回产物 filePath 所在目录（产物已 enrich 过绝对路径）。
+  function comfyOutputDir(job) {
+    try {
+      const proc = state.snapshot?.relay?.backend?.proc || null;
+      const root = proc && typeof proc.install === "string" ? proc.install.trim() : "";
+      if (root) return join(root, "ComfyUI", "output");
+    } catch { /* 忽略 */ }
+    try {
+      const outs = job && Array.isArray(job.outputs) ? job.outputs : [];
+      for (const o of outs) {
+        if (o && typeof o.filePath === "string" && o.filePath) return dirname(o.filePath);
+      }
+    } catch { /* 忽略 */ }
+    return null;
   }
 
   function noteForReady() {
@@ -1853,6 +1972,7 @@ export default defineApp(async (sdk) => {
     if (job) {
       job.outputs = outputs;
       await enrichOutputs(job);
+      persistJobsSoon();
       return { outputs: job.outputs, job };
     }
     const tmp = { outputs, promptId };
@@ -5128,6 +5248,67 @@ export default defineApp(async (sdk) => {
 
       app.get("/comfyui-hana/health", (c) => c.json({ ok: true, app: { id: APP_ID, version: APP_VERSION }, ts: new Date().toISOString() }));
 
+      // 打开产物目录（2026-10-18）：卡片按钮调起资源管理器。
+      // 为何不在卡片里直接做：宿主 external.open 只放行 http(s)（源码 `/^https?:/i` 过滤），
+      // 本地目录永远打不开。而 App 后端持有 app/runtime.execute 能力（启服务就是这条路），
+      // 因此改由后端 spawn explorer.exe 完成——卡片只发一个 POST。
+      app.post("/comfyui-hana/open-output-dir", async (c) => {
+        const dbg = {};
+        try {
+          if (!sdk.runtime || typeof sdk.runtime.start !== "function") {
+            return c.json({ ok: false, error: "runtime-unavailable" }, 503);
+          }
+          // 目录：优先用快照安装根推 <install>/ComfyUI/output，否则退到最近产物目录
+          const proc = state.snapshot?.relay?.backend?.proc || null;
+          dbg.install = proc && typeof proc.install === "string" ? proc.install : null;
+          const dir = comfyOutputDir(null);
+          dbg.dir = dir;
+          if (!dir) {
+            return c.json({ ok: false, error: "output-dir-unknown", dbg }, 404);
+          }
+          try { mkdirSync(dir, { recursive: true }); } catch (e) { dbg.mkdirErr = msgOf(e); }
+
+          // 2026-10-18 修正：runtime 只接受 "node" | "command"，
+          // 且可执行文件必须放在 command 字段（不是 entry）。
+          // 之前写 runtime:"process" + entry:"explorer.exe"，宿主直接拒：
+          //   "runtime must be 'node' or 'command'."
+          // 另外用绝对路径，裸名在受管 runtime 下可能解析不到。
+          const winDir = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+          const candidates = [
+            { command: join(winDir, "explorer.exe"), args: [dir] },
+            { command: join(winDir, "System32", "cmd.exe"), args: ["/c", "start", "", dir] },
+            { command: join(winDir, "System32", "rundll32.exe"), args: ["url.dll,FileProtocolHandler", dir] },
+          ];
+          const errs = [];
+          for (const at of candidates) {
+            try {
+              // 2026-10-18：local-machine 档强制要求 network:"external"，
+              // 传 "none" 会被宿主拒：
+              //   "The cross-platform native and local-machine profiles require
+              //    explicit network: 'external' and its separate grant."
+              const rt = await sdk.runtime.start({
+                runtime: "command",
+                command: at.command,
+                args: at.args,
+                profile: "local-machine",
+                cwd: dir,
+                network: "external",
+              });
+              log(`open-output-dir → ${dir}（${at.command}，runtime=${rt && rt.runtimeId ? rt.runtimeId : "?"}）`);
+              return c.json({ ok: true, dir, via: at.command, dbg });
+            } catch (e) {
+              errs.push(`${at.command}: ${msgOf(e)}`);
+            }
+          }
+          dbg.attempts = errs;
+          warn(`open-output-dir 全部失败：${errs.join(" | ")}`);
+          return c.json({ ok: false, error: "start-failed", dbg }, 500);
+        } catch (e) {
+          warn(`open-output-dir 失败：${msgOf(e)}`);
+          return c.json({ ok: false, error: msgOf(e), dbg }, 500);
+        }
+      });
+
       // ── TODO 节流探针实验（临时代码，验证完按结论处理）────────────────────────
       // 「网络直采」通道（hui 页 → 后端报数，数据必达）：页面每 10s POST {t, n, vis}
       //（页面侧见 app/ui/workspace.js 的 setupThrottleProbe 网络直采段），本路由把一行 JSON
@@ -5577,9 +5758,21 @@ export default defineApp(async (sdk) => {
         try {
           const cardId = String(c.req.query("cardId") || "").trim();
           const id = String(c.req.query("id") || "").trim();
-          if (!cardId && !id) return c.json({ ok: false, error: "需要 ?cardId=<卡片实例 id> 或 ?id=<promptId 或 taskId>" }, 400);
-          const job = cardId ? await findJobByCardId(cardId) : await findJobById(id);
-          if (!job) return c.json({ ok: true, found: false, id: cardId || id, proxyPrefix: proxyPrefix() });
+          // latest=1：不管身份，直接给「最近一条任务」（2026-10-18）。
+          // 用途：卡片若拿不到 surface 上下文（宿主没注入 cardInstanceId），
+          // 至少能显示最近一次生图的进度/结果，而不是死卡在「正在等待卡片上下文…」。
+          const latest = String(c.req.query("latest") || "") === "1";
+          let job;
+          if (cardId) job = await findJobByCardId(cardId);
+          else if (id) job = await findJobById(id);
+          else if (latest) {
+            const all = [...(state.jobs?.values?.() ?? [])];
+            all.sort((a, b) => (b.submittedAt || 0) - (a.submittedAt || 0));
+            job = all[0] || null;
+          } else {
+            return c.json({ ok: false, error: "需要 ?cardId=<卡片实例 id> 或 ?id=<promptId 或 taskId> 或 ?latest=1" }, 400);
+          }
+          if (!job) return c.json({ ok: true, found: false, id: cardId || id || "latest", proxyPrefix: proxyPrefix() });
           const task = jobSummary(job);
           // 卡片 renderPreview 用全量帧做胶片回放（slice(-16)），而列表出口只带末帧；
           // 这里按需补拉单条（/_relay/prompts/<id>，full=true，全部 ≤16 帧）覆盖。取不到则退回末帧。
@@ -5597,6 +5790,7 @@ export default defineApp(async (sdk) => {
             ok: true,
             found: true,
             proxyPrefix: proxyPrefix(),
+            outputDir: comfyOutputDir(job),
             task,
             relayEvents: state.snapshot?.relay?.events || null,
           });
