@@ -1067,6 +1067,7 @@ function requestFrameReload(reason, url) {
   if (frameSuspectTimer) { clearTimeout(frameSuspectTimer); frameSuspectTimer = null; } // 旧循环止步，新文档重新评估
   els.loading.classList.add("show");
   els.frame.src = finalUrl;  // 含短期凭证，不落存储、不写日志
+  reportShellLifecycle("frame-reload", { reason: String(reason || ""), target: (() => { try { const u = new URL(finalUrl); return u.origin + u.pathname; } catch { return ""; } })() });
   console.log(`[comfyui-hana] 重载工作区 iframe（${reason}）`);
   return true;
 }
@@ -1843,7 +1844,87 @@ function setupThrottleProbe() {
   }, 10000);
 }
 
+// ── 壳页生命周期自报（2026-10-19）────────────────────────────────────────────
+// 目的：判定每次 hui 工作区页面是「被 reload」还是「被新建」。壳页自身记 boot（main 首行），
+// iframe 重设 src 记 frame-reload（requestFrameReload），落 <dataDir>/shell-lifecycle.jsonl。
+// 纪律：纯观测，静默失败，绝不影响壳页任何业务逻辑。
+function reportShellLifecycle(event, extra) {
+  try {
+    const nav = (performance.getEntriesByType && performance.getEntriesByType("navigation")[0]) || null;
+    const rec = {
+      event,                                  // "boot" | "frame-reload"
+      at: Date.now(),
+      timeOrigin: Math.round(performance.timeOrigin || 0),
+      sinceOriginMs: Math.round(Date.now() - (performance.timeOrigin || Date.now())),
+      navType: nav ? nav.type : "unknown",    // navigate | reload | back_forward | prerender | unknown
+      // 只留 pathname，且把 /_surface/<token>/ 的凭据段脱敏，避免 token 落日志
+      href: (() => { try { const u = new URL(location.href); return u.pathname.replace(/\/_surface\/[^/]+\//, "/_surface/<redacted>/"); } catch { return ""; } })(),
+      referrer: (() => { try { const u = new URL(document.referrer); return u.origin + u.pathname; } catch { return ""; } })(),
+      winName: String(window.name || "").slice(0, 80),
+      vis: document.visibilityState,
+      // 卸载时刻补报：只在 boot 时扫（frame-reload 不扫，避免重复消费）
+      gone: event === "boot" ? drainShellGone() : undefined,
+      ...(extra && typeof extra === "object" ? extra : {}),
+    };
+    const p = hana.api.fetch("/comfyui-hana/shell/lifecycle", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(rec),
+    });
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } catch { /* 静默：上报失败绝不影响壳页 */ }
+}
+
+// ── 卸载时刻捕获（2026-10-19）─────────────────────────────────────────────
+// pagehide / beforeunload 触发时立刻把时刻写进 localStorage（同步、可靠），
+// 下次 boot 时由 reportShellLifecycle 一并补报并清理。避免卸载瞬间网络不通导致丢证据。
+const GONE_PREFIX = "hui-gone-";
+function recordShellGone(kind, extra) {
+  try {
+    const key = GONE_PREFIX + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    const rec = {
+      kind,
+      at: Date.now(),
+      clientAt: Date.now(),
+      timeOrigin: Math.round(performance.timeOrigin || 0),
+      sinceOriginMs: Math.round(Date.now() - (performance.timeOrigin || Date.now())),
+      vis: document.visibilityState,
+      ...(extra && typeof extra === "object" ? extra : {}),
+    };
+    localStorage.setItem(key, JSON.stringify(rec));
+  } catch { /* 静默 */ }
+}
+
+// 取出所有待补报的卸载记录：最多最近 20 条（按 at 升序），并清空对应键（含超额的旧键，防堆积）。
+function drainShellGone() {
+  try {
+    const items = [];
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf(GONE_PREFIX) === 0) keys.push(k);
+    }
+    for (const k of keys) {
+      try {
+        const raw = localStorage.getItem(k);
+        if (raw) {
+          const v = JSON.parse(raw);
+          if (v && typeof v === "object") items.push(v);
+        }
+      } catch { /* 解析失败：跳过 */ }
+    }
+    for (const k of keys) { try { localStorage.removeItem(k); } catch { /* 静默 */ } }
+    items.sort((a, b) => (Number(a && a.at) || 0) - (Number(b && b.at) || 0));
+    return items.slice(-20);
+  } catch { return undefined; }
+}
+
 async function main() {
+  reportShellLifecycle("boot"); // 生命周期自报：必须在任何其他逻辑之前
+  try {
+    window.addEventListener("pagehide", (e) => recordShellGone("pagehide", { persisted: !!(e && e.persisted) }));
+    window.addEventListener("beforeunload", () => recordShellGone("beforeunload", {}));
+  } catch { /* 静默 */ }
   readSurfaceSession(); // 窗口 entry 兜底：先把路径段凭据回填进 URL（幂等），再进入任何 hana.api.fetch
   setupTitlebar(); // 自绘标题栏：仅 App 原生窗口态显示（拖动 + 三键；卡/iframe 零变化）
   setupKeepalivePokeListener(); // TODO 踹探针实验（临时代码，验证完按结论处理）：原生窗口态注册踹应答

@@ -1,16 +1,14 @@
 // app/lib/canvas-outline.mjs — 画布语义层 P3：大纲 outline（纯模块 · 零依赖）
 // ─────────────────────────────────────────────────────────────────────────────
 // outlineGraph(graph, { detail, select })：把「UI 格式 JSON」（前端 graph.toJSON() 输出）压成
-// 「功能块 + 块间连线」的大纲。块识别两级（group 优先，角色兜底）：
+// 「功能块 + 块间连线」的大纲。块识别两级（group 优先，其余统一归「其他」）：
 //   ① graph.groups 非空时：节点 pos=[x,y] 落在某 group 的 bounding=[bx,by,bw,bh] 内（含边界）
 //      → 归该组（落多个组取第一个；组名 = title，空则「组{i}」——i 为该组在 groups 中的
 //      序号、从 1 起）。块名重名去重：按 groups 顺序命名，与「已用名」冲突时追加「#k」
-//      （k 从 2 起递增直到唯一）；空标题「组{i}」与角色块名同样纳入检查——保证块名唯一、
+//      （k 从 2 起递增直到唯一）；空标题「组{i}」与「其他」块名同样纳入检查——保证块名唯一、
 //      块间边不因同名合并（方向信息不丢）。无 pos / 不入任何组 → 走 ②。
-//   ② 角色兜底（first-match，不区分大小写）：
-//      /Loader|LoadImage/ →「加载」；/TextEncode|TextGenerate|StringFormat/ →「文本」；
-//      /Sampler|Scheduler|Guider|Noise/ →「采样」；/^(Save|Preview)/ →「输出」；其余 →「其他」。
-//      （第三级「标题规范」本期不做；角色表按使用反馈扩展。）
+//   ② 未归组节点不再按节点类型分类，全部归入唯一的「其他」块（source:"role"）。
+//      （节点类型分类口径已按作者定案取消。）
 //   detail —— "blocks"（缺省，旧版行为：块级大纲）| "nodes"（T2 下钻：某块节点级视图）：
 //     detail="nodes" + select（按块名/索引选择；逗号分隔取并集，缺省=全部块）：
 //       块名（精确优先，不中回退大小写不敏感）或 #<n>（块序号，从 1 起，按 blocks 顺序）。
@@ -28,12 +26,7 @@
 import { analyzeGraph } from "./canvas-analysis.mjs";
 import { SEMANTIC_REV, formatNodeSymbol } from "./canvas-symbol.mjs";
 
-const ROLE_RULES = [
-  [/Loader|LoadImage/i, "加载"],
-  [/TextEncode|TextGenerate|StringFormat/i, "文本"],
-  [/Sampler|Scheduler|Guider|Noise/i, "采样"],
-  [/^(Save|Preview)/i, "输出"],
-];
+// 未归组节点的唯一块名（前端 bridge 侧副本同名，改动需同步）
 const ROLE_FALLBACK = "其他";
 
 // 数值容错解析：number 或可转数字的字符串 → number；其余 → null
@@ -109,9 +102,9 @@ export function outlineGraph(graph, options = {}) {
     }
   }
 
-  // 块分桶：group 优先；未归组 → ② 角色兜底（first-match）
+  // 块分桶：group 优先；未归组 → 全部进唯一「其他」桶（不再按节点类型分类）
   const groupBuckets = new Map(); // group index → node[]
-  const roleBuckets = new Map(); // role name → node[]
+  const otherNodes = [];
   for (const node of rawNodes) {
     if (!node || typeof node !== "object") continue;
     const gi = groupOf.get(node);
@@ -120,20 +113,11 @@ export function outlineGraph(graph, options = {}) {
       groupBuckets.get(gi).push(node);
       continue;
     }
-    const type = String(node.type ?? "");
-    let role = ROLE_FALLBACK;
-    for (const [re, name] of ROLE_RULES) {
-      if (re.test(type)) {
-        role = name;
-        break;
-      }
-    }
-    if (!roleBuckets.has(role)) roleBuckets.set(role, []);
-    roleBuckets.get(role).push(node);
+    otherNodes.push(node);
   }
 
   // 块名分配（按 groups 顺序）+ 重名去重：冲突时追加「#k」（k 从 2 起）；
-  // 空标题组「组{i}」与角色块名同样纳入「已用名」检查——保证块名唯一、块间边不因同名合并。
+  // 空标题组「组{i}」与「其他」块名同样纳入「已用名」检查——保证块名唯一、块间边不因同名合并。
   const usedNames = new Set();
   const dedupName = (base) => {
     let name = base;
@@ -153,8 +137,8 @@ export function outlineGraph(graph, options = {}) {
     const title = typeof g.title === "string" ? g.title.trim() : "";
     rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", nodes });
   }
-  for (const [role, nodes] of roleBuckets) {
-    rawBlocks.push({ name: dedupName(role), source: "role", nodes });
+  if (otherNodes.length) {
+    rawBlocks.push({ name: dedupName(ROLE_FALLBACK), source: "role", nodes: otherNodes });
   }
 
   // 块排序：按块内最小 node id 升序

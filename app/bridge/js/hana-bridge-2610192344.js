@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-15 hana-bridge-2610152337";
+const BUILD_TAG = "2026-10-19 hana-bridge-2610192344";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -2888,29 +2888,22 @@ async function reportHistoryImages(promptId, images) {
 
 // ── P2-F2（2026-10-11）：提交快照的块归属 blocks ──────────────────────────────
 // graphBlocks(graph)：对「UI 格式 JSON」算块归属 → [{name, source:"group"|"role", nodeIds:[…]}]。
-// 归组口径移植自 app/lib/canvas-outline.mjs（group 优先 + 角色兜底两级），纯函数零依赖 ——
-// CSP 'self' 下桥全局脚本不能 import ESM，只能复制而非引用；**改动需同步两侧**。
+// 归组口径移植自 app/lib/canvas-outline.mjs（group 优先，其余节点统一归唯一「其他」块），
+// 纯函数零依赖 —— CSP 'self' 下桥全局脚本不能 import ESM，只能复制而非引用；**改动需同步两侧**。
 // 口径：① graph.groups 非空时，节点 pos=[x,y] 落在某 group.bounding=[x,y,w,h] 内（含边界）
-// → 归该组，落多个组取第一个；无 pos / 不入任何组 → ② 角色兜底（first-match、不区分大小写）：
-// /Loader|LoadImage/→加载、/TextEncode|TextGenerate|StringFormat/→文本、
-// /Sampler|Scheduler|Guider|Noise/→采样、/^(Save|Preview)/→输出、其余→其他。
+// → 归该组，落多个组取第一个；无 pos / 不入任何组 → ② 不再按节点类型分类，全部归入唯一的
+// 「其他」块（source:"role"）。
 // 块名去重沿用同款：重名加 #2 递增直到唯一；空 title 用「组{i}」（i 为 groups 序号、从 1 起），
-// 与角色块名同池查重。与 outline 的差异：不产 summary/blockEdges/issues；块排序与 outline
+// 与「其他」块名同池查重。与 outline 的差异：不产 summary/blockEdges/issues；块排序与 outline
 // 一致（按块内最小 node id 升序，nodeIds 亦升序）。
 // 边界：graph 非对象/null → 返回 null（调用方整字段省略，Python 快照读回 null）；
-//       空 groups → 全部节点走角色兜底；空节点图 → []（合法零块；但提交通道有 hasGraph
+//       空 groups → 全部节点进「其他」块；空节点图 → []（合法零块；但提交通道有 hasGraph
 //       拦截，空节点图本就不上报，[] 只会出现在直连 Python 的请求里）。
 //       空 group（bounding 内无节点）不成块，同 outline。
 function graphBlocks(graph) {
   if (graph === null || typeof graph !== "object") return null;
   const rawNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
   const groups = Array.isArray(graph.groups) ? graph.groups : [];
-  const ROLE_RULES = [
-    [/Loader|LoadImage/i, "加载"],
-    [/TextEncode|TextGenerate|StringFormat/i, "文本"],
-    [/Sampler|Scheduler|Guider|Noise/i, "采样"],
-    [/^(Save|Preview)/i, "输出"],
-  ];
   const ROLE_FALLBACK = "其他";
   // ① group 归属：pos 点在 bounding 内（含边界）；命中即 break（落多组取第一个）
   const groupOfNode = new Map(); // node obj → group index
@@ -2930,9 +2923,9 @@ function graphBlocks(graph) {
       }
     }
   }
-  // 分桶：group 优先；未归组 → ② 角色兜底（first-match）
+  // 分桶：group 优先；未归组 → 全部进唯一「其他」桶（不再按节点类型分类）
   const groupBuckets = new Map(); // group index → node[]
-  const roleBuckets = new Map(); // role name → node[]
+  const otherNodes = [];
   for (const node of rawNodes) {
     if (!node || typeof node !== "object") continue;
     const gi = groupOfNode.get(node);
@@ -2941,18 +2934,9 @@ function graphBlocks(graph) {
       groupBuckets.get(gi).push(node);
       continue;
     }
-    const type = String(node.type ?? "");
-    let role = ROLE_FALLBACK;
-    for (const [re, name] of ROLE_RULES) {
-      if (re.test(type)) {
-        role = name;
-        break;
-      }
-    }
-    if (!roleBuckets.has(role)) roleBuckets.set(role, []);
-    roleBuckets.get(role).push(node);
+    otherNodes.push(node);
   }
-  // 块名分配（groups 顺序）+ 重名去重「#k」（k 从 2 起；空标题组名与角色名同池检查）
+  // 块名分配（groups 顺序）+ 重名去重「#k」（k 从 2 起；空标题组名与「其他」块名同池检查）
   const usedNames = new Set();
   const dedupName = (base) => {
     let name = base;
@@ -2972,8 +2956,8 @@ function graphBlocks(graph) {
     const title = typeof g.title === "string" ? g.title.trim() : "";
     rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", color: g.color, nodes });
   }
-  for (const [role, nodes] of roleBuckets) {
-    rawBlocks.push({ name: dedupName(role), source: "role", nodes });
+  if (otherNodes.length) {
+    rawBlocks.push({ name: dedupName(ROLE_FALLBACK), source: "role", nodes: otherNodes });
   }
   // 排序对齐 outline：块按块内最小 node id 升序
   const idNum = (v) => {
@@ -3960,18 +3944,26 @@ function historyTickBorderStyle(kind) {
 // 内条默认色（框已不在画布 / 取不到色）——低存在感中性灰。
 const HNODE_BAR_DIM = "rgba(255,255,255,.16)";
 
-// 活图「框名 → 框色」映射（内条取色源 = 画布 bundle 框色）。
-// 框名口径与内条渲染完全同源（都走 graphBlocks，source === "group"）；取不到活图/无框 → 空 Map。
-function historyLiveBlockColors() {
-  const m = new Map();
+// 活图块清单（graphBlocks 口径：group 优先、其余节点统一归唯一「其他」块）。
+// 取不到活图（无画布 / 无 toJSON / 异常）→ null（调用方各自退化）。取图路径沿用原 historyLiveBlockColors 的 g.toJSON()。
+function historyLiveBlocks() {
   try {
     const g = app && app.graph ? app.graph : null;
-    if (!g || typeof g.toJSON !== "function") return m;
+    if (!g || typeof g.toJSON !== "function") return null;
     const blocks = graphBlocks(g.toJSON());
-    for (const b of Array.isArray(blocks) ? blocks : []) {
-      if (b && b.source === "group" && typeof b.color === "string" && b.color) m.set(b.name, b.color);
-    }
-  } catch { /* 取不到 → 空 Map（渲染退化为中性灰） */ }
+    return Array.isArray(blocks) ? blocks : null;
+  } catch { return null; }
+}
+
+// 活图「框名 → 框色」映射（内条取色源 = 画布 bundle 框色）。
+// 框名口径与内条渲染完全同源（都走 graphBlocks，source === "group"）；取不到活图/无框 → 空 Map。
+// blocksIn：可选，已算好的活图块清单（省一次 toJSON）；不传则自取。
+function historyLiveBlockColors(blocksIn) {
+  const m = new Map();
+  const blocks = Array.isArray(blocksIn) ? blocksIn : historyLiveBlocks();
+  for (const b of Array.isArray(blocks) ? blocks : []) {
+    if (b && b.source === "group" && typeof b.color === "string" && b.color) m.set(b.name, b.color);
+  }
   return m;
 }
 
@@ -4384,19 +4376,34 @@ async function historyBarLoad(reqId, ctx, countEl) {
     if (!axis) return;
     axis.textContent = "";
     if (times) times.textContent = "";
-    // 统一母题「外框+内条」上下文：全局框列表（首次出现序）+ 活图框名→框色映射 + no-frame 退化标志。
+    // 统一母题「外框+内条」上下文：泳道表 + 活图框名→框色映射 + no-frame 退化标志。
+    // 泳道表口径（2026-10-19 作者定案）：「其他」是 graphBlocks 自然产出的块（画布上有未分组节点时才存在），
+    // 与组同级别。allBlocks 直接等于活图块名（按活图顺序去重），不额外追加任何泳道；
+    // 历史提交里块名对不上当前任何块的 → 那根不对应任何小条，不亮，也不会多出一条。
     if (ctx) {
-      const allBlocks = [];
-      const seen = new Set();
-      for (const ent of shown) {
-        const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
-        for (const b of bl) {
+      const liveBlocks = historyLiveBlocks(); // 活图块清单（取不到 → null）
+      let allBlocks = null;
+      if (liveBlocks) {
+        allBlocks = [];
+        const seen = new Set();
+        for (const b of liveBlocks) {
           const nm = b && b.name != null ? String(b.name) : "";
           if (nm && !seen.has(nm)) { seen.add(nm); allBlocks.push(nm); }
         }
+      } else {
+        // 活图取不到（无画布 / 异常）→ 退回旧行为：shown 的块名并集，保证不炸。
+        allBlocks = [];
+        const seen = new Set();
+        for (const ent of shown) {
+          const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
+          for (const b of bl) {
+            const nm = b && b.name != null ? String(b.name) : "";
+            if (nm && !seen.has(nm)) { seen.add(nm); allBlocks.push(nm); }
+          }
+        }
       }
       ctx.allBlocks = allBlocks;
-      ctx.colorMap = historyLiveBlockColors();
+      ctx.colorMap = historyLiveBlockColors(liveBlocks || undefined);
       ctx.singleBar = allBlocks.length === 0;
     }
     if (!shown.length) {
@@ -5775,17 +5782,31 @@ function historyTreeRenderTree(entries) {
   tree.style.width = W + "px";
   tree.style.height = contentH + "px";
   if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 视口高封顶（内容可拖/滚）
-  // 全局框列表：扫 entries 取 blocks[].name 并集（首次出现序）；空 → 每节点退化为单根色条
-  const globalBlocks = [];
-  const blockSeen = new Set();
-  for (const ent of entries) {
-    const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
-    for (const b of bl) {
-      if (!b || typeof b !== "object") continue;
-      const nm = b.name == null ? "" : String(b.name);
-      if (!blockSeen.has(nm)) {
-        blockSeen.add(nm);
-        globalBlocks.push(nm);
+  // 全局框列表（2026-10-19 修）：与「提交历史框」（hhb）同口径 —— 直接用活图块名（按活图顺序去重）。
+  // 旧实现扫 entries 取 blocks[].name 并集 → 历史上改过名的组 / 旧角色块名全被累进来，节点内小条堆到 12 根以上。
+  // 历史提交里对不上的块名：那根不对应任何小条（不做 hitSet 映射），不亮、也不新增。
+  const liveBlocks = historyLiveBlocks(); // 活图块清单（取不到 → null）
+  let globalBlocks = null;
+  if (liveBlocks) {
+    globalBlocks = [];
+    const seen = new Set();
+    for (const b of liveBlocks) {
+      const nm = b && b.name != null ? String(b.name) : "";
+      if (nm && !seen.has(nm)) { seen.add(nm); globalBlocks.push(nm); }
+    }
+  } else {
+    // 活图取不到（无画布 / 异常）→ 退回旧行为：entries 的 blocks[].name 并集（首次出现序），保证不炸。
+    globalBlocks = [];
+    const seen = new Set();
+    for (const ent of entries) {
+      const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
+      for (const b of bl) {
+        if (!b || typeof b !== "object") continue;
+        const nm = b.name == null ? "" : String(b.name);
+        if (!seen.has(nm)) {
+          seen.add(nm);
+          globalBlocks.push(nm);
+        }
       }
     }
   }

@@ -113,7 +113,8 @@ except ValueError:
 # 2026-10-14（提交树跨泳道分叉线改非对称控制点/更早分叉）：对齐新活动桥 hana-bridge-14130045。
 # 2026-10-15（提交历史框/树跟随 ComfyUI 明暗主题：中性色走 CSS 变量，深色档=原值）：对齐新活动桥 hana-bridge-15021810。
 # 2026-10-15（变动符号移到节点下方，避开右上 ×N 上标；悬停气泡上移 13px 让位）：对齐新活动桥 hana-bridge-2610152337。
-BRIDGE_BUILD_TAG = "2026-10-15 hana-bridge-2610152337"
+# 2026-10-19（提交树块并集 → 活图块名，与提交历史框同口径）：对齐新活动桥 hana-bridge-2610192344。
+BRIDGE_BUILD_TAG = "2026-10-19 hana-bridge-2610192344"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}

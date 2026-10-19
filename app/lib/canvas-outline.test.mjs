@@ -8,7 +8,7 @@ import { analyzeGraph } from "./canvas-analysis.mjs";
 
 // ── 合成样本图 A：2 个 groups（故意打乱 nodes 顺序以验证排序）──
 // 组1「尺寸组」含 #8/#27/#28；组2 无标题（含 #12/#20，#8 同时落在两组 → 取第一个=尺寸组）；
-// 其余走角色兜底（#2 加载 / #6 文本 / #30 其他 / #31 输出）；#30 悬空（供 issues 复用用）。
+// 其余未归组（#31/#2/#30/#6）统一进唯一「其他」块；#30 悬空（供 issues 复用用）。
 const GRAPH_A = {
   id: "wf-a",
   revision: 72,
@@ -59,7 +59,7 @@ const GRAPH_A = {
   ],
 };
 
-// ── 合成样本图 B：无 groups → 全走角色兜底 ──
+// ── 合成样本图 B：无 groups → 全部节点进唯一「其他」块 ──
 const GRAPH_B = {
   id: "wf-b",
   revision: 5,
@@ -93,48 +93,36 @@ function test(name, fn) {
   }
 }
 
-test("outline：双组图——group 命中/组名/重叠取首个/role 兜底/排序/块内箭头/去重", () => {
+test("outline：双组图——group 命中/组名/重叠取首个/未归组统一「其他」/排序/块内箭头/去重", () => {
   const r = outlineGraph(GRAPH_A);
   assert.strictEqual(r.op, "outline");
   assert.strictEqual(r.rev, 72);
   assert.deepStrictEqual(r.total, { nodes: 9, links: 7 });
-  assert.strictEqual(r.blockCount, 6);
+  assert.strictEqual(r.blockCount, 3);
   assert.deepStrictEqual(r.blocks, [
-    { name: "加载", source: "role", nodes: [2], summary: "#2(model.safetensors)" },
-    { name: "文本", source: "role", nodes: [6], summary: "#6(a cat)" },
+    { name: "其他", source: "role", nodes: [2, 6, 30, 31], summary: "#2(model.safetensors) #6(a cat) #30 #31(ComfyUI)" },
     { name: "尺寸组", source: "group", nodes: [8, 27, 28], summary: "#27(1248) #28(832) → #8" },
     { name: "组2", source: "group", nodes: [12, 20], summary: "#12 #20" },
-    { name: "其他", source: "role", nodes: [30], summary: "#30" },
-    { name: "输出", source: "role", nodes: [31], summary: "#31(ComfyUI)" },
   ]);
   // #8 同时落在两组 → 取第一个（尺寸组）；组2 无标题 → 「组2」
   assert.deepStrictEqual(r.blockEdges, [
-    ["加载", "组2"], // 41（2→12）与 46（2→20）两条归并为一条（去重）
-    ["文本", "组2"],
+    ["其他", "组2"], // 41（2→12）、42（6→12）、46（2→20）归并为一条（去重）
     ["尺寸组", "组2"], // 40（8→12）而来；38/39 为组内连线，不算
-    ["组2", "输出"],
+    ["组2", "其他"], // 43（12→31）
   ]);
 });
 
-test("outline：无 groups——角色归类与「其他」兜底", () => {
+test("outline：无 groups——全部节点统一归唯一「其他」块", () => {
   const r = outlineGraph(GRAPH_B);
-  assert.strictEqual(r.blockCount, 5);
+  assert.strictEqual(r.blockCount, 1);
   assert.deepStrictEqual(r.blocks, [
-    { name: "加载", source: "role", nodes: [1], summary: "#1(x.safetensors)" },
-    { name: "文本", source: "role", nodes: [2], summary: "#2(a cat)" },
-    { name: "采样", source: "role", nodes: [3], summary: "#3" },
-    { name: "输出", source: "role", nodes: [4], summary: "#4(ComfyUI)" },
-    { name: "其他", source: "role", nodes: [5, 6], summary: "#5(8) → #6" },
+    { name: "其他", source: "role", nodes: [1, 2, 3, 4, 5, 6], summary: "#1(x.safetensors) #2(a cat) #3 #5(8) → #4(ComfyUI) #6" },
   ]);
-  assert.deepStrictEqual(r.blockEdges, [
-    ["加载", "采样"],
-    ["文本", "采样"],
-    ["采样", "输出"], // 5→6 同块（其他），不算
-  ]);
+  assert.deepStrictEqual(r.blockEdges, []); // 全部同块，无跨块边
   assert.deepStrictEqual(r.issues, []);
 });
 
-test("outline：角色匹配大小写不敏感 + first-match（Noise 先于 Save）", () => {
+test("outline：节点类型不再参与分类（加载/文本/采样/输出 全进「其他」）", () => {
   const g = {
     nodes: [
       { id: 1, type: "checkpointloadersimple", inputs: [], outputs: [] },
@@ -146,14 +134,11 @@ test("outline：角色匹配大小写不敏感 + first-match（Noise 先于 Save
   };
   const r = outlineGraph(g);
   assert.deepStrictEqual(r.blocks.map((b) => [b.name, b.source, b.nodes]), [
-    ["加载", "role", [1]],
-    ["文本", "role", [2]],
-    ["采样", "role", [3, 5]], // SaveImageNoise 含 Noise → 采样（first-match 先于 Save）
-    ["输出", "role", [4]],
+    ["其他", "role", [1, 2, 3, 4, 5]],
   ]);
 });
 
-test("outline：group bounding 含边界（边角命中）；组外节点落角色", () => {
+test("outline：group bounding 含边界（边角命中）；组外节点落「其他」", () => {
   const g = {
     revision: 1,
     nodes: [
@@ -170,7 +155,7 @@ test("outline：group bounding 含边界（边角命中）；组外节点落角�
   ]);
 });
 
-test("outline：无 pos 节点走角色兜底（groups 存在时）", () => {
+test("outline：无 pos 节点归「其他」（groups 存在时）", () => {
   const g = {
     nodes: [
       { id: 1, type: "TextEncoder", inputs: [], outputs: [], pos: [10, 10] },
@@ -241,7 +226,7 @@ test("outline：同名组去重（AI / AI#2）——块间边方向不再丢失"
   assert.deepStrictEqual(r.blockEdges, [["AI", "AI#2"], ["AI#2", "AI"]]);
 });
 
-test("outline：LoadImage / LoadImageMask 归「加载」（此前落「其他」）", () => {
+test("outline：LoadImage / LoadImageMask 同样归「其他」（节点类型不再分类）", () => {
   const g = {
     nodes: [
       { id: 1, type: "LoadImage", mode: 0, inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: null }], widgets_values: ["example.png"] },
@@ -250,11 +235,11 @@ test("outline：LoadImage / LoadImageMask 归「加载」（此前落「其他�
   };
   const r = outlineGraph(g);
   assert.deepStrictEqual(r.blocks, [
-    { name: "加载", source: "role", nodes: [1, 2], summary: "#1(example.png) #2(mask.png)" },
+    { name: "其他", source: "role", nodes: [1, 2], summary: "#1(example.png) #2(mask.png)" },
   ]);
 });
 
-test("outline：重名去重覆盖「组{i}」与角色块名（碰撞走 #k）", () => {
+test("outline：重名去重覆盖「组{i}」与「其他」块名（碰撞走 #k）", () => {
   // a) 无标题组的「组{i}」与既有 title 碰撞 → #k
   const a = outlineGraph({
     nodes: [
@@ -268,15 +253,15 @@ test("outline：重名去重覆盖「组{i}」与角色块名（碰撞走 #k）"
   });
   assert.deepStrictEqual(a.blocks.map((x) => x.name), ["组2", "组2#2"]);
 
-  // b) 组 title 与角色块名碰撞 → 角色块让位 #k
+  // b) 组 title 与「其他」块名碰撞 → 角色块让位 #k
   const b = outlineGraph({
     nodes: [
       { id: 1, type: "AnyType", mode: 0, inputs: [], outputs: [], pos: [10, 10] },
       { id: 2, type: "LoadImage", mode: 0, inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: null }], widgets_values: [] },
     ],
-    groups: [{ title: "加载", bounding: [0, 0, 100, 100] }],
+    groups: [{ title: "其他", bounding: [0, 0, 100, 100] }],
   });
-  assert.deepStrictEqual(b.blocks.map((x) => [x.name, x.source]), [["加载", "group"], ["加载#2", "role"]]);
+  assert.deepStrictEqual(b.blocks.map((x) => [x.name, x.source]), [["其他", "group"], ["其他#2", "role"]]);
 });
 
 // ── T2：下钻（detail:"nodes" + select） ─────────────────────────────────────
@@ -287,11 +272,11 @@ test("outline T2：detail=nodes——按块名下钻（节点行 id/type/title/v
   assert.strictEqual(r.semanticRev, "s1");
   assert.strictEqual(r.detail, "nodes");
   assert.deepStrictEqual(r.total, { nodes: 9, links: 7 });
-  assert.strictEqual(r.blockCount, 6);
+  assert.strictEqual(r.blockCount, 3);
   assert.strictEqual(r.select, "尺寸组");
   assert.deepStrictEqual(r.blocks, [
     {
-      index: 3, name: "尺寸组", source: "group", nodeCount: 3,
+      index: 2, name: "尺寸组", source: "group", nodeCount: 3,
       nodes: [
         { id: 8, type: "SizeApply", title: "尺寸", value: null, symbol: '#8 SizeApply "尺寸"' },
         { id: 27, type: "PrimitiveInt", title: "尺寸·宽", value: 1248, symbol: '#27 PrimitiveInt "尺寸·宽" = 1248' },
@@ -305,24 +290,27 @@ test("outline T2：detail=nodes——按块名下钻（节点行 id/type/title/v
 test("outline T2：detail=nodes——索引 #1 / 并集排序 / #0 抛错", () => {
   const r = outlineGraph(GRAPH_A, { detail: "nodes", select: "#1" });
   assert.deepStrictEqual(r.blocks, [
-    { index: 1, name: "加载", source: "role", nodeCount: 1, nodes: [
+    { index: 1, name: "其他", source: "role", nodeCount: 4, nodes: [
       { id: 2, type: "CheckpointLoaderSimple", title: "Checkpoint 加载", value: "model.safetensors", symbol: '#2 CheckpointLoaderSimple "Checkpoint 加载" = "model.safetensors"' },
+      { id: 6, type: "CLIPTextEncode", title: "正向提示词", value: "a cat", symbol: '#6 CLIPTextEncode "正向提示词" = "a cat"' },
+      { id: 30, type: "EmptyLatentImage", title: "悬空尺寸", value: [512, 512, 1], symbol: '#30 EmptyLatentImage "悬空尺寸" = [512,512,1]' },
+      { id: 31, type: "SaveImage", title: "保存", value: "ComfyUI", symbol: '#31 SaveImage "保存" = "ComfyUI"' },
     ] },
   ]);
-  const u = outlineGraph(GRAPH_A, { detail: "nodes", select: "文本,#1" });
-  assert.deepStrictEqual(u.blocks.map((b) => [b.index, b.name]), [[1, "加载"], [2, "文本"]]);
+  const u = outlineGraph(GRAPH_A, { detail: "nodes", select: "组2,#1" });
+  assert.deepStrictEqual(u.blocks.map((b) => [b.index, b.name]), [[1, "其他"], [3, "组2"]]);
   assert.throws(() => outlineGraph(GRAPH_A, { detail: "nodes", select: "#0" }), /块索引从 #1 起/);
 });
 
 test("outline T2：detail=nodes——未命中→空结果+note；部分未命中记 note；缺省=全部块；大小写不敏感", () => {
   const r = outlineGraph(GRAPH_A, { detail: "nodes", select: "不存在" });
   assert.deepStrictEqual(r.blocks, []);
-  assert.strictEqual(r.note, '未命中任何块："不存在"；可选块：#1 加载、#2 文本、#3 尺寸组、#4 组2、#5 其他、#6 输出');
+  assert.strictEqual(r.note, '未命中任何块："不存在"；可选块：#1 其他、#2 尺寸组、#3 组2');
   const p = outlineGraph(GRAPH_A, { detail: "nodes", select: "尺寸组,zzz" });
-  assert.deepStrictEqual(p.blocks.map((b) => [b.index, b.name]), [[3, "尺寸组"]]);
-  assert.strictEqual(p.note, '部分未命中："zzz"；可选块：#1 加载、#2 文本、#3 尺寸组、#4 组2、#5 其他、#6 输出');
+  assert.deepStrictEqual(p.blocks.map((b) => [b.index, b.name]), [[2, "尺寸组"]]);
+  assert.strictEqual(p.note, '部分未命中："zzz"；可选块：#1 其他、#2 尺寸组、#3 组2');
   const all = outlineGraph(GRAPH_A, { detail: "nodes" });
-  assert.deepStrictEqual(all.blocks.map((b) => b.index), [1, 2, 3, 4, 5, 6]);
+  assert.deepStrictEqual(all.blocks.map((b) => b.index), [1, 2, 3]);
   assert.ok(!("select" in all));
   const ci = outlineGraph({
     nodes: [
@@ -340,7 +328,7 @@ test("outline T2：detail/select 校验——blocks+select 抛错 / 非法 detai
   assert.throws(() => outlineGraph(GRAPH_A, { detail: "xx" }), /detail 只支持 "blocks" 或 "nodes"/);
   assert.throws(() => outlineGraph(GRAPH_A, { detail: "nodes", select: 42 }), /select 必须是字符串/);
   const r = outlineGraph(GRAPH_A, { detail: "nodes", select: "  " }); // 空 = 未给出
-  assert.strictEqual(r.blocks.length, 6);
+  assert.strictEqual(r.blocks.length, 3);
 });
 
 test("outline T2：semanticRev = s1（blocks 与 nodes 两模式）", () => {

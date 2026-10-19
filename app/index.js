@@ -18,7 +18,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { defineApp } from "./sdk/app-contract/server-client.js";
 import { createHash, randomInt, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { projectGraph } from "./lib/canvas-project.mjs";
 import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
@@ -81,6 +81,119 @@ export default defineApp(async (sdk) => {
     throw new Error("comfyui-hana apply: ctx.dataDir 缺失（宿主未提供 App 数据目录）");
   }
   log(`apply entered | dataDir=${dataDir} | version=${APP_VERSION}`);
+
+  // ── 生命周期探针（2026-10-19）──────────────────────────────────────────────
+  // 目的：排查「App 被宿主重载导致前端全部重建」的触发者。只观测，不改任何业务逻辑。
+  //   1) 探测 sdk 顶层生命周期相关键名与类型
+  //   2) apply 记账 → <dataDir>/loading-events.jsonl
+  //   3) 尝试注册 dispose 钩子记账（effect → on('dispose') → 放弃）
+  // 全部包 try/catch：任何失败都不影响 App 正常启动。
+  try {
+    const PROBE_EVENTS_FILE = join(dataDir, "loading-events.jsonl");
+    const probeAppend = (rec) => {
+      try {
+        appendFileSync(PROBE_EVENTS_FILE, JSON.stringify(rec) + "\n", { flag: "a", mode: 0o600 });
+      } catch { /* 静默：探针写盘失败不影响启动 */ }
+    };
+    const LIFECYCLE_KEY_RE = /^(on$|effect$|dispose|ctx|lifecycle|scope|fiber|runtime)$/i;
+    const lifecycleKeys = Object.keys(sdk).filter((k) => LIFECYCLE_KEY_RE.test(k));
+    log(
+      "probe | lifecycle keys: " +
+        (lifecycleKeys.length ? lifecycleKeys.map((k) => `${k}:${typeof sdk[k]}`).join(", ") : "none"),
+    );
+    probeAppend({
+      at: Date.now(),
+      iso: new Date().toISOString(),
+      event: "apply",
+      pid: process.pid,
+      uptimeMs: Math.round(process.uptime() * 1000),
+      version: APP_VERSION,
+      memRss: process.memoryUsage().rss,
+    });
+    const onDispose = (kind) => {
+      try {
+        probeAppend({
+          at: Date.now(),
+          iso: new Date().toISOString(),
+          event: "dispose",
+          kind,
+          pid: process.pid,
+          uptimeMs: Math.round(process.uptime() * 1000),
+          memRss: process.memoryUsage().rss,
+          stack: (new Error().stack || "").split("\n").slice(1, 8).join(" | "),
+        });
+      } catch { /* 静默 */ }
+      try {
+        log("dispose hook fired | " + kind);
+      } catch { /* logger 此时可能已失效 */ }
+    };
+    let disposeKind = null;
+    if (typeof sdk.effect === "function") {
+      try {
+        sdk.effect(() => () => onDispose("effect"));
+        disposeKind = "effect";
+      } catch { /* 注册失败，落到下一候选 */ }
+    }
+    if (!disposeKind && typeof sdk.on === "function") {
+      try {
+        sdk.on("dispose", () => onDispose("on:dispose"));
+        disposeKind = "on:dispose";
+      } catch { /* 注册失败，放弃 */ }
+    }
+    log(disposeKind ? `probe | dispose hook: ${disposeKind}` : "probe | dispose hook: none");
+
+    // ── 进程级卸载记账（2026-10-19）────────────────────────────────────────
+    // 已实测：sdk 无 effect / on / dispose，且 App 跑在独立子进程（apply 时 uptime≈63ms、pid 每轮都是新的），
+    // 所以「等 dispose hook」这条线永远不会触发。改记 Node 进程级事件，用于判定卸载 / 重载的真实路径。
+    // 约束：只用 process.on 追加监听（不 once、不覆盖已有监听器）；写盘用 appendFileSync（exit 阶段异步写会丢）。
+    const probeStack = () => (new Error().stack || "").split("\n").slice(1, 9).join(" | ");
+    const record = (kind, extra) => {
+      try {
+        probeAppend({
+          at: Date.now(),
+          iso: new Date().toISOString(),
+          event: "process",
+          kind,
+          pid: process.pid,
+          uptimeMs: Math.round(process.uptime() * 1000),
+          memRss: process.memoryUsage().rss,
+          extra: extra && typeof extra === "object" ? extra : {},
+          stack: probeStack(),
+        });
+      } catch { /* 静默：记账失败不影响进程 */ }
+    };
+    const processHooks = [];
+    const addProcessHook = (evt, fn) => {
+      try {
+        process.on(evt, fn);
+        processHooks.push(evt);
+      } catch { /* 注册失败：不列入已注册清单 */ }
+    };
+    addProcessHook("exit", (code) => record("exit", { code }));
+    addProcessHook("SIGTERM", () => record("SIGTERM", {}));
+    addProcessHook("SIGINT", () => record("SIGINT", {}));
+    addProcessHook("beforeExit", (code) => record("beforeExit", { code }));
+    addProcessHook("disconnect", () => record("disconnect", {}));
+    // 不注册 uncaughtException / unhandledRejection：已实测注册这两个钩子会把 Node 默认的崩溃退出
+    // （exit=1）降级成静默存活（exit=0），改变 App 的故障语义，代价不可接受。
+    log(`probe | process hooks: ${processHooks.length ? processHooks.join(",") : "none"}`);
+
+    // ── 心跳文件（2026-10-19）──────────────────────────────────────────────
+    // 用途：进程被 Windows 硬杀、所有 JS 钩子都来不及跑时，仍能靠「最后一次成功落盘的时间戳」定位死亡时刻。
+    // 覆盖写（不追加）：文件大小恒定，只留最新一次心跳；timer.unref() 让定时器不阻止进程正常退出。
+    try {
+      const PROBE_HEARTBEAT_FILE = join(dataDir, "probe-heartbeat");
+      const beat = () => {
+        try {
+          writeFileSync(PROBE_HEARTBEAT_FILE, `${Date.now()} ${new Date().toISOString()}\n`, { mode: 0o600 });
+        } catch { /* 静默：写盘失败不影响进程 */ }
+      };
+      beat(); // 注册后立刻先写一次，不等第一个 5 秒
+      const timer = setInterval(beat, 5000);
+      timer.unref?.();
+      log("probe | heartbeat: 5000ms -> probe-heartbeat");
+    } catch { /* 静默：心跳失败不影响启动 */ }
+  } catch { /* 探针失败绝不影响启动 */ }
 
   // ── 运行时状态 ────────────────────────────────────────────────────────────
   const state = {
@@ -5513,6 +5626,39 @@ export default defineApp(async (sdk) => {
         shellBridge.lastSeenAt = Date.now();
         shellBridge.lastHello = body && typeof body === "object" ? body : {};
         return c.json({ ok: true, alive: true });
+      } catch (e) {
+        return c.json({ ok: false, error: msgOf(e) }, 500);
+      }
+    });
+
+    // 壳页生命周期自报（2026-10-19）：判定每次 hui 工作区页面是「被 reload」还是「被新建」。
+    // 壳页（ui/workspace.js reportShellLifecycle）在 main 首行报 boot、在 requestFrameReload
+    // 重设 iframe.src 后报 frame-reload；此处原样追加一行到 <dataDir>/shell-lifecycle.jsonl。
+    // 硬约束：body > 8 KiB 拒收（413，不截断）；写盘整段 try/catch，失败 500 但不抛；
+    // 路由自身任何异常都被这里吃掉，不影响其他路由。
+    const SHELL_LIFECYCLE_FILE = join(dataDir, "shell-lifecycle.jsonl");
+    const SHELL_LIFECYCLE_MAX_BYTES = 8 * 1024;
+    app.post("/comfyui-hana/shell/lifecycle", async (c) => {
+      try {
+        let text = "";
+        try { text = await c.req.text(); } catch { text = ""; }
+        const bytes = Buffer.byteLength(text || "", "utf8");
+        if (bytes > SHELL_LIFECYCLE_MAX_BYTES) {
+          return c.json({ ok: false, error: "body-too-large", bytes, limit: SHELL_LIFECYCLE_MAX_BYTES }, 413);
+        }
+        let body = {};
+        try { body = JSON.parse(text || "{}"); } catch { return c.json({ ok: false, error: "invalid-json" }, 400); }
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return c.json({ ok: false, error: "invalid-body" }, 400);
+        }
+        const rec = { ...body, serverAt: Date.now(), serverIso: new Date().toISOString() };
+        try {
+          appendFileSync(SHELL_LIFECYCLE_FILE, JSON.stringify(rec) + "\n", { flag: "a", mode: 0o600 });
+        } catch (e) {
+          error(`shell/lifecycle 写盘失败：${msgOf(e)}`);
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+        return c.json({ ok: true });
       } catch (e) {
         return c.json({ ok: false, error: msgOf(e) }, 500);
       }

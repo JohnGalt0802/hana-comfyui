@@ -216,7 +216,7 @@ function render(st) {
   } else {
     $("p-backend").textContent = "—";
   }
-  const sys = backend && !relayDown && backend.system ? backend.system : null;
+  const sys = backend && !relayDown && backend.reachable && backend.system ? backend.system : null;
   const verText = sys && sys.comfyui_version
     ? `${sys.comfyui_version}${sys.installed_frontend_version ? " · 前端 " + sys.installed_frontend_version : ""}`
     : "";
@@ -224,7 +224,7 @@ function render(st) {
   // 空值不占行（2026-10-16）：服务未跑时版本行、队列胶囊都隐藏，不留“—”占位
   const verRow = $("row-ver");
   if (verRow) verRow.hidden = !verText;
-  const q = !relayDown && relay && relay.queue ? relay.queue : null;
+  const q = !relayDown && backend && backend.reachable && relay && relay.queue ? relay.queue : null;
   const qText = q ? `${q.running} 运行 · ${q.pending} 排队` : "";
   const qEl = $("p-queue");
   if (qEl) { qEl.textContent = qText; qEl.hidden = !qText; }
