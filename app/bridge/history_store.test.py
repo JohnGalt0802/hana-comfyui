@@ -199,7 +199,7 @@ class TestIndex(TempRootTestCase):
     def test_build_index_line_new_fields(self):
         line = hs.build_index_line(
             {"seq": 3, "file": "0003-x.json", "parent": 2, "kind": "save", "sig": "deadbeef",
-             "blocks": [{"name": "组1", "source": "group", "nodeIds": [1, 2]}],
+             "blocks": [{"name": "组1", "source": "group", "nodeIds": [1, 2], "color": None}],
              "delta": {"changed": [], "added": [{"id": 5, "title": "X"}], "removed": []},
              "runs": [{"promptId": "p1", "at": "2026-10-11T00:00:00.000Z",
                        "images": [{"filename": "a.png", "subfolder": "", "type": "output"}]}]}
@@ -208,34 +208,43 @@ class TestIndex(TempRootTestCase):
         self.assertEqual(obj["parent"], 2)
         self.assertEqual(obj["kind"], "save")
         self.assertEqual(obj["sig"], "deadbeef")
-        self.assertEqual(obj["blocks"], [{"name": "组1", "source": "group", "nodeIds": [1, 2]}])
+        self.assertEqual(obj["blocks"], [{"name": "组1", "source": "group", "nodeIds": [1, 2], "color": None}])
         self.assertEqual(obj["runs"][0]["promptId"], "p1")
         self.assertEqual(obj["runs"][0]["images"][0]["filename"], "a.png")
         # 非法 kind → run；blocks 缺 source/nodeIds → 补 group/[]
         obj2 = json.loads(hs.build_index_line({"kind": "bot", "blocks": [{"name": "b"}]}))
         self.assertEqual(obj2["kind"], "run")
-        self.assertEqual(obj2["blocks"], [{"name": "b", "source": "group", "nodeIds": []}])
+        self.assertEqual(obj2["blocks"], [{"name": "b", "source": "group", "nodeIds": [], "color": None}])
         # blocks 非列表 → []
 
     def test_build_index_line_blocks_full(self):
-        # P5：索引行写**完整版** blocks（name + source + nodeIds），不再是摘要
+        # P5：索引行写**完整版** blocks（name + source + nodeIds + color），不再是摘要
         line = hs.build_index_line(
             {"seq": 1, "file": "0001-a.json",
              "blocks": [
-                 {"name": "加载", "source": "group", "nodeIds": [1, 2, 3]},
-                 {"name": "采样", "source": "role", "nodeIds": [9, 8]},
+                 {"name": "加载", "source": "group", "nodeIds": [1, 2, 3], "color": None},
+                 {"name": "采样", "source": "role", "nodeIds": [9, 8], "color": None},
              ]}
         )
         obj = json.loads(line)
         self.assertEqual(
             obj["blocks"],
-            [{"name": "加载", "source": "group", "nodeIds": [1, 2, 3]}, {"name": "采样", "source": "role", "nodeIds": [9, 8]}],
+            [{"name": "加载", "source": "group", "nodeIds": [1, 2, 3], "color": None},
+             {"name": "采样", "source": "role", "nodeIds": [9, 8], "color": None}],
         )
         # 缺 source/nodeIds 的块 → 补 group/[]；nodeIds 值原样保留；非对象块剔除
         line2 = json.loads(hs.build_index_line({"blocks": ["bad", {"name": "x"}]}))
-        self.assertEqual(line2["blocks"], [{"name": "x", "source": "group", "nodeIds": []}])
+        self.assertEqual(line2["blocks"], [{"name": "x", "source": "group", "nodeIds": [], "color": None}])
         self.assertEqual(json.loads(hs.build_index_line({"blocks": "bad"}))["blocks"], [])
         self.assertEqual(json.loads(hs.build_index_line({}))["blocks"], [])
+
+    def test_block_color_kept(self):
+        # 2026-10-20：block.color 是提交时的框色快照，_norm_block / build_index_line 都要保留，
+        # 不再回落 None（旧条目无该字段时才缺省 None）
+        blk = {"name": "框A", "source": "group", "nodeIds": [], "color": "#5aa0d8"}
+        self.assertEqual(hs._norm_block(blk), {"name": "框A", "source": "group", "nodeIds": [], "color": "#5aa0d8"})
+        line = json.loads(hs.build_index_line({"seq": 1, "blocks": [blk]}))
+        self.assertEqual(line["blocks"], [{"name": "框A", "source": "group", "nodeIds": [], "color": "#5aa0d8"}])
 
     def test_parse_index_good_bad_blank(self):
         good1 = json.dumps({"seq": 1, "file": "0001-a.json"})
@@ -294,10 +303,10 @@ class TestCommit(TempRootTestCase):
         self.assertEqual(snap["graph"]["nodes"][0]["id"], 1)
 
     def test_commit_with_blocks_index_full(self):
-        # N3：索引行仍存**完整版** blocks（含 source / nodeIds），但快照**不再重复存**
+        # N3：索引行仍存**完整版** blocks（含 source / nodeIds / color），但快照**不再重复存**
         blocks = [
-            {"name": "组1", "source": "group", "nodeIds": [1, 2]},
-            {"name": "采样", "source": "role", "nodeIds": [7]},
+            {"name": "组1", "source": "group", "nodeIds": [1, 2], "color": None},
+            {"name": "采样", "source": "role", "nodeIds": [7], "color": None},
         ]
         out = self.commit(
             {
@@ -314,7 +323,7 @@ class TestCommit(TempRootTestCase):
         self.assertEqual(snap["schemaVersion"], 2)
         with open(os.path.join(out["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
             entry = json.loads(fh.readline())
-        self.assertEqual(entry["blocks"], blocks)  # 索引行完整版（name + source + nodeIds）
+        self.assertEqual(entry["blocks"], blocks)  # 索引行完整版（name + source + nodeIds + color）
         # list_commits 读回一致
         listed = hs.list_commits("wf", self.root)
         self.assertEqual(listed["entries"][0]["blocks"], blocks)
@@ -682,12 +691,12 @@ class TestP5Purity(TempRootTestCase):
 
     def test_normalize_entry_keeps_new_fields(self):
         n = hs.normalize_entry({"seq": 5, "kind": "save", "parent": 3, "sig": "aa",
-                                "blocks": [{"name": "b", "source": "role", "nodeIds": [7]}], "runs": []})
+                                "blocks": [{"name": "b", "source": "role", "nodeIds": [7], "color": None}], "runs": []})
         self.assertEqual(n["runs"], [])
         self.assertEqual(n["kind"], "save")
         self.assertEqual(n["parent"], 3)
         self.assertEqual(n["sig"], "aa")
-        self.assertEqual(n["blocks"], [{"name": "b", "source": "role", "nodeIds": [7]}])
+        self.assertEqual(n["blocks"], [{"name": "b", "source": "role", "nodeIds": [7], "color": None}])
 
     def test_joint_sig_matches_js_fixture(self):
         # 跨语言一致性固定 fixture：与 JS 测试里的同一 graph 必须同串
@@ -755,7 +764,11 @@ class TestP5bWiring(TempRootTestCase):
         self.assertEqual(lines[1]["kind"], "run")
         # 合并不写新快照
         d = os.path.join(self.root, "workflows", ".history", "wf")
-        snaps = [f for f in os.listdir(d) if f.endswith(".json") and not f.endswith(hs.IMAGES_SUFFIX)]
+        snaps = [
+            f
+            for f in os.listdir(d)
+            if f.endswith(".json") and not f.endswith(hs.IMAGES_SUFFIX) and f != hs.HEAD_FILE_NAME
+        ]
         self.assertEqual(snaps, ["0001-p1.json"])
         # list 折叠：该节点 runs 有 2 条
         listed = hs.list_commits("wf", self.root)
@@ -799,10 +812,21 @@ class TestP5bWiring(TempRootTestCase):
 
     def test_merge_with_parent_given_nonexistent_no_merge(self):
         self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
-        # parent 指一个不存在的 seq → head 读不到 → 不合并，新建
+        # 2026-10-23 契约变更（§3.2）：parent 传了但索引里查不到 → **视为未传**，
+        # 按 head 优先级继续（HEAD 已被 #1 写成 1）。
+        # 故旧的「脏 parent 直捣进索引」不再成立：本例 sig 与 #1 相同 → 合并进 #1。
         out = self.commit({"workflow": "wf", "graph": self.G_SEED2, "promptId": "p2", "parent": 999})
+        self.assertTrue(out["merged"])
+        self.assertEqual(out["targetSeq"], 1)
+        self.assertEqual(len(self.index_lines()), 2)
+        self.assertEqual(self.index_lines()[1]["mergeInto"], 1)
+
+    def test_dirty_parent_falls_back_to_head_not_written(self):
+        # 脏 parent + sig 不同 → 新建节点，parent 不得落脏值（应为 head = 索引末条主行）
+        self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
+        out = self.commit({"workflow": "wf", "graph": self.G_STEPS, "promptId": "p2", "parent": 999})
         self.assertFalse(out["merged"])
-        self.assertEqual(self.index_lines()[1]["parent"], 999)
+        self.assertEqual(self.index_lines()[1]["parent"], 1)
 
     def test_save_commit_always_new(self):
         r1 = self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
@@ -910,6 +934,199 @@ class TestP5bWiring(TempRootTestCase):
         self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
         hs.save_commit({"workflow": "wf", "graph": self.G_STEPS}, self.root)
         self.assertFalse(os.path.exists(os.path.join(os.getcwd(), ".history")))
+
+
+class TestHeadPersistence(TempRootTestCase):
+    """2026-10-23：后端 HEAD 持久化（.head.json）—— 方案 §3.2 契约。
+
+    测点：读侧四种兜底（缺失/坏 JSON/指向不存在/指向 merge 行）、新建与合并对 head 的影响、
+    parent 优先级（显式 parent > head > 末条）、head-set 端点语义、list 的 head 字段、
+    save_commit 同口径。
+    """
+
+    def graph(self, steps, seed=1):
+        return {"nodes": [
+            {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": seed, "steps": steps}},
+            {"id": 2, "type": "EmptyLatentImage", "widgets_values_named": {"width": 512}},
+        ], "links": []}
+
+    def hist_dir(self, name="wf"):
+        return os.path.join(self.root, "workflows", ".history", hs.sanitize_workflow_name(name))
+
+    def head_path(self, name="wf"):
+        return os.path.join(self.hist_dir(name), hs.HEAD_FILE_NAME)
+
+    def read_head_file(self, name="wf"):
+        with open(self.head_path(name), encoding="utf-8") as fh:
+            return json.loads(fh.read())
+
+    def write_head_file(self, text, name="wf"):
+        with open(self.head_path(name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def index_lines(self, name="wf"):
+        path = os.path.join(self.hist_dir(name), hs.INDEX_FILE_NAME)
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+
+    def three_nodes(self, name="wf"):
+        """建 3 个主行（seq 1/2/3，各自 sig 不同 → 不合并），返回各自 seq。"""
+        seqs = []
+        for i, steps in enumerate((10, 20, 30), start=1):
+            out = self.commit({"workflow": name, "graph": self.graph(steps), "promptId": "p%d" % i})
+            self.assertFalse(out["merged"])
+            seqs.append(out["seq"])
+        self.assertEqual(seqs, [1, 2, 3])
+        return seqs
+
+    # ① 无 .head.json → parent 退回索引末条（老行为不变）
+    def test_missing_head_falls_back_to_last(self):
+        first = self.commit({"workflow": "wf", "graph": self.graph(10), "promptId": "p1"})
+        self.assertEqual(self.read_head_file()["seq"], 1)  # 新建即写 head
+        os.remove(self.head_path())  # 抹掉 head，模拟无 head 的老目录
+        out = self.commit({"workflow": "wf", "graph": self.graph(20), "promptId": "p2"})
+        self.assertFalse(out["merged"])
+        self.assertEqual(self.index_lines()[1]["parent"], first["seq"])
+        self.assertEqual(out["seq"], 2)
+
+    # ② 新建节点后 .head.json 跟随新 seq
+    def test_new_node_advances_head(self):
+        self.three_nodes()
+        self.assertEqual(self.read_head_file()["seq"], 3)
+        self.assertIn("at", self.read_head_file())
+        # 快照/索引目录同级
+        self.assertEqual(os.path.dirname(self.head_path()), self.hist_dir())
+        # 无 .tmp 残留
+        self.assertFalse(os.path.exists(self.head_path() + ".tmp"))
+
+    # ③ 合并（mergeInto）后 .head.json 不变
+    def test_merge_keeps_head(self):
+        r1 = self.commit({"workflow": "wf", "graph": self.graph(10), "promptId": "p1"})
+        before = self.read_head_file()
+        # 仅改 seed → 同 sig → 合并进行 #1
+        merged = self.commit({"workflow": "wf", "graph": self.graph(10, seed=999), "promptId": "p2"})
+        self.assertTrue(merged["merged"])
+        self.assertEqual(merged["targetSeq"], r1["seq"])
+        self.assertEqual(self.read_head_file(), before)
+
+    # ④ 回跳设 head 到中间节点后提交 → 新行 parent = 回跳目标（真分叉）
+    def test_set_head_then_commit_forks(self):
+        seqs = self.three_nodes()
+        target = seqs[0]
+        res = hs.set_head({"workflow": "wf", "seq": target, "at": "2026-10-23T00:00:00.000Z"}, self.root)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["seq"], target)
+        self.assertEqual(self.read_head_file()["seq"], target)
+        self.assertEqual(self.read_head_file()["at"], "2026-10-23T00:00:00.000Z")
+
+        out = self.commit({"workflow": "wf", "graph": self.graph(40), "promptId": "p4"})
+        self.assertFalse(out["merged"])
+        lines = self.index_lines()
+        self.assertEqual(lines[-1]["seq"], 4)
+        self.assertEqual(lines[-1]["parent"], target)  # 真分叉，不是末条 3
+        self.assertNotEqual(lines[-1]["parent"], 3)
+        # 提交后 head 前进到新节点
+        self.assertEqual(self.read_head_file()["seq"], 4)
+        # 图确实分叉：节点 1 有子 2 与 4
+        children = {}
+        for ln in lines:
+            if ln.get("parent") is not None:
+                children.setdefault(ln["parent"], []).append(ln["seq"])
+        self.assertEqual(sorted(children[target]), [2, 4])
+
+    # ⑤ .head.json 坏 JSON → 退回末条，不抛异常
+    def test_bad_json_head_falls_back(self):
+        self.three_nodes()
+        self.write_head_file("{ 这不是 json")
+        self.assertIsNone(hs.read_head(self.hist_dir(), self.index_lines()))
+        listed = hs.list_commits("wf", self.root)
+        self.assertTrue(listed["ok"])
+        self.assertIsNone(listed["head"])
+        out = self.commit({"workflow": "wf", "graph": self.graph(40), "promptId": "p4"})
+        self.assertFalse(out["merged"])
+        self.assertEqual(self.index_lines()[-1]["parent"], 3)  # 退回末条
+        # 新提交把 head 写回正轨
+        self.assertEqual(self.read_head_file()["seq"], 4)
+
+    def test_head_not_object_falls_back(self):
+        self.three_nodes()
+        self.write_head_file("[1,2,3]")
+        self.assertIsNone(hs.read_head(self.hist_dir(), self.index_lines()))
+        out = self.commit({"workflow": "wf", "graph": self.graph(40), "promptId": "p4"})
+        self.assertEqual(self.index_lines()[-1]["parent"], 3)
+
+    # ⑥ .head.json 指向已不存在的 seq → head-set 判 400，读 head 退回末条
+    def test_head_points_to_missing_seq(self):
+        self.three_nodes()
+        res = hs.set_head({"workflow": "wf", "seq": 99}, self.root)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], 400)
+        self.assertEqual(res["error"], "seq_not_found")
+        # 拒绝的写入不能改掉已有 head
+        self.assertEqual(self.read_head_file()["seq"], 3)
+        # 手写脏值（模拟用户删了历史文件）→ 读侧退回末条
+        self.write_head_file(json.dumps({"seq": 99, "at": "2026-10-23T00:00:00.000Z"}))
+        self.assertIsNone(hs.read_head(self.hist_dir(), self.index_lines()))
+        self.assertIsNone(hs.list_commits("wf", self.root)["head"])
+        out = self.commit({"workflow": "wf", "graph": self.graph(40), "promptId": "p4"})
+        self.assertEqual(self.index_lines()[-1]["parent"], 3)
+
+    def test_head_set_rejects_merge_row_seq(self):
+        r1 = self.commit({"workflow": "wf", "graph": self.graph(10), "promptId": "p1"})
+        merged = self.commit({"workflow": "wf", "graph": self.graph(10, seed=7), "promptId": "p2"})
+        self.assertTrue(merged["merged"])
+        merge_seq = max(x["seq"] for x in self.index_lines())
+        self.assertEqual(merge_seq, 2)
+        res = hs.set_head({"workflow": "wf", "seq": merge_seq}, self.root)
+        self.assertEqual(res["status"], 400)
+        self.assertEqual(res["error"], "seq_not_found")
+        self.assertEqual(self.read_head_file()["seq"], r1["seq"])
+
+    def test_head_set_param_guards(self):
+        self.three_nodes()
+        self.assertEqual(hs.set_head({"graph": {}}, self.root)["error"], "missing_workflow")
+        self.assertEqual(hs.set_head({"workflow": "  "}, self.root)["error"], "missing_workflow")
+        self.assertEqual(hs.set_head({"workflow": "wf"}, self.root)["error"], "missing_seq")
+        self.assertEqual(hs.set_head({"workflow": "wf", "seq": "abc"}, self.root)["error"], "missing_seq")
+        self.assertEqual(hs.set_head({"workflow": "wf", "seq": 2}, "")["status"], 500)
+
+    # ⑦ save_commit 也走 head（不再直接取末条）
+    def test_save_commit_uses_head(self):
+        seqs = self.three_nodes()
+        res = hs.set_head({"workflow": "wf", "seq": seqs[0]}, self.root)
+        self.assertTrue(res["ok"])
+        saved = hs.save_commit({"workflow": "wf", "graph": self.graph(40)}, self.root)
+        self.assertTrue(saved["ok"])
+        self.assertFalse(saved["merged"])
+        lines = self.index_lines()
+        self.assertEqual(lines[-1]["kind"], "save")
+        self.assertEqual(lines[-1]["parent"], seqs[0])  # head 而非末条 3
+        self.assertEqual(self.read_head_file()["seq"], saved["seq"])
+
+    # list_commits 的 head 字段
+    def test_list_returns_head(self):
+        self.three_nodes()
+        listed = hs.list_commits("wf", self.root)
+        self.assertEqual(listed["head"]["seq"], 3)
+        self.assertIn("at", listed["head"])
+        # 空历史 / 目录不存在 → head 为 None
+        empty = hs.list_commits("没有这个", self.root)
+        self.assertEqual(empty["entries"], [])
+        self.assertIsNone(empty["head"])
+
+    def test_list_head_none_when_no_file(self):
+        self.three_nodes()
+        os.remove(self.head_path())
+        self.assertIsNone(hs.list_commits("wf", self.root)["head"])
+
+    # 显式 parent 仍优先于 head（agent 通道）；但脏 parent 不再写进索引
+    def test_explicit_parent_beats_head(self):
+        seqs = self.three_nodes()
+        res = hs.set_head({"workflow": "wf", "seq": seqs[2]}, self.root)
+        self.assertTrue(res["ok"])
+        out = self.commit({"workflow": "wf", "graph": self.graph(40), "promptId": "p4", "parent": seqs[0]})
+        self.assertFalse(out["merged"])
+        self.assertEqual(self.index_lines()[-1]["parent"], seqs[0])
 
 
 class TestAttachImages(TempRootTestCase):
@@ -1348,7 +1565,9 @@ class TestMigrateHistory(TempRootTestCase):
             return [json.loads(x) for x in fh.read().splitlines()]
 
     def names(self, name):
-        return sorted(n for n in os.listdir(self.hist_dir(name)) if n != hs.INDEX_FILE_NAME)
+        return sorted(
+            n for n in os.listdir(self.hist_dir(name)) if n not in (hs.INDEX_FILE_NAME, hs.HEAD_FILE_NAME)
+        )
 
     # ① from 不存在
     def test_src_missing_noop(self):
@@ -1479,6 +1698,26 @@ class TestMigrateHistory(TempRootTestCase):
         # 目标索引可被 parse_index 正常读回（无坏行）；目标 1 条 → offset 2 → 源 #1 → 3
         self.assertEqual([x["seq"] for x in self.index_lines("正式 画布")], [1, 3])
         self.assertFalse(os.path.exists(self.hist_dir("临时 画布")))
+
+    # ⑤ 合并后校正目标 HEAD（2026-10-23：修「迁移后首次提交凭空长泳道」）
+    def test_merge_fixes_target_head(self):
+        self.commit({"workflow": "正式 画布", "graph": self.G_BASE, "promptId": "tgt1aaaa"})
+        self.commit({"workflow": "正式 画布", "graph": self.G_STEPS, "promptId": "tgt2bbbb"})
+        self.commit({"workflow": "临时 画布", "graph": self.G_BASE, "promptId": "src1aaaa"})
+        self.commit({"workflow": "临时 画布", "graph": self.G_STEPS, "promptId": "src2bbbb"})
+        self.assertEqual(hs.read_head(self.hist_dir("正式 画布"), self.index_lines("正式 画布"))["seq"], 2)
+
+        out = hs.migrate_history("临时 画布", "正式 画布", self.root)
+        self.assertTrue(out["ok"])
+        lines = self.index_lines("正式 画布")
+        self.assertEqual([x["seq"] for x in lines], [1, 2, 4, 5])
+        # HEAD 跟到合并后末条主行（5），不再是迁移前的 2
+        self.assertEqual(hs.read_head(self.hist_dir("正式 画布"), lines)["seq"], 5)
+        # 迁移后首次提交的 parent = 5（与旧口径一致，不凭空长泳道）
+        self.commit({"workflow": "正式 画布", "promptId": "after9999",
+                     "graph": {"nodes": [{"id": 1, "type": "KSampler",
+                                            "widgets_values_named": {"seed": 7, "steps": 11}}], "links": []}})
+        self.assertEqual(self.index_lines("正式 画布")[-1]["parent"], 5)
 
     def test_no_real_history_dir_touched(self):
         # 全部落盘限定在 self.root 的 tempfile 临时目录内

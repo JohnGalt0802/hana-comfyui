@@ -65,6 +65,7 @@ try:
     from .history_store import read_snapshot as _history_read_snapshot
     from .history_store import attach_images as _history_attach_images
     from .history_store import migrate_history as _history_migrate
+    from .history_store import set_head as _history_set_head
 except Exception as _exc:  # P1-C1：history_store 纯标准库，正常不会失败；防御性保护
     _history_commit = None
     _history_save_commit = None
@@ -72,6 +73,7 @@ except Exception as _exc:  # P1-C1：history_store 纯标准库，正常不会�
     _history_read_snapshot = None
     _history_attach_images = None
     _history_migrate = None
+    _history_set_head = None
     _HISTORY_IMPORT_ERR = _exc
 else:
     _HISTORY_IMPORT_ERR = None
@@ -114,7 +116,8 @@ except ValueError:
 # 2026-10-15（提交历史框/树跟随 ComfyUI 明暗主题：中性色走 CSS 变量，深色档=原值）：对齐新活动桥 hana-bridge-15021810。
 # 2026-10-15（变动符号移到节点下方，避开右上 ×N 上标；悬停气泡上移 13px 让位）：对齐新活动桥 hana-bridge-2610152337。
 # 2026-10-19（提交树块并集 → 活图块名，与提交历史框同口径）：对齐新活动桥 hana-bridge-2610192344。
-BRIDGE_BUILD_TAG = "2026-10-19 hana-bridge-2610192344"
+# 2026-10-23（后端 HEAD 持久化：.head.json + history-head-set；parent 由后端定）：对齐新活动桥 hana-bridge-23033000。
+BRIDGE_BUILD_TAG = "2026-10-23 hana-bridge-23033000"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
@@ -567,8 +570,17 @@ if _ROUTES is not None:
                     },
                     status=409,
                 )
-            sid = _live_pick(hits_live)
+            # 显式 sid 优先（2026-10-21，issue #2 P3-b）：
+            # 调用方直接指定了目标页时，不要被 workflow 路由重新推断覆盖。
+            # 否则「对干净页发的 openWorkflow」会因 workflow 命中多个活页而落到
+            # _live_pick（取最近上报页），实际发给了脏页 → 被脏保护拦住。
+            # 只有未给 sid 时才按 workflow 推断。
             routed = {"workflow": want_wf, "matched": len(hits_live)}
+            if sid:
+                routed["sidSource"] = "explicit"
+            else:
+                sid = _live_pick(hits_live)
+                routed["sidSource"] = "workflow-route"
             if hits_stale:
                 routed["staleSkipped"] = len(hits_stale)
                 LOG.info(
@@ -874,6 +886,27 @@ if _ROUTES is not None:
         status = out.pop("status", 200 if out.get("ok") else 500)
         return web.json_response(out, status=status)
 
+    # 2026-10-23：HEAD 持久化写入端点（见 docs/方案-修复提交图泳道与HEAD-20261023.md §3.2）。
+    # 回跳成功后由前端调用，把后端 HEAD 设为回跳目标 seq；parent 由后端据此决定。
+    # 请求体: { workflow, workflowId?, workflowPath?, workflowTemporary?, seq, at? }
+    # 信任模型同其它 history-* 端点（P1-D1）：8188 同源、本机-only，不校验 token。
+    @_ROUTES.post("/hana_bridge/history-head-set")
+    async def _hana_history_head_set(request):
+        """设置当前 HEAD（回跳目标）。body: { workflow, workflowId?, seq, at? }
+        200 → {"ok": true, "seq": n}；400 → missing_workflow / missing_seq / seq_not_found。"""
+        try:
+            user_dir = _history_user_dir()
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        body = await _json(request)
+        # 2026-10-14：同一 id 主键口径 / identity 归一化入参（照拄 history-commit 的取参方式）。
+        workflow_id = str((body or {}).get("workflowId") or "").strip() or None
+        workflow_path = str((body or {}).get("workflowPath") or "").strip() or None
+        workflow_temporary = bool((body or {}).get("workflowTemporary"))
+        out = _history_set_head(body, user_dir, workflow_id, path=workflow_path, temporary=workflow_temporary)
+        status = out.pop("status", 200 if out.get("ok") else 500)
+        return web.json_response(out, status=status)
+
     # 2026-10-14：缩图 + 磁盘缓存端点（见 docs/方案-预览图降分辨率与缓存-20261014.md §2）。
     # ComfyUI 的 /view?preview= 只压格式+质量、不改分辨率（2K 原图 → webp;75 仍 213KB）
     # 且无缓存头；本端点降分辨率并按 hash 稳定缓存 → 可长缓存、二次零下载。
@@ -921,7 +954,7 @@ if _ROUTES is not None:
         )
 
     LOG.info(
-        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-save / history-attach-images / history-list / history-snapshot / history-migrate / thumb），"
+        "hana_bridge: 路由已注册（call / hello / result / ping / history-commit / history-save / history-attach-images / history-list / history-snapshot / history-migrate / history-head-set / thumb），"
         "token 就绪，超时 %gs",
         CALL_TIMEOUT_SEC,
     )

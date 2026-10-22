@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-19 hana-bridge-2610192344";
+const BUILD_TAG = "2026-10-23 hana-bridge-23033000";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -184,6 +184,38 @@ function workflowDirty(wf) {
     if (typeof m === "function") return !!wf.isModified();
   } catch { /* 忽略 */ }
   return false;
+}
+
+// ── P3-b（2026-10-21，issue #2）：多页面定向的「判定可见化」──────────────────────
+// 桥 js 侧看不到别的页面开着什么（没有 _frontends 表，aw 永远是本页的活动工作流），
+// 能做的唯一判断是「这条指令是不是发给本页的」——靠 api.clientId（= /ws 的 sid）自比。
+// 注意：这两个函数只产出「标注」，不改变脏保护的拦/放口径（口径仍是 dirty && force!==true）。
+// 理由：异页 sid 放行是错的——py 侧 sid 无命中/歧义时会退化为广播，此时本页才是执行目标，
+// 放行就等于丢掉用户未保存的编辑。
+
+// 判定这条指令是否发给本页。
+// 返回 true=是本页 / false=不是本页 / "unknown"=本页 clientId 取不到；无 sid → null。
+function sidTargetsSelf(rawSid) {
+  const sid = rawSid == null ? "" : String(rawSid).trim();
+  if (!sid) return null;
+  let me = null;
+  try {
+    const v = api && api.clientId;
+    if (typeof v === "string" && v.trim()) me = v.trim();
+  } catch { /* 忽略 */ }
+  if (!me) return "unknown";
+  if (sid === me) return true;
+  if (me.startsWith(sid)) return true; // py 侧允许 8 位短 sid 前缀定向
+  return false;
+}
+
+// 计算脏检查走哪个分支（仅用于标注/日志，不参与拦/放判断）。
+function dirtyGateBranch(force, hasSid, targetsSelf) {
+  if (force === true) return "skipped-force";
+  if (!hasSid) return "enforced-no-sid";
+  if (targetsSelf === true) return "enforced-active-page";
+  if (targetsSelf === "unknown") return "enforced-sid-unknown";
+  return "enforced-sid-not-self";
 }
 
 // 工作流是否为「临时页」（从未落盘、无真实文件路径）：v1.55.14 源码核对为布尔 getter
@@ -848,7 +880,7 @@ async function pushStateSnapshot() {
 //   · 超时注记：前端等待默认 6s（HANA_BRIDGE_TIMEOUT 可调）——大批量注意 6s 约束；
 //     超时（504）≠ 未生效，重试前先对账 rev。v0 不设条数硬限。
 //   · 并发：模块级 in-flight 锁，同页并发 patch 直接拒绝（明确报错）。
-const PATCH_ALLOWED = ["addNode", "setWidget", "connect", "disconnect", "setNodeMode", "removeNode", "save"];
+const PATCH_ALLOWED = ["addNode", "setWidget", "connect", "disconnect", "setNodeMode", "removeNode", "moveNode", "setNodeSize", "save"];
 const PATCH_FORBIDDEN = ["undo", "loadWorkflowFile", "openWorkflow", "organize"];
 const PATCH_REF_FIELDS = ["nodeId", "fromNode", "toNode"];
 
@@ -1010,6 +1042,38 @@ function verifyPatchResult(item, resolved, result) {
   }
   if (item.key === "removeNode") {
     if (findNode(resolved.nodeId)) return `#${resolved.nodeId} 仍在图中`;
+    return null;
+  }
+  if (item.key === "moveNode") {
+    // 校验每个目标节点真的落在期望坐标（容差 0.5，前端可能取整）
+    const rows = Array.isArray(resolved.nodes) && resolved.nodes.length
+      ? resolved.nodes
+      : [[resolved.nodeId, Array.isArray(resolved.pos) ? resolved.pos[0] : resolved.x,
+                          Array.isArray(resolved.pos) ? resolved.pos[1] : resolved.y]];
+    for (const row of rows) {
+      const n = findNode(row[0]);
+      if (!n) return "#" + row[0] + " 不见了";
+      const ex = Number(row[1]), ey = Number(row[2]);
+      if (Math.abs(n.pos[0] - ex) > 0.5 || Math.abs(n.pos[1] - ey) > 0.5) {
+        return "#" + row[0] + " 坐标未生效（期望 " + ex + "," + ey +
+               "，实为 " + n.pos[0] + "," + n.pos[1] + "）";
+      }
+    }
+    return null;
+  }
+  if (item.key === "setNodeSize") {
+    const n = findNode(resolved.nodeId);
+    if (!n) return "#" + resolved.nodeId + " 不见了";
+    if (resolved.collapsed === true && !(n.flags && n.flags.collapsed)) {
+      return "#" + resolved.nodeId + " 未折叠";
+    }
+    if (Array.isArray(resolved.size) && resolved.size.length === 2) {
+      const ex = Number(resolved.size[0]), ey = Number(resolved.size[1]);
+      const aw = n.size && n.size[0], ah = n.size && n.size[1];
+      if (Math.abs(aw - ex) > 1 || Math.abs(ah - ey) > 1) {
+        return "#" + resolved.nodeId + " 尺寸未生效（期望 " + ex + "x" + ey + "，实为 " + aw + "x" + ah + "）";
+      }
+    }
     return null;
   }
   if (item.key === "setNodeMode") {
@@ -1228,6 +1292,31 @@ function runPatchDryRun(list) {
           issues.push(`输入槽不存在：${a.slot}（可用：${(node.inputs || []).map((i) => i.name).join(", ")}）`);
         } else if (!node.inputs[ii] || node.inputs[ii].link == null) {
           issues.push(`输入 ${a.slot} 本来就没有连线`);
+        }
+      }
+    } else if (key === "moveNode") {
+      const rows = Array.isArray(a.nodes) && a.nodes.length
+        ? a.nodes
+        : [[a.nodeId, Array.isArray(a.pos) ? a.pos[0] : a.x, Array.isArray(a.pos) ? a.pos[1] : a.y]];
+      for (const row of rows) {
+        if (!Array.isArray(row) || row.length < 3) { issues.push("nodes 每项须为 [nodeId, x, y]"); continue; }
+        const node = take(row[0]);
+        if (!node) continue;
+        if (!Number.isFinite(Number(row[1])) || !Number.isFinite(Number(row[2]))) {
+          issues.push("节点 " + row[0] + " 坐标非有限数字");
+        }
+      }
+    } else if (key === "setNodeSize") {
+      if (a.nodeId === undefined) issues.push("缺少 nodeId");
+      const node = take(a.nodeId);
+      if (node) {
+        if (Array.isArray(a.size)) {
+          if (a.size.length !== 2 || !a.size.every((v) => Number.isFinite(Number(v)) && Number(v) > 0)) {
+            issues.push("size 需为 [w,h] 两个正数");
+          }
+        }
+        if (a.collapsed !== undefined && typeof a.collapsed !== "boolean") {
+          issues.push("collapsed 需为布尔");
         }
       }
     } else if (key === "setNodeMode") {
@@ -1678,11 +1767,22 @@ const OPS = {
     // 质检①（2026-10-08）：原判定只认 function 形式；v1.55.14 的 isModified 为布尔 getter
     // （ComfyWorkflow._isModified）→ function 判定恒 false、保护实际失效。改用 workflowDirty()
     // （兼容 getter / 函数两种形态；loadWorkflowFile 侧同点已走 workflowDirty，不受影响）。
+    // P3-b（2026-10-21，issue #2）：先算 branch 用于「标注 + 日志」（这条指令到底是不是发给本页的）；
+    // 拦/放口径与原来严格等价：原来 ⟺ dirty && force!==true，现 ⟺ dirty && branch!=="skipped-force"
+    // （branch 只在 force===true 时取 skipped-force）。异页 sid 放行是错的：py 侧 sid 无命中/歧义时
+    // 退化为广播，此时本页就是执行目标，放行等于丢掉用户未保存的编辑。
+    const rawSid = a.sid;
+    const hasSid = rawSid != null && String(rawSid).trim() !== "";
+    const gateBranch = dirtyGateBranch(a.force === true, hasSid, hasSid ? sidTargetsSelf(rawSid) : null);
     let dirty = false;
     try { dirty = workflowDirty(aw); } catch { dirty = false; }
-    if (dirty && a.force !== true) {
-      return { opened: false, blocked: "dirty", activeBefore: before };
+    const sidLog = hasSid ? String(rawSid).trim().slice(0, 8) : "(none)";
+    const pageLog = before || "(未命名)";
+    if (dirty && gateBranch !== "skipped-force") {
+      console.info(LOG_TAG + " openWorkflow 脏保护拦截 sid=" + sidLog + " branch=" + gateBranch + " page=" + pageLog);
+      return { opened: false, blocked: "dirty", activeBefore: before, dirtyCheck: gateBranch };
     }
+    console.info(LOG_TAG + " openWorkflow 脏保护放行 sid=" + sidLog + " branch=" + gateBranch + " page=" + pageLog);
 
     // 在已保存的工作流里找目标（按 path 精确、按文件名/去扩展名的名字宽松）
     const list = (() => {
@@ -1752,6 +1852,7 @@ const OPS = {
       activeBefore: before,
       activeAfter: expectAfter,
       nodeCount,
+      dirtyCheck: gateBranch,
       note: "已发起完整装载（异步）：装载完成后画布刷新并激活该工作流，调用方按 nodeCount / activeAfter 落定校验确认",
     };
   },
@@ -2097,6 +2198,129 @@ const OPS = {
     };
   },
 
+  // moveNode：移动一个或多个节点到指定坐标。设计取舍：
+  //   · 支持 nodes:[[id,x,y],...] 批量（排布场景一次改几十个，逐个调太慢）
+  //   · 逆操作记录每个节点原坐标，undo 一次复原全部
+  //   · 不自动撑分组框（框与节点是两件事，避免隐式副作用）
+  "canvas.moveNode": (args) => {
+    const a = args || {};
+    let list = [];
+    if (Array.isArray(a.nodes) && a.nodes.length) {
+      for (const row of a.nodes) {
+        if (!Array.isArray(row) || row.length < 3) {
+          throw new Error("nodes \u6bcf\u9879\u987b\u4e3a [nodeId, x, y]");
+        }
+        const id = row[0];
+        const x = Number(row[1]);
+        const y = Number(row[2]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          throw new Error("\u8282\u70b9 " + id + " \u7684\u5750\u6807\u4e0d\u662f\u6709\u9650\u6570\u5b57");
+        }
+        list.push({ id, x, y });
+      }
+    } else {
+      const id = a.nodeId;
+      let x, y;
+      if (Array.isArray(a.pos) && a.pos.length === 2) {
+        x = Number(a.pos[0]); y = Number(a.pos[1]);
+      } else {
+        x = Number(a.x); y = Number(a.y);
+      }
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        throw new Error("moveNode \u9700\u8981 pos:[x,y]\uff08\u6216 x/y\uff09\uff0c\u6216\u6279\u91cf nodes:[[id,x,y],...]");
+      }
+      list.push({ id, x, y });
+    }
+
+    for (const it of list) {
+      if (!findNode(it.id)) throw new Error("\u627e\u4e0d\u5230\u8282\u70b9\uff1a" + it.id);
+    }
+
+    const before = list.map((it) => {
+      const n = findNode(it.id);
+      return { id: n.id, x: n.pos[0], y: n.pos[1] };
+    });
+
+    withChange(() => {
+      for (const it of list) {
+        const n = findNode(it.id);
+        n.pos = [it.x, it.y];
+      }
+    });
+    pollGraph();
+
+    pushUndo("moveNode " + list.length + " \u4e2a\u8282\u70b9", () => {
+      withChange(() => {
+        for (const b of before) {
+          const n = findNode(b.id);
+          if (n) n.pos = [b.x, b.y];
+        }
+      });
+      pollGraph();
+    });
+
+    // 可选：按「标题编号前缀」重建分组框（fitGroups:true）。
+    // 为什么不能只"扩框"：moveNode 只动节点，旧框原地不动 → 框与节点的对应关系已经错了
+    //（实测 outline：「③ 画布」框住 #5、「② 提示词」框住 #13/#15）。
+    // 所以这里不信任旧框，按标题前缀重新指定成员并用 setGroup 重算 bounds。
+    let fitted = 0;
+    if (a.fitGroups === true) {
+      const NUMERALS = "\u2460\u2461\u2462\u2463\u2464\u2465\u2466\u2467\u2468\u2469";
+      const groups = liveGroupList(app.graph);
+      const dist = new Map();   // 前缀 -> [节点 id]
+      for (const it of list) {
+        const n = findNode(it.id);
+        if (!n) continue;
+        const t = String(n.title || "").trim();
+        const p = t && NUMERALS.indexOf(t[0]) >= 0 ? t[0] : "note";
+        if (!dist.has(p)) dist.set(p, []);
+        dist.get(p).push(n.id);
+      }
+      for (const [p, ids] of dist) {
+        if (p === "note" && ids.length > 6) continue;   // 无编号主干太多，不套框
+        // 找同名/同前缀的现有组
+        let target = -1;
+        for (let gi = 0; gi < groups.length; gi++) {
+          const gt = String(groups[gi].title || "").trim();
+          if (p !== "note" && gt && gt[0] === p) { target = gi; break; }
+          if (p === "note" && (gt.startsWith("\u4f7f\u7528") || gt.startsWith("\u8bf4\u660e"))) { target = gi; break; }
+        }
+        const bounds = liveBoundsForNodes(ids);
+        if (!bounds) continue;
+        if (target >= 0) {
+          const g = groups[target];
+          withChange(() => applyGroupBounds(g, bounds));
+          try { if (typeof g.recomputeInsideNodes === "function") g.recomputeInsideNodes(); } catch {}
+          fitted++;
+        } else {
+          // 没有对应组：新建。构造器必须走 lgraphGroupCtor()——
+          // 实测 LiteGraph.LGraphGroup 在部分前端拿不到，而 graph.add(e) 只认
+          // e instanceof LGraphGroup，纯对象会被当成节点。
+          try {
+            const Ctor = lgraphGroupCtor();
+            if (Ctor) {
+              const g = new Ctor();
+              g.title = p === "note" ? "\u4f7f\u7528\u8bf4\u660e" : p;
+              g.color = "#3f789e";
+              withChange(() => {
+                applyGroupBounds(g, bounds);
+                app.graph.add(g);
+              });
+              fitted++;
+            }
+          } catch { /* 建组失败不阻断移动 */ }
+        }
+      }
+      if (fitted) pollGraph();
+    }
+
+    return {
+      moved: list.length,
+      nodes: list.map((it) => ({ id: it.id, pos: [it.x, it.y] })),
+      groupsFitted: fitted,
+    };
+  },
+
   "canvas.removeNode": (args) => {
     const a = args || {};
     const node = findNode(a.nodeId);
@@ -2239,6 +2463,66 @@ const OPS = {
       nodeId: node.id,
       mode,
       label: mode === 2 ? "mute" : mode === 4 ? "bypass" : "正常",
+      before,
+    };
+  },
+
+  // setNodeSize：设置节点尺寸，并可选折叠。
+  // 为什么要折叠：纯功能节点（VAE 解码、各种 Loader、shift 位移）没有值得读的内容，
+  // 展开状态白占画布面积（实测 VAE 解码 320x180，折叠后 300x32，省 82%）。
+  "canvas.setNodeSize": (args) => {
+    const a = args || {};
+    const node = findNode(a.nodeId);
+    if (!node) throw new Error("找不到节点：" + a.nodeId);
+    const wantCollapse = a.collapsed === true;
+
+    let w = null, h = null;
+    if (Array.isArray(a.size) && a.size.length === 2) {
+      w = Number(a.size[0]); h = Number(a.size[1]);
+    } else {
+      if (a.width !== undefined) w = Number(a.width);
+      if (a.height !== undefined) h = Number(a.height);
+    }
+    if (w !== null && (!Number.isFinite(w) || w <= 0)) throw new Error("width 需为正数");
+    if (h !== null && (!Number.isFinite(h) || h <= 0)) throw new Error("height 需为正数");
+    if (w === null && h === null && !wantCollapse) {
+      throw new Error("setNodeSize 需要 size:[w,h]（或 width/height），或 collapsed:true");
+    }
+
+    const before = {
+      size: Array.isArray(node.size) ? [node.size[0], node.size[1]] : null,
+      collapsed: !!(node.flags && node.flags.collapsed),
+    };
+
+    withChange(() => {
+      if (w !== null && h !== null) {
+        node.size = [w, h];
+      } else {
+        const cur = Array.isArray(node.size) ? node.size : [300, 100];
+        node.size = [w !== null ? w : cur[0], h !== null ? h : cur[1]];
+      }
+      if (wantCollapse || a.collapsed === false) {
+        node.flags = node.flags || {};
+        node.flags.collapsed = wantCollapse;
+      }
+    });
+    pollGraph();
+
+    pushUndo("setNodeSize #" + node.id, () => {
+      const cur = findNode(node.id);
+      if (!cur) return;
+      withChange(() => {
+        if (before.size) cur.size = [before.size[0], before.size[1]];
+        cur.flags = cur.flags || {};
+        cur.flags.collapsed = before.collapsed;
+      });
+      pollGraph();
+    });
+
+    return {
+      nodeId: node.id,
+      size: [node.size[0], node.size[1]],
+      collapsed: !!(node.flags && node.flags.collapsed),
       before,
     };
   },
@@ -2702,11 +2986,7 @@ function installQueuePromptCapture() {
   queuePromptCaptureInstalled = true;
 }
 
-// ── P5b（2026-10-11）：HEAD 管理（per-workflow localStorage）──────────────────
-// 契约见 docs/方案-画布提交历史-P5b-数据模型接线.md §3.1。键结构照抄 copilot：
-//   hana.history.head.v1:<ws>:<hashPath(pageKey)>（pageKey 取法同 copilotPageKey）。
-// 值：{ seq, at }。seq 为 null → 删键。只存最小信息；异常一律 try/catch 吞。
-const HISTORY_HEAD_LS_PREFIX = "hana.history.head.v1:";
+// HEAD 由后端 .head.json 持有，前端不落 localStorage（2026-10-23；原 hana.history.head.v1:* 写入已清）。
 
 // pageKey = activeWorkflow.path（fallback：key → name）；取不到返回 null（同 copilotPageKey 口径）
 function historyPageKey() {
@@ -2724,47 +3004,16 @@ function historyPageKey() {
   }
 }
 
-function historyHeadKey(pageKey) {
-  return HISTORY_HEAD_LS_PREFIX + copilotWorkspaceId() + ":" + hashPathKey(pageKey);
-}
-
-// 读当前页 HEAD：{seq, at} | null（坏 JSON / 无 pageKey / 无键 → null）
-function historyHeadGet() {
-  try {
-    const pk = historyPageKey();
-    if (!pk) return null;
-    const raw = localStorage.getItem(historyHeadKey(pk));
-    if (!raw) return null;
-    const v = JSON.parse(raw);
-    if (!v || typeof v !== "object" || v.seq == null) return null;
-    return { seq: v.seq, at: v.at != null ? v.at : null };
-  } catch {
-    return null;
-  }
-}
-
-// 写当前页 HEAD；seq 为 null → 删键。异常一律吞。
-function historyHeadSet(seq, at) {
-  try {
-    const pk = historyPageKey();
-    if (!pk) return;
-    const key = historyHeadKey(pk);
-    if (seq == null) {
-      localStorage.removeItem(key);
-      return;
-    }
-    localStorage.setItem(key, JSON.stringify({ seq, at: at != null ? at : null }));
-  } catch {
-    /* 忽略 */
-  }
-}
-
 // 上报一次提交（契约字段冻结，勿改字段名）：POST /hana_bridge/history-commit
 // ⚠️ P1-C2：目标改道桥 Python 后端（同源）；端点由 P1-C1 并行实现，未就绪时静默失败。
-// P5b：增 source / kind（可选参，默认 "user" / "run"，为 P8 agent 通道预留）与 parent
-//      （读 HEAD；无 HEAD → 不传该字段，后端用线性默认）。读响应判 merged：
-//      未合并 → 写新 seq 到 HEAD；merged:true → HEAD 不变（仍是目标节点）。
-async function reportHistoryCommit({ graph, promptId, blocks, source = "user", kind = "run" }) {
+// P5b：增 source / kind（可选参，默认 "user" / "run"，为 P8 agent 通道预留）与可选 parent
+//      （不传 → body 不带该字段，后端自己定）。读响应判 merged：
+//      未合并 / 合并 → HEAD 均由后端 .head.json 维护，前端不跟。
+//
+// 2026-10-23 修（HEAD 移交后端持久化，见 docs/方案-修复提交图泳道与HEAD-20261023.md §3.3）：
+//   父节点不再由前端决定。用户提交路径不往 body 写 parent，后端按 <history_dir>/.head.json 定链；
+//   调用方显式传 parent（agent 通道等）才原样透传。
+async function reportHistoryCommit({ graph, promptId, blocks, source = "user", kind = "run", parent = null }) {
   try {
     let workflow = null;
     try {
@@ -2781,16 +3030,14 @@ async function reportHistoryCommit({ graph, promptId, blocks, source = "user", k
       source: source || "user",
       kind: kind || "run",
     };
-    // P5b：parent = 当前 HEAD 节点 seq；无 HEAD → 不带字段（后端线性默认 = 索引末条）。
-    try {
-      const head = historyHeadGet();
-      if (head && head.seq != null) body.parent = head.seq;
-    } catch { /* 忽略 */ }
+    // P5b → 2026-10-23：parent 交给后端（.head.json）。
+    // 仅当调用方显式给了 parent（agent 通道等）才透传；用户提交路径不带该字段。
+    if (parent != null) body.parent = parent;
     // P2-F2：块归属（[{name, source:"group"|"role", nodeIds:[…]}]）随快照上报；
     // 仅在算出数组时携带 —— null / 计算失败 → 不带字段（Python 端快照同样省略，读回 null）。
     if (Array.isArray(blocks)) body.blocks = blocks;
     const resp = await postJson(HISTORY_COMMIT_PATH, withWorkflowId(body));
-    // P5b：读响应判合并。未合并（新建节点）→ HEAD 移到新 seq；合并 → HEAD 不变。
+    // P5b：读响应判合并。HEAD 不论合并与否都由后端 .head.json 维护，前端只负责刷新提交树。
     let data = null;
     try {
       data = await resp.json();
@@ -2798,7 +3045,6 @@ async function reportHistoryCommit({ graph, promptId, blocks, source = "user", k
       data = null;
     }
     if (data && data.ok === true && data.merged !== true && data.seq != null) {
-      historyHeadSet(data.seq, at);
       historyTreeRefresh(); // P7-树（2026-10-12）：新提交落地 → 刷新底部提交树（展开着重渲染；收起着只更新计数）
     }
   } catch (err) {
@@ -2847,6 +3093,17 @@ function installOutputCapture() {
     }
   });
   // 一次运行结束：上报并清暂存。后端按 filename+subfolder+type 去重合并（重复上报无害）。
+  //
+  // 2026-10-22 修（预览图一直不出现的真因）：
+  //   当前 ComfyUI 版本（8f04fd6e）不再逐节点发送 `executed` 事件 ——
+  //   execution.py 里 add_message 的事件只剩 execution_start / execution_cached /
+  //   execution_error / execution_interrupted / execution_success，
+  //   UI 产物改为存进 history_result，**需要客户端去 GET /history/{promptId} 拿**。
+  //   所以上面的 `executed` 监听永远收不到东西 → pendingImages 恒为空 →
+  //   images.length 为 0 → reportHistoryImages 从不被调 → sidecar 从不生成 → 预览永远出不来。
+  //
+  // 兜底：execution_success 时若 pending 为空，直接查 /history/{promptId} 抽 images。
+  //   `executed` 监听保留：旧版 ComfyUI / 某些自定义节点仍会发，两条路互补。
   api.addEventListener("execution_success", (e) => {
     try {
       const d = e && e.detail;
@@ -2854,7 +3111,12 @@ function installOutputCapture() {
       if (!pid) return;
       const images = pendingImages.get(pid) || [];
       pendingImages.delete(pid);
-      if (images.length) void reportHistoryImages(pid, images);
+      if (images.length) {
+        void reportHistoryImages(pid, images);
+      } else {
+        // 新版本路径：没有 executed 事件 → 去 history 取
+        void fetchHistoryImages(pid);
+      }
     } catch (err) {
       console.warn(LOG_TAG, "P4 出图产物上报失败（不影响执行）", err);
     }
@@ -2872,18 +3134,167 @@ function installOutputCapture() {
   outputCaptureInstalled = true;
 }
 
-// 上报一次出图产物（契约字段冻结，勿改字段名）：POST /hana_bridge/history-attach-images
-// ⚠️ 端点在索引里按 promptId 找 entry → 写/合并 sidecar；未就绪时静默失败。
-async function reportHistoryImages(promptId, images) {
+// 2026-10-22 新增：从 /history/{promptId} 抽产物文件名。
+// 适用当前 ComfyUI（不再发 executed 事件，UI 产物存进 history_result）。
+// 注意：/history 是内存态，只在本轮运行后一段时间内可取；拿到就立即上报到 sidecar。
+// 时序：execution_success 是 add_message 在前、history_result 赋值在后（execution.py L827 vs L834），
+//      所以收到事件的那一刻 history 可能还没写上 → 带重试。
+async function fetchHistoryImages(promptId, attempt) {
+  const n = attempt || 0;
+  try {
+    const resp = await api.fetchApi("/history/" + encodeURIComponent(promptId), { method: "GET" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const rec = data && data[promptId];
+    if (!rec || !rec.outputs) {
+      if (n < 6) setTimeout(() => { void fetchHistoryImages(promptId, n + 1); }, 500);
+      return;
+    }
+    const images = [];
+    for (const nid of Object.keys(rec.outputs)) {
+      const o = rec.outputs[nid];
+      if (!o || !Array.isArray(o.images)) continue;
+      for (const item of o.images) {
+        if (item && typeof item.filename === "string") {
+          images.push({
+            filename: item.filename,
+            subfolder: typeof item.subfolder === "string" ? item.subfolder : "",
+            type: typeof item.type === "string" ? item.type : "output",
+          });
+        }
+      }
+    }
+    if (images.length) void reportHistoryImages(promptId, images);
+    else if (n < 6) setTimeout(() => { void fetchHistoryImages(promptId, n + 1); }, 500);
+  } catch (err) {
+    if (n < 6) { setTimeout(() => { void fetchHistoryImages(promptId, n + 1); }, 500); return; }
+    console.warn(LOG_TAG, "P4 history 回查失败（不影响画布）", err);
+  }
+}
+
+// 上报一次出图产物（契约字段冻结，勿改字段名）：POST /hana_bridge/history-attach-images// ⚠️ 端点在索引里按 promptId 找 entry → 写/合并 sidecar；未就绪时静默失败。
+async function reportHistoryImages(promptId, images, attempt) {
+  const n = attempt || 0;
   try {
     let workflow = null;
     try { workflow = currentWorkflowInfo().name; } catch { workflow = null; }
-    await postJson(HISTORY_ATTACH_PATH, withWorkflowId({
+    const resp = await postJson(HISTORY_ATTACH_PATH, withWorkflowId({
       workflow, promptId, images, at: new Date().toISOString(),
     }));
+    // 2026-10-22 修：上报成功后必须通知两处 UI 重读，否则新图不会及时出现在
+    // 「提交历史框」和「提交树」的提交节点上 —— 它们只在「打开 / 新提交 / 展开」时 fetch，
+    // 而上报发生在出图完成后，早过了提交那一刻。
+    // 2026-10-22 诊断加强：端点返回什么必须看得见 —— 它静默失败（404）过，
+    // 而那正是「图出来了但没绑上」的真正现场。
+    let ok = false;
+    let errText = "";
+    try {
+      const j = await resp.json();
+      ok = !!(j && j.ok === true);
+      errText = j && j.error ? String(j.error) : "";
+      if (!ok) console.warn(LOG_TAG, "[P4] attach 失败 pid=" + promptId.slice(0, 8) + " resp=" + JSON.stringify(j).slice(0, 200));
+    } catch {
+      console.warn(LOG_TAG, "[P4] attach 响应非 JSON pid=" + promptId.slice(0, 8) + " status=" + (resp && resp.status));
+    }
+    if (ok) {
+      scheduleHistoryImagesRefresh();
+      return;
+    }
+    // 2026-10-22：404 = 索引里还没这条 promptId（提交上报晚于图片回查）→ 重试。
+    // 这是批量出图时的常态：一次多张图几乎同时完成，而提交只在上传时写一次。
+    if (/没有 promptId|404/i.test(errText) && n < 8) {
+      setTimeout(() => { void reportHistoryImages(promptId, images, n + 1); }, 700);
+    }
   } catch (err) {
     console.warn(LOG_TAG, "P4 出图产物回填失败（不影响画布）", err);
   }
+}
+
+// 2026-10-22 兜底：定期扫 /history，把「有图但 sidecar 里没绑上」的补上。
+//
+// 为什么需要：execution_success 事件在批量出图 / 快速连续提交时不可靠
+// （实测 seq671、seq674 有图有索引但没 sidecar，而手动 POST attach 立刻 200）。
+// 依赖事件总是有漏网。这个扫描只读两份数据（/history + history-list）做差集，
+// 幂等：已绑上的不重复写，后端 attach 本身也去重。
+//
+// 成本：每 12s 一次，两个 GET；页面隐藏（document.hidden）时跳过。
+const HISTORY_SYNC_MS = 12000;
+let historySyncBusy = false;
+let historySyncTimer = null;
+
+async function syncOrphanImages() {
+  if (historySyncBusy) return;
+  if (typeof document !== "undefined" && document.hidden) return;
+  historySyncBusy = true;
+  try {
+    // ① 当前工作流的提交列表（已含 images）
+    let wf = null;
+    try { wf = currentWorkflowInfo().name; } catch { wf = null; }
+    if (!wf) return;
+    const lr = await api.fetchApi(HISTORY_LIST_PATH + withWorkflowIdQs("?workflow=" + encodeURIComponent(wf)), { method: "GET" });
+    if (!lr.ok) return;
+    const ld = await lr.json();
+    if (!ld || ld.ok !== true) return;
+    const entries = Array.isArray(ld.entries) ? ld.entries : [];
+    // 已绑上图的 promptId 集合（entry.runs[].images 非空 或 entry.images 非空）
+    const bound = new Set();
+    for (const e of entries) {
+      const runs = Array.isArray(e.runs) ? e.runs : [];
+      for (const r of runs) {
+        if (r && r.promptId && Array.isArray(r.images) && r.images.length) bound.add(String(r.promptId));
+      }
+    }
+    // ② /history 里最近的运行
+    const hr = await api.fetchApi("/history", { method: "GET" });
+    if (!hr.ok) return;
+    const hd = await hr.json();
+    const pids = hd && typeof hd === "object" ? Object.keys(hd) : [];
+    for (const pid of pids) {
+      if (bound.has(pid)) continue;
+      const rec = hd[pid];
+      if (!rec || !rec.outputs) continue;
+      const imgs = [];
+      for (const nid of Object.keys(rec.outputs)) {
+        const o = rec.outputs[nid];
+        if (!o || !Array.isArray(o.images)) continue;
+        for (const item of o.images) {
+          if (item && typeof item.filename === "string") {
+            imgs.push({
+              filename: item.filename,
+              subfolder: typeof item.subfolder === "string" ? item.subfolder : "",
+              type: typeof item.type === "string" ? item.type : "output",
+            });
+          }
+        }
+      }
+      if (!imgs.length) continue;
+      void reportHistoryImages(pid, imgs);
+    }
+  } catch { /* 兜底不动主链 */ }
+  finally { historySyncBusy = false; }
+}
+
+function installOrphanImageSync() {
+  if (historySyncTimer) return;
+  historySyncTimer = setInterval(() => { void syncOrphanImages(); }, HISTORY_SYNC_MS);
+}
+
+// 出图后延迟重读两处 UI（幂等合并：同一轮多次出图只刷一次）。
+// 延迟 400ms：避开「sidecar 刚写、缩略图后端刚就绪」的极端时序。
+let historyImagesRefreshTimer = null;
+function scheduleHistoryImagesRefresh() {
+  if (historyImagesRefreshTimer) return;
+  historyImagesRefreshTimer = setTimeout(() => {
+    historyImagesRefreshTimer = null;
+    try {
+      // 提交树：展开着才重取（收起着下次展开会自己 fetch）
+      if (historyTreeEl && historyTreeEl.classList.contains("htr-open")) void historyTreeRefresh();
+    } catch { /* 不影响主链 */ }
+    try {
+      // 提交历史框：开着才重读
+      if (typeof historyBarReloadIfOpen === "function") historyBarReloadIfOpen();
+    } catch { /* 不影响主链 */ }
+  }, 400);
 }
 
 // ── P2-F2（2026-10-11）：提交快照的块归属 blocks ──────────────────────────────
@@ -2954,7 +3365,17 @@ function graphBlocks(graph) {
     if (!nodes) continue; // 空 group 不成块（同 outline）
     const g = groups[gi] || {};
     const title = typeof g.title === "string" ? g.title.trim() : "";
-    rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", color: g.color, nodes });
+    // color 兜底（2026-10-21）：toJSON() 出来的 group 不一定带 color，
+    // 而历史内条必须按「提交当时的框色」渲染。serialized 没有就回活图 group 对象取。
+    let gcolor = (typeof g.color === "string" && g.color) ? g.color : null;
+    if (!gcolor) {
+      try {
+        const liveGroups = (app && app.graph && Array.isArray(app.graph.groups)) ? app.graph.groups : [];
+        const lg = liveGroups[gi];
+        if (lg && typeof lg.color === "string" && lg.color) gcolor = lg.color;
+      } catch { /* 取不到就算了，宁可无色也不串色 */ }
+    }
+    rawBlocks.push({ name: dedupName(title || `组${gi + 1}`), source: "group", color: gcolor, nodes });
   }
   if (otherNodes.length) {
     rawBlocks.push({ name: dedupName(ROLE_FALLBACK), source: "role", nodes: otherNodes });
@@ -2996,6 +3417,8 @@ function graphBlocks(graph) {
 //    convertOffsetToCanvas 同单位），不乘 DPR。
 // 明确不做（待商榷，勿实现）：按块归属过滤、浅色主题、设置开关。（回滚已由 P3-G1 落地，见下方专块。）
 const HISTORY_LIST_PATH = "/hana_bridge/history-list"; // fetchApi 自动加 /api 前缀 → /api/hana_bridge/history-list（已实测等价）
+// 2026-10-23：回跳后把后端 HEAD（<history_dir>/.head.json）设到回跳目标 seq（方案 §3.2 端点）。
+const HISTORY_HEAD_SET_PATH = "/hana_bridge/history-head-set";
 const HISTORY_BAR_ID = "hana-history-bar";
 const HISTORY_BAR_STYLE_ID = "hana-history-bar-style";
 const HISTORY_LIGHTBOX_ID = "hana-history-lightbox"; // P4：点缩略图看原图的全屏浮层
@@ -3280,8 +3703,38 @@ function historyBarStyleEnsure() {
 #${HISTORY_BAR_ID} .hhb-msg:empty { display:none; }
 #${HISTORY_BAR_ID} .hhb-empty, #${HISTORY_BAR_ID} .hhb-err { color:var(--hhb-sub); padding:6px 2px; }
 #${HISTORY_BAR_ID} .hhb-err { color:var(--hhb-err); }
-#${HISTORY_LIGHTBOX_ID} { position:fixed; inset:0; z-index:10050; background:var(--hhb-lb-scrim); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; cursor:zoom-out; pointer-events:auto; user-select:none; }
-#${HISTORY_LIGHTBOX_ID} img { max-width:92vw; max-height:84vh; border-radius:8px; box-shadow:0 10px 40px var(--hhb-lb-img-shadow); background:var(--hhb-lb-img-bg); }
+#${HISTORY_LIGHTBOX_ID} {
+  position:fixed; inset:0; z-index:10050; background:var(--hhb-lb-scrim);
+  /* flex 只用来摆底部文字；图片走 absolute + transform（见下方 img 规则） */
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px;
+  cursor:zoom-out; pointer-events:auto;
+  overflow:hidden;
+}
+/* 2026-10-21：图片改 absolute 定位，不再受 max-width/max-height 限制。
+   原因和 task 卡 lightbox 那次一样：flex 会先按**原图尺寸**排版 img，
+   超容器时产生负偏移，再叠 transform 的 translate 就是两套偏移。
+   absolute 于 (0,0) 后，translate 就等于图的真实左上角，
+   与 hlTx/hlTy 严格一致，refit 的居中计算才准。 */
+#${HISTORY_LIGHTBOX_ID} img {
+  position:absolute; left:0; top:0;
+  max-width:none; max-height:none;
+  transform-origin:0 0;
+  will-change:transform;
+  border-radius:8px;
+  box-shadow:0 10px 40px var(--hhb-lb-img-shadow);
+  background:var(--hhb-lb-img-bg);
+  user-select:none; -webkit-user-drag:none;
+}
+/* 底部文字/页码固定到底部（图已 absolute 不参与 flex 布局，
+   若仍用 flex 居中会因为容器只剩文字而浮到中间，盖在图上）*/
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-cap,
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-page {
+  position:absolute; left:50%; transform:translateX(-50%);
+  z-index:1; pointer-events:none; text-align:center;
+}
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-cap { bottom:38px; }
+#${HISTORY_LIGHTBOX_ID} .hhb-lb-page { bottom:16px; }
+/* 旧 img 规则已由上方 absolute 版取代（2026-10-21） */
 #${HISTORY_LIGHTBOX_ID} .hhb-lb-cap { color:var(--hhb-lb-fg); font-size:12px; max-width:90vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #${HISTORY_LIGHTBOX_ID} .hhb-lb-page { color:var(--hhb-lb-fg); font-size:12px; font-variant-numeric:tabular-nums; }
 #${HISTORY_LIGHTBOX_ID} .hhb-lb-x { position:absolute; top:10px; right:14px; background:transparent; border:0; color:var(--hhb-lb-fg); font-size:20px; cursor:pointer; line-height:1; padding:0 4px; }
@@ -3718,6 +4171,9 @@ let historyLightboxItems = null; // 当前全屏多图清单（仅长度 ≥2 �
 let historyLightboxIndex = 0;
 let historyLightboxKeyBound = false; // 键盘监听只绑一次（以浮层是否存在为开关）
 let historyLightboxWheelAt = 0; // 滚轮翻页节流时间戳（防触控板惯性连翻）
+// 缩放/平移状态（2026-10-21）：点图放大↔缩回、滚轮缩放、放大态可拖。
+// 每次 openLightbox / 换图都重新 fit，所以不需持久化。
+let hlScale = 1, hlFit = 1, hlTx = 0, hlTy = 0;
 function historyLightboxShowAt(i) {
   const box = document.getElementById(HISTORY_LIGHTBOX_ID);
   const list = historyLightboxItems;
@@ -3729,7 +4185,21 @@ function historyLightboxShowAt(i) {
   const img = box.querySelector("img");
   const cap = box.querySelector(".hhb-lb-cap");
   if (img) {
-    img.onerror = () => { if (img.dataset.fb) return; img.dataset.fb = "1"; img.src = it.fullFallbackUrl || it.fullUrl; };
+    img.onerror = () => {
+      if (!img.dataset.fb) { img.dataset.fb = "1"; img.src = it.fullFallbackUrl || it.fullUrl; return; }
+      img.style.visibility = ""; // 备用图也挂了 → 别把浮层永久留成空白
+    };
+    // 翻页重置缩放（2026-10-21）：上一张的 scale/translate 对新图无意义，
+    // 先清掉 inline transform 与状态，等新图 load 后由 refit 重新居中。
+    //
+    // 2026-10-23 修（用户报：滚轮切换时会先瞬间放大一下再切）：
+    // img.src 换新后、新图解码完成前，浏览器会继续显示上一帧（旧图）；
+    // 而这一帧的 transform 已被清空 → 旧图以原始尺寸铺开，看着就是“先放大”。
+    // 处理：新图就绪（refit 完成）前整张隐藏，彻底消掉中间那一帧。
+    img.style.visibility = "hidden";
+    img.style.transform = "";
+    img.style.cursor = "zoom-in";
+    hlScale = 1; hlFit = 1; hlTx = 0; hlTy = 0;
     img.src = it.fullUrl || "";
     img.alt = it.label ? String(it.label) : "";
   }
@@ -3804,18 +4274,91 @@ function historyOpenLightbox(fullUrl, caption, opts) {
     historyLightboxClose();
   });
   box.append(img, cap, pageEl, prev, next, x);
-  // 点任意处关闭（✕ / 箭头已 stopPropagation，不会重复触发）
+
+  // 单击交互（2026-10-21 用户定）：
+  //   点图片 → 放大 ↔ 缩回（**不关闭**）
+  //   点图片以外（遮罩 / 标题 / 留白）→ 仅关闭大图
+  // 与拖动共存：按下到抬起位移 ≤5px 才算单击，超过当作拖拽平移。
+  const LB_SLOP = 5;
+  let press = null;
+  const atFit = () => Math.abs(hlScale - hlFit) <= hlFit * 0.02 + 1e-6;
+  // 光标（2026-10-21 用户定）：不用小手，用放大/缩小图标。
+  // 还能放大时 zoom-in，已在放大态时 zoom-out（再点就是缩回）。
+  // 提前声明：applyLb 会调它，不能放到 applyLb 后面（TDZ）。
+  let syncCursor = () => {};
+  const applyLb = () => {
+    img.style.transform = `translate(${hlTx}px, ${hlTy}px) scale(${hlScale})`;
+    img.style.transformOrigin = "0 0";
+    syncCursor();
+  };
+  // 以视口坐标 (cx,cy) 为锚点缩放（推导：tx' = cx - (cx-tx)·k）
+  const zoomAt = (next, cx, cy) => {
+    const s2 = Math.max(0.05, Math.min(8, next));
+    if (!(hlScale > 0) || Math.abs(s2 - hlScale) < 1e-9) return;
+    const k = s2 / hlScale;
+    hlTx = cx - (cx - hlTx) * k;
+    hlTy = cy - (cy - hlTy) * k;
+    hlScale = s2;
+    applyLb();
+  };
+  const refit = () => {
+    const nw = img.naturalWidth || 1, nh = img.naturalHeight || 1;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const fit = Math.min(1, (vw * 0.92) / nw, (vh * 0.84) / nh);
+    hlFit = fit; hlScale = fit;
+    hlTx = (vw - nw * fit) / 2;
+    hlTy = (vh - nh * fit) / 2;
+    applyLb();
+    img.style.visibility = ""; // 新图已就绪且按 fit 摆好，此刻才显示（配合翻页隐藏）
+  };
+  img.addEventListener("load", refit);
+  if (img.complete && img.naturalWidth) refit();
+  img.draggable = false;
+  // 光标实现（在 applyLb/atFit 就绪后绑定，applyLb 里调 syncCursor 自动跟随状态）
+  syncCursor = () => {
+    img.style.cursor = atFit() ? "zoom-in" : "zoom-out";
+  };
+  syncCursor();
+
+  img.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) { press = null; return; }
+    press = { x: e.clientX, y: e.clientY, id: e.pointerId, moved: 0, tx: hlTx, ty: hlTy };
+  });
+  img.addEventListener("pointermove", (e) => {
+    if (!press || e.pointerId !== press.id) return;
+    const d = Math.hypot(e.clientX - press.x, e.clientY - press.y);
+    if (d > press.moved) press.moved = d;
+    // 超过阈值就进入拖拽：只改平移，不改缩放
+    if (press.moved > LB_SLOP) {
+      hlTx = press.tx + (e.clientX - press.x);
+      hlTy = press.ty + (e.clientY - press.y);
+      applyLb();
+    }
+  });
+  img.addEventListener("pointerup", (e) => {
+    if (!press || e.pointerId !== press.id) { press = null; return; }
+    const wasClick = press.moved <= LB_SLOP;
+    const cx = e.clientX, cy = e.clientY;
+    press = null;
+    if (!wasClick) return;                                   // 拖过了，不算单击
+    if (atFit()) zoomAt(Math.max(hlFit * 2, 1), cx, cy);     // 放大：至少到 1:1
+    else refit();                                            // 缩回并重新居中
+  });
+  img.addEventListener("pointercancel", () => { press = null; });
+
+  // 点图片以外才关闭（图片自己的单击已在上方消费）
   box.addEventListener("click", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
+    if (ev.target === img) return;                           // 点图：不关
     historyLightboxClose();
   });
-  // 滚轮翻页（多图）：向下/右滚 → 下一张，向上/左滚 → 上一张；单图不拦（不 preventDefault，页面正常滚）。
-  // 节流 220ms 防触控板惯性连翻。不动已有箭头/键盘逻辑。
+  // 滚轮：切图（2026-10-21 用户定：滚轮用于翻图，不用于缩放）。
+  // 单图不拦，否则浮层会把页面滚动锁死；多图保留 220ms 节流防触控板惯性连翻。
   box.addEventListener(
     "wheel",
     (ev) => {
-      if (!historyLightboxItems || historyLightboxItems.length < 2) return; // 单图不翻
+      if (!historyLightboxItems || historyLightboxItems.length < 2) return; // 单图不拦
       ev.preventDefault();
       const d = Math.abs(ev.deltaY) >= Math.abs(ev.deltaX) ? ev.deltaY : ev.deltaX;
       if (!d) return;
@@ -3987,6 +4530,45 @@ function historyNodeStyleEnsure() {
 // 内条堆（统一母题）：全局框各一根；「碰过」的框 → 该框真色（亮），未碰 → 中性灰。
 // barNames=全局框名（singleBar 时传 [null] 退化为单根）；hitSet=碰过的框名 Set（null=旧数据全灰）；
 // colorMap=框名→框色。
+// 单条历史条目自己的内条视图：槽位 = 该提交时的 blocks 顺序，颜色 = 该提交时存的框色。
+// 为什么必须这样（2026-10-20 用户指出）：内条原来按「当前活图块清单」建槽，
+// 靠块名去点亮。提交之后一旦改框色 / 删框 / 改名，旧提交的内条颜色和槽位就跟不上，
+// 表现为「已提交的节点颜色变了 / 条数不对」。历史必须只读历史。
+// 旧条目没有 blocks 或没有 color → 回退活图（保持老行为的可用性）。
+function historyBarsSpecFor(ent, liveNames, liveColorMap, singleBar) {
+  const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : null;
+  if (singleBar || !bl || bl.length === 0) {
+    return { names: liveNames, colorMap: liveColorMap, singleBar: !!singleBar, fromHistory: false };
+  }
+  const names = [];
+  const cmap = new Map();
+  let anyColor = false;
+  for (const b of bl) {
+    if (!b || typeof b !== "object") continue;
+    const nm = b.name == null ? "" : String(b.name);
+    names.push(nm);
+    if (b.source === "group" && typeof b.color === "string" && b.color) {
+      cmap.set(nm, b.color);
+      anyColor = true;
+    }
+  }
+  // 边界：有历史 blocks 但一个颜色都没存（本修复之前写的旧条目）。
+  // 此时**不能回落到活图取色**（那正是「改了框色旧节点跟着变」的病根），
+  // 而是让缺色的条用中性暗色 —— 宁可一致地朴素，也不可错位地鲜艳。
+  if (!anyColor) {
+    return { names, colorMap: cmap, singleBar: false, fromHistory: true,
+             hitSet: Array.isArray(ent.blockNames) ? new Set(ent.blockNames.map(String)) : new Set(names) };
+  }
+  if (names.length === 0) {
+    return { names: liveNames, colorMap: liveColorMap, singleBar: !!singleBar, fromHistory: false };
+  }
+  // 命中集合：该条目 blockNames（由桥侧按 delta 算好）；无则退回「全部亮」
+  const hit = Array.isArray(ent.blockNames)
+    ? new Set(ent.blockNames.map((x) => String(x)))
+    : new Set(names);
+  return { names, colorMap: cmap, singleBar: false, fromHistory: true, hitSet: hit };
+}
+
 function historyBarsBuild(barNames, hitSet, colorMap, singleBar) {
   const bars = document.createElement("div");
   bars.className = "hnode-bars";
@@ -4024,7 +4606,10 @@ function historyBarTickMake(reqId, ent, ctx) {
   // 内条堆（统一母题）：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰；旧数据全灰。
   const legacyTick = historyTickIsLegacy(ent);
   const hitSet = legacyTick ? null : new Set((Array.isArray(ent && ent.blockNames) ? ent.blockNames : []).map((x) => String(x)));
-  const bars = historyBarsBuild(ctx && ctx.allBlocks, hitSet, ctx && ctx.colorMap, !!(ctx && ctx.singleBar));
+  // 优先用「该提交自己的」块顺序与框色（历史只读历史）；旧数据回退活图
+  const _specA = historyBarsSpecFor(ent, ctx && ctx.allBlocks, ctx && ctx.colorMap, !!(ctx && ctx.singleBar));
+  const bars = historyBarsBuild(_specA.names, _specA.fromHistory ? _specA.hitSet : hitSet,
+                                _specA.colorMap, _specA.singleBar);
   tick.appendChild(bars);
   // 合并提交（runs.length > 1）：刻度加粗（.hhb-tick-bulge）；列宽足够（colW >= 10）时再叠 ×N 徽标。
   const runs = ent && Array.isArray(ent.runs) ? ent.runs : [];
@@ -4460,6 +5045,17 @@ function historyBarUpdateAxisFade(axis) {
 
 // 打开弹层（重复调用=切换：先拆旧再建新）。
 // P6-1：参数由 anchor 点改为 group 本体 —— 锚定「框矩形顶部上方」（弹层底边贴近框顶）。
+// 提交历史框重读（2026-10-22）：出图上报后调。
+// 做法是「关掉再按同样视角重开」—— 复用现有 historyBarOpen / historyBarOpenRole 的
+// 全部逻辑（锚点/框过滤/角色块过滤），不另写取数路径。没开着就不动。
+function historyBarReloadIfOpen() {
+  if (!historyBarEl) return;
+  const g = historyBarGroup;
+  const roleName = historyBarRoleName;
+  historyBarClose();
+  if (roleName && typeof historyBarOpenRole === "function") historyBarOpenRole(roleName);
+  else if (g) historyBarOpen(g);
+}
 function historyBarOpen(group) {
   historyBarStyleEnsure();
   historyTickStateClear(); // P6-1：重开 → 三态残留先清
@@ -5196,12 +5792,27 @@ async function historyRollbackExecute() {
       return null;
     });
     if (okGraph === null) throw new Error("画布装载失败（loadGraphData 报错，画布未变）");
-    // P5b（契约 §3.1）：回跳成功 → 写 HEAD = 回跳到的 seq。
-    // 这样「回跳后改再提交」时 parent 指向回跳节点 = 分支。异常吞掉，不影响回跳。
-    try {
-      const backSeq = snap.seq != null ? snap.seq : (sel && sel.seq);
-      if (backSeq != null) historyHeadSet(backSeq, snap.at != null ? snap.at : null);
-    } catch { /* 忽略 */ }
+    // P5b（契约 §3.1）→ 2026-10-23：回跳成功 → 把后端 HEAD 设为回跳到的 seq（.head.json）。
+    // 这样「回跳后改再提交」时后端拿 HEAD 当 parent = 真分叉。
+    // HEAD 由后端 .head.json 持有，前端不落 localStorage（2026-10-23）。
+    // 后端失败：不再全吞 —— console.warn 留痕，但不影响回跳成功提示与流程。
+    const backSeq = snap.seq != null ? snap.seq : (sel && sel.seq);
+    const backAt = snap.at != null ? snap.at : null;
+    if (backSeq != null) {
+      try {
+        const resp = await postJson(HISTORY_HEAD_SET_PATH, withWorkflowId({
+          workflow: currentWorkflowInfo().name,
+          seq: backSeq,
+          at: backAt != null ? backAt : new Date().toISOString(),
+        }));
+        if (!resp || resp.ok !== true) {
+          // postJson 只在网络层抛错；HTTP 4xx/5xx 会正常 resolve，这里也要留痕（不当成功）。
+          console.warn(LOG_TAG, "回跳后写后端 HEAD 失败", resp && resp.status);
+        }
+      } catch (err) {
+        console.warn(LOG_TAG, "回跳后写后端 HEAD 失败", err);
+      }
+    }
     // 成功：关弹层（规格 2）……
     historyRollback.busy = false;
     historyBarClose();
@@ -5340,13 +5951,39 @@ let historyTreeToggleEl = null; // 展开/收起按钮
 let historyTreeSleepEl = null; // 休眠折叠条（+N 休眠分支）
 let historyTreeFadeLEl = null; // 左端渐隐
 let historyTreeFadeREl = null; // 右端渐隐
-let historyTreeGeom = null; // 最近一次渲染几何 {colW,laneH,W,H}（预留）
+let historyTreeGeom = null; // 最近一次渲染几何 {colW,laneH,W,H}（连线路由用；必须为真实值）
+// 缩放（2026-10-22）：滚轮控制提交树的密度，1=默认。
+// 作用在 colW 与 laneH 两个尺度上，范围 0.45~2.2（再小节点就点不中，再大就一屏看不下）。
+// 持久化到 localStorage（用户调好一次不用重复调）。
+const HISTORY_TREE_ZOOM_LS = "hana.historyTreeZoom.v1";
+const HISTORY_TREE_ZOOM_MIN = 0.6;   // 再小节点只剩 5px，点不中（热区 -htr-hot-w 另算但仍太窄）
+const HISTORY_TREE_ZOOM_MAX = 2.2;
+let historyTreeZoomCache = null;
+function historyTreeZoomGet() {
+  if (typeof historyTreeZoomCache === "number") return historyTreeZoomCache;
+  let z = 1;
+  try {
+    const v = parseFloat(localStorage.getItem(HISTORY_TREE_ZOOM_LS));
+    if (isFinite(v)) z = Math.max(HISTORY_TREE_ZOOM_MIN, Math.min(HISTORY_TREE_ZOOM_MAX, v));
+  } catch { /* 忽略 */ }
+  historyTreeZoomCache = z; return z;
+}
+function historyTreeZoomSet(z) {
+  const next = Math.max(HISTORY_TREE_ZOOM_MIN, Math.min(HISTORY_TREE_ZOOM_MAX, z));
+  if (Math.abs(next - historyTreeZoomGet()) < 0.001) return false;
+  historyTreeZoomCache = next;
+  try { localStorage.setItem(HISTORY_TREE_ZOOM_LS, String(next)); } catch { /* 忽略 */ }
+  return true;
+}
 // 视角（时序 / 紧凑）：全局一种，localStorage 持久化（2026-10-14）。
-const HISTORY_TREE_VIEW_LS = "hana.historyTreeView.v1"; // "time" | "compact"
+const HISTORY_TREE_VIEW_LS = "hana.historyTreeView.v2"; // "time" | "compact"（v1→v2：2026-10-22 换默认值，旧偏好作废）
 let historyTreeViewMode = null;
 function historyTreeViewGet() {
   if (historyTreeViewMode === "time" || historyTreeViewMode === "compact") return historyTreeViewMode;
-  let m = "compact"; // 2026-10-14：默认视角 time→compact（仅 localStorage 无值时；有历史选择仍按历史）
+  let m = "time"; // 2026-10-22：默认视角 compact→time（用户明确要求「按时序和规则」）
+  // 为什么改回时序：compact 下 x = 父x+1，多个提交会挤在同一 x 上，
+  // 跨行的竖段全堆在同一道缝里 → 必然相互穿插，怎么排轨道都不够。
+  // 时序下每个提交独占一个 x，竖段只跨 1 格，根本不会长穿。
   try { const v = localStorage.getItem(HISTORY_TREE_VIEW_LS); if (v === "compact" || v === "time") m = v; } catch { /* 忽略 */ }
   historyTreeViewMode = m; return m;
 }
@@ -5357,9 +5994,15 @@ function historyTreeViewSet(m) {
 let historyTreeOpen = false; // 展开态（内存镜像；持久化走 historyTreeState*）
 let historyTreeReqId = 0; // 竞态哨兵：重渲染/收起后递增，在途旧响应作废
 let historyTreeEntries = []; // 最近一次成功 fetch 的 entries（resize 重画连线用，不 refetch）
+// 2026-10-23：后端 HEAD（history-list 响应的 data.head），小黄点数据源。展开/收起时都更新。
+let historyTreeHead = null;
+// 2026-10-23（用户定）：首次渲染把 HEAD 滚到视口中间（他反馈「新开画布看不见节点在哪，得找」）。
+// 每个工作流只自动居中一次；切换工作流重置，之后的重渲染（resize / 提交刷新）不抢用户当前的滚动位置。
+let historyTreeCenteredOnce = false;
+let historyTreeCenteredFor = null;
 let historyTreeDragEndAt = -1e9; // 最近一次「带位移拖拽」结束时刻（远过去=无；节点 click 与拖拽消歧用，见 historyTreeNodeClick）
 
-// —— 收纳状态存取（键结构同 historyHeadKey；pageKey 取不到 → 不持久化，按收纳默认）——
+// —— 收纳状态存取（键结构同 copilot 页键；pageKey 取不到 → 不持久化，按收纳默认）——
 function historyTreeLsKey() {
   try {
     const pk = historyPageKey();
@@ -5506,16 +6149,25 @@ function historyTreeStyleEnsure() {
 #${HISTORY_TREE_ID} .tcanvas::-webkit-scrollbar { display: none; }
 #${HISTORY_TREE_ID} .tcanvas.htr-dragging { cursor: grabbing; }
 #${HISTORY_TREE_ID} .lanes { position: relative; height: 100%; }
-/* 泳道基准线：每条显示泳道一根 1px 微亮横线 */
+/* 泳道基准线（2026-10-22 改）：从「横贯面板」改成「左侧短标记」。
+   旧：left:0; right:0 → 一整条横线贯穿。跨泳道连线每穿一条泳道就在它上面切一个
+   十字，用户看到的就是「连线跟泳道交叉」——那些长横线就是基准线本身。
+   现：只留左侧 18px 一段作泳道标识，右边整条不再画 → 竖线与它碰不上。 */
 #${HISTORY_TREE_ID} .htr-laneaxis {
-  position: absolute; left: 0; right: 0; height: 1px;
+  position: absolute; left: 0; width: 18px; height: 1px;
   background: var(--htr-lane); pointer-events: none;
+}
+/* 泳道序号：贴在左侧标记右边，跟着内容一起横滚（说明该行是第几条泳道） */
+#${HISTORY_TREE_ID} .htr-laneaxis::after {
+  content: attr(data-lane);
+  position: absolute; left: 22px; top: -5px;
+  font-size: 9px; line-height: 1; color: var(--htr-sub); opacity: .5;
 }
 /* 节点（统一母题）：外框 = 线型(操作)+色(谁)；内条堆 = 本次碰过的画布框（框色，见 .hnode-bar） */
 #${HISTORY_TREE_ID} .node {
   position: absolute; transform: translate(-50%, -50%);
   display: flex; flex-direction: column; align-items: stretch;
-  width: var(--nw, 10px); min-width: 6px; min-height: 22px; /* 2026-10-12：节点加高 18→22（laneH 36 不变 → 行内仍留 ≥14px 间隙） */
+  width: var(--nw, 10px); min-width: 6px; height: var(--htr-node-h, 22px); min-height: var(--htr-node-h, 22px); /* 2026-10-22：高改由变量控制（随缩放），旧值 22 写死 */
   padding: 2px 0; margin: 0; box-sizing: border-box; /* 3a修（2026-10-13）：横向 padding 1.5px→0，内条出血贴外框内侧 */
   border: 2px solid color-mix(in oklab, var(--htr-c, #5aa0d8) 60%, transparent); border-style: solid; border-radius: 4.5px; /* 3a修：统一 2px，与框节点同口径 */ /* 第8条：border-color 半透明 → 发光描边 */
   background: var(--htr-node-bg); cursor: pointer; z-index: 1; /* 连线层之下（.htr-edges z-index:0） */ /* 2026-10-14：底色不透明——连线经过节点矩形时被遮住，不再透出 */
@@ -5636,39 +6288,56 @@ function historyTreeStyleEnsure() {
 // row = lane（2026-10-12 去折叠：全量显示，不再出现 row=-1）。
 // G 算法（2026-10-14）：新分支插到父泳道正下方（消交叉）。
 // 确定性：同输入两次 deepEqual（不依赖遍历顺序；同 parent 多 child 时 seq 最小者先接手）。
-function commitGraphLanes(entries) {
-  if (!Array.isArray(entries) || entries.length === 0) {
-    return { lanes: [], nodes: [], rows: 0, sleepingCount: 0 };
-  }
-  // (1) 泳道分配（单遍，seq 升序）——泳道对象数组，物理顺序即行序（lanes[0] 在最上）
-  const lanes = []; // { head: seq|null, seqs: [] }；只增不回收
-  const objOf = new Map(); // seq -> 泳道对象（该 seq 所在泳道）
-  const nodeLane = []; // 与 entries 同序的「泳道对象」
-  for (let i = 0; i < entries.length; i += 1) {
+// 单遍插入式分配（2026-10-22 按用户规则重写）：
+//
+// 用户定的规则（原话）：
+//   「出分支 → 放在父泳道下方 → 父泳道下方的泳道全部往下平移一泳道」
+//   「不要只往下，初始泳道上，奇数次的分支往下，偶数次的分支往上」
+//   「除了初始泳道的其他泳道，在上方的向上分支，在下方的向下分支」
+//
+// 即：新分支永远插在**紧邻父泳道**的位置（不开到列表末尾），
+//     插入方向按上方的规则选，插入后其余泳道自然平移一格。
+//     这样父子泳道永远相邻，汇聚边绝不会跨越无关泳道。
+//
+// 返回泳道对象数组（物理顺序即上下顺序）与每节点所属泳道对象。
+function assignLanesRaw(entries) {
+  const lanes = [];
+  const objOf = new Map();
+  const nodeLane = [];
+  const branchCount = new Map(); // 每条泳道已分出多少个分支（奇偶决定方向）
+  let rootLane = null;          // 初始泳道（第一个建立的）
+
+  for (let i = 0; i < entries.length; i++) {
     const e = entries[i] || {};
     const seq = e.seq;
     const p = e.parent;
     let target = null;
-    // ① 延续：找 head === p 的泳道
-    // parent 必须是 < seq 的整数；孤儿 / parent>=seq / 非整数 / 缺失 一律视同根
+    // 继承：「父是本泳道最新提交」→ 继续用这条泳道
     if (Number.isInteger(p) && p < seq) {
-      for (const lane of lanes) {
-        if (lane.head === p) {
-          target = lane;
-          break;
-        }
-      }
+      for (const lane of lanes) { if (lane.head === p) { target = lane; break; } }
     }
-    // ② 新分支：插到父泳道正下方；父泳道不存在 → append
     if (!target) {
-      const pObj = Number.isInteger(p) && p < seq ? objOf.get(p) : null;
+      const pObj = (Number.isInteger(p) && p < seq) ? objOf.get(p) : null;
+      target = { head: null, seqs: [] };
       if (pObj) {
-        const pos = lanes.indexOf(pObj) + 1;
-        target = { head: null, seqs: [] };
-        lanes.splice(pos, 0, target);
+        if (!rootLane) rootLane = pObj;
+        const pIdx = lanes.indexOf(pObj);
+        const rootIdx = lanes.indexOf(rootLane);
+        let up;
+        if (pObj === rootLane) {
+          // 初始泳道分叉：奇数次往下、偶数次往上
+          const n = (branchCount.get(pObj) || 0) + 1;
+          branchCount.set(pObj, n);
+          up = (n % 2 === 0);
+        } else {
+          // 其余泳道：在初始泳道上方的一律向上、下方的一律向下
+          up = pIdx < rootIdx;
+        }
+        if (up) lanes.splice(pIdx, 0, target);
+        else lanes.splice(pIdx + 1, 0, target);
       } else {
-        target = { head: null, seqs: [] };
         lanes.push(target);
+        if (!rootLane) rootLane = target;
       }
     }
     target.head = seq;
@@ -5676,19 +6345,108 @@ function commitGraphLanes(entries) {
     objOf.set(seq, target);
     nodeLane.push(target);
   }
-  // (2) 全量显示（2026-10-12：取消 LANES_MAX_ROWS 折叠）——所有泳道全部显示：
-  //     row = lane、rows = laneCount、sleepingCount 恒 0（lanes[].sleeping 恒 false）。
-  //     泳道多时由 .tcanvas 拖拽/滚动查看（见 2c）。逻辑与 app/lib/commit-graph-lanes.mjs 逐条一致。
-  const laneIndex = new Map();
-  lanes.forEach((lane, idx) => laneIndex.set(lane, idx));
+  return { lanes, nodeLane };
+}
+
+// 几何交叉：两条「子→父」线段在 y 区间重叠内是否交换左右。共用端点不算。
+function countCrossings(entries, laneOfSeq) {
+  const edges = [];
+  for (const e of entries) {
+    if (!Number.isInteger(e.parent)) continue;
+    const c = laneOfSeq.get(e.seq), p = laneOfSeq.get(e.parent);
+    if (c === undefined || p === undefined) continue;
+    edges.push({ x1: e.seq, y1: c, x2: e.parent, y2: p });
+  }
+  let cross = 0;
+  for (let i = 0; i < edges.length; i++) {
+    const a = edges[i];
+    for (let j = i + 1; j < edges.length; j++) {
+      const b = edges[j];
+      if (a.x1 === b.x1 || a.x2 === b.x2 || a.x1 === b.x2 || a.x2 === b.x1) continue;
+      const aLo = Math.min(a.y1, a.y2), aHi = Math.max(a.y1, a.y2);
+      const bLo = Math.min(b.y1, b.y2), bHi = Math.max(b.y1, b.y2);
+      if (aHi < bLo || bHi < aLo) continue;
+      const yl = Math.max(aLo, bLo), yh = Math.min(aHi, bHi);
+      if (yl > yh) continue;
+      const xa = (y) => a.y1 === a.y2 ? a.x1 : a.x1 + (a.x2 - a.x1) * (y - a.y1) / (a.y2 - a.y1);
+      const xb = (y) => b.y1 === b.y2 ? b.x1 : b.x1 + (b.x2 - b.x1) * (y - b.y1) / (b.y2 - b.y1);
+      if ((xa(yl) - xb(yl)) * (xa(yh) - xb(yh)) < 0) cross++;
+    }
+  }
+  return cross;
+}
+
+// 跨道：边跨越中间泳道时，那条泳道在该 x 区间内有节点（视觉上也难读，一并计入代价）
+function countLaneHops(entries, laneOfSeq, xOfSeq) {
+  const laneXs = new Map();
+  for (const [seq, l] of laneOfSeq) {
+    if (!laneXs.has(l)) laneXs.set(l, []);
+    laneXs.get(l).push(xOfSeq.get(seq));
+  }
+  let hops = 0;
+  for (const e of entries) {
+    if (!Number.isInteger(e.parent) || !laneOfSeq.has(e.parent)) continue;
+    const lo = Math.min(laneOfSeq.get(e.seq), laneOfSeq.get(e.parent));
+    const hi = Math.max(laneOfSeq.get(e.seq), laneOfSeq.get(e.parent));
+    const xlo = Math.min(xOfSeq.get(e.parent), xOfSeq.get(e.seq));
+    const xhi = Math.max(xOfSeq.get(e.parent), xOfSeq.get(e.seq));
+    for (let L = lo + 1; L < hi; L++) {
+      if ((laneXs.get(L) || []).some((x) => x > xlo && x < xhi)) hops++;
+    }
+  }
+  return hops;
+}
+
+// 代价：交叉权重更高（交叉比跨道更难读），跨道 1 分。
+function scoreOf(entries, laneOfSeq, xOfSeq) {
+  const cross = countCrossings(entries, laneOfSeq);
+  const hops = countLaneHops(entries, laneOfSeq, xOfSeq);
+  return { cross, hops, score: cross * 2 + hops };
+}
+
+
+
+function commitGraphLanes(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { lanes: [], nodes: [], rows: 0, sleepingCount: 0, cost: { cross: 0, hops: 0, score: 0 } };
+  }
+
+  // (1) 分配（插入式：新分支紧邻父泳道，插入后其余泳道平移一格）
+  const { lanes } = assignLanesRaw(entries);
+  const laneSeqs = lanes.map((l) => l.seqs.slice());
+  const laneOfSeq = new Map();
+  laneSeqs.forEach((seqs, i) => { for (const s of seqs) laneOfSeq.set(s, i); });
+
+  // (2) 不再做重排（2026-10-22 去）：插入式分配已保证父子泳道相邻，
+  //     即「新分支紧贴原泳道、其余泳道顺势平移」，不需要事后优化顺序。
+  //     重排反而会把这种天然的相邻关系打乱（历史 bug 源）。
+  //     下面只算代价，纯供诊断用。
+  const xOfSeq = new Map(entries.map((e, i) => [e.seq, i]));
+  const score = scoreOf(entries, laneOfSeq, xOfSeq);
+
+  // (3) 全量显示
   const nodes = [];
-  for (let i = 0; i < entries.length; i += 1) {
-    const lane = laneIndex.get(nodeLane[i]);
+  for (let i = 0; i < entries.length; i++) {
+    const lane = laneOfSeq.get(entries[i].seq);
     nodes.push({ seq: entries[i].seq, lane, row: lane });
   }
-  const outLanes = lanes.map((lane, idx) => ({ lane: idx, headSeq: lane.head, sleeping: false }));
-  return { lanes: outLanes, nodes, rows: lanes.length, sleepingCount: 0 };
+  const outLanes = laneSeqs.map((seqs, idx) => ({
+    lane: idx,
+    headSeq: seqs.length ? seqs[seqs.length - 1] : null,
+    sleeping: false,
+  }));
+
+  return {
+    lanes: outLanes,
+    nodes,
+    rows: laneSeqs.length,
+    sleepingCount: 0,
+    cost: score,
+  };
 }
+
+
+
 
 // 计数：N 节点；M 分支（parent 被 ≥2 个节点指向的 parent 数）；K 泳道（总泳道数，全量显示、无折叠）。
 function historyTreeUpdateCounts(entries) {
@@ -5701,9 +6459,14 @@ function historyTreeUpdateCounts(entries) {
   }
   let branches = 0;
   for (const v of cnt.values()) if (v >= 2) branches += 1;
-  const graph = commitGraphLanes(entries);
+  // mergeInto 行是「与前一提交结构相同、只多了次运行」的合并记录，
+  // 它们没有独立快照、也没有 blocks，**不应渲染成独立节点**。
+  // 实测：某工作流 156 条索引里 131 条是 mergeInto，全被当成节点画出来，
+  // 且因缺 blocks 被打上 data-legacy → 整棵树一片 55% 淡化（用户报「都不亮了」）。
+  const solidEntries = (Array.isArray(entries) ? entries : []).filter((e) => e && e.mergeInto == null);
+  const graph = commitGraphLanes(solidEntries);
   historyTreeCountEl.textContent =
-    entries.length + " 节点 · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
+    solidEntries.length + " 节点 · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
 }
 
 // 纯函数（自测用）：entries: [{seq,parent}]（seq 升序）；mode: "time"|"compact"。
@@ -5746,9 +6509,11 @@ function historyTreeRenderTree(entries) {
     if (sleepEl) sleepEl.classList.remove("htr-sleep-on");
     return { nodeEls: new Map(), graph: null };
   }
-  const graph = commitGraphLanes(entries);
+  // 与计数函数同口径：mergeInto 行不渲染（它们没有独立快照，只有「并进前一条」的语义）
+  const solidEntries = (Array.isArray(entries) ? entries : []).filter((e) => e && e.mergeInto == null);
+  const graph = commitGraphLanes(solidEntries);
   const bySeq = new Map(); // seq → ent
-  for (const ent of entries) {
+  for (const ent of solidEntries) {
     if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
   }
   // 时间轴等距（2026-10-12 修）：每个「可见提交」占等宽一格。
@@ -5768,17 +6533,29 @@ function historyTreeRenderTree(entries) {
   for (const v of xOf.values()) if (v > maxX) maxX = v;
   const cols = maxX + 1;
   const availW = (historyTreeCanvasEl && historyTreeCanvasEl.clientWidth) || 320;
-  const colW = Math.max(28, Math.min(56, (availW - 24) / cols)); // 2026-10-14：下限 16→28（拉大列距，给跨泳道过渡留空间；面板可横滚，宽度增加可接受）
-  const laneH = 36; // 泳道行高（节点加高到 22 → 相邻行仍留 ≥14px 间隙，laneH 不变）
+  // 2026-10-22：colW / laneH 受缩放控制。默认（zoom=1）比旧版紧凑（18~48 对旧 28~56）。
+  // 缩小只影响格子密度：节点最小仍有 ~7px（热区是另一套 --htr-hot-w，不受这影响）。
+  const zoomZ = historyTreeZoomGet();
+  const colWMin = Math.max(7, 18 * zoomZ);
+  const colWMax = Math.max(colWMin + 1, 48 * zoomZ);
+  const colW = Math.max(colWMin, Math.min(colWMax, ((availW - 24) / cols) * zoomZ));
+  const laneH = Math.max(14, Math.round(36 * zoomZ)); // 泳道行高随缩放，下限 14（再低就上下重叠）
   const nw = Math.max(5, Math.min(colW - 3, colW * 0.42)); // 2026-10-14：0.45→0.42（略瘦，多留间隙）
   const nwBulge = Math.min(nw + 10, colW - 3); // 第8条：多块更宽（+8→+10，封顶 colW-3）→ 单/多差拉大
+  // 节点高度随缩放（2026-10-22）：旧版写死 22；缩小后 22 会撑满整行导致上下撞。
+  // 不高于 laneH-6（至少留 6px 行间缝），不低于 8（再小点不中）。
+  const nodeH = Math.max(8, Math.min(22, Math.round(22 * zoomZ), laneH - 6));
   // 内容宽只由内容决定（cols * colW），绝不被容器宽绑架（去 maxSeq*colW / availW-4，防右侧假留白）
-  const W = cols * colW;
+  // 2026-10-22：右侧留白 = 半个视口宽。
+  // 目的：最右侧的提交节点能被拖到面板中间（否则它永远贴在右边缘，改不了、看不全上下文）。
+  // 留白 = clientWidth/2 刚好够把最右节点滚到中线。
+  const rightPad = Math.max(24, ((historyTreeCanvasEl && historyTreeCanvasEl.clientWidth) || 320) / 2);
+  const W = cols * colW + rightPad;
   // 2026-10-12：内容高 = 全量泳道（rows=laneCount）；视口（.tcanvas）高封顶 ≤200，多的靠拖/滚查看。
   // .lanes 取内容全高 → 连线层（height:100%）不被截，SVG 也不再被 300×150 缺省视口裁。
   const contentH = Math.max(46, graph.rows * laneH + 6);
   const H = Math.min(200, contentH); // 视口高上限 200（面板不占满屏）
-  historyTreeGeom = { colW, laneH, W, H: contentH };
+  historyTreeGeom = { colW, laneH, nodeH, W, H: contentH, rightPad };
   tree.style.width = W + "px";
   tree.style.height = contentH + "px";
   if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 视口高封顶（内容可拖/滚）
@@ -5798,7 +6575,7 @@ function historyTreeRenderTree(entries) {
     // 活图取不到（无画布 / 异常）→ 退回旧行为：entries 的 blocks[].name 并集（首次出现序），保证不炸。
     globalBlocks = [];
     const seen = new Set();
-    for (const ent of entries) {
+    for (const ent of solidEntries) {
       const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
       for (const b of bl) {
         if (!b || typeof b !== "object") continue;
@@ -5812,15 +6589,17 @@ function historyTreeRenderTree(entries) {
   }
   const singleBar = globalBlocks.length === 0;
   const liveColors = historyLiveBlockColors(); // 内条色 = 画布框色（整树算一次）
-  // 泳道基准线（每条显示泳道一根 1px 横线）
+  // 泳道基准标记（2026-10-22 改）：左侧短标记 + 泳道序号，不再横贯面板。
+  // 旧版 left:0;right:0 的长横线会被跨泳道竖线切出十字 —— 用户报的「连线跟泳道交叉」就是它。
   for (let row = 0; row < graph.rows; row += 1) {
     const ax = document.createElement("div");
     ax.className = "htr-laneaxis";
     ax.style.top = row * laneH + laneH / 2 + "px";
+    ax.dataset.lane = String(row + 1); // 序号标注（CSS ::after）
     tree.appendChild(ax);
   }
   const nodeEls = new Map(); // seq → 节点元素（连线测量用）
-  const head = historyHeadGet();
+  const head = historyTreeHead; // 2026-10-23：小黄点跟后端 HEAD（historyTreeRefresh 缓存），不读 localStorage
   for (const nd of graph.nodes) {
     if (!nd || nd.row < 0) continue; // 去折叠后不会出现（保留兜底）
     const ent = bySeq.get(nd.seq);
@@ -5844,6 +6623,7 @@ function historyTreeRenderTree(entries) {
     node.style.top = nd.row * laneH + laneH / 2 + 3 + "px";
     node.style.setProperty("--nw", nw + "px");
     node.style.setProperty("--nw-bulge", nwBulge + "px"); // 第7条：多块宽（已 clamp colW-2）
+    node.style.setProperty("--htr-node-h", nodeH + "px"); // 2026-10-22：节点高随缩放
     // 2026-10-14：透明热区尺寸——横向节点+12 但封顶 colW-2（防相邻重叠），纵向留 8px 行间拖动带。
     // ⚠️ 必须 clamp（下限+上限都夹）：max(baseW+12, colW-2) 在合并节点时 baseW 大会突破上限 → 盖到邻列。
     const baseW = runsN > 1 ? nwBulge : nw;
@@ -5853,7 +6633,10 @@ function historyTreeRenderTree(entries) {
     node.style.setProperty("--htr-hot-h", hotH + "px");
     if (colW < 14) node.dataset.tight = "1"; // 密档降级
     // 统一母题内条堆：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰
-    node.appendChild(historyBarsBuild(globalBlocks, hitSet, liveColors, singleBar));
+    // 同 A：内条槽位与颜色取该提交自己的快照
+    const _specB = historyBarsSpecFor(ent, globalBlocks, liveColors, singleBar);
+    node.appendChild(historyBarsBuild(_specB.names, _specB.fromHistory ? _specB.hitSet : hitSet,
+                                      _specB.colorMap, _specB.singleBar));
     // ×N 徽标（合并提交；colW < 10 不渲染）
     if (runsN > 1 && colW >= 10) {
       const badge = document.createElement("span");
@@ -5886,8 +6669,27 @@ function historyTreeRenderTree(entries) {
       sleepEl.classList.remove("htr-sleep-on");
     }
   }
-  // 打开定位到最新（最右）
-  if (historyTreeCanvasEl) historyTreeCanvasEl.scrollLeft = historyTreeCanvasEl.scrollWidth;
+  // 打开定位（2026-10-23 用户定）：首次渲染把「当前编辑节点」（HEAD）滚到视口中间；
+  // 找不到 HEAD 才退回「最右贴边」。之后的重渲染不抢滚动位置。
+  if (historyTreeCanvasEl) {
+    const c = historyTreeCanvasEl;
+    if (!historyTreeCenteredOnce) {
+      historyTreeCenteredOnce = true;
+      const hseq = head && xOf.has(head.seq) ? head.seq : null;
+      if (hseq != null) {
+        const hnd = (graph.nodes || []).find((n) => n && n.seq === hseq);
+        const cxp = (xOf.get(hseq) + 0.5) * colW;
+        const cyp = hnd ? hnd.row * laneH + laneH / 2 : contentH / 2;
+        const maxL = Math.max(0, Math.max(W, c.scrollWidth || 0) - c.clientWidth);
+        const maxT = Math.max(0, contentH - c.clientHeight);
+        c.scrollLeft = Math.max(0, Math.min(maxL, cxp - c.clientWidth / 2));
+        c.scrollTop = Math.max(0, Math.min(maxT, cyp - c.clientHeight / 2));
+      } else {
+        const contentOnly = cols * colW;   // 不含右侧留白的内容宽
+        c.scrollLeft = Math.max(0, contentOnly - c.clientWidth);
+      }
+    }
+  }
   historyTreeUpdateFade();
   return { nodeEls, graph };
 }
@@ -5978,9 +6780,37 @@ function historyTreeEnsure() {
   sleep.className = "htr-sleep";
   panel.append(tcanvas, fadeL, fadeR, sleep);
   // 横向滚轮（同框口径：ΔX 优先，否则 ΔY；到两端放行）+ scroll 渐隐
+  // 2026-10-22：Ctrl/Shift + 滚轮 = 缩放；普通滚轮保持原来的横/纵向滚动。
+  // 缩放锚定鼠标位置：记下鼠标在内容坐标系里的点，重渲染后把同一点拉回鼠标下，不跳。
   tcanvas.addEventListener(
     "wheel",
     (ev) => {
+      // —— 缩放（2026-10-22）：直接滚轮 = 缩放（用户要求）。
+      // 平移改用：Shift + 滚轮 / 拖动 / 底部滚动条。
+      {
+        ev.preventDefault();
+        const oldZoom = historyTreeZoomGet();
+        const step = ev.deltaY > 0 ? -1 : 1;
+        const next = Math.max(HISTORY_TREE_ZOOM_MIN, Math.min(HISTORY_TREE_ZOOM_MAX, oldZoom * (step > 0 ? 1.12 : 1 / 1.12)));
+        if (Math.abs(next - oldZoom) < 0.001) return;
+        // 锚点：鼠标相对 tcanvas 视口的位置 + 当前 scroll = 内容坐标
+        const rect = tcanvas.getBoundingClientRect();
+        const mx = ev.clientX - rect.left;
+        const my = ev.clientY - rect.top;
+        const cx = tcanvas.scrollLeft + mx;
+        const cy = tcanvas.scrollTop + my;
+        const ratio = next / oldZoom;
+        historyTreeZoomSet(next);
+        const res = historyTreeRenderTree(historyTreeEntries);
+        if (res && res.nodeEls) historyTreeDrawEdges(res.nodeEls, res.graph);
+        // 重渲染后内容尺寸变了 → 把锚点拉回鼠标下（下一帧，等布局定型）
+        requestAnimationFrame(() => {
+          tcanvas.scrollLeft = cx * ratio - mx;
+          tcanvas.scrollTop = cy * ratio - my;
+          historyTreeUpdateFade();
+        });
+        return;
+      }
       // 2026-10-12：纵向可滚且是纵向滚（|ΔY|≥|ΔX|）→ 放行原生纵向滚动（泳道多时看下方）
       if (tcanvas.scrollHeight > tcanvas.clientHeight && Math.abs(ev.deltaY) >= Math.abs(ev.deltaX)) return;
       if (tcanvas.scrollWidth <= tcanvas.clientWidth) return; // 不可横滚 → 放行
@@ -6073,6 +6903,11 @@ async function historyTreeRefresh() {
   } catch {
     wfName = "";
   }
+  // 换工作流 = 新画布：允许下次渲染重新把 HEAD 居中（同工作流内保持用户滚动位置）
+  if (wfName !== historyTreeCenteredFor) {
+    historyTreeCenteredFor = wfName;
+    historyTreeCenteredOnce = false;
+  }
   try {
     // 照抄弹层取法（HISTORY_LIST_PATH = /hana_bridge/history-list，fetchApi 自动加 /api 前缀）
     const resp = await api.fetchApi(HISTORY_LIST_PATH + withWorkflowIdQs("?workflow=" + encodeURIComponent(wfName)), {
@@ -6084,6 +6919,9 @@ async function historyTreeRefresh() {
     if (reqId !== historyTreeReqId) return; // 已有更新的 refresh / 已收起重开：作废
     const entries = Array.isArray(data.entries) ? data.entries : [];
     historyTreeEntries = entries; // 缓存：resize 重画连线用，不 refetch
+    // 2026-10-23：HEAD 以后端为准（data.head = {seq, at} | null）。
+    // 收起着（只更计数、不渲染）也要更新，否则下次展开渲染的小黄点会停在旧值。
+    historyTreeHead = (data && data.head && typeof data.head.seq === "number") ? data.head : null;
     historyTreeUpdateCounts(entries);
     if (historyTreeEl && historyTreeEl.classList.contains("htr-open") && historyTreeTreeEl) {
       const res = historyTreeRenderTree(entries);
@@ -6321,6 +7159,36 @@ function historyTreePick(tick, ent) {
 //  · 同 row → 水平直线
 //  · 跨 row → 圆角贝塞尔 M x1,y1 C mx,y1 mx,y2 x2,y2
 //  · 一端在折叠泳道（row=-1，即节点未渲染）→ 淡出为水平短线 opacity .18（表示此处有分支被折叠）
+// 折线 → 圆角路径（2026-10-23 用户定「连线换成曲线」）：
+// 不动骨架——行间隙轨道、侧向接入的 L 形、跨道轨道错开全部照旧，只把每个拐角用二次贝塞尔磨圆。
+// 半径按相邻两段长度的一半自动收窄，短段不会被切出倒刺；2 点直线原样输出。
+function roundedPolyline(pts, radius) {
+  const n = Array.isArray(pts) ? pts.length : 0;
+  if (n < 2) return "";
+  const f1 = (v) => v.toFixed(1);
+  let s = "M" + f1(pts[0].x) + " " + f1(pts[0].y);
+  if (n === 2) return s + "L" + f1(pts[1].x) + " " + f1(pts[1].y);
+  for (let i = 1; i < n - 1; i++) {
+    const p0 = pts[i - 1];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const d1 = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+    const d2 = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const r = Math.min(radius, d1 / 2, d2 / 2);
+    if (!(r >= 0.6) || !(d1 > 0) || !(d2 > 0)) {
+      s += "L" + f1(p1.x) + " " + f1(p1.y);
+      continue;
+    }
+    const ax = p1.x + ((p0.x - p1.x) / d1) * r;
+    const ay = p1.y + ((p0.y - p1.y) / d1) * r;
+    const bx = p1.x + ((p2.x - p1.x) / d2) * r;
+    const by = p1.y + ((p2.y - p1.y) / d2) * r;
+    s += "L" + f1(ax) + " " + f1(ay);
+    s += "Q" + f1(p1.x) + " " + f1(p1.y) + " " + f1(bx) + " " + f1(by);
+  }
+  return s + "L" + f1(pts[n - 1].x) + " " + f1(pts[n - 1].y);
+}
+
 // nodeEls/graph 均来自 historyTreeRenderTree；rAF 等一帧布局稳定后测量。
 function historyTreeDrawEdges(nodeEls, graph) {
   const tree = historyTreeTreeEl;
@@ -6329,15 +7197,14 @@ function historyTreeDrawEdges(nodeEls, graph) {
   for (const ent of historyTreeEntries) {
     if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
   }
-  const rowOf = new Map(); // seq → row（来自算法结果；未渲染时也能查折叠）
+  const rowOf = new Map();
   if (graph && Array.isArray(graph.nodes)) {
     for (const nd of graph.nodes) if (nd) rowOf.set(nd.seq, nd.row);
   }
-  // 渲染时 tree.textContent="" 已清掉旧 svg，这里新挂一层
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("class", "htr-edges");
   tree.appendChild(svg);
-  const geom = historyTreeGeom || { colW: 6, laneH: 40 };
+  const geom = historyTreeGeom || { colW: 40, laneH: 36, nodeH: 22 };
   requestAnimationFrame(() => {
     let tr = null;
     try {
@@ -6345,101 +7212,223 @@ function historyTreeDrawEdges(nodeEls, graph) {
     } catch {
       return;
     }
-    if (!tr || (!tr.width && !tr.height)) return; // 已收起 / 不可见：不画
-    let d = "";
-    let faded = "";
-    // P8：端点从节点中心裁剪到节点外框边缘（线与节点间留缝，不再穿框/被填充盖住）。
-    // rect: {l,t,r,b}（相对 tree）；从 (cx,cy) 朝 (tx,ty) 方向求与外框边界的交点。
-    const trimToEdge = (rect, cx, cy, tx, ty) => {
-      const dx = tx - cx;
-      const dy = ty - cy;
-      let t = 1;
-      if (dx > 1e-6) t = Math.min(t, (rect.r - cx) / dx);
-      else if (dx < -1e-6) t = Math.min(t, (rect.l - cx) / dx);
-      if (dy > 1e-6) t = Math.min(t, (rect.b - cy) / dy);
-      else if (dy < -1e-6) t = Math.min(t, (rect.t - cy) / dy);
-      if (!isFinite(t) || t < 0) t = 0;
-      return { x: cx + dx * t, y: cy + dy * t };
+    if (!tr || (!tr.width && !tr.height)) return;
+
+    // ── 几何 ────────────────────────────────────────────────────────────
+    let cw = (geom && geom.colW) || 40;
+    if (!(cw >= 12)) cw = 40;
+    const lh = (geom && geom.laneH) || 36;
+    const nh = (geom && geom.nodeH) || 22;
+    const off3 = Math.max(1, Math.round(3 * (lh / 36)));
+    const cyOf = (row) => row * lh + lh / 2 + off3;
+    const botOf = (row) => cyOf(row) + nh / 2;
+    const topOf = (row) => cyOf(row) - nh / 2;
+    const corrOf = (row) => {
+      const rowBottom = (row + 1) * lh;
+      const gap = Math.max(1, rowBottom - botOf(row));
+      return rowBottom - gap / 2;
     };
-    // 2026-10-14：跨泳道分叉错开用——按父 seq 计数（同一父的第几个跨泳道子，从 0 起）。
-    const branchCount = new Map();
+
+    // ── 第一遍：收集边 ──────────────────────────────────────────────────
+    const edges = [];
+    const fadedParts = [];
+    const TRACK_GAP = 2.5;
+
+    // 各泳道节点的 x 区间（按真实 DOM 量一次），供「侧向接入是否挡路」判定用。
+    const xRangesByRow = new Map();
+    for (const [sq, el] of nodeEls) {
+      const r = rowOf.get(sq);
+      if (r == null) continue;
+      let rc = null;
+      try { rc = el.getBoundingClientRect(); } catch { continue; }
+      if (!rc || !rc.width) continue;
+      const l = rc.left - tr.left;
+      const rr = rc.right - tr.left;
+      if (!xRangesByRow.has(r)) xRangesByRow.set(r, []);
+      xRangesByRow.get(r).push({ seq: sq, l, r: rr });
+    }
+    // 目标泳道在 [xa,xb] 这段水平区间内是否有其它节点占位（含子节点自己则排除）。
+    const laneBlocked = (row, exceptSeq, xa, xb) => {
+      const lo = Math.min(xa, xb);
+      const hi = Math.max(xa, xb);
+      const list = xRangesByRow.get(row) || [];
+      for (const it of list) {
+        if (it.seq === exceptSeq) continue;
+        if (it.r > lo + 0.5 && it.l < hi - 0.5) return true;
+      }
+      return false;
+    };
+
     for (const ent of historyTreeEntries) {
       const seq = ent && ent.seq;
       if (seq == null) continue;
       const p = ent.parent;
-      if (p == null || !bySeq.has(p)) continue; // 根 / 孤儿不画
+      if (p == null || !bySeq.has(p)) continue;
       const childEl = nodeEls.get(seq);
       const parentEl = nodeEls.get(p);
       const cRow = rowOf.get(seq);
       const pRow = rowOf.get(p);
-      // 一端在折叠泳道（row=-1）→ 淡出短线（父或子自身未渲染）
+
       if (childEl == null || parentEl == null) {
         const visible = childEl || parentEl;
         if (!visible) continue;
-        const r = rowOf.get(childEl ? p : seq);
-        void r;
         let vr;
-        try {
-          vr = visible.getBoundingClientRect();
-        } catch {
-          continue;
-        }
+        try { vr = visible.getBoundingClientRect(); } catch { continue; }
         if (!vr || !vr.width) continue;
         const vx = vr.left + vr.width / 2 - tr.left;
         const vy = vr.bottom - tr.top;
-        // 折叠分支方向：子未渲染（向右分出）→ 向右短横；父未渲染（向左接入）→ 向左短横
         const dir = childEl ? -1 : 1;
-        faded +=
-          "M" + vx.toFixed(1) + " " + vy.toFixed(1) +
-          "L" + (vx + dir * 12).toFixed(1) + " " + vy.toFixed(1);
+        fadedParts.push("M" + vx.toFixed(1) + " " + vy.toFixed(1) +
+          "L" + (vx + dir * 12).toFixed(1) + " " + vy.toFixed(1));
         continue;
       }
+      if (pRow == null || cRow == null) continue;
       let cr, pr;
       try {
         cr = childEl.getBoundingClientRect();
         pr = parentEl.getBoundingClientRect();
-      } catch {
+      } catch { continue; }
+      if (!cr.width || !pr.width) continue;
+
+      const pcx = pr.left + pr.width / 2 - tr.left;
+      const ccx = cr.left + cr.width / 2 - tr.left;
+      const pcy = pr.top + pr.height / 2 - tr.top;
+      const ccy = cr.top + cr.height / 2 - tr.top;
+
+      if (pRow === cRow) {
+        edges.push({
+          kind: "same", ep: [seq, p],
+          pts: [{ x: pcx + pr.width / 2, y: pcy }, { x: ccx - cr.width / 2, y: ccy }],
+        });
         continue;
       }
-      if (!cr.width || !pr.width) continue;
-      const pcx = pr.left + pr.width / 2 - tr.left;
-      const pcy = pr.top + pr.height / 2 - tr.top;
-      const ccx = cr.left + cr.width / 2 - tr.left;
-      const ccy = cr.top + cr.height / 2 - tr.top;
-      const pRect = { l: pr.left - tr.left, r: pr.right - tr.left, t: pr.top - tr.top, b: pr.bottom - tr.top };
-      const cRect = { l: cr.left - tr.left, r: cr.right - tr.left, t: cr.top - tr.top, b: cr.bottom - tr.top };
-      const s = trimToEdge(pRect, pcx, pcy, ccx, ccy);
-      const e = trimToEdge(cRect, ccx, ccy, pcx, pcy);
-      const x1 = s.x;
-      const y1 = s.y;
-      const x2 = e.x;
-      const y2 = e.y;
-      if (pRow === cRow || Math.abs(y2 - y1) < 0.5) {
-        // 同泳道 → 水平直线
-        d += "M" + x1.toFixed(1) + " " + y1.toFixed(1) + "L" + x2.toFixed(1) + " " + y2.toFixed(1);
-      } else {
-        // 2026-10-14（迭代3）：固定过渡段 + 直线——过渡水平投影固定（T=16，同父多子微增 4px，封顶 dx*0.7），
-        // 过渡段用三次贝塞尔（两端水平切线，平滑换道），之后纯水平直线到子左边缘 → 更干脆。
-        const branchIdx = branchCount.get(p) || 0;
-        branchCount.set(p, branchIdx + 1);   // 同父第几个跨泳道子（从 0 起）
-        const xr = pRect.r;                  // 父右边缘
-        const xl = cRect.l;                  // 子左边缘
-        const dx = xl - xr;
-        const T = 28;                                            // 2026-10-14：16→28（过渡更宽 → 端曲率更低、更舒展）
-        const t = Math.max(2, Math.min(T + branchIdx * 4, dx * 0.72)); // 2026-10-14：0.7→0.72
-        d +=
-          "M" + xr.toFixed(1) + " " + pcy.toFixed(1) +
-          "C" + (xr + t / 2).toFixed(1) + " " + pcy.toFixed(1) +
-          " " + (xr + t / 2).toFixed(1) + " " + ccy.toFixed(1) +
-          " " + (xr + t).toFixed(1) + " " + ccy.toFixed(1) +
-          "L" + xl.toFixed(1) + " " + ccy.toFixed(1);
+
+      const down = cRow > pRow;
+      const hop = Math.abs(cRow - pRow);
+      const yP = down ? botOf(pRow) : topOf(pRow);
+      const yC = down ? topOf(cRow) : botOf(cRow);
+
+      if (Math.abs(ccx - pcx) < 0.5 && hop === 1) {
+        edges.push({ kind: "cross", ep: [seq, p], pts: [{ x: pcx, y: yP }, { x: ccx, y: yC }] });
+        continue;
       }
+      if (hop === 1) {
+        // 2026-10-23（用户定）：相邻泳道 + 水平错开时，不再绕到行间隙再拐回子节点顶部，
+        // 而是从父节点底（/顶）直接下到子节点垂直中心，再水平接入它靠近父一侧的腰边。
+        // 少一个拐点、路径更短，读起来更顺。
+        // 两条前置：① 目标泳道在这段水平区间里没有其它节点挡路（否则线会穿节点）；
+        //           ② 水平段得真有一段可走（太短就退化成一个小绊，不如原折线）。
+        const sideX = ccx > pcx ? (ccx - cr.width / 2) : (ccx + cr.width / 2);
+        const horizRun = Math.abs(sideX - pcx);
+        if (horizRun >= 8 && !laneBlocked(cRow, seq, pcx, sideX)) {
+          edges.push({
+            kind: "cross", ep: [seq, p],
+            pts: [{ x: pcx, y: yP }, { x: pcx, y: ccy }, { x: sideX, y: ccy }],
+          });
+          continue;
+        }
+        const c1 = down ? corrOf(pRow) : corrOf(pRow - 1);
+        edges.push({
+          kind: "cross", ep: [seq, p],
+          pts: [{ x: pcx, y: yP }, { x: pcx, y: c1 }, { x: ccx, y: c1 }, { x: ccx, y: yC }],
+        });
+        continue;
+      }
+      const pCol = Math.round(pcx / cw - 0.5);
+      const cCol = Math.round(ccx / cw - 0.5);
+      let gapIdx;
+      if (cCol > pCol) gapIdx = pCol + 1;
+      else if (cCol < pCol) gapIdx = pCol;
+      else gapIdx = pCol + 1;
+      const yA = down ? corrOf(pRow) : corrOf(pRow - 1);
+      const yB = down ? corrOf(cRow - 1) : corrOf(cRow);
+      edges.push({
+        kind: "cross-long", ep: [seq, p], gapIdx,
+        lo: Math.min(pRow, cRow), hi: Math.max(pRow, cRow),
+        pts: [
+          { x: pcx, y: yP }, { x: pcx, y: yA },
+          { x: gapIdx * cw, y: yA }, { x: gapIdx * cw, y: yB },
+          { x: ccx, y: yB }, { x: ccx, y: yC },
+        ],
+      });
+    }
+
+    // ── 轨道分配：同一列间隙内行区间重叠的边错开 ──────────────────────────
+    const gapW = Math.max(TRACK_GAP, cw - nh);
+    const maxTracks = Math.max(1, Math.floor(gapW / TRACK_GAP));
+    const byGap = new Map();
+    for (const e of edges) {
+      if (e.kind !== "cross-long") continue;
+      if (!byGap.has(e.gapIdx)) byGap.set(e.gapIdx, []);
+      byGap.get(e.gapIdx).push(e);
+    }
+    for (const [, list] of byGap) {
+      list.sort((a, b) => a.lo - b.lo || a.hi - b.hi);
+      const trackEnd = [];
+      for (const e of list) {
+        let t = 0;
+        for (; t < trackEnd.length; t++) if (trackEnd[t] < e.lo) break;
+        if (t >= maxTracks) t = trackEnd.indexOf(Math.min.apply(null, trackEnd));
+        e.track = t;
+        trackEnd[t] = e.hi;
+      }
+      const n = Math.max(1, Math.min(maxTracks, trackEnd.length));
+      for (const e of list) {
+        const off = (e.track - (n - 1) / 2) * TRACK_GAP;
+        const gx = e.gapIdx * cw + off;
+        e.pts[2].x = gx;
+        e.pts[3].x = gx;
+      }
+    }
+
+    // ── 第二遍：拼路径（同泳道水平线遇竖线断开）──────────────────────────
+    const BRIDGE_GAP = 4;
+    const vSegs = [];
+    for (const e of edges) {
+      if (!e.pts || e.pts.length < 2) continue;
+      for (let i = 0; i + 1 < e.pts.length; i++) {
+        const a = e.pts[i];
+        const b = e.pts[i + 1];
+        if (Math.abs(a.x - b.x) < 0.5 && Math.abs(a.y - b.y) > 0.5) {
+          vSegs.push({ x: a.x, lo: Math.min(a.y, b.y), hi: Math.max(a.y, b.y) });
+        }
+      }
+    }
+    const dParts = [];
+    for (const e of edges) {
+      const pts = e.pts;
+      if (!pts || pts.length < 2) continue;
+      if (e.kind === "same" && pts.length === 2) {
+        const y = pts[0].y;
+        const xa = Math.min(pts[0].x, pts[1].x);
+        const xb = Math.max(pts[0].x, pts[1].x);
+        const cuts = [];
+        for (const v of vSegs) {
+          if (v.x > xa + 1 && v.x < xb - 1 && y > v.lo - 1 && y < v.hi + 1) cuts.push(v.x);
+        }
+        cuts.sort((p, q) => p - q);
+        let cur = xa;
+        for (const cx of cuts) {
+          const l = cx - BRIDGE_GAP / 2;
+          if (l > cur + 0.5) dParts.push({ from: cur, to: l, y });
+          cur = cx + BRIDGE_GAP / 2;
+        }
+        if (xb > cur + 0.5) dParts.push({ from: cur, to: xb, y });
+        continue;
+      }
+      // 2026-10-23（用户定）：折线统一走圆角曲线，骨架点不变。
+      dParts.push({ raw: roundedPolyline(pts, 10) });
+    }
+    let d = "";
+    for (const p of dParts) {
+      if (p.raw) { d += p.raw; continue; }
+      d += "M" + p.from.toFixed(1) + " " + p.y.toFixed(1) +
+           "L" + p.to.toFixed(1) + " " + p.y.toFixed(1);
     }
     let html = "";
     if (d) html += '<path d="' + d + '"/>';
-    if (faded) html += '<path d="' + faded + '" opacity="0.18"/>';
+    if (fadedParts.length) html += '<path d="' + fadedParts.join("") + '" opacity="0.18"/>';
     svg.innerHTML = html;
-    void geom;
   });
 }
 // 执行期间把变更来源标为 "agent"；装载类窗口另标 "system"（见 beginSystemWindow）。
@@ -6447,7 +7436,7 @@ function historyTreeDrawEdges(nodeEls, graph) {
 const WRITE_OPS = new Set([
   "canvas.loadWorkflowFile", "canvas.openWorkflow", "canvas.activateWorkflow",
   "canvas.setWidget", "canvas.addNode", "canvas.removeNode",
-  "canvas.connect", "canvas.disconnect", "canvas.setNodeMode",
+  "canvas.connect", "canvas.disconnect", "canvas.setNodeMode", "canvas.moveNode",
   "canvas.addGroup", "canvas.setGroup", "canvas.removeGroup",
   "canvas.save", "canvas.undo", "canvas.patch", "canvas.organize",
   "canvas.queue", "canvas.duplicate", "canvas.visual", "canvas.copilot",
@@ -6535,6 +7524,8 @@ app.registerExtension({
     installQueuePromptCapture();
     // P4 修：常驻安装出图产物捕获（与后端无关，先行；幂等；上报失败静默）。
     installOutputCapture();
+  // 2026-10-22 兜底：依赖事件有漏网，再加一层定期扫描补绑（幂等）。
+  installOrphanImageSync();
     // P7-树（2026-10-12）：底部提交树容器挂载（幂等）+ 首次刷新（收起着只更新计数）。
     historyTreeEnsure();
     void historyTreeRefresh();

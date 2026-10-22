@@ -1,32 +1,13 @@
 // app/lib/commit-graph-lanes.test.mjs
+// 断言口径：与桥内联版 hana-bridge-23033000.js 的 assignLanesRaw / countCrossings /
+// countLaneHops / scoreOf / commitGraphLanes 逐条对齐（2026-10-23 同步）。
+// 规则：初始泳道奇数次分支往下、偶数次往上；非初始泳道按在初始泳道上下方决定方向；
+//       新分支紧邻父泳道插入，其余泳道平移一格；row = lane（全量显示）；cost 仅诊断不参与重排。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { commitGraphLanes } from "./commit-graph-lanes.mjs";
 
-// 几何交叉检测（方案 §2 的评测口径）：x = entries 下标（拓扑/时序），y = 泳道；
-// 逐条 parent→child 边拆段，判断是否穿过中间泳道上的节点竖线。返回交叉数。
-function countCrossings(entries, g) {
-  const xOf = new Map(entries.map((e, i) => [e.seq, i]));
-  const laneOf = new Map(g.nodes.map((n) => [n.seq, n.lane]));
-  const laneXs = new Map();
-  for (const n of g.nodes) {
-    if (!laneXs.has(n.lane)) laneXs.set(n.lane, []);
-    laneXs.get(n.lane).push(xOf.get(n.seq));
-  }
-  let crossings = 0;
-  for (const e of entries) {
-    const p = e.parent;
-    if (!Number.isInteger(p) || p >= e.seq || !laneOf.has(p)) continue;
-    const lo = Math.min(laneOf.get(e.seq), laneOf.get(p));
-    const hi = Math.max(laneOf.get(e.seq), laneOf.get(p));
-    const xlo = Math.min(xOf.get(p), xOf.get(e.seq));
-    const xhi = Math.max(xOf.get(p), xOf.get(e.seq));
-    for (let L = lo + 1; L < hi; L += 1) {
-      if ((laneXs.get(L) || []).some((x) => x > xlo && x < xhi)) crossings += 1;
-    }
-  }
-  return crossings;
-}
+const laneOfMap = (g) => new Map(g.nodes.map((n) => [n.seq, n.lane]));
 
 const linear = (n) => {
   const out = [];
@@ -34,80 +15,113 @@ const linear = (n) => {
   return out;
 };
 
-test("1. 线性 10 条 → 1 泳道、10 节点全 row=0、sleepingCount=0", () => {
+test("1. 纯线性链：单泳道、row 全 0、sleeping 恒 false、cost 全 0", () => {
   const g = commitGraphLanes(linear(10));
   assert.equal(g.lanes.length, 1);
   assert.equal(g.rows, 1);
   assert.equal(g.sleepingCount, 0);
   assert.equal(g.nodes.length, 10);
-  for (const n of g.nodes) assert.equal(n.row, 0);
+  for (const n of g.nodes) {
+    assert.equal(n.lane, 0);
+    assert.equal(n.row, 0);
+  }
   assert.deepEqual(g.lanes, [{ lane: 0, headSeq: 10, sleeping: false }]);
+  assert.deepEqual(g.cost, { cross: 0, hops: 0, score: 0 });
 });
 
-test("2. 一次分叉（seq3 分出两支）→ 2 泳道、两行全显示", () => {
-  const g = commitGraphLanes([
+test("2. 根泳道第一次分叉 → 新分支向下（父泳道下方，紧邻）", () => {
+  const entries = [
     { seq: 1, parent: null },
     { seq: 2, parent: 1 },
-    { seq: 3, parent: 2 },
-    { seq: 4, parent: 3 },
-    { seq: 5, parent: 3 },
-  ]);
+    { seq: 3, parent: 1 },
+  ];
+  const g = commitGraphLanes(entries);
   assert.equal(g.lanes.length, 2);
-  assert.equal(g.rows, 2);
-  assert.equal(g.sleepingCount, 0);
-  assert.deepEqual(g.nodes, [
-    { seq: 1, lane: 0, row: 0 },
-    { seq: 2, lane: 0, row: 0 },
-    { seq: 3, lane: 0, row: 0 },
-    { seq: 4, lane: 0, row: 0 },
-    { seq: 5, lane: 1, row: 1 },
-  ]);
+  // 奇数次 → 往下：父泳道留在原位 0，新泳道在 1
+  assert.deepEqual([...laneOfMap(g)], [[1, 0], [2, 0], [3, 1]]);
+  assert.equal(g.lanes[0].headSeq, 2);
+  assert.equal(g.lanes[1].headSeq, 3);
 });
 
-test("3. 分叉后一支长期不动 → 不折叠，sleeping 恒 false、row=lane", () => {
-  const g = commitGraphLanes([
+test("3. 根泳道第二次分叉 → 新分支向上（插到父泳道上方，其余平移一格）", () => {
+  const entries = [
+    { seq: 1, parent: null },
+    { seq: 2, parent: 1 },
+    { seq: 3, parent: 1 }, // 奇数次：下
+    { seq: 4, parent: 1 }, // 偶数次：上
+  ];
+  const g = commitGraphLanes(entries);
+  assert.equal(g.lanes.length, 3);
+  assert.deepEqual([...laneOfMap(g)], [[1, 1], [2, 1], [3, 2], [4, 0]]);
+  // headSeq 按物理行序：[上插的 4, 根 2, 下插的 3]
+  assert.deepEqual(g.lanes.map((l) => l.headSeq), [4, 2, 3]);
+  assert.equal(g.cost.cross, 0);
+  assert.equal(g.cost.hops, 0);
+});
+
+test("4. 同一父节点多个子（兄弟）：奇偶交替上下、紧邻插入、互不交叉", () => {
+  const entries = [
     { seq: 1, parent: null },
     { seq: 2, parent: 1 },
     { seq: 3, parent: 1 },
     { seq: 4, parent: 1 },
     { seq: 5, parent: 1 },
-    { seq: 6, parent: 1 },
-    { seq: 7, parent: 2 },
-    { seq: 8, parent: 7 },
-    { seq: 9, parent: 8 },
-    { seq: 10, parent: 9 },
-  ]);
-  assert.equal(g.lanes.length, 5);
-  assert.equal(g.rows, 5); // 去折叠：全量 5 行
-  assert.equal(g.sleepingCount, 0);
-  // G 下：新分支插到父泳道正下方，后续分支会把先建分支的泳道下推（lane 索引会变；泳道数 5 不变）。
-  assert.deepEqual(g.lanes, [
-    { lane: 0, headSeq: 10, sleeping: false },
-    { lane: 1, headSeq: 6, sleeping: false },
-    { lane: 2, headSeq: 5, sleeping: false },
-    { lane: 3, headSeq: 4, sleeping: false },
-    { lane: 4, headSeq: 3, sleeping: false },
-  ]);
-  // 长期不动的泳道其节点不再被折叠（row 不再是 -1）；row = lane。
-  const n3 = g.nodes.find((n) => n.seq === 3);
-  assert.equal(n3.row, n3.lane);
-  assert.ok(n3.row >= 0, "去折叠后不应再有 row=-1 的节点");
-  assert.ok(g.lanes.every((l) => l.sleeping === false));
-});
-
-test("4. 泳道数 > 旧上限 4 → 全部显示：rows = laneCount、sleepingCount = 0", () => {
-  const entries = [{ seq: 1, parent: null }];
-  for (let s = 2; s <= 7; s++) entries.push({ seq: s, parent: 1 }); // 6 条泳道
-  entries.push({ seq: 8, parent: 2 }, { seq: 9, parent: 8 });
+  ];
   const g = commitGraphLanes(entries);
-  assert.equal(g.lanes.length, 6);
-  assert.equal(g.rows, 6); // 不再截断到 4
-  assert.equal(g.sleepingCount, 0);
-  assert.equal(g.lanes.filter((l) => l.sleeping).length, 0);
-  assert.ok(g.rows > 4, "rows 应超过旧上限 4（取消折叠）");
+  assert.equal(g.lanes.length, 4);
+  // 第 1 支下、第 2 支上、第 3 支下：根泳道最终落在 lane 1
+  assert.deepEqual([...laneOfMap(g)], [[1, 1], [2, 1], [3, 3], [4, 0], [5, 2]]);
+  assert.deepEqual(g.lanes.map((l) => l.headSeq), [4, 2, 5, 3]);
+  assert.equal(g.cost.cross, 0);
+  assert.equal(g.cost.hops, 0);
 });
 
-test("5. 确定性：同输入两次调用 deepEqual", () => {
+test("5. 非初始泳道分叉：在初始泳道下方的一律向下、上方的一律向上", () => {
+  // seq1 根；seq3 是根向下分出的分支（lane 1）；seq5 再从 seq3 分叉 → 在根下方 → 继续向下
+  const entries = [
+    { seq: 1, parent: null },
+    { seq: 2, parent: 1 },
+    { seq: 3, parent: 1 }, // 根第一次分叉：向下
+    { seq: 4, parent: 3 },
+    { seq: 5, parent: 3 }, // 从 lane 1（根下方）分叉 → 向下
+  ];
+  const g = commitGraphLanes(entries);
+  const lane = laneOfMap(g);
+  assert.equal(lane.get(3), 1); // 根的分支在根下方
+  assert.equal(lane.get(5), lane.get(3) + 1); // 下方泳道 → 继续向下
+  assert.equal(g.cost.cross, 0);
+  assert.equal(g.cost.hops, 0);
+});
+
+test("6. 孤儿 / parent 缺失 / parent >= seq / 非整数 parent → 视同根，各开一条泳道", () => {
+  assert.deepEqual(commitGraphLanes([]), {
+    lanes: [], nodes: [], rows: 0, sleepingCount: 0, cost: { cross: 0, hops: 0, score: 0 },
+  });
+  assert.deepEqual(commitGraphLanes(null), {
+    lanes: [], nodes: [], rows: 0, sleepingCount: 0, cost: { cross: 0, hops: 0, score: 0 },
+  });
+  assert.doesNotThrow(() =>
+    commitGraphLanes([
+      { seq: 5, parent: 99 },
+      { seq: 6, parent: 7 },
+      { seq: 7, parent: 1.5 },
+      { seq: 8 },
+      { seq: 9, parent: null },
+    ]),
+  );
+  const g = commitGraphLanes([
+    { seq: 5, parent: 99 },   // 孤儿（指向不存在的 seq）
+    { seq: 6 },               // 缺失 parent
+    { seq: 7, parent: 1.5 },  // 非整数 parent
+    { seq: 9, parent: 12 },   // parent >= seq
+  ]);
+  assert.equal(g.lanes.length, 4);
+  assert.deepEqual([...laneOfMap(g)], [[5, 0], [6, 1], [7, 2], [9, 3]]);
+  assert.deepEqual(g.lanes.map((l) => l.headSeq), [5, 6, 7, 9]);
+  assert.equal(g.sleepingCount, 0);
+});
+
+test("7. 确定性：同输入两次调用 deepEqual", () => {
   const entries = [
     { seq: 1, parent: null },
     { seq: 2, parent: 1 },
@@ -120,44 +134,49 @@ test("5. 确定性：同输入两次调用 deepEqual", () => {
     { seq: 9, parent: 6 },
     { seq: 10, parent: 9 },
   ];
-  assert.deepEqual(commitGraphLanes(entries), commitGraphLanes(entries));
+  const a = commitGraphLanes(entries);
+  const b = commitGraphLanes(entries);
+  assert.deepEqual(a, b);
+  // 不修改入参
+  assert.deepEqual(entries.map((e) => Object.keys(e).sort().join(",")), entries.map(() => "parent,seq"));
 });
 
-test("6. 空 / 孤儿 parent / 异常 parent 不抛异常", () => {
-  assert.deepEqual(commitGraphLanes([]), { lanes: [], nodes: [], rows: 0, sleepingCount: 0 });
-  assert.doesNotThrow(() =>
-    commitGraphLanes([
-      { seq: 5, parent: 99 },       // 孤儿（指向不存在的 seq）
-      { seq: 6, parent: 7 },        // parent >= seq
-      { seq: 7, parent: 1.5 },      // 非整数 parent
-      { seq: 8 },                   // 缺失 parent
-      { seq: 9, parent: null },     // 显式根
-    ]),
-  );
-  const g = commitGraphLanes([{ seq: 5, parent: 99 }, { seq: 6 }, { seq: 7, parent: 1.5 }]);
-  // 全部视同根 → 各开新泳道
-  assert.equal(g.lanes.length, 3);
-  assert.deepEqual(g.nodes.map((n) => n.lane), [0, 1, 2]);
+test("8. cost 字段存在、非负、score = cross*2 + hops", () => {
+  const g = commitGraphLanes([
+    { seq: 1, parent: null },
+    { seq: 2, parent: 1 },
+    { seq: 3, parent: 1 },
+    { seq: 4, parent: 2 },
+    { seq: 5, parent: 3 },
+  ]);
+  assert.ok(g.cost && typeof g.cost === "object");
+  for (const k of ["cross", "hops", "score"]) {
+    assert.equal(typeof g.cost[k], "number", `cost.${k} 应为 number`);
+    assert.ok(Number.isInteger(g.cost[k]) && g.cost[k] >= 0, `cost.${k} 应为非负整数`);
+  }
+  assert.equal(g.cost.score, g.cost.cross * 2 + g.cost.hops);
+  // 插入式分配下父子泳道恒相邻 → 交叉与跨道均为 0
+  assert.equal(g.cost.cross, 0);
+  assert.equal(g.cost.hops, 0);
 });
 
-test("7. 每个节点 row=lane（去折叠，无 -1）；nodes 与输入同序", () => {
+test("9. 全量显示：row = lane，无 row=-1；nodes 与输入同序", () => {
   const entries = [{ seq: 1, parent: null }];
-  for (let s = 2; s <= 7; s++) entries.push({ seq: s, parent: 1 });
+  for (let s = 2; s <= 7; s++) entries.push({ seq: s, parent: 1 }); // 6 条泳道
   entries.push({ seq: 8, parent: 2 }, { seq: 9, parent: 8 });
   const g = commitGraphLanes(entries);
-  assert.equal(g.nodes.length, entries.length);
+  assert.equal(g.lanes.length, 6);
+  assert.equal(g.rows, 6);
+  assert.equal(g.sleepingCount, 0);
+  assert.ok(g.lanes.every((l) => l.sleeping === false));
   for (const n of g.nodes) {
-    assert.equal(typeof n.row, "number");
-    assert.ok(Number.isInteger(n.row));
-    assert.equal(n.row, n.lane); // 去折叠：row 直接等于 lane
-    assert.ok(n.row >= 0);
+    assert.equal(n.row, n.lane);
+    assert.ok(n.row >= 0, "去折叠后不应出现 row=-1");
   }
-  assert.ok(!g.nodes.some((n) => n.row === -1), "去折叠后不应再有 row=-1 的节点");
-  // nodes 的 seq 与输入同序
   assert.deepEqual(g.nodes.map((n) => n.seq), entries.map((e) => e.seq));
 });
 
-test("8. 新分支插父下方：分叉后再分叉 → 新分支 lane = 父 lane + 1、无交叉", () => {
+test("10. 新分支恒紧邻父泳道（|Δlane| = 1）且不产生交叉", () => {
   const entries = [
     { seq: 1, parent: null },
     { seq: 2, parent: 1 },
@@ -168,16 +187,22 @@ test("8. 新分支插父下方：分叉后再分叉 → 新分支 lane = 父 lan
     { seq: 7, parent: 6 },
   ];
   const g = commitGraphLanes(entries);
-  const laneOf = new Map(g.nodes.map((n) => [n.seq, n.lane]));
-  // 无交叉：几何交叉检测器为 0（方案 §5 的真实验收口径）
-  assert.equal(countCrossings(entries, g), 0);
-  // 新分支插到父泳道正下方：seq6（从 2 分出）应在 seq2 泳道的下一行
-  assert.equal(laneOf.get(6), laneOf.get(2) + 1);
-  // seq7（从 6 延续）应继承 seq6 泳道
-  assert.equal(laneOf.get(7), laneOf.get(6));
+  const lane = laneOfMap(g);
+  // 每个「与父不同泳道」的节点必须紧邻父泳道
+  for (const e of entries) {
+    if (!Number.isInteger(e.parent) || !lane.has(e.parent)) continue;
+    const d = Math.abs(lane.get(e.seq) - lane.get(e.parent));
+    assert.ok(d <= 1, `seq ${e.seq} 与父 ${e.parent} 泳道距离应为 0 或 1，实际 ${d}`);
+  }
+  // seq7 从 seq6 延续 → 同泳道
+  assert.equal(lane.get(7), lane.get(6));
+  // seq6 从 seq2 分出 → 紧邻（此处向上，根泳道在下方）
+  assert.equal(lane.get(6), lane.get(2) - 1);
+  assert.equal(g.cost.cross, 0);
+  assert.equal(g.cost.hops, 0);
 });
 
-test("9. 用户样本无交叉：分叉后再分叉（seq18）不跨道", () => {
+test("11. 多级分叉样本无交叉（cost 全 0，泳道数 3）", () => {
   const entries = [
     { seq: 1, parent: null },
     { seq: 2, parent: 1 },
@@ -194,9 +219,30 @@ test("9. 用户样本无交叉：分叉后再分叉（seq18）不跨道", () => 
     { seq: 18, parent: 10 },
   ];
   const g = commitGraphLanes(entries);
-  const laneOf = new Map(g.nodes.map((n) => [n.seq, n.lane]));
-  // 无交叉：几何交叉检测器为 0
-  assert.equal(countCrossings(entries, g), 0);
-  // seq18 从其父 seq10 分出，应紧贴父泳道下方
-  assert.equal(laneOf.get(18), laneOf.get(10) + 1);
+  const lane = laneOfMap(g);
+  assert.equal(g.lanes.length, 3);
+  assert.equal(g.cost.cross, 0);
+  assert.equal(g.cost.hops, 0);
+  // seq18 从其父 seq10 分出、紧邻父泳道
+  assert.equal(Math.abs(lane.get(18) - lane.get(10)), 1);
+});
+
+test("12. 非初始泳道在初始泳道上方分叉 → 向上且紧邻（lane(6) < lane(4)、Δ = 1）", () => {
+  // seq1 根；根前两次分叉：seq3 向下、seq4 向上（落在根上方）；seq5 从 seq4 延续；
+  // seq6 再从 seq4 分叉 → 父泳道在初始泳道上方 → 继续向上
+  const entries = [
+    { seq: 1, parent: null },
+    { seq: 2, parent: 1 },
+    { seq: 3, parent: 1 }, // 根第 1 次分叉：向下
+    { seq: 4, parent: 1 }, // 根第 2 次分叉：向上
+    { seq: 5, parent: 4 },
+    { seq: 6, parent: 4 }, // 从 lane 1（根上方）分叉 → 向上
+  ];
+  const g = commitGraphLanes(entries);
+  const lane = laneOfMap(g);
+  assert.ok(lane.get(4) < lane.get(1), "seq4 应落在初始泳道上方");
+  assert.ok(lane.get(6) < lane.get(4), "上方泳道分叉应向上：lane(6) < lane(4)");
+  assert.equal(lane.get(4) - lane.get(6), 1, "新分支应紧邻父泳道（不跨道）");
+  assert.equal(g.cost.cross, 0);
+  assert.equal(g.cost.hops, 0);
 });

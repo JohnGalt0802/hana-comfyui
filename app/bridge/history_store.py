@@ -431,15 +431,23 @@ def _norm_runs(runs):
 
 
 def _norm_block(blk):
-    """归一化 block（完整版）：{name, source, nodeIds}；source 缺省 "group"，nodeIds 缺省 []。"""
+    """归一化 block（完整版）：{name, source, nodeIds, color}。
+
+    color（2026-10-20 新增）：提交时画布框的颜色快照。
+    为何必须存：内条颜色原来回头查「活图框色」，一旦提交之后改框色/删框/改名，
+    旧提交的内条就跟着变错位——历史应当只读历史。
+    旧条目无此字段 → 缺省 None（读侧退回活图/中性灰，不报错）。
+    """
     b = blk if isinstance(blk, dict) else {}
     src = b.get("source")
     src = src if isinstance(src, str) and src else "group"
     ids = b.get("nodeIds")
+    c = b.get("color")
     return {
         "name": "" if b.get("name") is None else str(b.get("name")),
         "source": src,
         "nodeIds": list(ids) if isinstance(ids, list) else [],
+        "color": c if isinstance(c, str) and c else None,
     }
 
 
@@ -520,6 +528,10 @@ _UUID_RE = re.compile(
 # claims 登记表 / 目录元数据文件名
 CLAIMS_FILE_NAME = ".claims.json"
 META_FILE_NAME = ".meta.json"
+# 2026-10-23：HEAD（当前所在提交节点）持久化文件，与 index.jsonl 同级。
+# 内容 {"seq": 12, "at": "<ISO>"}；HEAD 是**图的状态**，不再依赖前端 localStorage。
+# 见 docs/方案-修复提交图泳道与HEAD-20261023.md §3.2。
+HEAD_FILE_NAME = ".head.json"
 
 
 def is_valid_uuid(v):
@@ -1006,6 +1018,115 @@ def _last_node_seq(entries):
     return seq
 
 
+# ── 9.6 HEAD 持久化（2026-10-23：修「回跳后提交不分叉」）──────────────────────
+# 契约：docs/方案-修复提交图泳道与HEAD-20261023.md §3.2。
+# HEAD = 当前所在的提交节点，是**图的状态**而非浏览器状态：落盘在历史目录 .head.json，
+# 与 index.jsonl 同级；parent 由后端据此决定，前端 localStorage 只作 UI 缓存。
+def head_file_path(dir_path):
+    """HEAD 文件绝对路径：<history_dir>/.head.json。"""
+    return os.path.join(dir_path, HEAD_FILE_NAME)
+
+
+def _is_main_seq(entries, seq):
+    """seq 是否指向索引里存在的**主行**（存在且无 mergeInto 标记）。"""
+    n = _to_int(seq, None)
+    if n is None:
+        return False
+    entry = _find_entry_by_seq(entries, n)
+    return entry is not None and entry.get("mergeInto") is None
+
+
+def read_head(dir_path, entries):
+    """读持久化 HEAD。返回 {"seq": int, "at": str|None} 或 None。
+
+    None 的四种情形（§3.2 读规则）：文件缺失 / 坏 JSON / 非对象 / seq 非有限数或
+    指向**不存在的主行**。即：**不返回脏值**（history-list 的 head 字段取此口径）。
+    """
+    path = head_file_path(dir_path)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.loads(fh.read())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    seq = _to_int(obj.get("seq"), None)
+    if seq is None or not _is_main_seq(entries, seq):
+        return None
+    at = obj.get("at")
+    return {"seq": seq, "at": None if at is None else str(at)}
+
+
+def _head_seq_or_last(dir_path, entries):
+    """定 parent 用的 headSeq：HEAD 有效 → 其 seq；文件缺失 / 坏 JSON / 指向不存在的主行
+    → 退回 `_last_node_seq(entries)`（§3.2 读规则最后一行）。
+    """
+    head = read_head(dir_path, entries)
+    return head["seq"] if head else _last_node_seq(entries)
+
+
+def _write_head(dir_path, seq, at=None):
+    """原子写 .head.json（同目录 .tmp → os.replace，沿用本模块既有做法）。
+
+    ⚠️ 失败语义未在 §3.2 覆盖；此处沿用本模块 `_write_meta_file` 的既有口径：
+       失败静默（best-effort），不阻断已成功的提交——读侧有「退回末条」兜底。
+    """
+    obj = {"seq": _to_int(seq, 0), "at": _to_iso(at)}
+    path = head_file_path(dir_path)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def set_head(body, user_dir, workflow_id=None, path=None, temporary=None):
+    """POST /hana_bridge/history-head-set 的实现：把持久化 HEAD 设为指定 seq。
+
+    请求体: { workflow, workflowId?, workflowPath?, workflowTemporary?, seq, at? }
+    返回 {ok:True, status:200, seq} 或 {ok:False, status:400, error:…}；
+    error 取值：missing_workflow / missing_seq / seq_not_found。
+    seq 必须指向索引里存在的**主行**（无 mergeInto），否则 400 seq_not_found。
+    """
+    b = body if isinstance(body, dict) else {}
+    workflow = b.get("workflow") if isinstance(b.get("workflow"), str) else ""
+    workflow = workflow.strip()
+    if not workflow:
+        return {"ok": False, "status": 400, "error": "missing_workflow"}
+    seq = _to_int(b.get("seq"), None)
+    if seq is None:
+        return {"ok": False, "status": 400, "error": "missing_seq"}
+    if not isinstance(user_dir, str) or not user_dir.strip():
+        return {"ok": False, "status": 500, "error": "无法解析 ComfyUI 用户目录（user_dir 未就绪）"}
+
+    dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
+    index_path = os.path.join(dir_path, INDEX_FILE_NAME)
+    entries = []
+    try:
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as fh:
+                entries = parse_index(fh.read())["entries"]
+    except OSError as exc:
+        return {"ok": False, "status": 500, "error": "读取索引失败：%s" % exc}
+
+    if not _is_main_seq(entries, seq):
+        return {"ok": False, "status": 400, "error": "seq_not_found"}
+
+    _write_head(dir_path, seq, b.get("at"))
+    return {"ok": True, "status": 200, "seq": seq}
+
+
 # ── 10. 提交落盘 ────────────────────────────────────────────────────────────
 def commit(body, user_dir, workflow_id=None, path=None, temporary=None):
     """处理一次提交上报：写快照 + 追加索引行。返回带 status 的结果对象，由路由拆出 HTTP 码。
@@ -1059,12 +1180,17 @@ def commit(body, user_dir, workflow_id=None, path=None, temporary=None):
     except OSError as exc:
         return {"ok": False, "status": 500, "error": "读取索引失败：%s" % exc}
 
-    # 归一化签名（忽略 seed 类 widget）+ 确定 headSeq（parent 传了就用它；否则索引末条 seq）
+    # 归一化签名（忽略 seed 类 widget）+ 确定 headSeq
+    # 2026-10-23 契约（§3.2）：parent 优先级 = ①请求体显式 parent（且存在于索引主行）
+    # ②.head.json 的 seq（且存在于索引主行）③_last_node_seq(entries)。
+    # 旧代码 parent_given 只看「有没有传」；传了但索引里查不到（脏 parent）会让图断链，
+    # 故降为未传（与契约「否则视为未给」一致）。
     sig = graph_sig_ignoring_seed(b.get("graph"))
-    if parent_given:
-        head_seq = _norm_parent(parent_raw)
+    parent_norm = _norm_parent(parent_raw) if parent_given else None
+    if parent_norm is not None and _is_main_seq(entries, parent_norm):
+        head_seq = parent_norm
     else:
-        head_seq = _last_node_seq(entries)
+        head_seq = _head_seq_or_last(dir_path, entries)
     head_graph = _head_node_graph(dir_path, entries, head_seq)
 
     # 合并判定（仅 kind=="run"）：headSeq 存在 + 能读到 head 节点快照 graph + 签名相同
@@ -1196,13 +1322,19 @@ def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, 
             "dir": dir_path,
         }
 
+    # 2026-10-23（§3.2）：新建节点成功 → .head.json ← 新节点 seq。
+    # 放在本函数（而非 commit/save_commit）里：两处新建都走这里，口径天然一致；
+    # merge 分支不经过本函数，head 自然不变。写失败静默（读侧有退回末条兜底）。
+    _write_head(dir_path, seq)
+
     return {"ok": True, "status": 200, "merged": False, "seq": seq, "file": file_name, "dir": dir_path}
 
 
 def save_commit(body, user_dir, workflow_id=None, path=None, temporary=None):
     """P5b：存档当前画布 —— 永远**新建**一个 kind="save" 节点（无 promptId、不参与合并判定）。
     请求体: { workflow, graph, at?, source? }（无 promptId）。返回 {ok, status, seq, file, dir}。
-    复用 _create_node；delta 相对 head（索引末条）算，parent=head。
+    复用 _create_node；parent 取持久化 HEAD（.head.json，见 §3.2 读规则）——HEAD 缺失/
+    坏 JSON/指向不存在的主行 → 退回索引末条主行；delta 相对该 head 节点的快照 graph 算。
     2026-10-14：新增可选 workflow_id → 键走 id（resolve_history_dir，先 id 后名回退）；缺省走原名键。
     同日新增可选 path / temporary → identity 归一化（见 history_key / _identity_of）。
     """
@@ -1220,6 +1352,11 @@ def save_commit(body, user_dir, workflow_id=None, path=None, temporary=None):
     if src is None:
         src = "user"
 
+    # 2026-10-23（§3.2）：parent 优先级与 commit 一致
+    # ①请求体显式 parent（且存在于索引主行）②.head.json ③索引末条主行
+    parent_raw = b.get("parent")
+    parent_given = parent_raw is not None and parent_raw != ""
+
     dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
     index_path = os.path.join(dir_path, INDEX_FILE_NAME)
     entries = []
@@ -1230,7 +1367,11 @@ def save_commit(body, user_dir, workflow_id=None, path=None, temporary=None):
     except OSError as exc:
         return {"ok": False, "status": 500, "error": "读取索引失败：%s" % exc}
 
-    head_seq = _last_node_seq(entries)
+    parent_norm = _norm_parent(parent_raw) if parent_given else None
+    if parent_norm is not None and _is_main_seq(entries, parent_norm):
+        head_seq = parent_norm
+    else:
+        head_seq = _head_seq_or_last(dir_path, entries)
     head_graph = _head_node_graph(dir_path, entries, head_seq)
 
     return _create_node(
@@ -1337,6 +1478,7 @@ def migrate_history(from_name, to_name, user_dir):
     offset = next_seq(dst_entries)  # 起点：目标的下一条空位（源 seq 整体后移 offset）
 
     out_lines = []
+    out_rows = []  # 与 out_lines 同序：合并后用于校正 HEAD 的末条主行
     conflicts = 0
     for e in src_entries:
         new_seq = _to_int(e.get("seq"), 0) + offset
@@ -1380,6 +1522,7 @@ def migrate_history(from_name, to_name, user_dir):
                         pass  # sidecar 迁移失败不阻断合并（产物图列表可重建）
             row["file"] = new_name
         out_lines.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        out_rows.append(row)
 
     # 追加改写后的行（追加写，禁止读全文重写整份索引）
     if out_lines:
@@ -1395,13 +1538,24 @@ def migrate_history(from_name, to_name, user_dir):
                 "merged": 0,
             }
 
+    # 2026-10-23：合并成功后校正目标 HEAD —— 目标目录的 .head.json 仍是迁移前旧值，
+    # 会让迁移后首次提交 parent 指回旧末条，在图上凭空长出一条泳道。
+    # 口径：HEAD = 合并后索引的末条**主行**（含刚追加的行，不用迁移前的 entries）。
+    # 未追加任何行（全冲突/空源）→ 图未变，不动 HEAD（避免覆盖用户已设的回跳 HEAD）。
+    if out_lines:
+        merged_head = _last_node_seq(list(dst_entries) + out_rows)
+        if merged_head is not None:
+            _write_head(dst_dir, merged_head)
+
     # 源目录里索引未引用的余留文件（弃用快照等）：不冲突就一并移入（不丢数据）
+    # 2026-10-23：HEAD 文件不走「余留」通道 —— 它是**每个历史目录各自的**单值状态，
+    # 不能当作可搬运的产物（目标已有自己的 HEAD 时不搬，会导致源目录删不干净）。
     try:
         leftover = os.listdir(src_dir)
     except OSError:
         leftover = []
     for name in leftover:
-        if name == INDEX_FILE_NAME:
+        if name in (INDEX_FILE_NAME, HEAD_FILE_NAME):
             continue
         src_p = os.path.join(src_dir, name)
         dst_p = os.path.join(dst_dir, name)
@@ -1412,10 +1566,13 @@ def migrate_history(from_name, to_name, user_dir):
         except OSError:
             pass
 
-    # 内容已全部并入 → 删源索引 + 源目录（删不干净不算失败）
+    # 内容已全部并入 → 删源索引 + 源 HEAD + 源目录（删不干净不算失败）
     try:
         if os.path.isfile(src_index):
             os.remove(src_index)
+        src_head = head_file_path(src_dir)
+        if os.path.isfile(src_head):
+            os.remove(src_head)
         os.rmdir(src_dir)
     except OSError:
         pass
@@ -1488,7 +1645,7 @@ def list_commits(workflow, user_dir, workflow_id=None, path=None, temporary=None
     dir_path = resolve_history_dir(user_dir, workflow, workflow_id, path=path, temporary=temporary)
     index_path = os.path.join(dir_path, INDEX_FILE_NAME)
     if not os.path.isdir(dir_path):
-        return {"ok": True, "status": 200, "entries": [], "badLines": 0}
+        return {"ok": True, "status": 200, "entries": [], "badLines": 0, "head": None}
     try:
         with open(index_path, "r", encoding="utf-8") as fh:
             parsed = parse_index(fh.read())
@@ -1520,7 +1677,14 @@ def list_commits(workflow, user_dir, workflow_id=None, path=None, temporary=None
         norm["runs"] = _node_runs(e, sidecar_runs, rows)
         norm["images"] = _merge_images([], [im for r in norm["runs"] for im in r["images"]])
         out_entries.append(norm)
-    return {"ok": True, "status": 200, "entries": out_entries, "badLines": parsed["badLines"]}
+    return {
+        "ok": True,
+        "status": 200,
+        "entries": out_entries,
+        "badLines": parsed["badLines"],
+        # 2026-10-23（§3.2）：持久化 HEAD；指向不存在的主行 / 文件缺失 / 坏 JSON → null
+        "head": read_head(dir_path, parsed["entries"]),
+    }
 
 
 # ── 12. 快照全文读取（P3-G1：回跳用）───────────────────────────────────────
