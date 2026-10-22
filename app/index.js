@@ -36,7 +36,10 @@ const APP_ID = "comfyui-hana";
 //   2026-10-09：卡片功能恢复——任务卡（task.html，submit/queue 回执 details.card）与环境检查卡
 //     （envcheck.html，卡按钮路由 /comfyui-hana/backend/{envcheck,clear,wait} 一并恢复）；
 //     流内卡走工具回执通道，不注册 contributes.cards（卡片中心零新增）。
-const APP_VERSION = "0.13.1";
+// 版本号：**必须与 manifest.json 的 version 一致**（两处分开存是历史原因，
+// 不一致会导致 status / health 报旧版本，面板显示对不上实际安装）。
+// 2026-10-21：曾因 manifest 升 0.13.3 而此处留 0.13.1，状态页显示 v0.13.1。
+const APP_VERSION = "0.13.3";
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
@@ -50,6 +53,112 @@ const JOB_TIMEOUT_MS = 60 * 60 * 1000; // 单任务最长跟踪 60 分钟
 const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
 const TERMINAL_STATES = new Set(["failed", "exited", "stopped"]);
 const TERMINAL_JOB = new Set(["completed", "error", "interrupted", "canceled", "timeout"]);
+
+// ── 任务状态判定（#2 P3-c：状态滞后）────────────────────────────────────────
+// 抽成模块级纯函数：不读全局、不发请求，便于单测（真值表见 docs/issue #2）。
+// 为什么需要：原来 actionQuery 只写 `job ? job.state : ...`——内存里只要有 job 就用
+// 提交时写死的 pending，事件缓存与 execution history 全都看不到，于是任务已在跑、
+// query 还显示 pending。原则：能证明在跑的证据优先于提交时的旧记录。
+const JOB_STALE_MS = 120_000; // pending 超过该时长且队列/历史都查不到 → 记 unknown
+
+/**
+ * 多源取最可信的任务状态。
+ * @param {object} ev
+ * @param {string} ev.promptId
+ * @param {{known:boolean, running:string[], pending:string[]}|null} ev.queue /_relay/queue-detail
+ * @param {object|null} ev.history execution history 条目（中继 trimHistoryEntry 已扁平化：
+ *                             completed 在顶层、status 是 status_str、error 是提取出的对象）
+ * @param {{state?:string}|null} ev.rec 中继事件缓存记录
+ * @param {{state?:string, submittedAt?:number}|null} ev.job App 内存记录
+ * @param {number} [ev.now]
+ * @returns {{state:string, source:string, evidence:object}}
+ */
+export function resolveJobState(ev = {}) {
+  const promptId = typeof ev.promptId === "string" ? ev.promptId : "";
+  const queue = ev.queue && typeof ev.queue === "object" ? ev.queue : null;
+  // 只有探测成功（known===true）才能断言「不在队列里」；后端不可达时不得据此判 unknown。
+  const queueKnown = Boolean(queue && queue.known === true);
+  const runningIds = queueKnown && Array.isArray(queue.running) ? queue.running : [];
+  const pendingIds = queueKnown && Array.isArray(queue.pending) ? queue.pending : [];
+  const entry = ev.history && typeof ev.history === "object" ? ev.history : null;
+  const rec = ev.rec && typeof ev.rec === "object" ? ev.rec : null;
+  const job = ev.job && typeof ev.job === "object" ? ev.job : null;
+  const now = Number.isFinite(ev.now) ? ev.now : Date.now();
+  const evidence = {
+    queueKnown,
+    queue: null,
+    history: null,
+    rec: rec && typeof rec.state === "string" ? rec.state : null,
+    job: job && typeof job.state === "string" ? job.state : null,
+    submittedAgeMs: null,
+  };
+  const done = (state, source) => ({ state, source, evidence });
+
+  // a. /queue 运行中：后端正在执行的直接证据（强证据，压过残留 history）
+  if (promptId && runningIds.includes(promptId)) {
+    evidence.queue = "running";
+    return done("running", "/queue 运行中");
+  }
+  // b. /queue 排队中：后端确实在排队
+  if (promptId && pendingIds.includes(promptId)) {
+    evidence.queue = "pending";
+    return done("pending", "/queue 排队中");
+  }
+  // c. execution history：后端落库的终态（运行中查不到，只有完成/错误会落库）
+  if (entry) {
+    if (entry.completed === true) {
+      evidence.history = "completed";
+      return done("completed", "execution history（completed）");
+    }
+    if (entry.status === "error") {
+      const interrupted = Boolean(entry.error && /interrupt/i.test(String(entry.error.type || "")));
+      evidence.history = interrupted ? "interrupted" : "error";
+      return done(interrupted ? "interrupted" : "error", "execution history（error）");
+    }
+  }
+  // d. 事件缓存（中继订阅 /ws）：可能断连/丢帧，弱于队列与历史
+  const recState = rec && typeof rec.state === "string" ? rec.state : null;
+  if (recState && recState !== "unknown") {
+    return done(recState, "事件缓存（中继 /ws）");
+  }
+  // e. App 内存记录兜底：提交时写入，之后无人维护（所以排最后）
+  const jobState = job && typeof job.state === "string" ? job.state : null;
+  if (jobState) {
+    const submittedAt = Number.isFinite(job.submittedAt) ? job.submittedAt : null;
+    const age = submittedAt ? Math.max(0, now - submittedAt) : null;
+    evidence.submittedAgeMs = age;
+    // 只有队列确实探测成功（known）时，「都查不到」才成立；否则不能因查不到就判 unknown
+    if (jobState === "pending" && age !== null && age > JOB_STALE_MS && queueKnown) {
+      return done("unknown", "队列与历史均无记录，App 记录停在 pending");
+    }
+    return done(jobState, "App 记录（提交时写入）");
+  }
+  return done("unknown", queueKnown ? "队列与历史均无记录" : "无可用的状态来源");
+}
+
+/**
+ * 回写守卫：是否把 job.state 从 from 改成 next（回写让任务卡等消费方跟着更新）。
+ * 返回 null（不动）或 {mode:"state"|"settle", state}。
+ * - 终态绝不改写：既防回退到 running/pending，也防两种终态互改（会重复触发结算/投递）
+ * - 写终态只走 settleJob（唯一结算路径），不另开第二套
+ * - running → pending 不改：队列详情有 TTL，刚开跑一瞬可能还在 pending 列表
+ * - unknown 不回写：任务卡 stateLine 没有 unknown 分支，会渲染成「运行中」，比不知道更误导
+ */
+export function planJobWriteBack(from, next) {
+  const cur = typeof from === "string" ? from : "";
+  const to = typeof next === "string" ? next : "";
+  if (!to) return null;
+  if (TERMINAL_JOB.has(cur)) return null;
+  if (to === "unknown") return null;
+  if (cur === to) return null;
+  if (to === "running") return { mode: "state", state: to };
+  if (TERMINAL_JOB.has(to)) return { mode: "settle", state: to };
+  if (to === "pending") {
+    if (cur === "running") return null;
+    return { mode: "state", state: to };
+  }
+  return null;
+}
 const CAP_TASKS = "app/tasks.manage";
 const CAP_START_TURN = "app/session.start-turn";
 const CAP_STAGE_FILE = "app/session.stage-file";
@@ -450,6 +559,7 @@ export default defineApp(async (sdk) => {
       state.phase = "ready";
       state.lastError = null;
       startStatusPolling();
+      void alignLaunchConfig(true); // 就绪点①：强制补推本地启动参数（中继侧内存态，重启即丢）
       void maybeAutoStartBackend(); // 中继就绪后按配置决定是否拉起 ComfyUI 服务（不阻塞启动）
       return result;
     } catch (e) {
@@ -526,9 +636,447 @@ export default defineApp(async (sdk) => {
   const previewSettingsFile = join(dataDir, "preview-settings.json");
   const PREVIEW_TIERS = Object.freeze(["basic", "hd"]);
   const PREVIEW_DEFAULT = Object.freeze({ enabled: false, tier: "basic" });
-  // HD 档（taesd）所需解码器：ComfyUI 按「前缀」在 models/vae_approx/ 匹配
-  // （latent_formats.py: QwenImage21.taesd_decoder_name = "taeqi2_1_decoder"），文件名须以该前缀开头。
-  const PREVIEW_HD_FILENAME = "taeqi2_1_decoder.pth";
+  // HD 档解码器显式指定（issue #1 修复）：单独一个文件，**不写进 preview-settings.json**——
+  // writePreviewSettings 只写 {enabled,tier,at}，塞进去会被下一次开关覆盖掉。
+  const previewDecoderFile = join(dataDir, "preview-decoder.json");
+
+  // [r5-preview:begin] ── HD 档解码器对照表 + 判族纯函数（无 IO，可独立求值）────────────
+  // ★ 本区是可求值切片：验收脚本按这两个标记取 substring、注入 join/dirname 后 eval，
+  //   所以区内**不得引用闭包变量**。要加带 IO 的逻辑，请放在区外（本区之后）。
+  //
+  // 背景（issue #1）：原实现把 HD 档解码器写死成 "taeqi2_1_decoder.pth"，依据只有
+  // latent_formats.py:961 QwenImage21.taesd_decoder_name。用户跑 MOSS-Image 时：
+  //   supported_models.py:2050  MOSSImage.latent_format = latent_formats.Flux2
+  //   latent_formats.py:239     Flux2.taesd_decoder_name = "taef2_decoder"
+  // 而 ComfyUI 在 models/vae_approx 里按**前缀**匹配（latent_preview.py get_previewer:
+  //   fn for fn in folder_paths.get_filename_list("vae_approx") if fn.startswith(name)），
+  // 匹配不到只 logging.warning 然后静默降级 latent2rgb —— 现象就是「任务卡全程没有预览帧，
+  // 只在完成时出现成品」。即：下对了文件，下错了名字。
+  //
+  // 值逐条核对自 comfy/latent_formats.py 的 taesd_decoder_name；family 列 = supported_models.py
+  // 里 latent_format = ... 的归属（同族的其它模型也一并列出，便于用户对号）。
+  //
+  // ⚠ 表内顺序 = 判族优先级（matchPreviewDecoder 顺序扫、首个命中即返回）：
+  //   · taef2 必须排在 taef1 之前 —— moss_image_* / flux-2-* / flux3 都是 Flux2（128ch latent）。
+  //     若 FLUX.1 那条先命中，MOSS-Image 会被判成 taef1：文件是合法解码器名、装上也「成功」，
+  //     但 16ch 解码器解 128ch latent 什么也出不来，且不报错。
+  //   · taeqi2_1 必须排在 lighttaew2_1 之前 —— 初代 QwenImage 用的是 Wan21 latent，与 Wan2.1
+  //     共用 lighttaew2_1，所以 "qwenimage" 通配只能留给后面那条。
+  //   · lighttaehy1_5 必须排在 taehv 之前（hunyuanvideo15 的 compact 里含 "hunyuanvideo"）。
+  //   · lighttaew2_2 必须排在 lighttaew2_1 之前（wan2_2 / wan22 的归属）。
+  //   顺序写错**不会报错**——拿到的仍是一个合法解码器文件名，只是族不对、预览继续空白。
+  const PREVIEW_DECODERS = Object.freeze([
+    {
+      key: "taef2_decoder",
+      fileName: "taef2_decoder.pth",
+      family: "FLUX.2 / FLUX.3 / MOSS-Image / Lens / Ideogram4 / MageFlow / ErnieImage（latent_formats.Flux2，latent_channels=128）",
+      keywords: ["taef2", "flux2", "flux3", "mossimage", "lens", "ideogram4", "mageflow", "ernieimage"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taesd@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taesd/main/taef2_decoder.pth", headStatus: 200, bytes: 2704756 },
+        { name: "jsdelivr · 同仓镜像（HEAD 实测 200）", url: "https://cdn.jsdelivr.net/gh/madebyollin/taesd@main/taef2_decoder.pth", headStatus: 200 },
+      ],
+    },
+    {
+      key: "taeqi2_1_decoder",
+      fileName: "taeqi2_1_decoder.pth",
+      family: "QwenImage 2.1（latent_formats.QwenImage21）",
+      keywords: ["taeqi2", "qwenimage2"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taesd@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taesd/main/taeqi2_1_decoder.pth", headStatus: 200, bytes: 15314938 },
+        { name: "jsdelivr · 同仓镜像（HEAD 实测 200）", url: "https://cdn.jsdelivr.net/gh/madebyollin/taesd@main/taeqi2_1_decoder.pth", headStatus: 200 },
+      ],
+    },
+    {
+      key: "taef1_decoder",
+      fileName: "taef1_decoder.pth",
+      family: "FLUX.1 / HiDream(1.0) / Z-Image / Chroma / Kandinsky5-Image / LongCat / OmniGen2 / Lumina2（latent_formats.Flux，latent_channels=16）",
+      keywords: ["taef1", "flux1", "fluxdev", "fluxschnell", "hidream", "zimage", "lumina", "chroma", "kandinsky5image", "longcat", "omnigen"],
+      // HiDream-O1 是像素空间（HiDreamO1Pixel，无 VAE、上游也没有 taesd）：宁可 null 也不错配 taef1。
+      excludes: ["hidreamo1"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taesd@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taesd/main/taef1_decoder.pth", headStatus: 200, bytes: 4943336 },
+        { name: "jsdelivr · 同仓镜像（HEAD 实测 200）", url: "https://cdn.jsdelivr.net/gh/madebyollin/taesd@main/taef1_decoder.pth", headStatus: 200 },
+      ],
+    },
+    {
+      key: "taesd3_decoder",
+      fileName: "taesd3_decoder.pth",
+      family: "SD3 / SD3.5（latent_formats.SD3）",
+      keywords: ["taesd3", "sd3", "sd35"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taesd@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taesd/main/taesd3_decoder.pth", headStatus: 200, bytes: 4940671 },
+        { name: "jsdelivr · 同仓镜像（HEAD 实测 200）", url: "https://cdn.jsdelivr.net/gh/madebyollin/taesd@main/taesd3_decoder.pth", headStatus: 200 },
+      ],
+    },
+    {
+      key: "taesdxl_decoder",
+      fileName: "taesdxl_decoder.pth",
+      family: "SDXL（含 Refiner / Playground v2.5）/ PixArt-Σ / HunyuanDiT / AuraFlow（latent_formats.SDXL）",
+      keywords: ["taesdxl", "sdxl", "playground", "pixartsigma", "hunyuandit", "auraflow"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taesd@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taesd/main/taesdxl_decoder.pth", headStatus: 200, bytes: 4913541 },
+        { name: "jsdelivr · 同仓镜像（HEAD 实测 200）", url: "https://cdn.jsdelivr.net/gh/madebyollin/taesd@main/taesdxl_decoder.pth", headStatus: 200 },
+      ],
+    },
+    {
+      key: "lighttaew2_2",
+      fileName: "lighttaew2_2.pth",
+      family: "Wan 2.2（视频，latent_formats.Wan22）",
+      keywords: ["lighttaew22", "taew22", "wan22"],
+      downloadable: true,
+      sources: [
+        { name: "HuggingFace · lightx2v/Autoencoders（HEAD 实测 200）", url: "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lighttaew2_2.pth", headStatus: 200, bytes: 45712042 },
+        { name: "hf-mirror · 同仓镜像（HEAD 实测 200）", url: "https://hf-mirror.com/lightx2v/Autoencoders/resolve/main/lighttaew2_2.pth", headStatus: 200, bytes: 45712042 },
+        { name: "GitHub raw · madebyollin/taehv@main（HEAD 实测 200，但文件名是 taew2_2.pth）", url: "https://raw.githubusercontent.com/madebyollin/taehv/main/taew2_2.pth", headStatus: 200, bytes: 22884021 },
+      ],
+      caution: "⚠ 命名坑：GitHub 上游（madebyollin/taehv）的文件名不带 light 前缀（taew2_2.pth），而 ComfyUI 按 startswith(\"lighttaew2_2\") 匹配 —— 直接下那份不会被认出。首选 HF lightx2v/Autoencoders（文件名就叫 lighttaew2_2.pth）；非要用 GitHub 那份，落地必须改名为 lighttaew2_2.pth。",
+    },
+    {
+      key: "lighttaehy1_5",
+      fileName: "lighttaehy1_5.pth",
+      family: "HunyuanVideo 1.5（视频，latent_formats.HunyuanVideo15）",
+      keywords: ["lighttaehy15", "taehy15", "hunyuanvideo15"],
+      downloadable: true,
+      sources: [
+        { name: "HuggingFace · lightx2v/Autoencoders（HEAD 实测 200）", url: "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lighttaehy1_5.pth", headStatus: 200, bytes: 45528051 },
+        { name: "hf-mirror · 同仓镜像（HEAD 实测 200）", url: "https://hf-mirror.com/lightx2v/Autoencoders/resolve/main/lighttaehy1_5.pth", headStatus: 200, bytes: 45528051 },
+        { name: "GitHub raw · madebyollin/taehv@main（HEAD 实测 200，但文件名是 taehv1_5.pth）", url: "https://raw.githubusercontent.com/madebyollin/taehv/main/taehv1_5.pth", headStatus: 200, bytes: 22785107 },
+      ],
+      caution: "⚠ 同上：GitHub 上游叫 taehv1_5.pth，不带 light 前缀，ComfyUI 不认。首选 HF 源；GitHub 那份需改名为 lighttaehy1_5.pth。",
+    },
+    {
+      key: "taeh3",
+      fileName: "taeh3.pth",
+      family: "MiniMax H3 / H3 AV（视频，latent_formats.MiniMaxH3Video）",
+      keywords: ["taeh3", "minimaxh3"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taehv@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taehv/main/taeh3.pth", headStatus: 200, bytes: 22745717 },
+        { name: "HuggingFace · t8star/Taeh3-Comfy（HEAD 实测 200，safetensors）", url: "https://huggingface.co/t8star/Taeh3-Comfy/resolve/main/models/vae_approx/taeh3.safetensors", headStatus: 200, bytes: 22709752 },
+      ],
+      caution: "⚠ jsdelivr 对该仓的 taeh3.pth 实测 403（大文件 CDN 限额），只有 GitHub raw 可用。ComfyUI 对 taeh3 是「视频 TAE」分支（latent_preview.py VIDEO_TAES），用 VAE(load_torch_file) 加载，.pth / .safetensors 都行。",
+    },
+    {
+      key: "taehv",
+      fileName: "taehv.pth",
+      family: "HunyuanVideo 1.0 / Kandinsky 5（视频，latent_formats.HunyuanVideo）",
+      keywords: ["taehv", "hyvideo", "hunyuanvideo", "kandinsky5"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taehv@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taehv/main/taehv.pth", headStatus: 200, bytes: 22679486 },
+      ],
+      caution: "⚠ jsdelivr 对该仓同路径实测 403；HF 上的 madebyollin/taehv 仓库不存在（只有 GitHub）。",
+    },
+    {
+      key: "lighttaew2_1",
+      fileName: "lighttaew2_1.pth",
+      family: "Wan 2.1 / QwenImage（初代）/ Krea2 / JoyImage / Anima / Cosmos-Predict2（latent_formats.Wan21）",
+      keywords: ["lighttaew21", "taew21", "wan21", "qwenimage", "krea2", "joyimage", "anima"],
+      downloadable: true,
+      sources: [
+        { name: "HuggingFace · lightx2v/Autoencoders（HEAD 实测 200）", url: "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lighttaew2_1.pth", headStatus: 200, bytes: 45301802 },
+        { name: "hf-mirror · 同仓镜像（HEAD 实测 200）", url: "https://hf-mirror.com/lightx2v/Autoencoders/resolve/main/lighttaew2_1.pth", headStatus: 200, bytes: 45301802 },
+        { name: "GitHub raw · madebyollin/taehv@main（HEAD 实测 200，但文件名是 taew2_1.pth）", url: "https://raw.githubusercontent.com/madebyollin/taehv/main/taew2_1.pth", headStatus: 200, bytes: 22678901 },
+      ],
+      caution: "⚠ 同 lighttaew2_2：GitHub 上游不带 light 前缀，ComfyUI 不认；首选 HF 源。另注意初代 QwenImage 用的是 Wan21 latent，与 Wan2.1 共用这个解码器。",
+    },
+    {
+      key: "taesd_decoder",
+      fileName: "taesd_decoder.pth",
+      family: "SD 1.x / SD 2.x / SVD / Stable Zero123 / PixArt-α（latent_formats.SD15）",
+      keywords: ["taesd", "sd15", "sd2", "sdv1", "svd", "stablezero123", "pixartalpha"],
+      downloadable: true,
+      sources: [
+        { name: "GitHub raw · madebyollin/taesd@main（HEAD 实测 200）", url: "https://raw.githubusercontent.com/madebyollin/taesd/main/taesd_decoder.pth", headStatus: 200, bytes: 4913399 },
+        { name: "jsdelivr · 同仓镜像（HEAD 实测 200）", url: "https://cdn.jsdelivr.net/gh/madebyollin/taesd@main/taesd_decoder.pth", headStatus: 200 },
+      ],
+    },
+    {
+      key: null,
+      fileName: null,
+      family: "Mochi（Genmo Mochi 1，视频）",
+      keywords: ["mochi"],
+      downloadable: false,
+      sources: [],
+      caution: "上游就没有：latent_formats.py:335 Mochi.taesd_decoder_name 原文是 None #TODO（模型没训练完）。没有文件可下 —— 这族只能走基础档 latent2rgb。",
+    },
+  ]);
+
+  // 归一：小写 + 非字母数字折叠为 _；compact 再去掉分隔符（"qwen_image_2.1_bf16" → qwenimage21bf16）
+  function normDecoderToken(s) {
+    const t = String(s === undefined || s === null ? "" : s).toLowerCase().trim();
+    return { norm: t.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, ""), compact: t.replace(/[^a-z0-9]+/g, "") };
+  }
+
+  // 判族：按文件名 / 模型名猜 latent_format 族。表内顺序即优先级；命中不了返回 null（宁可 null 不猜错）。
+  function matchPreviewDecoder(name) {
+    const { compact } = normDecoderToken(name);
+    if (!compact) return null;
+    for (const e of PREVIEW_DECODERS) {
+      const ex = e.excludes || [];
+      if (ex.length && ex.some((x) => { const k = normDecoderToken(x).compact; return k && compact.includes(k); })) continue;
+      const hit = (e.keywords || []).some((kw) => { const k = normDecoderToken(kw).compact; return k && compact.includes(k); });
+      if (hit) return e;
+    }
+    return null;
+  }
+
+  // 用户显式指定（key / 文件名 / 关键词别名）→ 表项。不认识的**报错**，不偷换、不猜。
+  function resolveDecoderInput(raw) {
+    const { compact } = normDecoderToken(raw);
+    if (!compact) return { ok: false, error: "decoder 不能是空串" };
+    if (compact === "null" || compact === "none") {
+      return { ok: true, entry: PREVIEW_DECODERS.find((x) => x.key === null) || null, note: "显式指定无解码器族（Mochi）" };
+    }
+    const exact = PREVIEW_DECODERS.find((x) => x.key && (normDecoderToken(x.key).compact === compact || normDecoderToken(x.fileName).compact === compact));
+    if (exact) return { ok: true, entry: exact };
+    const byKw = matchPreviewDecoder(raw);
+    if (byKw) return { ok: true, entry: byKw };
+    return {
+      ok: false,
+      error: `不认识的 decoder（收到 "${String(raw)}"）。可用值：${PREVIEW_DECODERS.map((x) => (x.key === null ? "null" : x.key)).join(" / ")}`,
+    };
+  }
+
+  // ComfyUI 的前缀 = taesd_decoder_name（= fileName 去掉扩展名）
+  function decoderPrefix(entry) {
+    if (!entry || !entry.fileName) return null;
+    return String(entry.fileName).replace(/\.(pth|pt|safetensors|bin)$/i, "");
+  }
+
+  // 已装判定：后端 /models/vae_approx 列表里找「以该前缀开头」的文件（与 latent_preview 的匹配口径一致）。
+  function findInstalledDecoderFile(files, entry) {
+    const prefix = decoderPrefix(entry);
+    if (!prefix) return null;
+    const p = prefix.toLowerCase();
+    return (Array.isArray(files) ? files : []).find((f) => String(f).toLowerCase().startsWith(p)) || null;
+  }
+
+  // 安装探测结果 → ComfyUI 主目录候选（便携版外层 / 源码安装都覆盖；顺序即优先）。
+  // 为什么不能直接用 installs[0].path：便携版外层根（D:\\ComfyUI）的 models/ 并不在它下面，
+  // 真正的模型目录在 <root>/ComfyUI/models（relay detectInstall 的 mainPy 才是权威）。
+  function comfyMainDirCandidates(installs) {
+    const out = [];
+    const push = (d) => { if (d && !out.includes(d)) out.push(d); };
+    for (const it of Array.isArray(installs) ? installs : []) {
+      if (!it) continue;
+      if (typeof it.mainPy === "string" && it.mainPy) push(dirname(it.mainPy));
+      if (typeof it.path === "string" && it.path) { push(it.path); push(join(it.path, "ComfyUI")); }
+    }
+    return out;
+  }
+
+  // 画布快照 → 判族。快照形状见 bridge/js nodeSummary：{id,type,title,mode,widgets:{widgetName:value}}。
+  // 评分口径：模型/loader 节点上的模型名控件 > loader 节点类型名 > 其它控件 > 普通节点类型名。
+  function guessDecoderFromSummary(summary) {
+    const nodes = summary && Array.isArray(summary.nodes) ? summary.nodes : [];
+    const MODEL_WIDGET = /(unet|ckpt|checkpoint|model|dit|weights|vae|file|path|name)/i;
+    const STRONG_WIDGET = /^(unet_name|ckpt_name|model_path|model_name|model|model_file)$/i;
+    const cands = [];
+    for (const n of nodes) {
+      if (!n) continue;
+      if (n.mode === 2 || n.mode === 4) continue; // 2=mute / 4=bypass：不参与执行，不算证据
+      const type = String(n.type || "");
+      const isLoader = /(loader|unet|dit|ckpt|checkpoint)/i.test(type);
+      if (type) cands.push({ score: isLoader ? 10 : 3, kind: "type", nodeId: n.id, nodeType: type, value: type });
+      const widgets = n.widgets && typeof n.widgets === "object" ? n.widgets : {};
+      for (const k of Object.keys(widgets)) {
+        const v = widgets[k];
+        if (typeof v !== "string" || !v.trim()) continue;
+        if (!MODEL_WIDGET.test(k)) continue;
+        cands.push({
+          score: (isLoader ? 20 : 6) + (STRONG_WIDGET.test(k) ? 4 : 0),
+          kind: "widget", nodeId: n.id, nodeType: type, widget: k, value: v,
+        });
+      }
+    }
+    cands.sort((a, b) => b.score - a.score);
+    for (const c of cands) {
+      const e = matchPreviewDecoder(c.value);
+      if (e) return { entry: e, evidence: { nodeId: c.nodeId, nodeType: c.nodeType, via: c.kind, widget: c.widget || null, value: c.value } };
+    }
+    const seen = cands.filter((c) => c.kind === "widget").slice(0, 5).map((c) => `${c.nodeType || "?"}.${c.widget}=${c.value}`);
+    return {
+      entry: null,
+      reason: cands.length
+        ? `画布快照里没有认出已知解码器族（看到的模型名：${seen.join("；") || "无模型类控件"}）`
+        : "画布快照里没有节点",
+    };
+  }
+  // [r5-preview:end]
+
+  // ── 解码器显式指定：读写（独立文件，避免被 writePreviewSettings 覆盖）──────────
+  function readPreviewDecoderKey() {
+    try {
+      const raw = JSON.parse(readFileSync(previewDecoderFile, "utf8"));
+      return raw && typeof raw.key === "string" && raw.key.trim() ? raw.key.trim() : null;
+    } catch { return null; }
+  }
+
+  function writePreviewDecoderKey(key) {
+    try {
+      mkdirSync(dataDir, { recursive: true });
+      writeFileAtomic(previewDecoderFile, JSON.stringify({ key: key || null, at: new Date().toISOString() }, null, 2));
+      return true;
+    } catch (e) {
+      warn(`preview-decoder 写入失败：${msgOf(e)}`);
+      return false;
+    }
+  }
+
+  // 中继侧文件 stat（app 进程受宿主文件沙箱限制，不能直接 existsSync 宿主安装目录）。
+  // ⚠ 函数名不能叫 relayStatPath：下方「文件源通道」区（约 L4520）已有一个同名函数，
+  //   同在 apply 作用域内 → 函数声明提升后后者胜出，返回形状不同（那个返 stat 对象、这个返 {ok,isFile}），
+  //   调用方会拿到 undefined 的 ok 而静默走到「未复验」分支（本轮实测踩到过）。
+  async function relayStatItem(p) {
+    if (!relayReady()) return { ok: false, error: "中继未就绪，无法复验路径" };
+    try {
+      const { ok, data } = await relayJson("/_relay/fs/stat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: p }),
+        timeoutMs: 8_000,
+      });
+      const st = ok && data && data.stat ? data.stat : null;
+      return { ok: !!(st && st.exists), isFile: !!(st && st.isFile), isDir: !!(st && st.isDirectory), stat: st, error: ok ? null : (data && data.error) || "stat 失败" };
+    } catch (e) { return { ok: false, error: msgOf(e) }; }
+  }
+
+  // 解析真正的 ComfyUI 主目录（main.py 所在目录）。拿不到就 null + 原因，不给可疑路径。
+  const PREVIEW_MAIN_DIR_TTL_MS = 60_000;
+  let previewMainDirCache = { at: 0, sig: "", value: null };
+
+  function probeInstalls() {
+    const env = state.snapshot && state.snapshot.relay ? state.snapshot.relay.env : null;
+    return env && Array.isArray(env.installs) ? env.installs : [];
+  }
+
+  async function resolveComfyMainDir(force = false) {
+    const installs = probeInstalls();
+    const sig = JSON.stringify(installs.map((i) => [i && i.path, i && i.mainPy, i && i.kind]));
+    if (!force && previewMainDirCache.value && previewMainDirCache.sig === sig && Date.now() - previewMainDirCache.at < PREVIEW_MAIN_DIR_TTL_MS) {
+      return previewMainDirCache.value;
+    }
+    let out = null;
+    if (!installs.length) {
+      out = { dir: null, source: null, verified: false, error: "未探测到本机 ComfyUI 安装（中继 env.installs 为空，中继可能未就绪）" };
+    } else {
+      for (const cand of comfyMainDirCandidates(installs)) {
+        const st = await relayStatItem(join(cand, "main.py"));
+        if (st.ok && st.isFile) { out = { dir: cand, source: `main.py 实测存在（${cand}）`, verified: true, error: null }; break; }
+      }
+      if (!out) {
+        // 中继不可达 / stat 全部失败：退到探测给的 mainPy 目录（探测本身就是 existsSync 过的，只是这次没复验）
+        const trust = installs.find((i) => i && typeof i.mainPy === "string" && i.mainPy);
+        out = trust
+          ? { dir: dirname(trust.mainPy), source: "中继安装探测的 mainPy 目录（本次未能复验）", verified: false, error: null }
+          : { dir: null, source: null, verified: false, error: "无法确定 ComfyUI 主目录：探测到的安装里没有可确认的 main.py" };
+      }
+    }
+    previewMainDirCache = { at: Date.now(), sig, value: out };
+    return out;
+  }
+
+  // models/vae_approx 目标目录。注：ComfyUI 的 models_dir 可被 --base-directory / extra_model_paths.yaml 改掉，
+  // 本函数只按标准布局算；装到别处时以 /models/vae_approx 实测列表为准（见 fetchVaeApproxList）。
+  async function resolvePreviewVaeApproxDir(force = false) {
+    const m = await resolveComfyMainDir(force);
+    if (!m.dir) return { targetDir: null, mainDir: null, verified: false, dirExists: null, source: m.source, error: m.error };
+    const dir = join(m.dir, "models", "vae_approx");
+    const st = await relayStatItem(dir);
+    return {
+      targetDir: dir,
+      mainDir: m.dir,
+      verified: m.verified === true,
+      dirExists: st.ok ? st.isDir !== false : null,
+      source: m.source,
+      error: null,
+    };
+  }
+
+  // 后端「实际认到的」解码器清单：folder_paths.get_filename_list("vae_approx")（缓存按目录 mtime 失效，新文件立即可见）
+  async function fetchVaeApproxList() {
+    if (!relayReady()) return { ok: false, files: [], error: `中继未就绪（phase=${state.phase}）` };
+    try {
+      const { ok, status, data } = await relayJson("/models/vae_approx", { timeoutMs: 20_000 });
+      if (!ok || !Array.isArray(data)) return { ok: false, files: [], error: `后端 /models/vae_approx 不可用（HTTP ${status}）` };
+      return { ok: true, files: data.map((x) => String(x)), error: null };
+    } catch (e) { return { ok: false, files: [], error: msgOf(e) }; }
+  }
+
+  // ── 判族三条路：user（显式指定）→ canvas（画布快照，带缓存）→ fallback（null + 原因）──
+  const PREVIEW_CANVAS_TTL_MS = 30_000;
+  const PREVIEW_CANVAS_FALLBACK_TTL_MS = 5_000; // 没认出来时缓存短一点：画布刚打开能尽快被认到
+  const PREVIEW_CANVAS_MAX_AGE_SEC = 900; // 快照超过 15 分钟视为过期（画布多半已关，不拿旧图当证据）
+  let previewCanvasCache = { at: 0, result: null };
+
+  async function detectPreviewDecoder(opts = {}) {
+    const force = opts.force === true;
+    // ① user：请求参数显式指定（不认识就报错，不偷换）
+    if (opts.user !== undefined && opts.user !== null && String(opts.user).trim() !== "") {
+      const hit = resolveDecoderInput(opts.user);
+      if (!hit.ok) return { key: null, entry: null, source: "user", via: "request", error: hit.error };
+      return { key: hit.entry ? hit.entry.key : null, entry: hit.entry, source: "user", via: "request" };
+    }
+    // ① user（已存设置）
+    const stored = readPreviewDecoderKey();
+    if (stored) {
+      const hit = resolveDecoderInput(stored);
+      if (hit.ok && hit.entry) return { key: hit.entry.key, entry: hit.entry, source: "user", via: "setting" };
+    }
+    // ② canvas：画布快照（服务端缓存，零往返）；带 TTL 缓存，别每次 query 都打桥
+    if (!force && previewCanvasCache.result) {
+      const ttl = previewCanvasCache.result.source === "canvas" ? PREVIEW_CANVAS_TTL_MS : PREVIEW_CANVAS_FALLBACK_TTL_MS;
+      if (Date.now() - previewCanvasCache.at < ttl) return previewCanvasCache.result;
+    }
+    let res;
+    try {
+      const inv = await canvasBridgeInvoke("canvas.state", {}, 8_000);
+      if (!inv.ok) {
+        res = { key: null, entry: null, source: "fallback", error: `画布快照不可用（${inv.error || "桥未回帖"}）` };
+      } else {
+        const st = inv.payload && typeof inv.payload === "object" ? inv.payload : {};
+        const summary = st.summary || null;
+        const ageSec = Number(st.ageSec);
+        if (!summary || !Array.isArray(summary.nodes) || !summary.nodes.length) {
+          res = { key: null, entry: null, source: "fallback", error: "画布快照为空（当前没有打开的工作流快照）" };
+        } else if (Number.isFinite(ageSec) && ageSec > PREVIEW_CANVAS_MAX_AGE_SEC) {
+          res = { key: null, entry: null, source: "fallback", error: `画布快照已过期（${Math.round(ageSec)}s 前；画布可能已关闭）` };
+        } else {
+          const g = guessDecoderFromSummary(summary);
+          res = g.entry
+            ? { key: g.entry.key, entry: g.entry, source: "canvas", evidence: g.evidence, snapshotAgeSec: Number.isFinite(ageSec) ? ageSec : null }
+            : { key: null, entry: null, source: "fallback", error: g.reason };
+        }
+      }
+    } catch (e) {
+      res = { key: null, entry: null, source: "fallback", error: `画布快照不可用（${msgOf(e)}）` };
+    }
+    previewCanvasCache = { at: Date.now(), result: res };
+    return res;
+  }
+
+  // 对外的表行（加 installed / prefix；不暴露内部 excludes 之类的实现细节）
+  function previewDecoderRow(entry, files) {
+    const installedFile = findInstalledDecoderFile(files, entry);
+    return {
+      key: entry.key,
+      fileName: entry.fileName,
+      prefix: decoderPrefix(entry),
+      family: entry.family,
+      keywords: entry.keywords.slice(),
+      downloadable: entry.downloadable !== false,
+      installed: !!installedFile,
+      installedFile: installedFile || null,
+      sources: entry.sources.slice(),
+      ...(entry.caution ? { caution: entry.caution } : {}),
+    };
+  }
 
   function readAllowWrite() {
     try {
@@ -586,6 +1134,64 @@ export default defineApp(async (sdk) => {
     }
   }
 
+  // ── 启动参数设置（issue #2 P1）──────────────────────────────────────────
+  // 额外启动参数 + 启动前环境变量。真相源在本文件（launch-settings.json），生效值经中继
+  // /_relay/launch-config 下发；中继只在生成启动器（backend-launcher.cmd）时用它——
+  // 所以改完不会影响已在跑的实例，需重启服务才生效。
+  // env 规范形态：[{k,v}]（与中继一致）。本地只做「文本→数组」的形态归一（首个 = 切分），
+  // 完整校验（非法字符 / KEY 规则 / --port 保留参数）全部在中继那一处做，不在这里重复实现。
+  const launchSettingsFile = join(dataDir, "launch-settings.json");
+  const LAUNCH_DEFAULT = Object.freeze({ extraArgs: "", env: [] });
+
+  function normalizeLaunchEnvLocal(raw) {
+    if (raw === undefined || raw === null) return [];
+    if (Array.isArray(raw)) {
+      return raw.map((e) => ({
+        k: e && typeof e.k === "string" ? e.k.trim() : "",
+        v: e && e.v !== undefined && e.v !== null ? String(e.v) : "",
+      }));
+    }
+    if (typeof raw === "string") {
+      const out = [];
+      const lines = raw.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        const eq = line.indexOf("=");
+        if (eq < 0) throw new Error(`环境变量第 ${i + 1} 行：缺少「=」，应写成 KEY=VALUE`);
+        out.push({ k: line.slice(0, eq).trim(), v: line.slice(eq + 1).trim() });
+      }
+      return out;
+    }
+    throw new Error("env 必须是 [{k,v}] 数组，或 KEY=VALUE 多行文本");
+  }
+
+  // env 数组 → 多行文本（设置页 textarea 展示用）
+  function launchEnvText(env) {
+    return (Array.isArray(env) ? env : []).map((e) => `${e.k}=${e.v}`).join("\n");
+  }
+
+  function readLaunchSettings() {
+    try {
+      const raw = JSON.parse(readFileSync(launchSettingsFile, "utf8"));
+      const extraArgs = raw && typeof raw.extraArgs === "string" ? raw.extraArgs : "";
+      let env = [];
+      try { env = normalizeLaunchEnvLocal(raw && raw.env); } catch { env = []; } // 盘上内容坏 → 空 env，不报错
+      return { extraArgs, env };
+    } catch { return { extraArgs: LAUNCH_DEFAULT.extraArgs, env: [] }; }
+  }
+
+  function writeLaunchSettings({ extraArgs, env }) {
+    try {
+      mkdirSync(dataDir, { recursive: true });
+      writeFileSync(launchSettingsFile, JSON.stringify({ extraArgs: typeof extraArgs === "string" ? extraArgs : "", env: Array.isArray(env) ? env : [], at: new Date().toISOString() }, null, 2), { mode: 0o600 });
+      return true;
+    } catch (e) {
+      warn(`launch-settings 写入失败：${msgOf(e)}`);
+      return false;
+    }
+  }
+
   // 归一化中继回读的 {enabled, method}（method 非两级档位 → null；enabled 但无 method 视为关）。
   function normalizeRelayPreview(raw) {
     const src = raw && typeof raw === "object" ? raw : {};
@@ -616,6 +1222,70 @@ export default defineApp(async (sdk) => {
       return { pushed: true, error: null };
     } catch (e) {
       return { pushed: false, error: msgOf(e) };
+    }
+  }
+
+  // 推送启动参数给中继。中继校验失败回 400 + 逐项点名的 error，这里原样带回给设置页。
+  async function relayLaunchPush(extraArgs, env) {
+    try {
+      const res = await relayFetch("/_relay/launch-config", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ extraArgs, env }),
+        timeoutMs: 8_000,
+      });
+      let data = null;
+      try { data = await res.json(); } catch { data = null; }
+      if (!res.ok) {
+        return { pushed: false, status: res.status, error: (data && data.error) || `relay HTTP ${res.status}` };
+      }
+      return { pushed: true, status: res.status, error: null, data };
+    } catch (e) {
+      return { pushed: false, status: 0, error: msgOf(e) };
+    }
+  }
+
+  // 中继回读（启动参数）：不可达/未就绪一律返回 null，不抛错。
+  async function relayLaunchRead() {
+    if (!relayReady()) return null;
+    try {
+      const { ok, data } = await relayJson("/_relay/launch-config", { timeoutMs: 5_000 });
+      if (!ok || !data || typeof data !== "object") return null;
+      return {
+        extraArgs: typeof data.extraArgs === "string" ? data.extraArgs : "",
+        env: Array.isArray(data.env) ? data.env : [],
+      };
+    } catch { return null; }
+  }
+
+  // 中继就绪后把本地启动参数补推给中继（中继侧是内存态，重启就回落为空 → 不补推就丢了）。
+  // 两个就绪点调用：① ensureManagedRuntime 进 ready 时 force；② 状态轮询末尾（节流 ≥30s）。
+  // 幂等：内容未变且中继 pid 未变就不推；失败只 warn，不抛错（不影响启动与轮询）。
+  const LAUNCH_ALIGN_MS = 30_000;
+  let lastLaunchAlignAt = 0;
+  let lastLaunchSig = null;
+  let lastLaunchPid = 0;
+
+  async function alignLaunchConfig(force = false) {
+    if (!relayReady()) return;
+    const now = Date.now();
+    if (!force && now - lastLaunchAlignAt < LAUNCH_ALIGN_MS) return;
+    lastLaunchAlignAt = now;
+    try {
+      const snap = state.snapshot;
+      const pid = (snap && snap.relay && snap.relay.relay && snap.relay.relay.pid) || 0;
+      const s = readLaunchSettings();
+      const sig = JSON.stringify(s);
+      if (!force && sig === lastLaunchSig && pid === lastLaunchPid) return; // 同内容 + 同中继实例：不重复推
+      const { pushed, error } = await relayLaunchPush(s.extraArgs, s.env);
+      if (pushed) {
+        lastLaunchSig = sig;
+        lastLaunchPid = pid;
+      } else {
+        warn(`启动参数补推失败（下次轮询重试）：${error}`);
+      }
+    } catch (e) {
+      warn(`启动参数补推异常：${msgOf(e)}`);
     }
   }
 
@@ -789,6 +1459,7 @@ export default defineApp(async (sdk) => {
     }
     state.snapshot = { at: Date.now(), relay: relay || null, error: lastErrText };
     void syncCustomRoots(); // 中继重启（pid 变化）时自动重推自定义安装位置
+    void alignLaunchConfig(); // 就绪点②：轮询末尾对齐启动参数（节流 ≥30s；中继重启 pid 变即重推）
 
     if (!relay && state.phase === "ready") {
       try {
@@ -1052,16 +1723,18 @@ export default defineApp(async (sdk) => {
       const r = await relayJson("/_relay/prompts", { timeoutMs: 6_000 });
       if (r.ok) promptsSnap = r.data;
     } catch { /* 快照失败时仍走 history 兜底 */ }
+    // 队列证据（#2 P3-c）：只用于「有证据的单向提升」，不产生终态、不回退
+    const queue = await fetchQueueDetail();
     for (const job of active) {
       try {
-        await refreshJob(job, promptsSnap);
+        await refreshJob(job, promptsSnap, queue);
       } catch (e) {
         warn(`任务跟踪失败（${job.promptId}）：${msgOf(e)}`);
       }
     }
   }
 
-  async function refreshJob(job, promptsSnap) {
+  async function refreshJob(job, promptsSnap, queue = null) {
     const now = Date.now();
     const rec =
       (promptsSnap?.active || []).find((r) => r.promptId === job.promptId) ||
@@ -1084,8 +1757,20 @@ export default defineApp(async (sdk) => {
         return settleJob(job, job.cancelRequested ? "canceled" : "interrupted", null, null);
       }
     }
+    // 队列证据（#2 P3-c）：任务实际已在跑、但 /ws 事件还没到（或中继重连丢帧）时，
+    // job.state 会一直停在提交时的 pending，任务卡就永远「排队中」。
+    // 这里只做「有证据的单向提升」：队列说它在跑 → 提为 running（不产生终态、不回退）。
+    const queueRunning = Boolean(queue && queue.known === true && Array.isArray(queue.running) && queue.running.includes(job.promptId));
+    if (queueRunning) {
+      const plan = planJobWriteBack(job.state, "running");
+      if (plan && plan.mode === "state") {
+        job.state = plan.state;
+        if (!job.startedAt) job.startedAt = now;
+      }
+    }
     // history 权威收尾（完成/错误/中断都会落 history）
-    if (!job.historyFetched && (rec?.state === "completed" || now - job.submittedAt > 3_000)) {
+    // 队列已确认它在执行时不采信 history：残留条目（上一轮同 id）不得把运行中错结为完成。
+    if (!queueRunning && !job.historyFetched && (rec?.state === "completed" || now - job.submittedAt > 3_000)) {
       try {
         const { ok, data } = await relayJson(`/_relay/history?id=${encodeURIComponent(job.promptId)}`, { timeoutMs: 8_000 });
         if (ok && Array.isArray(data?.entries) && data.entries.length) {
@@ -2011,6 +2696,23 @@ export default defineApp(async (sdk) => {
     return null;
   }
 
+  // /_relay/queue-detail 查询（#2 P3-c）：拿不到/中继不支持时返回 null，调用方按「不可用」处理。
+  async function fetchQueueDetail() {
+    try {
+      const r = await relayJson("/_relay/queue-detail", { timeoutMs: 5_000 });
+      if (r.ok && r.data && typeof r.data === "object" && r.data.ok === true) {
+        return {
+          known: r.data.known === true,
+          running: Array.isArray(r.data.running) ? r.data.running : [],
+          pending: Array.isArray(r.data.pending) ? r.data.pending : [],
+        };
+      }
+      return null;
+    } catch {
+      return null; // 中继不可达：不据此否定任何结论
+    }
+  }
+
   async function actionQuery(args) {
     const promptId = await resolvePromptId(args);
     if (promptId) {
@@ -2024,14 +2726,29 @@ export default defineApp(async (sdk) => {
         const h = await relayJson(`/_relay/history?id=${encodeURIComponent(promptId)}`, { timeoutMs: 8_000 });
         entry = h.ok && Array.isArray(h.data?.entries) ? h.data.entries[0] : null;
       } catch { /* 历史可缺 */ }
-      const jobState = job ? job.state : (entry ? (entry.completed ? "completed" : entry.status === "error" ? "error" : "running") : rec ? rec.state : "unknown");
+      const queue = await fetchQueueDetail();
+      // 多源取最可信（强证据优先于提交时的旧记录）；纯函数，见顶层 resolveJobState
+      const verdict = resolveJobState({ promptId, queue, history: entry, rec, job });
+      const jobState = verdict.state;
+      // 回写：让任务卡等消费方跟着更新（终态不改写；终态只走 settleJob）
+      if (job) {
+        const plan = planJobWriteBack(job.state, jobState);
+        if (plan && plan.mode === "state") {
+          job.state = plan.state;
+          persistJobsSoon();
+        } else if (plan && plan.mode === "settle") {
+          // 与 refreshJob 同口径：用户已请求取消的任务不结为 interrupted/error，统结为 canceled
+          const kind = job.cancelRequested && (plan.state === "interrupted" || plan.state === "error") ? "canceled" : plan.state;
+          try { await settleJob(job, kind, entry && entry.error ? entry.error : null, entry); } catch (e) { warn(`query 回写终态失败（${job.promptId}）：${msgOf(e)}`); }
+        }
+      }
       // 投递状态探针（宿主侧：published=已发布待投递 / delivered=已送达；子代理会话预期停在 published）
       let delivery = null;
       if (job && job.taskId && typeof sdk.tasks?.getDelivery === "function") {
         try { delivery = await sdk.tasks.getDelivery(job.taskId); } catch { /* 读不到不影响查询 */ }
       }
       const lines = [`ComfyUI 任务查询：${promptId}`];
-      lines.push(`- 状态：${jobState}${job && job.taskId ? ` · 宿主任务 ${job.taskId}` : ""}`);
+      lines.push(`- 状态：${jobState}（依据：${verdict.source}）${job && job.taskId ? ` · 宿主任务 ${job.taskId}` : ""}`);
       if (job) lines.push(`- 标签：${job.label} · 用时 ${Math.round(elapsedMsOf(job) / 1000)}s`);
       if (delivery) lines.push(`- 投递：${delivery.state}${delivery.delivered ? "（已送达）" : "（未送达）"}`);
       if (rec) {
@@ -2045,7 +2762,7 @@ export default defineApp(async (sdk) => {
       }
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { comfyui: { action: "query", promptId, state: jobState, job: job ? jobSummary(job) : null, delivery, event: rec || null, history: entry || null } },
+        details: { comfyui: { action: "query", promptId, state: jobState, evidence: verdict.source, evidenceDetail: verdict.evidence, job: job ? jobSummary(job) : null, delivery, event: rec || null, history: entry || null } },
       };
     }
     // 列最近
@@ -2394,6 +3111,7 @@ export default defineApp(async (sdk) => {
     connect: { drive: "canvas.connect", desc: "连线", write: true },
     disconnect: { drive: "canvas.disconnect", desc: "断开一条输入连线", write: true },
     setNodeMode: { drive: "canvas.setNodeMode", desc: "mute / bypass / 恢复正常", write: true },
+    moveNode: { drive: "canvas.moveNode", desc: "移动节点到指定坐标（支持批量）", write: true },
     addGroup: { drive: "canvas.addGroup", desc: "新建分组（nodeIds 自动算框，含外扩 20；bounds 显式优先）", write: true },
     setGroup: { drive: "canvas.setGroup", desc: "改组：index|title 定位，改标题 / 重算框", write: true },
     removeGroup: { drive: "canvas.removeGroup", desc: "删组（不动节点）", write: true },
@@ -2409,6 +3127,7 @@ export default defineApp(async (sdk) => {
     copilot: { drive: "canvas.copilot", desc: "开关当前画布副驾驶（enabled=true/false；Agent 开启受「允许 Agent 开启画布副驾驶」总闸管辖）", write: true },
     // T2 接线：语义 diff（两份工作流 JSON）——目前仅 source="file"（live 对 file 列为后续）。
     diff: { drive: "canvas.diff", desc: "语义 diff：两份工作流 JSON 的节点/连线/组差异（source=file；path=基准、pathB=目标）" },
+    historyDiff: { drive: "canvas.historyDiff", desc: "提交历史 diff：比两个提交（seq / promptId / HEAD~n）的语义差异；不依赖画布在线" },
   };
 
   // 壳页桥：工作区壳页与 iframe 同源，直接够得到 iframe.contentWindow.app。
@@ -3315,8 +4034,10 @@ export default defineApp(async (sdk) => {
     }
     if (sourceRaw === "file") return await actionCanvasFile(args, op, opRaw);
     if (op === "diff") {
-      throw new Error('「diff」目前仅支持 source="file"（对两份工作流 JSON 文件做语义 diff：path=基准、pathB=目标）；live 对 file 的比较列为后续');
+      throw new Error('「diff」目前仅支持 source="file"（对两份工作流 JSON 文件做语义 diff：path=基准、pathB=目标）；比较提交历史请用 op="historyDiff"');
     }
+    // ── 读类附加：historyDiff（提交历史两个版本的语义 diff；免闸门、不依赖画布在线）──
+    if (op === "historyDiff") return await actionCanvasHistoryDiff(args);
     // 写入类 op 需显式授权（默认关）；v2（2026-10-08）：副驾驶开关（copilot）改走总闸特判——
     // 只受「允许 Agent 开启画布副驾驶」管辖，不受写授权、不受目标页当前状态影响（否则鸡生蛋）。
     if (spec.write) {
@@ -3362,6 +4083,12 @@ export default defineApp(async (sdk) => {
       "page",
       "front",
       "enabled",
+      // sid（2026-10-21，issue #2 P3-b）：画布指令的定向目标。
+      // 不传时桥侧只能广播（多页同时在线时谁先回谁落定），
+      // 脏页先回 blocked:"dirty" 会抢到落定权，干净页的回复被丢弃——
+      // 表现就是「另一页脏，本页干净的 openWorkflow 也被拒」。
+      // 中继侧会把它提升到顶层 fwd.sid，桥 py 据此 send_sync 单发到目标页。
+      "sid",
     ]) {
       if (args && args[k] !== undefined) bridgeArgs[k] = args[k];
     }
@@ -3975,6 +4702,109 @@ export default defineApp(async (sdk) => {
       } catch { /* 中继不可用或查询失败：试下一个候选 */ }
     }
     return cands[0] || null;
+  }
+
+  // ── 提交历史 diff（2026-10-20）：比两个提交的语义差异 ────────────────
+  // 背景：历史库已有 list_commits / read_snapshot（bridge/history_store.py），
+  // 语义 diff 已有 diffGraph（lib/canvas-diff.mjs）；缺的只是接出口。
+  // 与 source=file 的 diff 区别：那里比两个磁盘文件，这里比两个历史快照。
+  // 端点：GET http://127.0.0.1:<port>/api/hana_bridge/history-list | history-snapshot
+  async function backendGetJson(pathQ, timeoutMs = 15_000) {
+    const port = state.servicePort;
+    if (!port) throw new Error("ComfyUI 服务端口未知（服务可能未启动）：请先启动 ComfyUI 服务");
+    const res = await sdk.network.fetch(`http://127.0.0.1:${port}${pathQ}`, { method: "GET", timeoutMs });
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch { data = { raw: String(text).slice(0, 800) }; }
+    return { status: res.status, ok: res.ok, data };
+  }
+
+  // 把「seq 数字 / HEAD / HEAD~n / latest / promptId」解析成具体 seq
+  function resolveHistoryRef(refRaw, entries) {
+    const seqs = entries.map((e) => Number(e.seq)).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+    if (!seqs.length) throw new Error("该工作流还没有提交历史");
+    const head = seqs[seqs.length - 1];
+    const r = String(refRaw == null ? "" : refRaw).trim();
+    if (!r || /^(head|latest|最新)$/i.test(r)) return { seq: head, how: "head" };
+    const rel = r.match(/^head~\s*(\d+)$/i);
+    if (rel) {
+      const n = Number(rel[1]);
+      const idx = seqs.length - 1 - n;
+      if (idx < 0) throw new Error(`HEAD~${n} 超出历史范围（共 ${seqs.length} 条）`);
+      return { seq: seqs[idx], how: `head~${n}` };
+    }
+    if (/^\d+$/.test(r)) return { seq: Number(r), how: "seq" };
+    // 当作 promptId：找对应条目
+    const hit = entries.find((e) => e && String(e.promptId || "") === r);
+    if (hit) return { seq: Number(hit.seq), how: "promptId" };
+    throw new Error(`无法识别的提交引用「${r}」：可用 seq 数字 / HEAD / HEAD~n / latest / promptId`);
+  }
+
+  async function actionCanvasHistoryDiff(args) {
+    const a = args || {};
+    const workflow = String(a.workflowName || a.workflow || a.name || "").trim();
+    if (!workflow) {
+      throw new Error('historyDiff 需要 workflowName（工作流名，如 "moss-image-SFT版-增强-量化"）；若历史按 id 存，再传 workflowId');
+    }
+    const q = new URLSearchParams({ workflow });
+    if (a.workflowId) q.set("workflowId", String(a.workflowId));
+    if (a.workflowPath) q.set("workflowPath", String(a.workflowPath));
+    if (a.workflowTemporary) q.set("workflowTemporary", "1");
+
+    const list = await backendGetJson(`/api/hana_bridge/history-list?${q.toString()}`);
+    if (!list.ok || !list.data || !list.data.ok) {
+      const msg = (list.data && (list.data.error || list.data.raw)) || `HTTP ${list.status}`;
+      throw new Error(`读提交索引失败：${msg}`);
+    }
+    const entries = Array.isArray(list.data.entries) ? list.data.entries : [];
+    if (!entries.length) throw new Error(`工作流「${workflow}」没有提交历史（先跑一次或手动存档）`);
+
+    const base = resolveHistoryRef(a.base != null ? a.base : a.from, entries);
+    const next = resolveHistoryRef(a.next != null ? a.next : a.to, entries);
+
+    async function loadSnapshot(seq) {
+      const qq = new URLSearchParams({ workflow, seq: String(seq) });
+      if (a.workflowId) qq.set("workflowId", String(a.workflowId));
+      if (a.workflowPath) qq.set("workflowPath", String(a.workflowPath));
+      if (a.workflowTemporary) qq.set("workflowTemporary", "1");
+      const r = await backendGetJson(`/api/hana_bridge/history-snapshot?${qq.toString()}`);
+      if (!r.ok || !r.data || !r.data.ok) {
+        const msg = (r.data && (r.data.error || r.data.raw)) || `HTTP ${r.status}`;
+        throw new Error(`读 seq=${seq} 快照失败：${msg}`);
+      }
+      const snap = r.data.snapshot || r.data;
+      const graph = snap && (snap.graph || snap);
+      if (!graph || !Array.isArray(graph.nodes)) throw new Error(`seq=${seq} 快照里没有可读的 graph`);
+      return graph;
+    }
+
+    const baseGraph = await loadSnapshot(base.seq);
+    const nextGraph = await loadSnapshot(next.seq);
+    const d = fileDiff(baseGraph, nextGraph);
+
+    const entryOf = (seq) => entries.find((e) => Number(e.seq) === Number(seq)) || {};
+    const eb = entryOf(base.seq);
+    const en = entryOf(next.seq);
+    const brief = (e) => ({
+      seq: e.seq, promptId: e.promptId || null, at: e.at || null,
+      source: e.source || null, kind: e.kind || null,
+      nodeCount: e.nodeCount, linkCount: e.linkCount,
+    });
+
+    const text = `${JSON.stringify(d, null, 2)}\n（diff：${d.summary}）\n` +
+      `（history：基准 seq=${base.seq}（${base.how}）@${eb.at || "?"} ↔ 目标 seq=${next.seq}（${next.how}）@${en.at || "?"}）`;
+
+    return {
+      content: [{ type: "text", text: text.length > 60_000 ? text.slice(0, 60_000) + "\n…（已截断）" : text }],
+      details: {
+        comfyui: {
+          action: "canvas", op: "historyDiff", ok: true, source: "history",
+          workflow,
+          base: brief(eb), next: brief(en),
+          clean: d.clean, summary: d.summary,
+        },
+      },
+    };
   }
 
   async function actionCanvasFile(args, op, opRaw) {
@@ -5168,6 +5998,7 @@ export default defineApp(async (sdk) => {
               "trace",
               "outline",
               "diff",
+              "historyDiff",
               "prompt",
               "running",
               "progress",
@@ -5186,6 +6017,7 @@ export default defineApp(async (sdk) => {
               "connect",
               "disconnect",
               "setNodeMode",
+              "moveNode",
               "addGroup",
               "setGroup",
               "removeGroup",
@@ -5221,9 +6053,11 @@ export default defineApp(async (sdk) => {
           slot: { description: "disconnect/trace 用：槽（名字或索引）" },
           dir: { type: "string", enum: ["up", "down"], description: "trace 用：up=直接来源（默认）/ down=直接去向" },
           mode: { type: "number", enum: [0, 2, 4], description: "setNodeMode 用：0=正常 / 2=mute / 4=bypass" },
+          pos: { type: "array", items: { type: "number" }, description: "moveNode 用：目标坐标 [x, y]（单节点形态，配 nodeId）" },
+          nodes: { type: "array", description: "moveNode 用：批量移动 [[nodeId, x, y], ...]（排布场景一次改多个节点，比逐条调快）" },
           edits: {
             type: "array",
-            description: "patch 用：编辑数组（顺序执行，原子回滚）。每条恰一个 key，可用：addNode / setWidget / connect / disconnect / setNodeMode / removeNode / save（save 仅限最后一条）。source=file 时另支持：addGroup{title,nodeIds?,bounds?} / setGroup{index|title,(title|nodeIds)} / removeGroup{index|title} / cloneNodes{nodeIds,offset?|position?}；save=写盘（仅末条、缺省自动）。示例：[{\"disconnect\":{\"nodeId\":8,\"slot\":\"width\"}},{\"addNode\":{\"type\":\"PrimitiveInt\",\"title\":\"宽度\",\"as\":\"w\"}},{\"setWidget\":{\"nodeId\":\"$w\",\"name\":\"value\",\"value\":1248}},{\"connect\":{\"fromNode\":\"$w\",\"fromSlot\":\"INT\",\"toNode\":8,\"toSlot\":\"width\"}},{\"save\":{}}]",
+            description: "patch 用：编辑数组（顺序执行，原子回滚）。每条恰一个 key，可用：addNode / setWidget / connect / disconnect / setNodeMode / removeNode / moveNode / save（save 仅限最后一条）。source=file 时另支持：addGroup{title,nodeIds?,bounds?} / setGroup{index|title,(title|nodeIds)} / removeGroup{index|title} / cloneNodes{nodeIds,offset?|position?}；save=写盘（仅末条、缺省自动）。示例：[{\"disconnect\":{\"nodeId\":8,\"slot\":\"width\"}},{\"addNode\":{\"type\":\"PrimitiveInt\",\"title\":\"宽度\",\"as\":\"w\"}},{\"setWidget\":{\"nodeId\":\"$w\",\"name\":\"value\",\"value\":1248}},{\"connect\":{\"fromNode\":\"$w\",\"fromSlot\":\"INT\",\"toNode\":8,\"toSlot\":\"width\"}},{\"save\":{}}]",
           },
           verify: { type: "boolean", description: "patch 用：执行后逐条对照终态（默认 true）；source=file 时＝应用后结构自检（+默认复跑 check 对比新增 issue）" },
           dryRun: { type: "boolean", description: "patch 用：只做预检、零图变更（默认 false）；输出逐条 checks；source=file 时＝内存模拟全批校验、不落盘" },
@@ -5243,6 +6077,11 @@ export default defineApp(async (sdk) => {
           multi: { type: "boolean", description: "trace 用：true=返回多级完整链（path[]）；缺省单步（与旧版一致）" },
           depth: { type: "number", description: "trace 用：多级链深度上限（1..1000 整数，缺省 10；给出即启用多级）" },
           pathB: { type: "string", description: "diff 用（source=file）：目标文件路径（path=基准、pathB=目标；相对工作流目录或绝对路径）" },
+          base: { type: "string", description: "historyDiff 用：基准提交引用——seq 数字 / HEAD / HEAD~n / latest / promptId（缺省 HEAD）" },
+          next: { type: "string", description: "historyDiff 用：目标提交引用——seq 数字 / HEAD / HEAD~n / latest / promptId（缺省 HEAD）" },
+          workflowName: { type: "string", description: "historyDiff 用：工作流名（historyDiff 不看 workflow 参数，用本字段；如 \"moss-image-SFT版-增强-量化\"）" },
+          workflowId: { type: "string", description: "historyDiff 用（可选）：画布身份 id（uuid）——有 id 时历史主键走 id" },
+          workflowPath: { type: "string", description: "historyDiff 用（可选）：工作流文件路径（identity 归一化）" },
         },
       },
       {
@@ -5265,7 +6104,7 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合（含四态环境诊断）；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队；mode=auto|canvas|backend 选执行位置——默认 auto：画布在线且已授权时复制副本-装载-画布执行（canvas.queue）；环境缺（中继/服务/工作区）自动自举：快返「环境准备中」→ 后台准备（服务拉起/必要时自动拉起工作区窗口）→ 就绪自动继续；阻断/补不上/授权缺停下（blocked：原因+选项，不自动改走后台）；inline 对象/带 inputs 结构豁免直走后台并注明）→ 返回 prompt_id，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停与环境检查（op=status/start/stop/envcheck/clear/wait：start 自动先 envcheck，异常时返回阻断说明；envcheck=检查 GPU 占用/端口残留；clear=按快照清理进程（snapshotId+pids）；wait=轮询就绪，单次≤25s）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
-        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）/ trace 追踪端口来源/去向（multi 多级链）/ outline 大纲（功能块+块间连线；detail 下钻）/ diff 两文件语义 diff（source=file；path 基准/pathB 目标）/ prompt 可提交形态 / running 当前执行节点 / progress 执行进度聚合（只读：执行中？/当前节点/画布节点数/队列剩余/promptId）/ probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / connect 连线 / disconnect 断线 / setNodeMode mute或bypass / addGroup 新建分组（nodeIds 自动算框）/ setGroup 改组（改名/重算框）/ removeGroup 删组（不动节点）/ save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖）；source=file 对工作流 JSON 文件操作：读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak；path 相对工作流目录 user/default/workflows 或绝对路径〕）——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
+        "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）/ trace 追踪端口来源/去向（multi 多级链）/ outline 大纲（功能块+块间连线；detail 下钻）/ diff 两文件语义 diff（source=file；path 基准/pathB 目标）/ prompt 可提交形态 / running 当前执行节点 / progress 执行进度聚合（只读：执行中？/当前节点/画布节点数/队列剩余/promptId）/ probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / moveNode 移动节点（nodeId+pos 或批量 nodes:[[id,x,y],...]）/ connect 连线 / disconnect 断线 / setNodeMode mute或bypass / addGroup 新建分组（nodeIds 自动算框）/ setGroup 改组（改名/重算框）/ removeGroup 删组（不动节点）/ save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖）；source=file 对工作流 JSON 文件操作：读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak；path 相对工作流目录 user/default/workflows 或绝对路径〕）——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "window=工作区原生窗：op=open 打开宿主原生窗装载工作区（/workspace.html；需能力 app/windows.manage；窗口页自取 surface 凭据；壳页桥为单桶——同刻仅一壳页，开窗前建议先关掉其它工作区壳页）/ op=status 列出本 App 已开窗口（默认）/ op=close 关闭窗口（默认关最近一次打开的，可传 windowId）。提交环境缺时自举链也会自动拉起该窗（同刻仅一壳页；无需手动）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
       parameters: {
@@ -5570,25 +6409,258 @@ export default defineApp(async (sdk) => {
         }
       });
 
-      // HD 档解码器下载（app 侧不能自发下载：见下方 needAgent 回执的实测依据）。
+      // ── 启动参数设置（issue #2 P1，2026-10-21）────────────────────────────
+      // 额外启动参数 + 启动前环境变量。流程：先写本地 json，再推中继。
+      // 中继是唯一做校验的地方（.cmd 注入面）：它回 400 时把刚才写的本地值回滚成旧值——
+      // 否则用户的已存配置会被一个校验不过的值覆盖掉（服务照样起不来，还查不出原因）。
+      // 中继未就绪：只存盘，标记 pushed:false，由 alignLaunchConfig 在就绪后补推。
+      app.get("/comfyui-hana/launch-settings", async (c) => {
+        try {
+          const s = readLaunchSettings();
+          const relay = await relayLaunchRead();
+          return c.json({ ok: true, extraArgs: s.extraArgs, env: s.env, envText: launchEnvText(s.env), relay });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      app.post("/comfyui-hana/launch-settings", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const cur = readLaunchSettings();
+          const extraArgs = body && typeof body.extraArgs === "string" ? body.extraArgs : cur.extraArgs;
+          let env = cur.env;
+          if (body && body.env !== undefined) {
+            try { env = normalizeLaunchEnvLocal(body.env); }
+            catch (e) { return c.json({ ok: false, error: msgOf(e) }, 400); }
+          }
+          // ① 先写本地 json（真相源）
+          if (!writeLaunchSettings({ extraArgs, env })) return c.json({ ok: false, error: "写入失败" }, 500);
+          // ② 再推中继；中继未就绪则只存盘
+          if (!relayReady()) {
+            return c.json({ ok: true, pushed: false, extraArgs, env, note: "中继未就绪，设置已存，待就绪后生效" });
+          }
+          const r = await relayLaunchPush(extraArgs, env);
+          if (!r.pushed && r.status === 400) {
+            // 中继校验拒收：把刚写的本地值回滚旧值（真值源不能被非法值拉斜）
+            const rb = writeLaunchSettings(cur);
+            log(`启动参数设置：中继拒收（${r.error}）→ 本地已${rb ? "回滚" : "回滚失败"}`);
+            return c.json({ ok: false, error: r.error, rolledBack: rb }, 400);
+          }
+          if (!r.pushed) {
+            // 到这里 relayReady() 已为真，说明是「推得动但这次推失败了」（中继抖动/校验外的网络问题），
+            // 与上面的「未就绪」不是同一种情况——文案要分开，否则排查时会被误导。
+            log(`启动参数设置：存盘成功但推送失败（${r.error}）→ 待补推`);
+            return c.json({ ok: true, pushed: false, extraArgs, env, note: "中继暂时推不进去，设置已存，待补推" });
+          }
+          lastLaunchSig = JSON.stringify({ extraArgs, env });
+          log(`启动参数设置：已保存并下发；重启服务生效（extraArgs=${extraArgs ? JSON.stringify(extraArgs) : "无"}，env ${env.length} 项）`);
+          return c.json({ ok: true, pushed: true, extraArgs, env, note: "已保存，需重启服务生效" });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      // ── 解码器清单 + 判族（issue #1 修复，2026-10-21）──────────────────────────
+      // 设置页与 agent 共用：对照表全量 + 当前判族结果 + 哪些已装 + 真实 targetDir。
+      // 判族三条路：user（?decoder= 或已存 preview-decoder.json）→ canvas（画布快照，带 30s 缓存）
+      // → fallback（decoder=null + reason，让用户自己选）。user 给了不认识的值直接 400，不偷换。
+      app.get("/comfyui-hana/preview-decoders", async (c) => {
+        try {
+          const q = c.req.query("decoder");
+          const force = String(c.req.query("refresh") || "") === "1";
+          const list = await fetchVaeApproxList();
+          const dir = await resolvePreviewVaeApproxDir(force);
+          const det = await detectPreviewDecoder({ user: q, force });
+          if (det.source === "user" && det.error) return c.json({ ok: false, error: det.error, decoders: PREVIEW_DECODERS.map((e) => previewDecoderRow(e, list.files)) }, 400);
+          const entry = det.entry || null;
+          return c.json({
+            ok: true,
+            decoders: PREVIEW_DECODERS.map((e) => previewDecoderRow(e, list.files)),
+            detection: {
+              key: det.key === undefined ? null : det.key,
+              source: det.source,
+              ...(det.via ? { via: det.via } : {}),
+              ...(det.entry ? { fileName: det.entry.fileName, family: det.entry.family } : {}),
+              ...(det.entry && det.entry.key === null ? { downloadable: false } : {}),
+              ...(det.evidence ? { evidence: det.evidence } : {}),
+              ...(det.snapshotAgeSec !== undefined && det.snapshotAgeSec !== null ? { snapshotAgeSec: det.snapshotAgeSec } : {}),
+              ...(det.error ? { reason: det.error } : {}),
+            },
+            target: dir,
+            installed: { ok: list.ok, files: list.files, error: list.error },
+            ...(entry
+              ? {
+                  download: {
+                    fileName: entry.fileName,
+                    prefix: decoderPrefix(entry),
+                    sources: entry.sources,
+                    ...(entry.caution ? { caution: entry.caution } : {}),
+                    installedFile: findInstalledDecoderFile(list.files, entry),
+                  },
+                }
+              : {}),
+          });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      // 显式指定/清除当前解码器（存 preview-decoder.json，与 preview-settings.json 分开存，互不覆盖）
+      app.post("/comfyui-hana/preview-decoders", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const raw = body && body.decoder;
+          if (raw === null || raw === undefined || String(raw).trim() === "") {
+            if (!writePreviewDecoderKey(null)) return c.json({ ok: false, error: "写入失败" }, 500);
+            previewCanvasCache = { at: 0, result: null };
+            return c.json({ ok: true, decoder: null, note: "已清除显式指定，判族回到画布快照 → fallback" });
+          }
+          const hit = resolveDecoderInput(raw);
+          if (!hit.ok) return c.json({ ok: false, error: hit.error }, 400);
+          // Mochi 那族的 key 就是 null（上游没解码器），直接存 null 会与「清除」同形丢不回来，
+          // 所以落盘用字面串 "null"，读回时 resolveDecoderInput 能认。
+          const key = hit.entry && hit.entry.key === null ? "null" : (hit.entry ? hit.entry.key : null);
+          if (!writePreviewDecoderKey(key)) return c.json({ ok: false, error: "写入失败" }, 500);
+          previewCanvasCache = { at: 0, result: null };
+          log(`预览解码器显式指定：${key === "null" ? "null（Mochi，上游无解码器）" : key}`);
+          return c.json({ ok: true, decoder: key, family: hit.entry ? hit.entry.family : null, fileName: hit.entry ? hit.entry.fileName : null });
+        } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
+      });
+
+      // 下载后的落地校验（issue #1 第 4 条）：只看 HTTP 200 不算成功——必须真出现在
+      // 后端的 /models/vae_approx 列表里（= ComfyUI 认得到），且与该族前缀对得上。
+      app.post("/comfyui-hana/preview-model/verify", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const wantName = body && typeof body.filename === "string" ? body.filename.trim() : "";
+          let entry = null;
+          if (body && body.decoder !== undefined && body.decoder !== null && String(body.decoder).trim() !== "") {
+            const hit = resolveDecoderInput(body.decoder);
+            if (!hit.ok) return c.json({ ok: false, error: hit.error }, 400);
+            entry = hit.entry;
+          } else if (wantName) {
+            entry = matchPreviewDecoder(wantName);
+          }
+          if (!entry && !wantName) {
+            const det = await detectPreviewDecoder({});
+            entry = det.entry;
+            if (!entry) return c.json({ ok: false, error: `没有可校验的目标：${det.error || "判族失败"}（请给 decoder 或 filename）` }, 400);
+          }
+          const list = await fetchVaeApproxList();
+          if (!list.ok) return c.json({ ok: false, verified: false, error: `读不到后端 /models/vae_approx：${list.error}`, files: list.files }, 502);
+          const prefix = entry ? decoderPrefix(entry) : null;
+          const name = wantName || (entry ? entry.fileName : "");
+          const hitFile = entry ? findInstalledDecoderFile(list.files, entry) : (list.files.includes(name) ? name : null);
+          // 额外报告「文件名对得上但前缀不对」这种容易被当成成功的现场（下对了文件、下错了名字）
+          // 判据：现有文件名里含目标前缀的主干（taef2_decoder / lighttaew2_2 等），但不是以它开头。
+          const stem = String((entry && decoderPrefix(entry)) || name || "").toLowerCase().replace(/\.(pth|safetensors|pt|bin)$/i, "");
+          const nearMiss = entry && !hitFile && stem
+            ? list.files.filter((f) => {
+                const lf = String(f).toLowerCase();
+                if (lf.startsWith(stem)) return false;
+                const core = stem.replace(/^light/, "");
+                return lf.includes(stem) || (core !== stem && lf.includes(core));
+              })
+            : [];
+          const verified = !!hitFile;
+          if (!verified && entry) {
+            log(`预览解码器校验失败：期望前缀 ${prefix}，/models/vae_approx 现有 ${list.files.length} 项`);
+          }
+          return c.json({
+            ok: verified,
+            verified,
+            decoder: entry ? entry.key : null,
+            expect: { fileName: name, prefix },
+            installedFile: hitFile,
+            ...(nearMiss.length ? { nearMiss } : {}),
+            files: list.files,
+            ...(verified
+              ? { note: `已落地且 ComfyUI 认得到（${hitFile}）；HD 档预览下次提交即生效` }
+              : { error: `文件没有出现在后端 /models/vae_approx 列表里（期望前缀 ${prefix || name}）——HD 档仍会静默降级到 latent2rgb` }),
+          }, verified ? 200 : 404);
+        } catch (e) {
+          return c.json({ ok: false, verified: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      // HD 档解码器下载指引（app 侧不能自发下载：见下方 needAgent 回执的实测依据）。
       // app 若要直接取文件，需要：① 清单 network.allowedHosts 声明外部主机（现仅 127.0.0.1）；
       // ② 写入 ComfyUI 安装目录（app 数据目录之外）的写权限/代理通道。两条都缺，故不做，直报 needAgent。
-      app.post("/comfyui-hana/preview-model/download", (c) => {
-        const base = comfyBase();
-        return c.json({
-          ok: false,
-          needAgent: true,
-          filename: PREVIEW_HD_FILENAME,
-          targetDir: base ? join(base, "models", "vae_approx") : null,
-          sources: [
-            { name: "GitHub raw（上游，已实测 200 / 15,314,938 B）", url: `https://raw.githubusercontent.com/madebyollin/taesd/main/${PREVIEW_HD_FILENAME}` },
-            { name: "jsdelivr（GitHub 镜像，已实测 200）", url: `https://cdn.jsdelivr.net/gh/madebyollin/taesd@main/${PREVIEW_HD_FILENAME}` },
-            // 注：hf-mirror.com 上无 madebyollin/taesd 该路径（实测 404），不要写镜像仓路径当必然存在。
-            // HF 备选是 diffusers 格式 .safetensors，键名与 ComfyUI TAESD state_dict 不一致，未经转换不可用。
-            { name: "HuggingFace（备选，需转换/验证）", url: "https://huggingface.co/madebyollin/taeqi2_1/resolve/main/taeqi2_1.safetensors", caution: "diffusers 格式，键名非 ComfyUI TAESD；优先用上面两个 .pth" },
-          ],
-          note: "请由 agent 用 hana-downloader 下载到 targetDir",
-        });
+      // body: {decoder?: <key|文件名>}；不给就按 user→canvas→fallback 判族。
+      app.post("/comfyui-hana/preview-model/download", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const q = c.req.query("decoder") || (body && body.decoder);
+          const det = await detectPreviewDecoder({ user: q, force: true });
+          if (det.source === "user" && det.error) return c.json({ ok: false, error: det.error, decoders: PREVIEW_DECODERS.map((e) => ({ key: e.key, fileName: e.fileName, family: e.family })) }, 400);
+          const dir = await resolvePreviewVaeApproxDir(true);
+          const list = await fetchVaeApproxList();
+          const base = {
+            needAgent: true,
+            // filename 是 setting 页（ui/assets/settings.js）在读的旧字段名；fileName 为本轮新口径。
+            // 两个都给，避免为了改名去动 ui/（本批不动 ui）。
+            filename: det.entry ? det.entry.fileName : null,
+            decoder: det.key === undefined ? null : det.key,
+            decoderSource: det.source,
+            ...(det.error ? { decoderReason: det.error } : {}),
+            ...(det.evidence ? { evidence: det.evidence } : {}),
+            targetDir: dir.targetDir,
+            targetDirSource: dir.source,
+            targetVerified: dir.verified,
+            ...(dir.error ? { targetError: dir.error } : {}),
+            installed: { ok: list.ok, files: list.files, error: list.error },
+            verifyRoute: "POST /comfyui-hana/preview-model/verify",
+          };
+          // 判不出族：明确失败 + 原因（不给一个看起来对的名字）
+          if (!det.entry) {
+            return c.json({
+              ...base,
+              ok: false,
+              error: `判不出当前模型属于哪个解码器族：${det.error || "无证据"}。请用 decoder 参数显式指定（GET /comfyui-hana/preview-decoders 可查可用值）。`,
+              note: "宁可不给，也不给一个可能错的解码器名",
+            }, 409);
+          }
+          if (det.entry.key === null || det.entry.downloadable === false) {
+            return c.json({
+              ...base,
+              ok: false,
+              downloadable: false,
+              fileName: null,
+              sources: [],
+              caution: det.entry.caution,
+              error: `${det.entry.family} 上游没有 taesd 解码器（latent_formats.py 里就是 None），无文件可下；这族只能用基础档 latent2rgb。`,
+            }, 409);
+          }
+          const installedFile = findInstalledDecoderFile(list.files, det.entry);
+          if (installedFile) {
+            return c.json({
+              ...base,
+              ok: true,
+              installed: { ...base.installed, matched: installedFile },
+              fileName: det.entry.fileName,
+              prefix: decoderPrefix(det.entry),
+              sources: det.entry.sources,
+              ...(det.entry.caution ? { caution: det.entry.caution } : {}),
+              note: `已装（${installedFile}），无需再下载`,
+            });
+          }
+          if (!dir.targetDir) {
+            return c.json({ ...base, ok: false, fileName: det.entry.fileName, prefix: decoderPrefix(det.entry), sources: det.entry.sources, error: `无法确定 models/vae_approx 目标目录：${dir.error || "主目录未确认"}` }, 409);
+          }
+          return c.json({
+            ...base,
+            ok: false,
+            fileName: det.entry.fileName,
+            prefix: decoderPrefix(det.entry),
+            family: det.entry.family,
+            sources: det.entry.sources,
+            ...(det.entry.caution ? { caution: det.entry.caution } : {}),
+            note: `请由 agent 用 hana-downloader 下载 ${det.entry.fileName} 到 targetDir；下完调 ${base.verifyRoute} 复核落地`,
+          });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
       });
 
       // 安装提示词（供前端「复制安装指令」；模板在后端单点维护）

@@ -110,12 +110,13 @@ label.chk input { accent-color: var(--accent); }
 
     <div id="s-preview-tier-wrap" style="display:none">
       <label class="chk"><input type="radio" name="s-preview-tier" value="basic"> 基础档 · <code>latent2rgb</code>：免下载，画面较粗糙</label>
-      <label class="chk"><input type="radio" name="s-preview-tier" value="hd"> 高清档 · <code>taesd</code>：需下载约 15 MB 预览模型，画面接近成品</label>
+      <label class="chk"><input type="radio" name="s-preview-tier" value="hd"> 高清档 · <code>taesd</code>：需下载对应的预览模型（几 MB 到几十 MB，随模型族不同），画面接近成品</label>
 
       <div id="s-preview-hd" style="display:none">
         <div class="row top"><span class="k">模型目标路径</span><span class="v" id="s-preview-model-dir">—</span></div>
         <p class="note" id="s-preview-model-note">
-          高清档需要解码器 <code>taeqi2_1_decoder.pth</code> 落到上面的目录。<b>本 App 不能自行下载</b>，
+          高清档需要<b>当前模型族对应的</b>解码器落到上面的目录（不同模型族文件名不同，如 FLUX.2/MOSS 用 <code>taef2_decoder.pth</code>、
+          QwenImage 2.1 用 <code>taeqi2_1_decoder.pth</code>）。<b>本 App 不能自行下载</b>，
           请点「请 Agent 下载」，由 agent 用 hana-downloader 取到该目录。装好前高清档不会有预览图。
         </p>
         <div class="ed">

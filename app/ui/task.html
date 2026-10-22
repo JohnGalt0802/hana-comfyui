@@ -53,7 +53,7 @@
     font: 13px/1.5 system-ui, -apple-system, 'Segoe UI', "Microsoft YaHei", sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  #tk-root { overflow: visible; }
+  #tk-root { overflow: visible; display: flow-root; }
 
 /* ── 头部 ────────────────────────────────────────────────────────────── */
 .tk-top { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
@@ -84,35 +84,126 @@
     background: var(--tk-sunken); overflow: hidden; display: flex;
     align-items: center; justify-content: center; min-height: 64px; cursor: zoom-in;
   }
-  .tk-pv-img { display: block; max-width: 100%; max-height: 320px; object-fit: contain; }
+  /* 2026-10-21 关键修正：去掉 72vh 上限。
+     iframe 高度由本卡的 reportSize 回填，即「视口高 = 内容高」。
+     此时 72vh 是自指约束：内容高 H 里含 0.72H，方程 H = 0.72H + 其余 收敛到 H≈319，
+     竖图被压成 230px 而不是 690（浏览器实测，非推算）。
+     视口高既然由内容决定，就不能拿来当内容的上限 —— 一律只用 --big-max。 */
+  .tk-pv-img {
+    display: block; width: auto; height: auto;
+    max-width: 100%;
+    max-height: var(--big-max, 690px);
+    margin: 0 auto;
+  }
 
 /* ── 产物：一张大图 + 下方同批小图条 ─────────────────────────────────
-   2026-10-18：处理中、产物区都不出滚动条；小图条按卡宽自适。 */
+   2026-10-21 按用户口径重定尺寸：
+   · 大图：最大边长 ≤ 卡片宽 × 1.5（460 → 690）。宽度不溢出卡片，
+     高度预算给竖图，避免竖图被压成一条。
+   · 小图：最大边长 = 大图同方向的 1/4（JS 算好写入 --thumb-size）。
+   · 卡片不出纵向滚动条；仅小图条在张数多时可横向滚动。 */
 .tk-out { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; }
 
-/* 大图：单张时按原比例吃满宽度；多张时限高避免卡片过长 */
+/* 大图：宽不溢出卡片；高度给到「卡宽×1.5」预算 */
 .tk-big {
   display: flex; align-items: center; justify-content: center;
   width: 100%; padding: 0; border: 0; border-radius: 8px;
   overflow: hidden; background: transparent; cursor: zoom-in; line-height: 0;
 }
-.tk-big img { display: block; width: 100%; height: auto; }
-.tk-out:not(.single) .tk-big img {
-    max-height: 520px; max-width: 100%; width: auto; height: auto;
-    margin: 0 auto;
-  }
+.tk-big img {
+  display: block; width: auto; height: auto;
+  max-width: 100%;
+  max-height: var(--big-max, 690px);   /* 同上：不叠加 vh 上限（自指循环） */
+  margin: 0 auto;
+}
 
-/* 小图条：一行，不换行、不滚动，尺寸由 JS 按张数给的 --thumb-size 控制 */
+/* 小图条：一行横排；张数多时可横向滚动（全卡唯一的许可滚动区） */
+/* 2026-10-21：滚动条「看得见」重做。原来 4px 高 + var(--tk-border)=20% 灰，
+   深色小图之间等于隐身（用户原话：小图必要时得有滚动条，要不怎么看全）。
+   现在 8px 高 + 中性灰 62%（明暗底上都够对比），track 给极淡底色做出「槽」。
+   刻意不用 scrollbar-width: thin —— 它会压掉下面的 webkit 自定义规则；
+   Firefox 走 scrollbar-color 兜底，以 webkit 那条为主。 */
 .tk-strip {
+  --tk-scroll-thumb: rgba(127,127,127,.62);
+  --tk-scroll-thumb-hover: rgba(127,127,127,.92);
+  --tk-scroll-track: rgba(127,127,127,.14);
+  --tk-scroll-h: 8px;
+  --tk-fade: 26px;                 /* 两侧渐隐宽度，JS 打 can-l / can-r 开关 */
   display: flex; gap: 5px; flex-wrap: nowrap;
   width: 100%;
-  overflow: hidden;   /* 不出滚动条 */
+  overflow-x: auto; overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 3px;
 }
-/* 2026-10-18：小图固定尺寸上限，不等分（等分会把 2 张撑成巨图）。
-   --thumb-size 由 JS 按张数给：<=4 张 64px、5-8 张 52px、9+ 张 42px。
-   固定尺寸 + 一行不换行，张数多时靠缩小尺寸容下，永不溢出。 */
+/* 注意（实测）：Chromium 只要看到 scrollbar-color 就会抛弃 ::-webkit-scrollbar 定制，
+   改用平台原生滚动条（Win 上 15px 高，太厚）。所以 scrollbar-color 只能给 Firefox，
+   用 @supports 隔离；Chromium 走下面的 webkit 伪元素（8px）。
+   两边都不写 scrollbar-width: thin（会盖掉实心宽条并因浏览器而异）。 */
+@supports (-moz-appearance: none) {
+  .tk-strip { scrollbar-color: var(--tk-scroll-thumb) var(--tk-scroll-track); }
+}
+.tk-strip::-webkit-scrollbar {
+  height: var(--tk-scroll-h);
+  width: 0;                       /* 纵向滚动条永不出现 */
+}
+.tk-strip::-webkit-scrollbar-track {
+  background: var(--tk-scroll-track); border-radius: calc(var(--tk-scroll-h) / 2);
+  margin: 0 1px;
+}
+.tk-strip::-webkit-scrollbar-thumb {
+  background: var(--tk-scroll-thumb);
+  border-radius: calc(var(--tk-scroll-h) / 2);
+  min-width: 40px;                /* 再短的 thumb 也得能抓住 */
+  border: 1px solid transparent;  /* 给 thumb 一点内缩，像一条独立滑块 */
+  background-clip: padding-box;
+}
+.tk-strip::-webkit-scrollbar-thumb:hover,
+.tk-strip::-webkit-scrollbar-thumb:active { background: var(--tk-scroll-thumb-hover); background-clip: padding-box; }
+.tk-strip::-webkit-scrollbar-corner { background: transparent; }
+/* 边缘渐隐：用 mask 渐隐小图本身（而不是盖一层色块），底色由宿主卡片透出来，
+   明暗主题都不用猜背景色。只在对应方向真的还有内容时显示（见 syncStripFades）。
+   第一层（横向渐变）管「哪边淡」；第二层（纵向渐变）把最底部滚动条那 8px（= --tk-scroll-h）
+   排除在外，否则滚动条自己也会跟着淡（改动前实测：右端 track 从 48 降到 36，
+   thumb 靠右时末端会被削）。mask-composite 不支持时退回单层，只是滚动条末段跟着淡一点。 */
+.tk-strip.can-r {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - var(--tk-fade)), transparent 100%);
+  mask-image: linear-gradient(to right, #000 calc(100% - var(--tk-fade)), transparent 100%);
+}
+.tk-strip.can-l {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 var(--tk-fade));
+  mask-image: linear-gradient(to right, transparent 0, #000 var(--tk-fade));
+}
+.tk-strip.can-l.can-r {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 var(--tk-fade), #000 calc(100% - var(--tk-fade)), transparent 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 var(--tk-fade), #000 calc(100% - var(--tk-fade)), transparent 100%);
+}
+@supports (mask-composite: add) {
+  /* 第一层管「哪边淡」；第二层只在最底那条滚动条位置不透明。
+     add（并集）= 两层取较大值：底部区域恒为 1，滚动条不会被渐隐削掉。 */
+  .tk-strip.can-r,
+  .tk-strip.can-l,
+  .tk-strip.can-l.can-r {
+    mask-composite: add;
+  }
+  .tk-strip.can-r:not(.can-l) {
+    mask-image:
+      linear-gradient(to right, #000 calc(100% - var(--tk-fade)), transparent 100%),
+      linear-gradient(to bottom, transparent calc(100% - var(--tk-scroll-h)), #000 calc(100% - var(--tk-scroll-h)));
+  }
+  .tk-strip.can-l:not(.can-r) {
+    mask-image:
+      linear-gradient(to right, transparent 0, #000 var(--tk-fade)),
+      linear-gradient(to bottom, transparent calc(100% - var(--tk-scroll-h)), #000 calc(100% - var(--tk-scroll-h)));
+  }
+  .tk-strip.can-l.can-r {
+    mask-image:
+      linear-gradient(to right, transparent 0, #000 var(--tk-fade), #000 calc(100% - var(--tk-fade)), transparent 100%),
+      linear-gradient(to bottom, transparent calc(100% - var(--tk-scroll-h)), #000 calc(100% - var(--tk-scroll-h)));
+  }
+}
+/* 小图尺寸由 JS 按「大图尺寸的 1/4」写入 --thumb-size */
 .tk-mini {
-  flex: 0 0 auto; width: var(--thumb-size, 64px); height: var(--thumb-size, 64px);
+  flex: 0 0 auto; width: var(--thumb-size, 110px); height: var(--thumb-size, 110px);
   padding: 0; border: 1px solid var(--tk-border); border-radius: 6px;
   overflow: hidden; background: var(--tk-sunken); cursor: pointer; line-height: 0;
   opacity: .62; transition: opacity .15s, border-color .15s;
@@ -138,9 +229,52 @@
 .tk-note { color: var(--tk-muted); font-size: 11.5px; margin-top: 6px; white-space: pre-wrap; line-height: 1.6; }
 
 /* ── 卡内 lightbox ───────────────────────────────────────────────────── */
-#tk-lb { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 14px; background: var(--overlay-strong, rgba(0,0,0,.84)); cursor: zoom-out; }
-#tk-lb img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; }
-#tk-lb .hint { position: absolute; left: 0; right: 0; bottom: 12px; text-align: center; color: var(--text-light, rgba(255,255,255,.55)); font-size: 11px; }
+/* ── 卡内 lightbox（看原图 + 滚轮缩放 + 拖动平移）─────────────────────
+   2026-10-21：原来的 lightbox 只能用 object-fit 缩到屏幕内，看不了原图细节。
+   现在：灰色蒙版铺满，图默认按原尺寸（超出屏幕则先缩到适配），
+   滚轮以鼠标位置为中心缩放，按住拖动平移，双击在「适配/原尺寸」间切换。
+   2026-10-21 修正：
+   · 蒙版必须自带颜色。原先用 var(--overlay-strong)，宿主主题里它 = rgba(0,0,0,.15)
+     （见 theme 变量表），实测只剩 15% 黑，等于没有蒙版。改为固定深灰，明暗主题都够遮。
+   · 不再用 flex 居中图。flex 会先按「原始尺寸」把 img 排进容器（超出则负偏移），
+     再叠加 transform 的 translate，两套偏移叠加 → 图实际跑到视口外（实测 y=-1086）。
+     改成 absolute 定位在 (0,0)，translate 就等于图的真实左上角，与 lbState 严格一致。 */
+#tk-lb {
+  --tk-lb-mask: rgba(30, 30, 33, .92);   /* 深灰蒙版，不跟宿主变量走 */
+  position: fixed; inset: 0; z-index: 9999;
+  overflow: hidden;
+  background: var(--tk-lb-mask);
+  cursor: zoom-out;              /* 空白处点击关闭 */
+  touch-action: none;            /* 触屏拖动交给 JS */
+}
+#tk-lb img {
+  position: absolute; left: 0; top: 0;   /* translate 的基准点 = 视口左上角 */
+  display: block;
+  max-width: none; max-height: none;   /* 不再被 object-fit 锁死，由 transform 控制 */
+  border-radius: 6px;
+  transform-origin: 0 0;
+  will-change: transform;
+  cursor: grab;
+  -webkit-user-drag: none; user-select: none;
+  image-rendering: auto;         /* 100% 时不做插值，看清原像素 */
+}
+#tk-lb.dragging img { cursor: grabbing; }
+#tk-lb .hint {
+  position: absolute; left: 0; right: 0; bottom: 12px; text-align: center;
+  /* 蒙版恒为深色，提示文字必须固定浅色；不能用 --text-light（浅色主题下是深灰，看不清） */
+  color: rgba(255,255,255,.6); font-size: 11px; white-space: nowrap;
+  pointer-events: none;           /* 不挡拖动与关闭 */
+}
+#tk-lb.failed img { display: none; }   /* 404/损坏图不留破图图标 */
+#tk-lb.failed .hint { color: #ffb0a4; }
+#tk-lb .zoom-badge {
+  position: absolute; right: 12px; top: 12px;
+  font-size: 11px; padding: 3px 8px; border-radius: 999px;
+  background: rgba(255,255,255,.1); color: rgba(255,255,255,.85);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none; opacity: 0; transition: opacity .2s;
+}
+#tk-lb.show-zoom .zoom-badge { opacity: 1; }
 </style>
 </head>
 <body>
@@ -152,7 +286,11 @@
     </div>
     <div class="tk-note">正在读取任务状态…</div>
   </div>
-  <div id="tk-lb" hidden><img alt="预览"><div class="hint">点击任意处关闭</div></div>
+  <div id="tk-lb" hidden>
+    <img alt="预览" draggable="false">
+    <div class="zoom-badge">100%</div>
+    <div class="hint">单击图片放大 / 再点缩回 · 滚轮缩放 · 拖动平移 · 点空白或 Esc 关闭</div>
+  </div>
   <script type="module" src="./assets/task.js"></script>
 </body>
 </html>

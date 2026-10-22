@@ -9,10 +9,12 @@
 //   GET  /_relay/prompts           进度事件缓存（订阅后端 /ws 得来）：active + recent
 //   GET  /_relay/prompts/<id>      单个 prompt 的事件记录
 //   GET  /_relay/history?id=&max=  历史摘要（裁剪版：status/error/outputs，避免全量历史体积）
+//   GET  /_relay/queue-detail      /queue 详情（running/pending 的 prompt_id 列表 + known；与 probeQueue 同缓存）
 //   GET  /_relay/metrics           主机指标（GPU / CPU / 内存；GPU 走 nvidia-smi 定时缓存）
 //   GET  /_relay/drives            安装位置候选（各盘剩余空间/可写性 + 推荐 <盘>:\ComfyUI）
 //   GET/POST /_relay/custom-roots  App 推送的自定义安装位置（POST 需 controlKey）
 //   GET/POST /_relay/preview-config 出图实时预览配置（{enabled, method}；POST 需 controlKey）
+//   GET/POST /_relay/launch-config  启动参数配置（{extraArgs, env}；POST 需 controlKey；校验失败 400 不落盘）
 //   POST /_relay/fs/stat           文件 stat（本机路径；{path}）
 //   POST /_relay/fs/read           读取文本/二进制（{path, encoding, maxBytes}，上限 8 MiB）
 //   POST /_relay/fs/write          写入文本（{path, text}，上限 16 MiB；原子写 .tmp→rename；app 沙箱外的落盘代做）
@@ -159,6 +161,13 @@ const backend = {
 };
 let queueInfo = null;
 let queueAt = 0;
+// /queue 详情（issue #2 P3-c）：只增不改——queueInfo 的 {running,pending} 数量语义保持不变（有其它消费方）。
+// queueDetail 保留 prompt_id 列表，供 App 判定「这个 prompt 到底在不在跑」。
+let queueDetail = null; // { running: string[], pending: string[], at: number }
+// 详情超过该时长未刷新即视为「探测不可用」（known=false）：宁可不断言，也不拿旧快照误判。
+// 取 5s（≥ 探测节拍 5s / 缓存 1s）：后端不可达时不刷新，5s 内就自动降为 known=false；
+// 反之若真在跑图，reachable 仍为 true（探测超时已去抖），probeQueue 会持续刷新，不会误降。
+const QUEUE_DETAIL_MAX_AGE_MS = 5_000;
 let config = null;
 let servingPort = null;
 
@@ -288,6 +297,17 @@ function loadConfig(argv) {
   if (logFile) raw.logFile = logFile;
   const controlKey = getFlag("--control-key");
   if (controlKey) raw.controlKey = controlKey;
+  // 安全（2026-10-21）：显式传了 --control-key 但不合法时必须硬失败。
+  // 原行为：validateConfig 里 <16 字符直接静默丢弃 → config.controlKey=undefined
+  //        → controlOk() 的「未配置密钥就开放」分支放行 → 整个 /_relay/* 变成无鉴权。
+  // 后果：传错密钥 = 把管理端点（含 backend/stop）裸露给任何人。
+  // 实测事故：测试传 --control-key testkey123（10 字符）导致本机 ComfyUI 被误杀。
+  if (controlKey && String(controlKey).length < 16) {
+    console.error(`[comfy-relay] --control-key 太短（${String(controlKey).length} 字符，需 ≥16）。`);
+    console.error("[comfy-relay] 拒绝以「无鉴权」状态启动：管理端点会被任意调用（含停止服务）。");
+    console.error("[comfy-relay] 请传入长度足够的密钥，或根本不传（本地调试可省略，那样会显式警告）。");
+    process.exit(2);
+  }
   const comfyBase = getFlag("--comfy-base");
   if (comfyBase) raw.comfyBase = comfyBase;
   const clientId = getFlag("--client-id");
@@ -490,6 +510,109 @@ function normalizePreviewCfg(raw) {
   return { enabled: src.enabled === true && !!method, method };
 }
 
+// ── 启动参数配置（issue #2 P1：额外启动参数 + 启动前环境变量）────────────────────
+// 为什么需要：用户往往已有自己的 bat（带 --windows-standalone-build、代理环境变量）。
+//   App「启动服务」自己生成启动器，拿不到这些配置 → 同一个 ComfyUI 两边行为不一致
+//   （v0.40+ 少了 standalone 参数就连带关掉 assets 系统；缺 HTTP(S)_PROXY 则 Manager 装节点/下模型失败）。
+// 形态选择：env 的规范形态是 [{k,v}] 数组（落盘 / 传输都是它）。
+//   也接受 "KEY=VALUE\nKEY2=VALUE2" 文本作为输入，解析后立刻归一成数组——
+//   VALUE 里常带 `=`（代理 URL 带查询串、密码含 `=`），文本形态只能约定「首个 = 切分」才无歧义；
+//   数组形态没有这个问题，所以内部一律用数组。
+// 口径：校验只做「拒绝」，不做转义。转义规则写错会把整条命令行连日志重定向一起弄坏。
+let launchCfg = { extraArgs: "", env: [] };
+const LAUNCH_ENV_MAX_ITEMS = 32;
+const LAUNCH_EXTRAARGS_MAX = 800;
+const LAUNCH_ENV_VALUE_MAX = 512;
+const LAUNCH_ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// .cmd 里会破坏语句的字符：换行、重定向/管道/连接、转义符、延迟展开与变量展开
+const LAUNCH_EXTRAARGS_BAD_RE = /[\r\n<>&|^`%!]/;
+// set "K=V" 行里被 cmd 展开或提前闭合引号的字符
+const LAUNCH_ENV_BAD_RE = /[\r\n%!"]/;
+// App 自己决定的参数：覆盖会把服务起到别的端口/地址上，UI 与中继就对不上了
+const LAUNCH_RESERVED_ARG_RE = /(^|\s)"?--(?:port|listen)(?=[="\s]|$)/i;
+
+// env 输入归一化：数组原样返回；文本按首个 = 切分。抛错由 validateLaunchConfig 统一转成 error。
+function normalizeLaunchEnvInput(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    const items = [];
+    const lines = raw.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      const eq = line.indexOf("=");
+      if (eq < 0) throw new Error(`环境变量第 ${i + 1} 行：缺少「=」，应写成 KEY=VALUE`);
+      items.push({ k: line.slice(0, eq).trim(), v: line.slice(eq + 1).trim() });
+    }
+    return items;
+  }
+  throw new Error("env 必须是 [{k,v}] 数组，或 KEY=VALUE 多行文本");
+}
+
+// 校验 + 归一化启动配置。返回 {ok:true, cfg} 或 {ok:false, error}（error 逐项指名，不静默丢弃）。
+function validateLaunchConfig(raw) {
+  const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const extraRaw = src.extraArgs === undefined || src.extraArgs === null ? "" : src.extraArgs;
+  if (typeof extraRaw !== "string") return { ok: false, error: "额外启动参数：必须是字符串" };
+  const extraArgs = extraRaw.trim();
+  if (extraArgs.length > LAUNCH_EXTRAARGS_MAX) {
+    return { ok: false, error: `额外启动参数：超长（${extraArgs.length} 字符，上限 ${LAUNCH_EXTRAARGS_MAX}）` };
+  }
+  const badArg = LAUNCH_EXTRAARGS_BAD_RE.exec(extraArgs);
+  if (badArg) {
+    const ch = badArg[0] === "\r" ? "\\r" : badArg[0] === "\n" ? "\\n" : badArg[0];
+    return { ok: false, error: `额外启动参数：不允许字符「${ch}」（.cmd 里会被解释成命令分隔/重定向/转义，App 不做转义）` };
+  }
+  if (((extraArgs.match(/"/g) || []).length) % 2 === 1) {
+    return { ok: false, error: "额外启动参数：双引号必须成对（落单的双引号会让整条命令行错位）" };
+  }
+  const reserved = LAUNCH_RESERVED_ARG_RE.exec(extraArgs);
+  if (reserved) {
+    return { ok: false, error: `额外启动参数：不允许 ${reserved[0].trim()}（监听地址与端口由 App 决定，覆盖会连错端口）` };
+  }
+
+  let items;
+  try { items = normalizeLaunchEnvInput(src.env); }
+  catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+  if (items.length > LAUNCH_ENV_MAX_ITEMS) {
+    return { ok: false, error: `环境变量：共 ${items.length} 项，上限 ${LAUNCH_ENV_MAX_ITEMS} 项` };
+  }
+  const seen = new Map();
+  const env = [];
+  for (let i = 0; i < items.length; i++) {
+    const n = i + 1;
+    const it = items[i];
+    if (!it || typeof it !== "object" || Array.isArray(it)) {
+      return { ok: false, error: `环境变量第 ${n} 项：应为 {k, v} 对象，收到 ${it === null ? "null" : typeof it}` };
+    }
+    const k = typeof it.k === "string" ? it.k.trim() : "";
+    if (!k) return { ok: false, error: `环境变量第 ${n} 项：KEY 为空` };
+    if (!LAUNCH_ENV_KEY_RE.test(k)) {
+      return { ok: false, error: `环境变量第 ${n} 项：KEY「${k}」不是合法环境变量名（须以字母或 _ 开头，仅含字母/数字/_）` };
+    }
+    const lower = k.toLowerCase();
+    if (seen.has(lower)) {
+      return { ok: false, error: `环境变量第 ${n} 项：KEY「${k}」与第 ${seen.get(lower)} 项重复（Windows 环境变量名不区分大小写）` };
+    }
+    seen.set(lower, n);
+    if (it.v !== undefined && it.v !== null && typeof it.v !== "string") {
+      return { ok: false, error: `环境变量第 ${n} 项（${k}）：VALUE 必须是字符串` };
+    }
+    const v = typeof it.v === "string" ? it.v : "";
+    if (v.length > LAUNCH_ENV_VALUE_MAX) {
+      return { ok: false, error: `环境变量第 ${n} 项（${k}）：VALUE 超长（${v.length} 字符，上限 ${LAUNCH_ENV_VALUE_MAX}）` };
+    }
+    const badVal = LAUNCH_ENV_BAD_RE.exec(v);
+    if (badVal) {
+      const ch = badVal[0] === "\r" ? "\\r" : badVal[0] === "\n" ? "\\n" : badVal[0];
+      return { ok: false, error: `环境变量第 ${n} 项（${k}）：VALUE 不允许字符「${ch}」（.cmd 的 set 语句会被展开或提前闭合，App 不做转义）` };
+    }
+    env.push({ k, v });
+  }
+  return { ok: true, cfg: { extraArgs, env } };
+}
+
 // 受管 runtime 的环境被宿主重写过（USERPROFILE/HOME 可能指向 app 的 .runtime-tmp），
 // os.homedir() 在那里拿到的不是真实用户目录。逐级回退并排除污染路径。
 function realHome() {
@@ -618,6 +741,12 @@ function resolveWorkflowsDir() {
 // 统一补 CHILD_ENV，缺 PATH 时固化的 "C:\Windows\System32" 也在内。
 const CHILD_ENV = {
   ...process.env,
+  // 禁止 git 任何交互式提问（2026-10-22 事故）：origin 走 ghproxy 镜像时，
+  // 镜像对 git-upload-pack 的 POST 回 401，git 判定「需要认证」→ 弹 GCM 凭据窗，
+  // 面板每 10 分钟静默查一次更新，于是无限弹窗、僵死进程越堆越多。
+  // 这里固化为「拿不到凭据就直接失败」：更新检查只报 error，绝不打扰用户。
+  GIT_TERMINAL_PROMPT: "0",
+  GCM_INTERACTIVE: "never",
   ProgramFiles: process.env.ProgramFiles || "C:\\Program Files",
   "ProgramFiles(x86)": process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
   ProgramData: process.env.ProgramData || "C:\\ProgramData",
@@ -737,7 +866,38 @@ const backendProc = {
   lastStop: null,
 };
 let startInFlight = null;   // 本进程内 in-flight 启动时间戳（去重用，兜底 state/计划任务）
-let pidCache = { at: 0, pids: [] };
+let pidCache = { at: 0, pids: [], diag: null };  // diag = 本次三路枚举的逐源诊断（停止服务日志 / 回执用）
+// 降级与淘汰的 warn 按 key 去重：listeningPids 在 5s 轮询路径上被反复调用，否则刷屏
+const pidWarned = new Set();
+function warnOnce(key, text) {
+  if (pidWarned.has(key)) return;
+  pidWarned.add(key);
+  if (pidWarned.size > 200) pidWarned.clear();
+  warn(text);
+}
+
+// 生成 backend-launcher.cmd 的内容（纯函数：便于单测，也用于「空配置逐字节一致」比对）。
+// 行序固定：@echo off → chcp → cd /d → set 环境变量（每项一行）→ python 行 → 末尾空行。
+// 空配置（launchCfg 缺省 / extraArgs 空 / env 空）时输出必须与改造前的内联拼装逐字节一致。
+function buildLauncherScript({ python, cwd, host, port, logFile, useManager, launchCfg: cfg } = {}) {
+  const userArgs = cfg && typeof cfg.extraArgs === "string" ? cfg.extraArgs.trim() : "";
+  // 顺序约定：App 自己加的（--enable-manager）在前，用户参数在后
+  const merged = [useManager ? "--enable-manager" : "", userArgs].filter(Boolean).join(" ");
+  const extraArgs = merged ? ` ${merged}` : "";
+  const envLines = Array.isArray(cfg && cfg.env)
+    ? cfg.env
+      .filter((e) => e && typeof e.k === "string" && e.k)
+      .map((e) => `set "${e.k}=${e.v === undefined || e.v === null ? "" : String(e.v)}"`)
+    : [];
+  return [
+    "@echo off",
+    "chcp 65001 >nul",
+    `cd /d "${cwd}"`,
+    ...envLines,
+    `"${python}" main.py --listen ${host} --port ${port}${extraArgs} >> "${logFile}" 2>&1`,
+    "",
+  ].join("\r\n");
+}
 
 function backendStatePath() {
   const dir = logFilePath ? dirname(logFilePath) : process.cwd();
@@ -786,6 +946,33 @@ function savePreviewCfg() {
   }
 }
 
+// 启动参数落盘（与 preview-config 同目录：runtime 日志目录 / standalone 的 cwd）
+function launchCfgPath() {
+  const dir = logFilePath ? dirname(logFilePath) : process.cwd();
+  return join(dir, "launch-config.json");
+}
+
+function loadLaunchCfg() {
+  try {
+    const raw = JSON.parse(readFileSync(launchCfgPath(), "utf8"));
+    const r = validateLaunchConfig(raw);
+    if (!r.ok) {
+      warn(`launch-config 落盘内容不合法（${r.error}）→ 按空配置启动（不影响服务启动）`);
+      return;
+    }
+    launchCfg = r.cfg;
+  } catch { /* 首次运行没有配置文件，正常（空配置 = 改造前行为） */ }
+}
+
+function saveLaunchCfg() {
+  try {
+    mkdirSync(dirname(launchCfgPath()), { recursive: true });
+    writeFileSync(launchCfgPath(), JSON.stringify({ ...launchCfg, savedAt: new Date().toISOString() }, null, 2), "utf8");
+  } catch (e) {
+    warn(`launch-config 写入失败（仅内存生效）：${(e && e.message) || e}`);
+  }
+}
+
 function runExe(exe, args, timeoutMs = 20_000) {
   try {
     const r = spawnSync(exe, args, { encoding: "utf8", timeout: timeoutMs, windowsHide: true, env: CHILD_ENV });
@@ -800,21 +987,319 @@ function runExe(exe, args, timeoutMs = 20_000) {
   }
 }
 
-// 8188 上正在监听的进程（撤下按钮的靶子；按端口找，不依赖进程名，兼容外部启动方式）
-function listeningPids() {
-  if (Date.now() - pidCache.at < PID_CACHE_MS) return pidCache.pids;
+// ── 8188 监听进程定位（三路兜底，issue #3）────────────────────────────────────
+// 为什么三路（2026-10-21，报告者 Win10 便携版实测）：他机器上 netstat 只有 ESTABLISHED/TIME_WAIT、
+//   一条 LISTENING 行都没有 → 原实现解析出 pids=[]，一个进程都没杀，UI 却报「已停止」。
+//   因此「一条 LISTENING 行都没有」判为该源**失明**（ok=false），而不是「端口没监听」。
+// 顺序：(a) netstat → (b) Get-NetTCPConnection → (c) 命令行匹配；前一路拿到结果即停。
+//   都拿不到时返回空数组（调用方语义不变：仍是 pid 数组）。
+
+// (a) netstat 解析（原逻辑保持）；全局无 LISTENING 行 → 失明
+function netstatListeningPids(port) {
   const r = runExe("netstat.exe", ["-ano", "-p", "TCP"], 15_000);
   const pids = new Set();
+  let listenRows = 0;
   for (const line of String(r.stdout || "").split(/\r?\n/)) {
     const parts = line.trim().split(/\s+/);
     if (parts.length < 5 || parts[0].toUpperCase() !== "TCP") continue;
-    if (!parts[1].endsWith(`:${backend.port}`)) continue;
+    if (String(parts[3]).toUpperCase() === "LISTENING") listenRows += 1;
+    if (!parts[1].endsWith(`:${port}`)) continue;
     if (String(parts[3]).toUpperCase() !== "LISTENING") continue;
     const pid = Number(parts[4]);
     if (Number.isInteger(pid) && pid > 0) pids.add(pid);
   }
-  pidCache = { at: Date.now(), pids: [...pids] };
+  if (!listenRows) {
+    return { ok: false, pids: [], reason: `netstat 输出无任何 LISTENING 行（exit ${r.code}${r.error ? ` ${r.error}` : ""}）` };
+  }
+  return { ok: true, pids: [...pids], reason: null };
+}
+
+// (b) Get-NetTCPConnection -State Listen（PS 不可用/被拒 → 静默降级为 ok=false）
+// 坑（未处理会误判）：本机实测 -LocalPort 无匹配行时该 cmdlet **抛异常**，
+//   FullyQualifiedErrorId = "CmdletizationQuery_NotFound,Get-NetTCPConnection"（不是返回空集合）。
+//   这是「查询成功、结果为空」，必须判 ok=true/pids=[]，否则会被当成失明而白跑 CIM 兜底。
+// 输出强制 UTF-8，且错误摘要只带类型名 + FQID（ASCII），避免 GBK 中文横幅乱码混入日志。
+function psListeningPids(port) {
+  const base = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
+  const script = `[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ErrorActionPreference='Stop'; try { $c=@(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop); "HANA_PS_OK"; if($c.Count -eq 0){"HANA_PS_EMPTY"} else { foreach($x in $c){ "HANA_PS_PID:" + [int]$x.OwningProcess } } } catch { if(("" + $_.FullyQualifiedErrorId) -like 'CmdletizationQuery_NotFound*'){ "HANA_PS_OK"; "HANA_PS_EMPTY" } else { "HANA_PS_ERR:" + $_.Exception.GetType().Name + " FQID=" + $_.FullyQualifiedErrorId } }`;
+  const r = runExe(PS_EXE, [...base, script], 12_000);
+  const out = String(r.stdout || "");
+  const text = `${out}\n${r.stderr || ""}`;
+  const err = text.match(/HANA_PS_ERR:([^\r\n]*)/);
+  if (err) return { ok: false, pids: [], reason: `Get-NetTCPConnection 不可用：${String(err[1]).replace(/[^\x20-\x7E]/g, "?").slice(0, 160)}` };
+  if (!/HANA_PS_OK/.test(text)) return { ok: false, pids: [], reason: `PowerShell 无标记输出（exit ${r.code}${r.error ? ` ${String(r.error).replace(/[^\x20-\x7E]/g, "?")}` : ""}）` };
+  const pids = [];
+  for (const m of out.matchAll(/HANA_PS_PID:(\d+)/g)) {
+    const pid = Number(m[1]);
+    if (Number.isInteger(pid) && pid > 0 && !pids.includes(pid)) pids.push(pid);
+  }
+  return { ok: true, pids, reason: null };  // 查询成功且为空（HANA_PS_EMPTY）= 确无监听者，不是失明
+}
+
+// (c) 命令行匹配：python*.exe 且命令行含 main.py 且 --port 值精确等于目标端口
+const PY_IMAGE_RE = /^python(w)?(\d+(\.\d+)*)?\.exe$/i;
+function portArgValue(cmdline) {
+  const m = String(cmdline || "").match(/--port(?:=|\s+)(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+function cmdlineComfyCandidates(port) {
+  const base = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
+  const script = `[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ErrorActionPreference='Stop'; try { $p=@(Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction Stop | Select-Object ProcessId,Name,CommandLine); "HANA_CIM_OK"; if($p.Count -eq 0){"HANA_CIM_EMPTY"} else { $p | ConvertTo-Json -Compress -Depth 3 } } catch { "HANA_CIM_ERR:" + $_.Exception.GetType().Name + " FQID=" + $_.FullyQualifiedErrorId }`;
+  const r = runExe(PS_EXE, [...base, script], 20_000);
+  const out = String(r.stdout || "");  // 只认 stdout（stderr 可能有本地化横幅，混进去会弄坏 JSON）
+  const err = `${out}\n${r.stderr || ""}`.match(/HANA_CIM_ERR:([^\r\n]*)/);
+  if (err) return { ok: false, cands: [], eliminated: [], reason: `CIM 枚举不可用：${String(err[1]).replace(/[^\x20-\x7E]/g, "?").slice(0, 160)}` };
+  if (!/HANA_CIM_OK/.test(out)) return { ok: false, cands: [], eliminated: [], reason: `CIM 枚举无标记输出（exit ${r.code}${r.error ? ` ${String(r.error).replace(/[^\x20-\x7E]/g, "?")}` : ""}）` };
+  const rows = parseJsonRows(out.split("HANA_CIM_OK")[1] ? out.split("HANA_CIM_OK")[1].replace(/HANA_CIM_EMPTY/g, "").trim() : "");
+  const cands = [];
+  const eliminated = [];
+  for (const row of rows) {
+    const pid = Number(row && row.ProcessId);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const name = basename(String((row && row.Name) || ""));
+    const cmdline = String((row && row.CommandLine) || "");
+    if (!PY_IMAGE_RE.test(name)) continue;                                    // 只认 python*.exe
+    if (!/(^|[\\/\s"'])main\.py([\s"']|$)/i.test(cmdline)) continue;         // 只认以 main.py 为入口的
+    const pv = portArgValue(cmdline);
+    if (pv === null) { eliminated.push({ pid, reason: `含 main.py 但无 --port 参数（不判为 ${port} 的监听者）` }); continue; }
+    if (pv !== Number(port)) { eliminated.push({ pid, reason: `--port=${pv} ≠ ${port}` }); continue; }
+    cands.push({ pid, name, cmdline });
+  }
+  return { ok: true, cands, eliminated, reason: null };
+}
+
+// 逐源诊断 → 日志片段：`netstat=0 ps=0 cmdline=1 候选=2(淘汰1) 采用=cmdline`（`-` = 该路未尝试）
+// 失明的源前缀 `!`（如 `ps=!0`），并在末尾追加 `失明=ps`，便于一眼看出降级发生在哪一路。
+// (c) 与监听结果取交集（纯函数，便于单测）。
+// 为何必需（2026-10-21 本机实测）：同一台机器有两个 python 进程命令行**完全一致**
+//   （`main.py --listen 127.0.0.1 --port 8188 --enable-manager`，pid 16908 / 6276），
+//   只有 6276 真在监听 8188。不取交集会误杀无辜进程。
+// listenersOk=false 时没有可信监听集合：只有单一候选才采用；多候选一律返回空 + 淘汰理由。
+function reconcileCmdlineCandidates(cands, listeners, listenersOk) {
+  const list = Array.isArray(cands) ? cands : [];
+  if (!list.length) return { keep: [], eliminated: [], ambiguous: false };
+  if (listenersOk) {
+    const set = new Set((listeners || []).map(Number));
+    const keep = list.filter((x) => set.has(Number(x.pid)));
+    const eliminated = list
+      .filter((x) => !set.has(Number(x.pid)))
+      .map((x) => ({ pid: x.pid, reason: `命令行匹配但不在 Get-NetTCPConnection 监听者中（监听者=${[...set].join(",") || "无"}）` }));
+    return { keep, eliminated, ambiguous: false };
+  }
+  if (list.length === 1) return { keep: [list[0]], eliminated: [], ambiguous: false };
+  return {
+    keep: [],
+    eliminated: list.map((x) => ({ pid: x.pid, reason: `无可信监听集合（Get-NetTCPConnection 不可用），多候选不采用` })),
+    ambiguous: true,
+  };
+}
+
+function pidSourcesText(diag) {
+  if (!diag) return "未知";
+  const cell = (s) => {
+    if (!s || s.state === "skip") return "-";
+    const n = String((s.pids || []).length);
+    return s.state === "blind" ? `!${n}` : n;
+  };
+  const parts = [`netstat=${cell(diag.netstat)}`, `ps=${cell(diag.ps)}`];
+  let cmd = `cmdline=${cell(diag.cmdline)}`;
+  if (diag.cmdline && diag.cmdline.state !== "skip" && (diag.cmdline.candidates || 0) > 0) {
+    cmd += ` 候选=${diag.cmdline.candidates}(淘汰${(diag.cmdline.eliminated || []).length})`;
+  }
+  parts.push(cmd, `采用=${diag.adopted || "无"}`);
+  const blind = ["netstat", "ps", "cmdline"].filter((k) => diag[k] && diag[k].state === "blind");
+  if (blind.length) parts.push(`失明=${blind.join(",")}`);
+  return parts.join(" ");
+}
+
+// 8188 上正在监听的进程（撤下按钮的靶子；按端口找，不依赖进程名，兼容外部启动方式）
+// 返回类型仍是 number[]（4 个调用点全部按数组消费）；逐源诊断挂在 pidCache.diag。
+function listeningPids() {
+  if (Date.now() - pidCache.at < PID_CACHE_MS) return pidCache.pids;
+  const port = backend.port;
+  const diag = {
+    port,
+    netstat: { state: "skip", pids: [], note: null },
+    ps: { state: "skip", pids: [], note: null },
+    cmdline: { state: "skip", pids: [], candidates: 0, eliminated: [], note: null },
+    adopted: null,
+  };
+  let pids = [];
+
+  // (a) netstat
+  const a = netstatListeningPids(port);
+  diag.netstat = { state: a.ok ? "ok" : "blind", pids: a.pids, note: a.reason || null };
+  if (a.ok && a.pids.length) {
+    pids = a.pids;
+    diag.adopted = "netstat";
+  } else if (!a.ok) {
+    warnOnce(`netstat-blind:${a.reason}`, `监听进程枚举降级：netstat 源失明（${a.reason}），改用 Get-NetTCPConnection`);
+  }
+
+  if (!diag.adopted) {
+    // (b) Get-NetTCPConnection
+    const b = psListeningPids(port);
+    diag.ps = { state: b.ok ? "ok" : "blind", pids: b.pids, note: b.reason || null };
+    if (b.ok && b.pids.length) {
+      pids = b.pids;
+      diag.adopted = "ps";
+    } else if (!b.ok) {
+      warnOnce(`ps-blind:${b.reason}`, `监听进程枚举降级：${b.reason}（PowerShell 受限属预期，继续命令行兜底）`);
+    }
+
+    // 短路：两个独立枚举器都成功且都为 0 → 一致认为无监听者，不必跑 (c)（CIM 全表枚举开销大，5s 轮询路径）
+    const bothOkEmpty = a.ok && b.ok && a.pids.length === 0 && b.pids.length === 0;
+    if (!diag.adopted && !bothOkEmpty) {
+      const c = cmdlineComfyCandidates(port);
+      diag.cmdline = {
+        state: c.ok ? "ok" : "blind",
+        pids: [],
+        candidates: c.cands.length,
+        eliminated: c.eliminated,
+        note: c.reason || null,
+      };
+      if (c.ok && c.cands.length) {
+        const rec = reconcileCmdlineCandidates(c.cands, b.pids, b.ok);
+        diag.cmdline.eliminated.push(...rec.eliminated);
+        diag.cmdline.pids = rec.keep.map((x) => x.pid);
+        if (rec.keep.length) {
+          pids = diag.cmdline.pids;
+          diag.adopted = "cmdline";
+        } else if (rec.ambiguous) {
+          // (b) 失明且多候选：无法交叉验证监听者，绝不批量 kill
+          diag.cmdline.note = `${c.cands.length} 个候选且无监听交叉验证 → 放弃（不批量 kill）`;
+          warnOnce(`cmdline-ambiguous:${c.cands.map((x) => x.pid).join(",")}`, `监听进程兜底放弃：命令行命中 ${c.cands.length} 个候选（${c.cands.map((x) => `pid=${x.pid}`).join(", ")}）且 Get-NetTCPConnection 不可用，无法确认谁在监听 ${port} → 一个都不杀`);
+        } else {
+          diag.cmdline.note = "候选与监听者交集为空（不采用）";
+        }
+      } else if (!c.ok) {
+        warnOnce(`cmdline-blind:${c.reason}`, `监听进程枚举降级：${c.reason}`);
+      }
+      for (const e of c.eliminated) warnOnce(`elim:${e.pid}:${e.reason}`, `监听进程候选淘汰：pid=${e.pid} ${e.reason}`);
+    } else if (bothOkEmpty) {
+      diag.cmdline.state = "skip";
+      diag.cmdline.note = "netstat 与 Get-NetTCPConnection 一致为 0，跳过命令行兜底";
+    }
+  }
+
+  pidCache = { at: Date.now(), pids: [...pids], diag };
   return pidCache.pids;
+}
+
+// ── 停止后的硬证据（issue #3：不再用「HTTP 是否可达」代言「进程是否杀掉」）──────────
+// alivePidsAmong：taskkill 后复查 pid 是否真的不在。CIM/Get-Process 回执缺失（被拒/不可用）
+//   即视为已退出；整体失明退化为逐 pid tasklist。
+// 等待给定 pid 终结（内核对象，不是轮询）。
+// 为什么换掉原来的「sleep 800ms + 单次查」：ComfyUI 退出要释放显存、关子进程，
+// 常超过 800ms —— 那一刻进程还在，就被判成 survivors，报「仍有进程存活」假失败
+// （2026-10-21 实际踩到：taskkill 成功、36300 随后确实消失，但判定报了 survivors）。
+// WaitForSingleObject 等的是进程句柄变 signaled —— 进程一终结内核直接唤醒，
+// 不存在「等得不够久」这种误判；超时才有真凭据说它还活着。
+// WAIT_OBJECT_0=0 已终结 / WAIT_TIMEOUT=0x102 仍存活 / OpenProcess 失败=进程已不存在。
+function waitPidsExit(pids, timeoutMs = 8_000) {
+  const ids = [...new Set((pids || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (!ids.length) return { ok: true, alive: [], waitedMs: 0 };
+  const base = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
+  // 逐个 pid：OpenProcess(SYNCHRONIZE) → WaitForSingleObject。
+  // 多个 pid 时串行等，总时长受 timeoutMs 约束（剩余时间递减）。
+  const script = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class HanaWait {
+  [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern IntPtr OpenProcess(int a, bool i, int p);
+  [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
+  [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
+}
+"@
+$SYNCHRONIZE = 0x00100000
+$budget = ${timeoutMs}
+"HANA_WAIT_OK"
+foreach ($id in @(${ids.join(",")})) {
+  $h = [HanaWait]::OpenProcess($SYNCHRONIZE, $false, $id)
+  if ($h -eq [IntPtr]::Zero) { "HANA_WAIT_GONE:\${id}"; continue }
+  $r = [HanaWait]::WaitForSingleObject($h, [uint32][Math]::Max(0, $budget))
+  [HanaWait]::CloseHandle($h) | Out-Null
+  if ($r -eq 0) { "HANA_WAIT_EXITED:\${id}" }
+  elseif ($r -eq 0x102) { "HANA_WAIT_ALIVE:\${id}" }
+  else { "HANA_WAIT_ERR:\${id}:$r" }
+}`;
+  const t0 = Date.now();
+  const r = runExe(PS_EXE, [...base, script], timeoutMs + 12_000);
+  const waitedMs = Date.now() - t0;
+  const text = `${r.stdout || ""}\n${r.stderr || ""}`;
+  if (/HANA_WAIT_OK/.test(text)) {
+    const alive = [];
+    for (const m of text.matchAll(/HANA_WAIT_ALIVE:(\d+)/g)) {
+      const pid = Number(m[1]);
+      if (ids.includes(pid) && !alive.includes(pid)) alive.push(pid);
+    }
+    // GONE（OpenProcess 失败）与 EXITED 都算已退出；ERR 保守当存活
+    for (const m of text.matchAll(/HANA_WAIT_ERR:(\d+):/g)) {
+      const pid = Number(m[1]);
+      if (ids.includes(pid) && !alive.includes(pid)) alive.push(pid);
+    }
+    return { ok: true, alive, waitedMs };
+  }
+  // 内核等待不可用（受限令牌/PowerShell 异常）→ 退化为单次快照，但**明确标记 ok:false**，
+  // 让调用方能分辨「等过了」与「只查了一眼」。
+  const alive = [];
+  for (const pid of ids) {
+    const t = runExe("tasklist.exe", ["/fi", `PID eq ${pid}`, "/fo", "csv", "/nh"], 10_000);
+    if (new RegExp(`"${pid}"`, "m").test(String(t.stdout || ""))) alive.push(pid);
+  }
+  return { ok: false, alive, waitedMs };
+}
+
+// 保留原名兼容既有调用方（语义已变为「等结束后再报」）。
+function alivePidsAmong(pids) {
+  return waitPidsExit(pids);
+}
+
+// probePortListening：独立做一次 TCP 连接探测。连上=true，ECONNREFUSED=false，超时/其它=null（不猜）
+function probePortListening(port, timeoutMs = 1_500) {
+  return new Promise((resolve) => {
+    let done = false;
+    let sock = null;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try { if (sock) sock.destroy(); } catch { /* 忽略 */ }
+      resolve(v);
+    };
+    try {
+      sock = net.connect({ host: backend.host, port });
+    } catch {
+      finish(null);
+      return;
+    }
+    sock.setTimeout(timeoutMs);
+    sock.once("connect", () => finish(true));
+    sock.once("timeout", () => finish(null));
+    sock.once("error", (e) => finish(e && e.code === "ECONNREFUSED" ? false : null));
+  });
+}
+
+// 停止结果判定（纯函数，便于单测）。reachable 只作佐证，不参与判定。
+function decideStopOutcome({ pids = [], survivors = [], portListening = null, reachable = false, failed = [], port = null } = {}) {
+  const hasPids = Array.isArray(pids) && pids.length > 0;
+  const failText = Array.isArray(failed) && failed.length ? `；taskkill 失败：${JSON.stringify(failed)}` : "";
+  if (hasPids && survivors.length) {
+    return { ok: false, branch: "survivors", error: `已执行 taskkill，但仍有进程存活：${survivors.join(",")}${failText}` };
+  }
+  if (hasPids && portListening === true) {
+    return { ok: false, branch: "killed-but-listening", error: `进程已终止（${pids.join(",")}），但端口 ${port} 仍被监听（可能被其他实例接手），不能判为已停止` };
+  }
+  if (hasPids) {
+    return { ok: true, branch: "killed", error: null };
+  }
+  if (portListening === false) {
+    return { ok: true, branch: "not-running", error: null };
+  }
+  if (portListening === true) {
+    return { ok: false, branch: "listen-no-pid", error: `端口 ${port} 有监听，但 netstat / Get-NetTCPConnection / 命令行三路均定位不到监听进程，服务可能仍在运行（未终止任何进程）` };
+  }
+  return { ok: false, branch: "unknown", error: `未定位到监听进程，且端口 ${port} 探测超时（无法确认是否已释放）——不猜成功，服务可能仍在运行` };
 }
 
 // 解析可启动目标：安装根 → venv python → main.py。策略与 probeEnv 同一套指纹，不硬编码路径。
@@ -880,14 +1365,17 @@ async function startBackendService(overridePath) {
     join(pyDir, "..", "Lib", "site-packages", "comfyui_manager"),
     join(pyDir, "Lib", "site-packages", "comfyui_manager"),
   ].some((p) => existsSync(p));
-  const extraArgs = useManager ? " --enable-manager" : "";
-  const script = [
-    "@echo off",
-    "chcp 65001 >nul",
-    `cd /d "${t.cwd}"`,
-    `"${t.python}" main.py --listen ${backend.host} --port ${backend.port}${extraArgs} >> "${logFile}" 2>&1`,
-    "",
-  ].join("\r\n");
+  // 用户配置的额外参数与启动前环境变量（launchCfg，落盘见 launchCfgPath）：
+  // 空配置时生成的 .cmd 与改造前逐字节一致（见 buildLauncherScript 的说明）。
+  const script = buildLauncherScript({
+    python: t.python,
+    cwd: t.cwd,
+    host: backend.host,
+    port: backend.port,
+    logFile,
+    useManager,
+    launchCfg,
+  });
   // 隐藏窗口：任务若直接指向 .cmd，Windows 会开一个可见控制台（实测：任务栏多出一个 cmd 窗口）。
   // 改用 wscript 的 Run(..., 0, False) 隐藏拉起；wscript 不可用（组策略禁脚本宿主）时回退直接 .cmd。
   const useVbs = existsSync(WSCRIPT_EXE);
@@ -947,7 +1435,7 @@ async function startBackendService(overridePath) {
   backendProc.lastError = null;
   saveBackendState();
   pidCache = { at: 0, pids: [] };
-  log(`请求启动 ComfyUI 服务：${t.python} main.py（cwd=${t.cwd}，日志 ${logFile}，启动器 ${useVbs ? launcherVbs : launcher}，manager=${useManager ? "on" : "off"}）`);
+  log(`请求启动 ComfyUI 服务：${t.python} main.py（cwd=${t.cwd}，日志 ${logFile}，启动器 ${useVbs ? launcherVbs : launcher}，manager=${useManager ? "on" : "off"}，额外参数=${launchCfg.extraArgs ? JSON.stringify(launchCfg.extraArgs) : "无"}，启动前环境变量=${launchCfg.env.length} 项）`);
 
   // 兜底诊断：90s 后仍未就绪就把成因指向可查的两处（否则面板只会显示“不可达”，无从下手）
   setTimeout(async () => {
@@ -970,32 +1458,94 @@ async function startBackendService(overridePath) {
     launcherCmd: launcher,
     hidden: useVbs,
     manager: useManager,
+    launch: { extraArgs: launchCfg.extraArgs, envCount: launchCfg.env.length },
     logFile,
     url: `http://${backend.host}:${backend.port}`,
   };
 }
 
+// taskkill 等中文系统工具输出是 GBK，而 runExe 按 utf8 解码 → 日志会出「????」乱码。
+// 停止日志要可读（issue #3），这里单独拿原始 buffer 按 GBK 解码。
+function killPidTree(pid) {
+  const r = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+    timeout: 20_000, windowsHide: true, env: CHILD_ENV,
+  });
+  let text = "";
+  const raw = Buffer.concat([r.stdout || Buffer.alloc(0), r.stderr || Buffer.alloc(0)]);
+  if (raw.length) {
+    try { text = new TextDecoder("gbk").decode(raw); }
+    catch { text = raw.toString("utf8"); }
+  }
+  const code = r.status === null || r.status === undefined ? -1 : r.status;
+  text = String(text || "").replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+  if (text.length > 240) text = `${text.slice(0, 240)}…`;
+  return { code, text: text || (r.error ? String(r.error.message) : "") };
+}
+
 async function stopBackendService() {
-  pidCache = { at: 0, pids: [] }; // 强制重查：不强依赖「可达」判断（端口有监听但 HTTP 不响时也要能撤）
+  pidCache = { at: 0, pids: [], diag: null }; // 强制重查：不强依赖「可达」判断（端口有监听但 HTTP 不响时也要能撤）
   const pids = listeningPids();
+  const diag = pidCache.diag;
+  const sources = pidSourcesText(diag);
   const stopped = [];
   const failed = [];
   for (const pid of pids) {
-    const r = runExe("taskkill.exe", ["/PID", String(pid), "/T", "/F"], 20_000);
-    if (r.code === 0) stopped.push(pid);
-    else failed.push({ pid, error: r.stderr || r.error || `exit ${r.code}` });
+    const k = killPidTree(pid);
+    if (k.code === 0) stopped.push(pid);
+    else failed.push({ pid, error: k.text || `exit ${k.code}` });
   }
   runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000); // 顺手清理启动器任务
   backendProc.starting = false;
   startInFlight = null;
-  await new Promise((r) => setTimeout(r, 800));
-  await probeBackend();
-  pidCache = { at: 0, pids: [] };
-  backendProc.lastStop = { at: new Date().toISOString(), pids, stopped, alive: backend.reachable };
-  backendProc.lastError = failed.length ? `部分进程未能终止：${JSON.stringify(failed)}` : null;
+
+  // 硬证据 1：等这些 pid **真正终结**（内核等待，不是轮询也不是固定 sleep）。
+  // 原来的 `sleep 800ms 后查一次」会把「正在退出」误判成 survivors（2026-10-21 实踩）。
+  // 返回 survivor 才算真没杀成；内核等待失败（受限令牌）时 ok=false，降级为快照，
+  // 此时 survivors 的结论仍可用但要当「没等过」看。
+  const waited = pids.length ? waitPidsExit(pids, 8_000) : { ok: true, alive: [], waitedMs: 0 };
+  const survivors = waited.alive;
+  if (survivors.length) {
+    log(`停止后仍有进程未退出（等 ${waited.waitedMs}ms）：${survivors.join(",")}${waited.ok ? "" : "（内核等待不可用，仅为快照）"}`);
+  }
+  // 硬证据 2：停止后独立做一次 TCP 连接探测（连上=true / ECONNREFUSED=false / 超时=null）
+  let portListening = await probePortListening(backend.port);
+  if (portListening === true) {
+    // true 分支复核：只允许 true→false 降级（避免把「正在退出」误判成「仍在运行」）
+    await new Promise((r) => setTimeout(r, 700));
+    if ((await probePortListening(backend.port)) === false) portListening = false;
+  }
+  await probeBackend(); // reachable 仅作佐证回传（probeBackend 有防重入，该值可能陈旧，不参与判定）
+  const reachable = backend.reachable;
+  pidCache = { at: 0, pids: [], diag: null };
+
+  const verdict = decideStopOutcome({ pids, survivors, portListening, reachable, failed, port: backend.port });
+  const alive = survivors.length > 0 || portListening !== false; // 旧字段兼容：可能仍在跑（不用 reachable 代言）
+  backendProc.lastStop = { at: new Date().toISOString(), pids, stopped, alive, survivors, portListening, ok: verdict.ok, branch: verdict.branch };
+  backendProc.lastError = verdict.ok
+    ? null
+    : (survivors.length || failed.length
+        ? `部分进程未能终止：${JSON.stringify(failed)}${survivors.length ? `，存活：${survivors.join(",")}` : ""}`
+        : verdict.error);
   saveBackendState();
-  log(`停止 ComfyUI 服务：pids=${JSON.stringify(pids)} stopped=${JSON.stringify(stopped)} 仍可达=${backend.reachable}`);
-  return { ok: !backend.reachable, pids, stopped, failed, alive: backend.reachable, already: pids.length === 0 };
+  const elimText = diag && diag.cmdline && (diag.cmdline.eliminated || []).length
+    ? ` 淘汰: ${diag.cmdline.eliminated.map((e) => `pid=${e.pid} ${e.reason}`).join("; ")}`
+    : "";
+  const line = `停止 ComfyUI 服务：pids=${JSON.stringify(pids)} stopped=${JSON.stringify(stopped)} 仍可达=${reachable} ok=${verdict.ok}[${verdict.branch}]（源: ${sources}${elimText}）${verdict.error ? ` error=${verdict.error}` : ""}`;
+  if (verdict.ok) log(line); else logErr(line);
+  return {
+    ok: verdict.ok,
+    pids,
+    stopped,
+    failed,
+    alive,
+    already: pids.length === 0,
+    survivors,
+    portListening,
+    branch: verdict.branch,
+    sources,
+    reachable,
+    ...(verdict.error ? { error: verdict.error } : {}),
+  };
 }
 
 // ── 拉起服务·T1 中继层（环境检查 / 快照清理 / 去重 / 等待就绪）───────────────────
@@ -1424,15 +1974,22 @@ async function applyThemeSettings(body) {
 }
 
 // ── ComfyUI 本体更新（M11）──────────────────────────────────────────────
-// 目标：源码安装的 ComfyUI 能在 App 里检查 / 执行更新（git pull + pip install -r requirements.txt）。
+// 目标：源码安装的 ComfyUI 能在 App 里检查 / 执行更新（git pull 或切 tag + pip install -r requirements.txt）。
 // 设计要点：
 //   · 长任务（pip 可数分钟）必须后台跑 —— 用异步 spawn，绝不 spawnSync 卡住中继事件循环；
-//   · 只用 git pull --ff-only：不产生 merge commit；本地有未提交改动会明确失败，不擅自处理；
+//   · 分支安装走 git pull --ff-only：不产生 merge commit；本地有未提交改动会明确失败，不擅自处理；
+//   · 便携版（官方 update/update_comfyui_stable.bat 会 `git checkout <最新 v* tag>`）处于 detached HEAD，
+//     pull 必定报 "not currently on a branch" —— 这种情况改走 fetch tags + checkout <最新 v* tag>；
+//   · pip 走第三方镜像缺包时（如清华源缺 comfyui-workflow-templates-media-assets-02），
+//     仅在输出命中「无匹配发行版 / 无满足版本」特征时回退官方 PyPI 重试一次，其它失败直接报错；
 //   · 更新前记录旧 commit（更新后一并记录），失败时把成因与回退线索写清楚；
 //   · 更新前先停服务（pip 覆盖文件时 8188 进程占用会失败）；更新后**不自动起服务**。
 const UPDATE_LOG_TAIL_MAX = 60;
 const GIT_TIMEOUT_MS = 120_000;
 const PIP_TIMEOUT_MS = 30 * 60_000;
+const PIP_ALL_RING = 200; // pip/git 全量环形缓冲行数：镜像缺包判据常在尾部之外（早滚出 tail）
+const PYPI_OFFICIAL = "https://pypi.org/simple";
+const TEMPLATES_PKG = "comfyui-workflow-templates";
 const UPDATE_CHECK_TTL_MS = 60_000;
 
 const updateProc = {
@@ -1496,24 +2053,38 @@ function resolveGit() {
   return null;
 }
 
-// 异步子进程（流式）：长任务专用。返回 { code, ok, tail }
-function runStream(exe, args, { cwd = null, timeoutMs = GIT_TIMEOUT_MS, onLine = null } = {}) {
+// 异步子进程（流式）：长任务专用。返回 { code, ok, tail, all? }
+//   · tail：最后 12 行（人看的摘要）；
+//   · all：仅当传入 all>0 时附加，最近 all 行的全量环形缓冲（判据用：镜像缺包/版本冲突的原始行
+//     往往早在 tail 之前就滚出去了）。不传 all 时返回体与旧版完全一致（向后兼容）。
+//   · envExtra：额外环境变量（pip 镜像回退要设 PIP_EXTRA_INDEX_URL），不传则用 CHILD_ENV。
+function runStream(exe, args, { cwd = null, timeoutMs = GIT_TIMEOUT_MS, onLine = null, all = 0, envExtra = null } = {}) {
   return new Promise((resolve) => {
     const lines = [];
+    const ring = all > 0 ? [] : null;
     const keep = (chunk) => {
       for (const raw of String(chunk || "").split(/\r?\n/)) {
         const s = raw.replace(/\s+$/, "");
         if (!s) continue;
         if (lines.length < 40) lines.push(s); else lines[lines.length - 1] = s;
+        if (ring) {
+          ring.push(s);
+          if (ring.length > all) ring.splice(0, ring.length - all);
+        }
         pushUpdateLog(s);
         if (onLine) onLine(s);
       }
     };
+    const done = (code, tailText) => {
+      const out = { code, ok: code === 0, tail: tailText };
+      if (ring) out.all = ring.join("\n");
+      resolve(out);
+    };
     let child;
     try {
-      child = spawn(exe, args, { cwd: cwd || undefined, windowsHide: true, env: CHILD_ENV });
+      child = spawn(exe, args, { cwd: cwd || undefined, windowsHide: true, env: envExtra ? { ...CHILD_ENV, ...envExtra } : CHILD_ENV });
     } catch (e) {
-      return resolve({ code: -1, ok: false, tail: String((e && e.message) || e) });
+      return done(-1, String((e && e.message) || e));
     }
     const timer = setTimeout(() => {
       try { child.kill(); } catch { /* 忽略 */ }
@@ -1521,8 +2092,8 @@ function runStream(exe, args, { cwd = null, timeoutMs = GIT_TIMEOUT_MS, onLine =
     }, timeoutMs);
     child.stdout?.on("data", keep);
     child.stderr?.on("data", keep);
-    child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, ok: false, tail: String((e && e.message) || e) }); });
-    child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? -1, ok: code === 0, tail: lines.slice(-12).join("\n") }); });
+    child.on("error", (e) => { clearTimeout(timer); done(-1, String((e && e.message) || e)); });
+    child.on("close", (code) => { clearTimeout(timer); done(code ?? -1, lines.slice(-12).join("\n")); });
   });
 }
 
@@ -1538,6 +2109,197 @@ function gitInfo(git, repoDir) {
     dirty: dirtyLines.length > 0,
     dirtyDetail: dirtyLines.slice(0, 5),
   };
+}
+
+// 仓库状态：detached HEAD 判定 + 最新 v* 标签。
+// 便携版的更新脚本 update/update_comfyui_stable.bat 做的是 `git checkout <最新 v* tag>`，
+// 所以便携版仓库常年处于 detached HEAD：此时 `git pull --ff-only` 必定报 "not currently on a branch"。
+// 两个信号交叉确认：rev-parse --abbrev-ref HEAD == "HEAD"；symbolic-ref -q --short HEAD 退出码非 0。
+function detectRepoState(git, repoDir) {
+  const g = (args) => runExe(git, ["-C", repoDir, ...args], 15_000);
+  const abbrev = String(g(["rev-parse", "--abbrev-ref", "HEAD"]).stdout || "").trim();
+  const sym = g(["symbolic-ref", "-q", "--short", "HEAD"]);
+  const symOut = String(sym.stdout || "").trim();
+  const detached = abbrev === "HEAD" || (sym.code !== 0 && !symOut);
+  const tags = String(g(["tag", "--list", "v*", "--sort=-v:refname"]).stdout || "")
+    .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  return {
+    detached,
+    branch: detached ? null : (abbrev || symOut || null),
+    latestTag: tags[0] || null,
+  };
+}
+
+// 更新路径 + 人话说明（让用户点更新前就知道会走哪条）
+function updatePathOf(repoState, isRepo) {
+  if (!isRepo) return "none";
+  return repoState && repoState.detached ? "checkout-tag" : "pull";
+}
+
+function updatePathNote(repoState, isRepo, extra = null) {
+  if (!isRepo) {
+    return "无 .git（便携包 tar 解压 / 手工解压）：没有版本基准点，只能盲装依赖，" +
+      "反而可能把依赖升到比代码新，因此拒绝代为更新。请用官方 update/update_comfyui_stable.bat 更新。";
+  }
+  const tag = repoState && repoState.latestTag;
+  if (repoState && repoState.detached) {
+    return tag
+      ? `当前不在任何分支（detached HEAD，便携版常态）：会 fetch 标签后切到最新 tag ${tag}（等同官方 update/update_comfyui_stable.bat），不执行 pull。`
+      : "当前不在任何分支（detached HEAD），但仓库里没找到 v* 标签，无法确定目标版本，更新会失败。";
+  }
+  const br = (repoState && repoState.branch) || "master";
+  return `当前在分支 ${br}：会 git fetch 后 git pull --ff-only 快进到 origin/${br}` +
+    (tag ? `（远端最新 tag ${tag} 不会自动切到，便携版请用官方脚本）` : "") +
+    (extra ? `；${extra}` : "");
+}
+
+// ── pip 镜像回退判定 ───────────────────────────────────────────────────
+// 回退特征：镜像缺包 / 固定版本不存在 / pip 依赖解析冲突。
+// 编译错、权限错、磁盘满都不算（回退也没用，且会把症状掩盖成网络问题）。
+// 说明：前三条是任务书指定的镜像缺包特征；后两条（ResolutionImpossible / conflicting dependencies）
+// 是 pip「版本冲突」的固定措辞，镜像落后同样会造出这类冲突，按验收真值表一并纳入回退范围。
+const PIP_MIRROR_MISS_RE = /No matching distribution found|Could not find a version that satisfies|ERROR: Could not find|ResolutionImpossible|conflicting dependencies/i;
+
+function pipMirrorGap(res) {
+  if (!res || res.ok) return false;
+  const text = `${(res && res.all) || ""}\n${(res && res.tail) || ""}`;
+  return PIP_MIRROR_MISS_RE.test(text);
+}
+
+// ── requirements 里的 comfyui-workflow-templates 主包约束 ───────────────
+// 注意：requirements 里还有 comfyui-workflow-templates-media-assets-01/02 等子包行，
+// 用 (?![\-\w]) 把它们排除，否则会抽错版本号。
+const RE_TEMPLATES_LINE = /^comfyui-workflow-templates(?![\-\w])/i;
+
+function readTemplatesConstraint(repoDir) {
+  let text;
+  try { text = readFileSync(join(repoDir, "requirements.txt"), "utf8"); }
+  catch (e) { return { ok: false, error: `读 requirements.txt 失败：${(e && e.message) || e}` }; }
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, "").trim();
+    if (!line || !RE_TEMPLATES_LINE.test(line)) continue;
+    const rest = line.replace(/^comfyui-workflow-templates\s*/i, "").replace(/^\[[^\]]*\]\s*/, "");
+    const m = /^(==|>=|<=|~=|!=|>|<)\s*([0-9][0-9A-Za-z.\-+]*)/.exec(rest);
+    if (!m) return { ok: false, error: `${TEMPLATES_PKG} 行未固定版本（${line}）` };
+    return { ok: true, op: m[1], version: m[2], line };
+  }
+  return { ok: false, error: `requirements.txt 里没有 ${TEMPLATES_PKG} 约束行` };
+}
+
+function cmpVer(a, b) {
+  const pa = String(a || "").split(/[.\-+]/).map((v) => parseInt(v, 10)).filter((n) => !Number.isNaN(n));
+  const pb = String(b || "").split(/[.\-+]/).map((v) => parseInt(v, 10)).filter((n) => !Number.isNaN(n));
+  const n = Math.max(pa.length, pb.length);
+  for (let i = 0; i < n; i += 1) {
+    const x = pa[i] ?? 0, y = pb[i] ?? 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+function versionSatisfies(installed, op, want) {
+  if (!installed) return false;
+  if (op === "==") return installed === want;
+  const c = cmpVer(installed, want);
+  if (op === ">=") return c >= 0;
+  if (op === "<=") return c <= 0;
+  if (op === ">") return c > 0;
+  if (op === "<") return c < 0;
+  if (op === "!=") return c !== 0;
+  if (op === "~=") {
+    const pre = (v) => String(v).split(".").slice(0, 2).join(".");
+    return c >= 0 && pre(installed) === pre(want);
+  }
+  return installed === want;
+}
+
+function pipShowVersion(python, pkg) {
+  const r = runExe(python, ["-m", "pip", "show", pkg], 30_000);
+  const m = /^Version:\s*(\S+)/im.exec(String(r.stdout || ""));
+  return m ? m[1] : null;
+}
+
+// 主包版本校准（尽力而为）：requirements 要 0.11.89，pip 可能因为别的约束把它解成 0.11.6 —— 显式钉回去。
+// 失败只 warn（soft step，不写 lastError、不使整体失败）。
+async function calibrateTemplatesPkg(ctx, step) {
+  try {
+    const c = readTemplatesConstraint(ctx.repoDir);
+    if (!c.ok) {
+      pushUpdateLog(`依赖校准跳过：${c.error}`);
+      step("依赖校准", true, `跳过：${c.error}`, { soft: true });
+      return;
+    }
+    const installed = pipShowVersion(ctx.python, TEMPLATES_PKG);
+    if (versionSatisfies(installed, c.op, c.version)) {
+      step("依赖校准", true, `${TEMPLATES_PKG} 已满足 ${c.op}${c.version}（当前 ${installed}）`, { soft: true });
+      return;
+    }
+    pushUpdateLog(`依赖校准：${TEMPLATES_PKG} 当前 ${installed || "未安装"}，要求 ${c.op}${c.version}，显式安装 …`);
+    const r = await runStream(ctx.python, ["-m", "pip", "install", `${TEMPLATES_PKG}==${c.version}`], {
+      cwd: ctx.repoDir, timeoutMs: PIP_TIMEOUT_MS, all: PIP_ALL_RING,
+    });
+    if (r.ok) {
+      step("依赖校准", true, `${installed || "未安装"} → ${c.version}`, { soft: true });
+    } else {
+      step("依赖校准", false, `校准失败（不影响本次更新结论）：${r.tail}`, { soft: true });
+      warn(`依赖校准失败：${TEMPLATES_PKG}==${c.version} 未装成，请人工处理：${r.tail}`);
+    }
+  } catch (e) {
+    step("依赖校准", false, `校准异常（不影响更新结论）：${(e && e.message) || e}`, { soft: true });
+    warn(`依赖校准异常：${(e && e.message) || e}`);
+  }
+}
+
+// tag 路径：fetch 已带 --tags，取最新的 v* tag 并 checkout（不 pull）
+async function updateByCheckoutTag(ctx, step) {
+  const git = ctx.git.path, repoDir = ctx.repoDir;
+  pushUpdateLog('git tag --list "v*" --sort=-v:refname …');
+  const tl = await runStream(git, ["-C", repoDir, "tag", "--list", "v*", "--sort=-v:refname"], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING });
+  const tags = String(tl.all || tl.tail || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const latestTag = tags[0] || null;
+  if (!latestTag) {
+    step("切换 tag", false, "fetch --tags 后仍没有 v* 标签，无法确定目标版本");
+    throw new Error("detached HEAD 且仓库内无 v* 标签，无法按标签更新（请人工处理）");
+  }
+  pushUpdateLog(`目标 tag：${latestTag}`);
+  const ex = runExe(git, ["-C", repoDir, "describe", "--exact-match", "--tags", "HEAD"], 15_000);
+  const cur = String(ex.stdout || "").trim();
+  if (ex.code === 0 && cur === latestTag) {
+    step("切换 tag", true, `已在最新 tag ${latestTag}，跳过 checkout`);
+    return { latestTag, skipped: true };
+  }
+  pushUpdateLog(`git checkout ${latestTag} …`);
+  const c = await runStream(git, ["-C", repoDir, "checkout", latestTag], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING });
+  step("切换 tag", c.ok, c.ok ? `→ ${latestTag}` : c.tail);
+  if (!c.ok) throw new Error(`git checkout ${latestTag} 失败：${c.tail}`);
+  return { latestTag, skipped: false };
+}
+
+// 分支路径：pull --ff-only。返回 false 表示「不在分支上」，调用方可改走 tag 路径重试；其它失败直接抛。
+async function pullOnce(ctx, step) {
+  const p = await runStream(ctx.git.path, ["-C", ctx.repoDir, "pull", "--ff-only"], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING });
+  step("拉取更新", p.ok, p.tail);
+  if (p.ok) return true;
+  const text = `${p.all || ""}\n${p.tail || ""}`;
+  if (/not currently on a branch|not on any branch/i.test(text)) return false;
+  throw new Error("git pull --ff-only 失败：本地可能有未提交改动或历史分叉（不擅自 merge/reset，请人工处理后重试）");
+}
+
+// 代码更新总入口：detached → 切 tag；分支 → pull（pull 报「不在分支」则回退 tag 重试一次）
+async function applyCodeUpdate(ctx, step) {
+  const st = detectRepoState(ctx.git.path, ctx.repoDir);
+  if (st.detached) {
+    pushUpdateLog("检测到 detached HEAD（便携版常态）：走 tag 路径，不执行 git pull");
+    const r = await updateByCheckoutTag(ctx, step);
+    return { mode: "checkout-tag", fellBack: false, latestTag: r.latestTag };
+  }
+  pushUpdateLog(`当前在分支 ${st.branch || "?"}：走 git pull --ff-only`);
+  const ok = await pullOnce(ctx, step);
+  if (ok) return { mode: "pull", fellBack: false, latestTag: st.latestTag };
+  pushUpdateLog("pull 提示「not currently on a branch」：自动回退 tag 路径重试一次");
+  const r = await updateByCheckoutTag(ctx, step);
+  updateProc.lastError = null; // 已用 tag 路径成功接上，清掉 pull 那次的失败标记
+  return { mode: "checkout-tag", fellBack: true, latestTag: r.latestTag };
 }
 
 // 更新上下文：ComfyUI 源码目录（git 仓库）+ venv python
@@ -1570,41 +2332,81 @@ function readBridgeToken() {
 }
 
 // 检查更新（fetch + 比较；带 TTL 缓存，避免 UI 反复触发网络）
+// 返回体额外给 repoState / updatePath / pathNote：用户点更新前就知道会走哪条路径。
+// 注意：这三项也随 TTL 缓存一起回（缓的是整个 out 对象），不会出现「命中缓存就丢字段」。
 async function checkUpdate(force = false) {
   if (!force && updateCheckCache.data && Date.now() - updateCheckCache.at < UPDATE_CHECK_TTL_MS) return updateCheckCache.data;
   const ctx = resolveUpdateContext();
   if (!ctx.ok) return { ok: false, error: ctx.error };
   const local = gitInfo(ctx.git.path, ctx.repoDir);
   if (!ctx.isRepo) {
-    const out = { ok: true, isGit: false, note: "该安装不是 Git 仓库（便携包 / 手工解压），App 无法代为更新", local, checkedAt: new Date().toISOString() };
+    const repoState = { detached: false, branch: null, latestTag: null };
+    const out = {
+      ok: true, isGit: false,
+      note: "该安装不是 Git 仓库（便携包 / 手工解压），App 无法代为更新",
+      repoState,
+      updatePath: "none",
+      pathNote: updatePathNote(repoState, false),
+      local,
+      checkedAt: new Date().toISOString(),
+    };
     updateCheckCache = { at: Date.now(), data: out };
     return out;
   }
-  const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "origin"], { timeoutMs: GIT_TIMEOUT_MS });
+  const rs = detectRepoState(ctx.git.path, ctx.repoDir);
+  const repoState = { detached: rs.detached, branch: rs.branch, latestTag: rs.latestTag };
+  const updatePath = updatePathOf(rs, true);
+  const pathNote = updatePathNote(rs, true);
+  // detached 要拿标签，分支要 prunes 远端引用：都要 --tags（便携版靠 tag 定位版本）
+  const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "--tags", "origin"], { timeoutMs: GIT_TIMEOUT_MS });
   if (!f.ok) {
-    const out = { ok: false, isGit: true, local, error: `git fetch 失败：${f.tail}`, checkedAt: new Date().toISOString() };
+    const out = {
+      ok: false, isGit: true, local,
+      repoState, updatePath, pathNote,
+      error: `git fetch 失败：${f.tail}`, checkedAt: new Date().toISOString(),
+    };
     updateCheckCache = { at: Date.now(), data: out };
     return out;
   }
+  // fetch 后标签可能更新（新 tag 刚推上去）
+  const rs2 = detectRepoState(ctx.git.path, ctx.repoDir);
+  const latestTag = rs2.latestTag || repoState.latestTag;
   const g = (args) => runExe(ctx.git.path, ["-C", ctx.repoDir, ...args], 20_000);
-  const branch = local.branch || "master";
-  const remoteRef = `origin/${branch}`;
-  const behind = Number(g(["rev-list", "--count", `HEAD..${remoteRef}`]).stdout || 0) || 0;
-  const ahead = Number(g(["rev-list", "--count", `${remoteRef}..HEAD`]).stdout || 0) || 0;
+  let remoteRef, behind, ahead, upToDate;
+  if (rs.detached) {
+    // detached HEAD：没有上游分支，基准换成最新 tag
+    remoteRef = latestTag;
+    if (latestTag) {
+      behind = Number(g(["rev-list", "--count", `HEAD..${latestTag}`]).stdout || 0) || 0;
+      ahead = Number(g(["rev-list", "--count", `${latestTag}..HEAD`]).stdout || 0) || 0;
+      upToDate = behind === 0 && ahead === 0;
+    } else {
+      behind = 0; ahead = 0; upToDate = false;
+    }
+  } else {
+    const branch = local.branch || rs.branch || "master";
+    remoteRef = `origin/${branch}`;
+    behind = Number(g(["rev-list", "--count", `HEAD..${remoteRef}`]).stdout || 0) || 0;
+    ahead = Number(g(["rev-list", "--count", `${remoteRef}..HEAD`]).stdout || 0) || 0;
+    upToDate = behind === 0;
+  }
   const out = {
     ok: true,
     isGit: true,
     repoDir: ctx.repoDir,
     git: { path: ctx.git.path, version: ctx.git.version },
     local,
+    repoState: { ...repoState, latestTag },
+    updatePath,
+    pathNote: updatePathNote({ ...repoState, latestTag }, true),
     remote: {
       ref: remoteRef,
-      commit: g(["rev-parse", "--short", remoteRef]).stdout || null,
-      describe: g(["describe", "--tags", "--always", remoteRef]).stdout || null,
+      commit: remoteRef ? (g(["rev-parse", "--short", remoteRef]).stdout || null) : null,
+      describe: remoteRef ? (g(["describe", "--tags", "--always", remoteRef]).stdout || null) : null,
     },
     behind,
     ahead,
-    upToDate: behind === 0,
+    upToDate,
     checkedAt: new Date().toISOString(),
   };
   updateCheckCache = { at: Date.now(), data: out };
@@ -1616,7 +2418,14 @@ function startUpdateJob() {
   if (updateProc.running) return { accepted: false, reason: "already-running", phase: updateProc.phase };
   const ctx = resolveUpdateContext();
   if (!ctx.ok) return { accepted: false, reason: ctx.error };
-  if (!ctx.isRepo) return { accepted: false, reason: "该安装不是 Git 仓库（便携包），无法代为更新" };
+  const rs = ctx.isRepo ? detectRepoState(ctx.git.path, ctx.repoDir) : { detached: false, branch: null, latestTag: null };
+  const repoState = { detached: rs.detached, branch: rs.branch, latestTag: rs.latestTag };
+  const updatePath = updatePathOf(rs, ctx.isRepo);
+  const pathNote = updatePathNote(rs, ctx.isRepo);
+  if (!ctx.isRepo) {
+    // 便携版 tar 包（无 .git）：拒绝。拿不到版本基准点，唯一能做的 pip install 反而可能把依赖升到比代码新。
+    return { accepted: false, reason: "该安装不是 Git 仓库（便携包 tar），无法代为更新；请用官方 update/update_comfyui_stable.bat", repoState, updatePath, pathNote };
+  }
 
   updateProc.running = true;
   updateProc.phase = "stopping";
@@ -1629,11 +2438,13 @@ function startUpdateJob() {
   updateProc.before = gitInfo(ctx.git.path, ctx.repoDir);
   updateStateLoaded = true;
   saveUpdateState();
-  log(`开始更新 ComfyUI：repo=${ctx.repoDir} 当前=${updateProc.before.describe || updateProc.before.commit}`);
+  log(`开始更新 ComfyUI：repo=${ctx.repoDir} 当前=${updateProc.before.describe || updateProc.before.commit} 路径=${updatePath}`);
 
-  const step = (name, ok, detail) => {
-    updateProc.steps.push({ name, ok: !!ok, detail: detail ? String(detail).slice(0, 400) : null, at: new Date().toISOString() });
-    if (!ok) updateProc.lastError = `${name}：${detail || "失败"}`;
+  // soft：尽力而为的步骤（依赖校准），失败只记 warn，不写 lastError、不影响整体结论
+  const step = (name, ok, detail, opts = {}) => {
+    const soft = !!(opts && opts.soft);
+    updateProc.steps.push({ name, ok: !!ok, detail: detail ? String(detail).slice(0, 400) : null, at: new Date().toISOString(), ...(soft ? { soft: true } : {}) });
+    if (!ok && !soft) updateProc.lastError = `${name}：${detail || "失败"}`;
     saveUpdateState();
   };
 
@@ -1648,28 +2459,45 @@ function startUpdateJob() {
       } else {
         step("停止服务", true, "服务本来就没在跑");
       }
-      // 2) fetch
+      // 2) fetch（--tags：便携版靠 tag 定位版本，必须把标签一起拉下来）
       updateProc.phase = "fetching"; saveUpdateState();
-      pushUpdateLog("git fetch --prune origin …");
-      const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "origin"], { timeoutMs: GIT_TIMEOUT_MS });
+      pushUpdateLog("git fetch --prune --tags origin …");
+      const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "--tags", "origin"], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING });
       step("抓取远端", f.ok, f.ok ? null : f.tail);
       if (!f.ok) throw new Error("git fetch 失败（网络或镜像不可用）");
-      // 3) pull --ff-only
+      // 3) 代码更新：detached → 切最新 tag；分支 → pull（pull 报「不在分支」则回退 tag 重试一次）
       updateProc.phase = "pulling"; saveUpdateState();
-      pushUpdateLog("git pull --ff-only …");
-      const p = await runStream(ctx.git.path, ["-C", ctx.repoDir, "pull", "--ff-only"], { timeoutMs: GIT_TIMEOUT_MS });
-      step("拉取更新", p.ok, p.tail);
-      if (!p.ok) throw new Error("git pull --ff-only 失败：本地可能有未提交改动或历史分叉（不擅自 merge/reset，请人工处理后重试）");
-      // 4) pip install -r requirements.txt
+      const code = await applyCodeUpdate(ctx, step);
+      pushUpdateLog(`代码更新完成：路径=${code.mode}${code.fellBack ? "（pull 不可用后回退）" : ""} 目标=${code.latestTag || "-"}`);
+      // 4) pip install -r requirements.txt（镜像缺包时回退官方 PyPI）
       updateProc.phase = "installing"; saveUpdateState();
       pushUpdateLog("pip install -r requirements.txt …（可能数分钟）");
-      const i = await runStream(ctx.python, ["-m", "pip", "install", "-r", "requirements.txt"], { cwd: ctx.repoDir, timeoutMs: PIP_TIMEOUT_MS });
-      step("安装依赖", i.ok, i.tail);
-      if (!i.ok) throw new Error("pip install 失败（依赖可能处于半更新状态，请按日志处理后再启动服务）");
+      let i = await runStream(ctx.python, ["-m", "pip", "install", "-r", "requirements.txt"], {
+        cwd: ctx.repoDir, timeoutMs: PIP_TIMEOUT_MS, all: PIP_ALL_RING,
+      });
+      if (i.ok) {
+        step("安装依赖", true, i.tail);
+      } else if (!pipMirrorGap(i)) {
+        // 非镜像缺包（编译错 / 权限 / 磁盘…）：回退无意义，直接报错
+        step("安装依赖", false, i.tail);
+        throw new Error("pip install 失败（非镜像缺包类错因，不回退；依赖可能处于半更新状态，请按日志人工处理后再启动服务）");
+      } else {
+        // 镜像缺包：首次失败记为中间尝试（soft：不写 lastError），结论只认回退那次
+        step("安装依赖", false, `镜像缺包，准备回退官方 PyPI：${i.tail}`, { soft: true });
+        pushUpdateLog(`镜像缺包特征命中，回退官方 PyPI 重试：--extra-index-url ${PYPI_OFFICIAL}`);
+        i = await runStream(ctx.python, ["-m", "pip", "install", "-r", "requirements.txt", "--extra-index-url", PYPI_OFFICIAL], {
+          cwd: ctx.repoDir, timeoutMs: PIP_TIMEOUT_MS, all: PIP_ALL_RING,
+          envExtra: { PIP_EXTRA_INDEX_URL: PYPI_OFFICIAL },
+        });
+        step("镜像回退：官方 PyPI", i.ok, i.ok ? `已用 ${PYPI_OFFICIAL} 补包` : i.tail);
+        if (!i.ok) throw new Error("pip install 回退官方 PyPI 仍失败（依赖可能处于半更新状态，请按日志人工处理后再启动服务）");
+      }
+      // 5) 主包版本校准（尽力而为：失败只 warn，不算更新失败）
+      await calibrateTemplatesPkg(ctx, step);
       updateProc.after = gitInfo(ctx.git.path, ctx.repoDir);
       updateProc.phase = "done";
-      step("完成", true, `${updateProc.before?.describe || "?"} → ${updateProc.after?.describe || "?"}`);
-      log(`ComfyUI 更新完成：${updateProc.before?.commit} → ${updateProc.after?.commit}`);
+      step("完成", true, `${updateProc.before?.describe || "?"} → ${updateProc.after?.describe || "?"}（${code.mode}）`);
+      log(`ComfyUI 更新完成：${updateProc.before?.commit} → ${updateProc.after?.commit}（${code.mode}）`);
       updateCheckCache = { at: 0, data: null };
     } catch (e) {
       updateProc.phase = "failed";
@@ -1682,7 +2510,7 @@ function startUpdateJob() {
     }
   })();
 
-  return { accepted: true, phase: updateProc.phase, before: updateProc.before, repoDir: ctx.repoDir, python: ctx.python };
+  return { accepted: true, phase: updateProc.phase, before: updateProc.before, repoDir: ctx.repoDir, python: ctx.python, repoState, updatePath, pathNote };
 }
 
 function updateStatusPayload() {
@@ -1779,6 +2607,32 @@ function driveTargets() {
   return { ok: true, platform: process.platform, minFreeGB: MIN_FREE_GB, targets };
 }
 
+// /queue 条目 → prompt_id 列表（纯函数，便于单测）。
+// 真实结构（2026-10-21 本机 8188 实测）：每个 item 是数组
+//   [number, prompt_id(UUID 字符串), prompt, extra_data, outputs_to_execute]
+//   → prompt_id 在 item[1]；server.py 的 _remove_sensitive_from_queue 砍到 item[:5]。
+// 容错：将来若改成对象形态（{prompt_id} / {id}）也能读；数组形态仍以 item[1] 为准。
+function queueIdsFrom(list) {
+  const out = [];
+  if (!Array.isArray(list)) return out;
+  for (const item of list) {
+    if (typeof item === "string") {
+      if (item) out.push(item);
+      continue;
+    }
+    if (Array.isArray(item)) {
+      const id = item[1];
+      if (typeof id === "string" && id) out.push(id);
+      continue;
+    }
+    if (item && typeof item === "object") {
+      const id = typeof item.prompt_id === "string" ? item.prompt_id : (typeof item.id === "string" ? item.id : null);
+      if (id) out.push(id);
+    }
+  }
+  return out;
+}
+
 async function probeQueue() {
   if (Date.now() - queueAt < QUEUE_CACHE_MS && queueInfo) return;
   try {
@@ -1793,10 +2647,27 @@ async function probeQueue() {
       const pending = Array.isArray(data.queue_pending) ? data.queue_pending.length : Number(data.queue_pending) || 0;
       queueInfo = { running, pending };
       queueAt = Date.now();
+      // 只增：同一次探测顺带留 id 列表（数量语义一字不动）
+      queueDetail = { running: queueIdsFrom(data.queue_running), pending: queueIdsFrom(data.queue_pending), at: queueAt };
     }
   } catch {
     /* 队列探测失败不影响状态出口（reachable 由 probeBackend 维护） */
   }
+}
+
+// /_relay/queue-detail 出口：known=true 才代表「探测成功且足够新」，调用方据此才能断言
+// 「不在队列里」；known=false（后端不可达/探测失败/快照过期）时列表为空，调用方不得据此否定。
+function queueDetailPayload() {
+  const at = queueDetail ? queueDetail.at : 0;
+  const known = Boolean(queueDetail) && Date.now() - at <= QUEUE_DETAIL_MAX_AGE_MS;
+  return {
+    ok: true,
+    known,
+    running: known ? queueDetail.running.slice() : [],
+    pending: known ? queueDetail.pending.slice() : [],
+    at: at ? new Date(at).toISOString() : null,
+    ageMs: at ? Date.now() - at : null,
+  };
 }
 
 // ── 进度事件缓存（订阅后端 /ws）─────────────────────────────────────────────
@@ -2854,6 +3725,39 @@ const server = http.createServer((req, res) => {
     jsonOut(res, 405, { error: "method not allowed" }, req.method);
     return;
   }
+  if (pathOnly === "/_relay/launch-config") {
+    // 启动参数配置（管理端点，需 x-comfy-relay-key）：{ extraArgs, env }
+    // env 规范形态 [{k,v}]；POST 也接受 "K=V\nK2=V2" 文本，成功后回读一律是数组形态。
+    // 校验失败 → 400 且不写盘（已有配置保持原样，不被半截输入污染）。
+    if (req.method === "GET" || req.method === "HEAD") {
+      jsonOut(res, 200, { ok: true, ...launchCfg }, req.method);
+      return;
+    }
+    if (req.method === "POST") {
+      if (!controlOk(req)) {
+        jsonOut(res, 403, { error: "comfy-relay: control key required" });
+        return;
+      }
+      void (async () => {
+        let body;
+        try { body = await readBodyJson(req); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+        const v = validateLaunchConfig(body);
+        if (!v.ok) {
+          log(`launch-config 拒绝（未写盘）：${v.error}`);
+          jsonOut(res, 400, { ok: false, error: v.error }, req.method);
+          return;
+        }
+        launchCfg = v.cfg;
+        saveLaunchCfg(); // 落盘（失败仅告警、内存仍生效）
+        // 只记条数，不记 VALUE：代理 URL 可能带凭据
+        log(`launch-config 更新：extraArgs=${launchCfg.extraArgs ? JSON.stringify(launchCfg.extraArgs) : "无"}，env ${launchCfg.env.length} 项`);
+        jsonOut(res, 200, { ok: true, ...launchCfg }, req.method);
+      })();
+      return;
+    }
+    jsonOut(res, 405, { error: "method not allowed" }, req.method);
+    return;
+  }
   if (pathOnly === "/_relay/bridge") {
     // 画布桥（只读阶段）：转发到 ComfyUI 里 hana_bridge 注册的同源路由。
     // 为何不直连前端：ComfyUI 的 CSP 是 connect-src 'self' data:（server.py），前端连不出 8188。
@@ -3092,6 +3996,18 @@ const server = http.createServer((req, res) => {
     void handleHistory(req, res);
     return;
   }
+  if (pathOnly === "/_relay/queue-detail") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    void (async () => {
+      // 缓存策略与 probeQueue 一致（QUEUE_CACHE_MS），不按请求频率打后端
+      if (backend.reachable && Date.now() - queueAt > QUEUE_CACHE_MS) await probeQueue();
+      jsonOut(res, 200, queueDetailPayload(), req.method);
+    })();
+    return;
+  }
   if (pathOnly === "/_relay/history/commit") {
     // 画布提交快照落盘（P1-B1）：接一次提交上报 → 写快照文件 + 追一行索引。
     // 逻辑全在 history-commit.mjs（纯模块，可单测）；此处只做注册/读体/解析目录/拆状态码。
@@ -3215,8 +4131,15 @@ async function main() {
   }
   loadBackendState(); // 服务进程状态（上次由哪个入口拉起、日志位置）跨中继重启保留
   loadPreviewCfg();    // 出图实时预览配置（落盘回读；默认关）
+  loadLaunchCfg();     // 启动参数与启动前环境变量（落盘回读；默认空 = 改造前行为）
   if (!config.controlKey && config.mode === "managed") {
     warn("受管模式未配置 controlKey：/_relay 管理端点将开放（应由 App 配置）");
+  }
+  // standalone（手动调试）不传密钥是允许的，但必须把风险说清楚：
+  // 管理端点含 backend/stop，无鉴权任何人可调。
+  if (!config.controlKey && config.mode !== "managed") {
+    warn("standalone 模式未配置 controlKey：/_relay 管理端点（含停止服务）**无鉴权开放**。" +
+         "本地调试可接受，但不要暴露到外部网络；生产请传 --control-key（≥16 字符）。");
   }
 
   if (config.requireBackend) await waitBackendOrExit(config);

@@ -263,7 +263,10 @@ async function loadPreviewModel() {
 
 function previewGuideText() {
   const dir = (previewModelInfo && previewModelInfo.targetDir) || "<ComfyUI>/models/vae_approx";
-  const file = (previewModelInfo && previewModelInfo.filename) || "taeqi2_1_decoder.pth";
+  // 不硬编码具体解码器名（issue #1）：不同模型族对应不同解码器，写死某一个会把人引到错误文件。
+  // 接口总会带 filename；拿不到就如实说不知道，让人回设置页刷新，不要偷摸着猜一个。
+  const file = (previewModelInfo && previewModelInfo.filename)
+    || "（未知：请先刷新设置页，或在 GET /comfyui-hana/preview-decoders 按当前模型族选定）";
   const srcs = (previewModelInfo && Array.isArray(previewModelInfo.sources)) ? previewModelInfo.sources : [];
   const list = srcs.map((s) => `- ${s.name}: ${s.url}${s.caution ? `（${s.caution}）` : ""}`).join("\n");
   return `请下载 ComfyUI 预览模型 ${file} 到 ${dir}\n优先镜像源：\n${list}`;
@@ -318,9 +321,9 @@ $("s-preview-agent-get").addEventListener("click", async () => {
   const dir = previewModelInfo && previewModelInfo.targetDir;
   try {
     const res = await hana.emit("preview-model-download-request", {
-      filename: (previewModelInfo && previewModelInfo.filename) || "taeqi2_1_decoder.pth",
+      filename: (previewModelInfo && previewModelInfo.filename) || null,
       targetDir: dir || null,
-      message: `请下载 ComfyUI 预览模型 ${(previewModelInfo && previewModelInfo.filename) || "taeqi2_1_decoder.pth"} 到 ${dir || "<ComfyUI>/models/vae_approx"}`,
+      message: `请下载 ComfyUI 预览模型 ${(previewModelInfo && previewModelInfo.filename) || "（未知：请先刷新设置页或在 preview-decoders 选定）"} 到 ${dir || "<ComfyUI>/models/vae_approx"}`,
     });
     if (res && res.delivered) { setMsg("s-preview-model-msg", "已发回会话，agent 收到后会开始下载。", "ok"); return; }
     throw new Error("emit 未送达");
@@ -342,6 +345,125 @@ $("s-preview-copy").addEventListener("click", async () => {
   } catch { setMsg("s-preview-model-msg", "复制失败。", "bad"); }
 });
 
+// ── 启动参数（issue #2 P1，2026-10-21）─────────────────────────────────
+// 为什么需要：用户往往已有自己的 bat（带 --windows-standalone-build、代理环境变量）。
+// App「启动服务」自己生成启动器，先前拿不到这些配置 → 同一个 ComfyUI 两边行为不一致。
+// 说明：区块 DOM 在本文件里建（本次只允许改 comfy-relay.mjs / index.js / settings.js），
+// 样式全部复用 settings.html 已有 class（.sec/.ed/.msg/.note/code），不另造视觉。
+function buildLaunchSection() {
+  const sec = document.createElement("div");
+  sec.className = "sec";
+  sec.id = "s-launch-sec";
+
+  const h2 = document.createElement("h2");
+  h2.textContent = "启动参数";
+
+  const note1 = document.createElement("p");
+  note1.className = "note";
+  note1.textContent = "给 App 拉起的 ComfyUI 进程追加参数与环境变量，让你那套 bat 的配置在这里也能生效。留空即恢复默认（不加参数、不改环境）。";
+
+  const k1 = document.createElement("div");
+  k1.className = "k";
+  k1.style.marginTop = "10px";
+  k1.textContent = "额外启动参数";
+
+  const row1 = document.createElement("div");
+  row1.className = "ed";
+  const extra = document.createElement("input");
+  extra.type = "text";
+  extra.id = "s-launch-args";
+  extra.placeholder = "--windows-standalone-build";
+  extra.spellcheck = false;
+  extra.autocomplete = "off";
+  row1.appendChild(extra);
+
+  const k2 = document.createElement("div");
+  k2.className = "k";
+  k2.style.marginTop = "12px";
+  k2.textContent = "启动前环境变量";
+
+  const row2 = document.createElement("div");
+  row2.className = "ed";
+  const env = document.createElement("textarea");
+  env.id = "s-launch-env";
+  env.rows = 4;
+  env.spellcheck = false;
+  env.placeholder = "HTTP_PROXY=http://127.0.0.1:7890\nHTTPS_PROXY=http://127.0.0.1:7890";
+  // 与 .ed input[type=text] 同一套观感（同边框/底色/圆角/字号），只多出多行与等宽布局
+  env.style.cssText = "flex:1;min-width:220px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.5;padding:6px 10px;border-radius:8px;color:var(--text);border:0.5px solid var(--border);background:rgba(127,127,127,.08);resize:vertical;box-sizing:border-box;";
+  row2.appendChild(env);
+
+  const note2 = document.createElement("p");
+  note2.className = "note";
+  note2.textContent = "每行一条 KEY=VALUE（以第一个 = 切分，所以值里可以带 =）。国内网络通常要设 HTTP_PROXY / HTTPS_PROXY，否则 Manager 装节点、下载模型会失败。";
+
+  const row3 = document.createElement("div");
+  row3.className = "ed";
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.id = "s-launch-save";
+  save.textContent = "保存";
+  row3.appendChild(save);
+
+  const msg = document.createElement("div");
+  msg.className = "msg";
+  msg.id = "s-launch-msg";
+
+  const note3 = document.createElement("p");
+  note3.className = "note";
+  note3.id = "s-launch-hint";
+  note3.innerHTML = "保存后<b>需重启服务才生效</b>：这些参数要等启动器（<code>backend-launcher.cmd</code>）重新生成时才写进去，而启动器只在点「启动服务」那一刻生成。已在跑的 ComfyUI 不会因保存而改变；想用上就先「停止服务」再「启动服务」。";
+
+  sec.append(h2, note1, k1, row1, k2, row2, note2, row3, msg, note3);
+  return sec;
+}
+
+const launchSecAnchor = $("s-preview-save-msg")?.closest(".sec") || null;
+const launchSec = buildLaunchSection();
+if (launchSecAnchor && launchSecAnchor.parentNode) {
+  launchSecAnchor.parentNode.insertBefore(launchSec, launchSecAnchor.nextSibling);
+} else {
+  document.body.appendChild(launchSec);
+}
+
+async function loadLaunch() {
+  try {
+    const { data } = await apiJson("/comfyui-hana/launch-settings");
+    if (data && data.ok) {
+      $("s-launch-args").value = data.extraArgs || "";
+      $("s-launch-env").value = typeof data.envText === "string"
+        ? data.envText
+        : (Array.isArray(data.env) ? data.env.map((e) => `${e.k}=${e.v}`).join("\n") : "");
+    }
+  } catch { /* 忽略 */ }
+}
+
+$("s-launch-save").addEventListener("click", async () => {
+  const extraArgs = ($("s-launch-args").value || "").trim();
+  const envText = $("s-launch-env").value || "";
+  setMsg("s-launch-msg", "保存中…", "");
+  try {
+    const { data } = await apiJson("/comfyui-hana/launch-settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ extraArgs, env: envText }),
+    });
+    if (!data || !data.ok) {
+      // 中继校验逐项点名（如「环境变量第 2 项：KEY「2BAD」不是合法环境变量名」），原样展示
+      setMsg("s-launch-msg", `保存失败：${(data && data.error) || "未知原因"}`, "bad");
+      return;
+    }
+    if (Array.isArray(data.env)) {
+      $("s-launch-env").value = data.env.map((e) => `${e.k}=${e.v}`).join("\n");
+    }
+    setMsg("s-launch-msg", data.pushed
+      ? "已保存，需重启服务生效（启动器在点「启动服务」时才生成）"
+      : `已保存${data.note ? `：${data.note}` : ""}；重启服务生效`, data.pushed ? "ok" : "");
+  } catch (e) {
+    setMsg("s-launch-msg", `保存失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
 // ── 启动 ──────────────────────────────────────────────────────────────────
 async function main() {
   syncTheme();
@@ -353,6 +475,7 @@ async function main() {
   void loadAllowWrite();
   void loadAllowCopilot();
   void loadPreview();
+  void loadLaunch();
   setInterval(() => { void poll(); }, 3000);
   setInterval(() => { void loadInstall(); }, 20000);
 }

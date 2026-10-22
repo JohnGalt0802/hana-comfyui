@@ -13,6 +13,11 @@ const root = document.getElementById("tk-root");
 const lb = document.getElementById("tk-lb");
 const lbImg = lb ? lb.querySelector("img") : null;
 const CARD_WIDTH = 460;
+// 尺寸基准（2026-10-21）：卡宽 460 与 index.js 的 preferredWidthPx 一致；
+// body 左右 padding 各 13（见 task.html 的 body { padding: 11px 13px 13px }）。
+const CONTENT_W = CARD_WIDTH - 26;                  // 内容区 434
+const BIG_MAX = Math.round(CARD_WIDTH * 1.5);      // 大图最大边长 690（用户口径：卡宽×1.5）
+const THUMB_SIZE = Math.round(BIG_MAX / 4);        // 小图 = 大图 1/4 ≈ 173
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -197,6 +202,12 @@ function errorHint(t) {
 
 // ── DOM 骨架：按阶段建不同的树 ───────────────────────────────────────────
 const el = {};
+// 尺寸基准尽早写入（预览可能比产物先出现，不能依赖 applyOutLayout）
+// 卡宽 460 → 大图最大边长 690（卡宽×1.5），小图 = 690/4 ≈ 173
+try {
+  document.documentElement.style.setProperty("--big-max", `${BIG_MAX}px`);
+  document.documentElement.style.setProperty("--thumb-size", `${THUMB_SIZE}px`);
+} catch { /* 忽略 */ }
 function ensureProcessShell() {
   if (el.stage === "process" && el.title && el.title.isConnected) return;
   el.stage = "process";
@@ -300,11 +311,87 @@ let lastOutKey = "";
 let outUrls = [];      // 当前一批产物的 url 列表
 let outIndex = 0;      // 大图当前显示第几张
 
+// 尺寸基准见文件顶部（CARD_WIDTH / CONTENT_W / BIG_MAX / THUMB_SIZE）
+
 function applyOutLayout(count) {
   el.out.classList.toggle("single", count <= 1);
-  // 小图尺寸随张数递减：<=4 张 64px，5-8 张 52px，9+ 张 42px
-  const sz = count <= 4 ? 64 : count <= 8 ? 52 : 42;
-  el.out.style.setProperty("--thumb-size", `${sz}px`);
+  // 大图高度预算：卡宽×1.5
+  el.out.style.setProperty("--big-max", `${BIG_MAX}px`);
+  // 小图 = 大图尺寸的 1/4（用户口径）。
+  // 大图的「参考尺寸」取它的最大边长（竖图取高、横图取宽，统一按预算算），
+  // 这样与图本身长短无关，小图尺寸稳定。
+  el.out.style.setProperty("--thumb-size", `${THUMB_SIZE}px`);
+  // 一行能放几张：内容区宽 / (小图宽 + gap 5) → 434/(173+5) = 2
+  const perRow = Math.max(1, Math.floor((CONTENT_W + 5) / (THUMB_SIZE + 5)));
+  el.out.classList.toggle("scrollable", count > perRow);
+  // 布局基准变了，渐隐开关要跟着重算（尺寸写进 CSS 变量后不重排就不会有 scrollWidth）
+  if (stripEl) requestAnimationFrame(() => syncStripFades());
+}
+
+// ── 小图条：溢出提示与滚轮横滚（2026-10-21）───────────────────────────
+// 用户口径：小图必要时得有滚动条，要不怎么看全。滚动条只是「存在感」还不够，
+// 所以另外做两件事：① 两侧渐隐（哪边还有内容哪边才渐隐）；② 垂直滚轮横滚。
+// 渐隐用 CSS mask 挂在 .tk-strip 上，切换 can-l / can-r 两个 class，
+// 判定依据是真实 scrollLeft / scrollWidth，不猜数学。
+let stripEl = null;
+let stripRO = null;
+const STRIP_EPS = 1;   // 亚像素容差：缩放 125% 时 scrollLeft 会是小数
+
+// 返回当前条的三态快照（同时把 class 刷到 DOM），便于外部/自测读回。
+function syncStripFades() {
+  const s = stripEl;
+  if (!s || !s.isConnected) return null;
+  const overflow = Math.max(0, s.scrollWidth - s.clientWidth);
+  const x = s.scrollLeft;
+  const canR = overflow > STRIP_EPS && x < overflow - STRIP_EPS;   // 右边还有
+  const canL = overflow > STRIP_EPS && x > STRIP_EPS;              // 左边还有
+  s.classList.toggle("can-r", canR);
+  s.classList.toggle("can-l", canL);
+  return { overflow, x, canL, canR, cls: s.className };
+}
+
+// 滚轮 → 横向滚动。
+// 口径（2026-10-21 用户明确）：**鼠标在小图条上时，滚轮只归小图条**。
+// 滚到边界就自然停住，不要把事件漏给聊天页——否则想横着看完最后一张，
+// 手一多滚一格密码就变成页面上下跳，反而更难看全。
+// 因此除不溢出、ctrl 缩放、纯横向滚轮三种情况外，一律 preventDefault。
+function onStripWheel(e) {
+  const s = stripEl;
+  if (!s || !s.isConnected) return;
+  const overflow = Math.max(0, s.scrollWidth - s.clientWidth);
+  if (overflow <= STRIP_EPS) return;          // 不溢出：不接管，让页面正常滚
+  if (e.ctrlKey) return;                      // ctrl+滚轮 = 缩放手势，不接管
+  const raw = e.deltaY;
+  if (!raw) return;                           // 纯横向滚轮（deltaX）交给浏览器
+  // deltaMode 归一：Firefox 默认按行计（1 行 = 3），换算成 px 才不会一格只挪 3px
+  const unit = e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? s.clientWidth : 1);
+  const dy = raw * unit;
+  // 只要鼠标在条上就吃掉这次滚轮（含已到边界的情况）——到边界就是不动，不外泄。
+  e.preventDefault();
+  const x = s.scrollLeft;
+  const next = clamp(x + dy, 0, overflow);
+  if (next !== x) s.scrollLeft = next;
+  syncStripFades();
+}
+
+// 小图条唯一入口：挂监听 + 初次同步。
+function attachStrip(strip) {
+  stripEl = strip;
+  strip.addEventListener("scroll", syncStripFades, { passive: true });
+  // passive:false 才能 preventDefault
+  strip.addEventListener("wheel", onStripWheel, { passive: false });
+  // 小图是 lazy 加载，图片陆续到位会改变 scrollWidth；load 不冒泡，用捕获里接
+  strip.addEventListener("load", syncStripFades, true);
+  // 卡宽变化（宿主改宽度 / 降级到全宽）也要重算
+  try {
+    if (typeof ResizeObserver === "function") {
+      if (stripRO) stripRO.disconnect();
+      stripRO = new ResizeObserver(() => syncStripFades());
+      stripRO.observe(strip);
+    }
+  } catch { /* 老宿主 */ }
+  syncStripFades();
+  requestAnimationFrame(() => syncStripFades());   // 图片/字体到达后 clientWidth 可能变
 }
 
 function selectOutput(i) {
@@ -313,6 +400,12 @@ function selectOutput(i) {
   outIndex = idx;
   if (el.bigImg) el.bigImg.src = outUrls[idx];
   thumbEls.forEach((b, j) => b.classList.toggle("on", j === idx));
+  // 选中项必须可见（键盘 Tab / 程序化选中都走这里）
+  const b = thumbEls[idx];
+  if (b && b.scrollIntoView) {
+    try { b.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch { /* 老宿主 */ }
+    syncStripFades();
+  }
 }
 
 function renderOutputs(outputs, proxyPrefix) {
@@ -325,6 +418,8 @@ function renderOutputs(outputs, proxyPrefix) {
   outUrls = urls;
   outIndex = 0;
   el.out.innerHTML = "";
+  stripEl = null;
+  if (stripRO) { stripRO.disconnect(); stripRO = null; }   // 旧条的观察器跟着旧 DOM 一起停掉
   applyOutLayout(urls.length);
   if (!urls.length) { thumbEls = []; return 0; }
 
@@ -356,26 +451,244 @@ function renderOutputs(outputs, proxyPrefix) {
       im.src = u;
       b.appendChild(im);
       b.addEventListener("click", () => selectOutput(i));
+      // 键盘 Tab 到某张时把它带进视野（inline:nearest = 只在需要时横滚，不做纵向跳动）
+      b.addEventListener("focus", () => {
+        try { b.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch { /* 老宿主 */ }
+        syncStripFades();
+      });
       strip.appendChild(b);
       return b;
     });
     el.out.appendChild(strip);
+    attachStrip(strip);
   } else {
     thumbEls = [];
+    stripEl = null;
   }
   reportSize(true);
   return 0;   // 全部展示，永不截断
 }
 
 // ── 卡内 lightbox ──
-function openLightbox(url) {
-  if (!lb || !lbImg) return;
-  lbImg.src = url;
-  lb.hidden = false;
+// ── 卡内 lightbox：看原图 + 滚轮缩放 + 拖动平移（2026-10-21）──
+// 交互：
+//   滚轮        → 以鼠标位置为锚点缩放（fit*0.5 ~ 8x）
+//   按住拖动    → 平移
+//   双击        → 在「适应屏幕」与「100% 原尺寸」两态间切换
+//   点空白/Esc  → 关闭（点在图上不关）
+//
+// 2026-10-21 修正要点：
+//   ① 锚点公式。transform-origin:0 0 + translate(tx,ty)，图左上角在视口坐标就是 (tx,ty)。
+//      图内坐标 ix 在屏幕上的位置 = tx + ix*scale。要让缩放到 s2 后同一个 ix 仍落在 cx：
+//          tx' + ix*s2 = cx，且 ix = (cx - tx)/s1
+//        ⇒ tx' = cx - (cx - tx) * (s2/s1)
+//      所以原公式方向对，但必须用「state 里的 tx/ty」算，不能用 getBoundingClientRect()
+//      —— rect 是含现有 transform 的结果，且 rect.x 在 flex 居中/圆角/缩放叠加下不等于 tx，
+//      实测锚点漂移 150px（图像空间）。现在改成纯 state 推导，与 DOM 布局解耦。
+//   ② dblclick。原实现 lbZoomAt(); 后又无条件 lbFit()，把刚设的 100% 立即覆盖回 fit（实测双击毫无反应）。
+//      改成明确的两态：当前≈fit → 1；否则 → fit。目标与当前相同时不做事。
+//   ③ 拖动。pointerdown 判定 e.target !== lbImg 会因图片上没有任何可命中区域之外的边缘而失败；
+//      更稳的写法是挂在 lb 上、用 e.target 只排除 hint/badge 等 UI，且允许在蒙版上拖也行——
+//      但保留「只在图上拖」的语义，同时把监听器改到 window 上做 move/up，防止指针移出图片后丢失。
+//   ④ lostpointercapture / pointercancel 都要复位 dragging，否则会卡住。
+//   ⑤ 关闭要清 transform / src / class / state，并重置 failed 态。
+//   ⑥ 加载失败要有可见提示，不能留一张破图 + 100% 徽标在那误导。
+const lbState = { scale: 1, tx: 0, ty: 0, fit: 1, natW: 0, natH: 0, dragging: false, sx: 0, sy: 0, pointerId: null };
+const lbBadge = lb ? lb.querySelector(".zoom-badge") : null;
+const lbHint = lb ? lb.querySelector(".hint") : null;
+const LB_HINT = lbHint ? lbHint.textContent : "";
+const LB_MIN = 0.02, LB_MAX = 8;   // 绝对 scale 上下限（fit 可能很小，下限按 fit 再收紧）
+
+function lbApply() {
+  if (!lbImg) return;
+  lbImg.style.transform = `translate(${lbState.tx}px, ${lbState.ty}px) scale(${lbState.scale})`;
+  if (lbBadge) {
+    // 徽标口径：相对「原尺寸」的真实倍率。100% = 1:1 原图，一眼能看出是否在看原图。
+    lbBadge.textContent = `${Math.round(lbState.scale * 100)}%`;
+  }
 }
-function closeLightbox() { if (lb) { lb.hidden = true; if (lbImg) lbImg.removeAttribute("src"); } }
-if (lb) lb.addEventListener("click", closeLightbox);
-try { window.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLightbox(); }); } catch { /* 忽略 */ }
+
+// 以视口坐标 (cx, cy) 为锚点缩放到 nextScale，保持鼠标下的图像点不动。
+function lbZoomAt(nextScale, cx, cy) {
+  if (!lbImg || !lbState.natW || !lbState.natH) return;
+  const lo = Math.min(LB_MIN, lbState.fit);      // 允许缩到 fit 以下但不超过它
+  const s2 = clamp(nextScale, lo, LB_MAX);
+  const s1 = lbState.scale;
+  if (!(s1 > 0) || Math.abs(s2 - s1) < 1e-9) return;
+  const k = s2 / s1;
+  // 推导见上方注释①：tx' = cx - (cx - tx) * k
+  lbState.tx = cx - (cx - lbState.tx) * k;
+  lbState.ty = cy - (cy - lbState.ty) * k;
+  lbState.scale = s2;
+  lbApply();
+  lb.classList.add("show-zoom");
+}
+
+// 按视口算适配缩放并居中（小图不放大，保持 1:1）
+function lbFit() {
+  if (!lbImg) return;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const pad = 28;
+  const nw = lbState.natW || lbImg.naturalWidth || 1;
+  const nh = lbState.natH || lbImg.naturalHeight || 1;
+  const fitScale = Math.min(1, (vw - pad) / nw, (vh - pad) / nh);
+  lbState.fit = fitScale;
+  lbState.scale = fitScale;
+  // 居中：图左上角 = (视口 - 图尺寸*scale) / 2
+  lbState.tx = (vw - nw * fitScale) / 2;
+  lbState.ty = (vh - nh * fitScale) / 2;
+  lbApply();
+}
+
+function lbResetDrag() {
+  lbState.dragging = false;
+  lbState.pointerId = null;
+  if (lb) lb.classList.remove("dragging");
+}
+
+function lbFail() {
+  lbState.natW = 0; lbState.natH = 0;
+  lbState.scale = 1; lbState.tx = 0; lbState.ty = 0; lbState.fit = 1;
+  if (lbImg) lbImg.style.transform = "";
+  if (lb) { lb.classList.add("failed"); lb.classList.remove("show-zoom"); }
+  if (lbBadge) lbBadge.textContent = "";
+  if (lbHint) lbHint.textContent = "图片加载失败";
+}
+
+function openLightbox(url) {
+  if (!lb || !lbImg || !url) return;
+  lbResetDrag();
+  lb.classList.remove("dragging", "show-zoom", "failed");
+  if (lbHint) lbHint.textContent = LB_HINT;
+  // 先复位 state，避免上一张的 scale/tx 泄到新图（尤其新图更小/更大时）
+  lbState.scale = 1; lbState.tx = 0; lbState.ty = 0; lbState.fit = 1;
+  lbImg.style.transform = "none";
+  lb.hidden = false;
+  const onReady = () => {
+    lbImg.removeEventListener("error", onErr);
+    const w = lbImg.naturalWidth || 0, h = lbImg.naturalHeight || 0;
+    if (!w || !h) { lbFail(); return; }
+    lbState.natW = w; lbState.natH = h;
+    lbFit();
+  };
+  const onErr = () => { lbImg.removeEventListener("load", onReady); lbFail(); };
+  lbImg.addEventListener("load", onReady, { once: true });
+  lbImg.addEventListener("error", onErr, { once: true });
+  lbImg.src = url;
+  // 缓存命中：complete 已真且尺寸已知，直接走一遍（load 不会再发）
+  if (lbImg.complete && lbImg.naturalWidth) onReady();
+}
+
+function closeLightbox() {
+  if (!lb) return;
+  lbResetDrag();
+  lb.hidden = true;
+  lb.classList.remove("dragging", "show-zoom", "failed");
+  lbState.scale = 1; lbState.tx = 0; lbState.ty = 0; lbState.fit = 1;
+  lbState.natW = 0; lbState.natH = 0;
+  if (lbHint) lbHint.textContent = LB_HINT;
+  if (lbBadge) lbBadge.textContent = "";
+  // 彻底断开上一张：清 transform + 摘 src（否则隐藏着的 img 仍占解码内存，且下张可能读到旧尺寸）
+  if (lbImg) { lbImg.style.transform = ""; lbImg.removeAttribute("src"); }
+}
+
+if (lb) {
+  // 滚轮缩放（passive:false 才能 preventDefault，阻止底页跟着滚）
+  lb.addEventListener("wheel", (e) => {
+    if (lb.hidden || !lbState.natW) return;
+    e.preventDefault();
+    // 触控板 / 按住 Ctrl（macOS 双指）会给出很小的 deltaY，统归一到一个步长
+    const step = 1.12;
+    const factor = e.deltaY < 0 ? step : 1 / step;
+    lbZoomAt(lbState.scale * factor, e.clientX, e.clientY);
+  }, { passive: false });
+
+  // 拖动平移：按下必须在图上（蒙版上按下 = 点空白关闭，不进入拖拽）
+  lb.addEventListener("pointerdown", (e) => {
+    if (lb.hidden || !lbState.natW) return;
+    if (e.button !== 0) return;                       // 只左键
+    if (e.target !== lbImg) return;                   // 只在图上拖
+    lbState.dragging = true;
+    lbState.pointerId = e.pointerId;
+    lbState.sx = e.clientX - lbState.tx;
+    lbState.sy = e.clientY - lbState.ty;
+    lb.classList.add("dragging");
+    // 2026-10-21 注意：这里绝不能 e.preventDefault()。
+    // 在 pointerdown 上调 preventDefault 会抑制后续兼容鼠标事件，
+    // 导致 dblclick 根本不触发（实测双击完全无反应）。
+    // 拖影已由 img[draggable=false] + user-select:none 阻断，无需 preventDefault。
+    try { lbImg.setPointerCapture(e.pointerId); } catch { /* 老浏览器忽略 */ }
+  });
+
+  // move/up 挂 window：指针即使移出图片/窗口边缘也不丢
+  window.addEventListener("pointermove", (e) => {
+    if (!lbState.dragging) return;
+    if (lbState.pointerId !== null && e.pointerId !== lbState.pointerId) return;
+    lbState.tx = e.clientX - lbState.sx;
+    lbState.ty = e.clientY - lbState.sy;
+    lbApply();
+  });
+  const endDrag = (e) => {
+    if (!lbState.dragging) return;
+    if (e && lbState.pointerId !== null && e.pointerId !== lbState.pointerId) return;
+    lbResetDrag();
+  };
+  window.addEventListener("pointerup", endDrag);
+  window.addEventListener("pointercancel", endDrag);
+  // 捕获被系统/其他元素抢走时也要复位，否则 dragging 永远为 true（下次拖动直接跳位）
+  if (lbImg) lbImg.addEventListener("lostpointercapture", endDrag);
+
+  // 双击已移除（2026-10-21）：单击已经承担「放大↔缩回」，再保留双击会冲突 ——
+  // 一次双击会先后触发两次单击（放大→缩回）再触发 dblclick（又切一次），
+  // 最终落到哪个态取决于事件顺序，不可控。想要 1:1 看原图，滚轮或单击放大后就能到。
+
+  // 单击图片：放大 ↔ 缩回（2026-10-21 用户定）。
+  // 与拖动共存的条件：按下到抬起的位移 ≤ CLICK_SLOP 才算“单击”，否则算拖拽不响应。
+  // 阈值取 5px：手抖、触控板微动不会误触；真要放大得明确地点一下。
+  // 目标态：当前≈fit → 放大到 2×fit（至少也到 1:1 原尺寸）；否则回 fit。
+  const LB_CLICK_SLOP = 5;
+  let pressPt = null;
+  lb.addEventListener("pointerdown", (e) => {
+    if (lb.hidden || e.target !== lbImg) { pressPt = null; return; }
+    if (e.button !== 0) { pressPt = null; return; }
+    pressPt = { x: e.clientX, y: e.clientY, id: e.pointerId, moved: 0 };
+  });
+  window.addEventListener("pointermove", (e) => {
+    if (!pressPt) return;
+    if (e.pointerId !== pressPt.id) return;
+    const d = Math.hypot(e.clientX - pressPt.x, e.clientY - pressPt.y);
+    if (d > pressPt.moved) pressPt.moved = d;
+  });
+  window.addEventListener("pointerup", (e) => {
+    if (!pressPt) return;
+    if (e.pointerId !== pressPt.id) { pressPt = null; return; }
+    const wasClick = pressPt.moved <= LB_CLICK_SLOP;
+    const cx = e.clientX, cy = e.clientY;
+    pressPt = null;
+    if (!wasClick || lb.hidden || !lbState.natW) return;   // 拖过了就不算单击
+    const atFit = Math.abs(lbState.scale - lbState.fit) <= lbState.fit * 0.02 + 1e-6;
+    if (atFit) {
+      // 放大：至少 2×fit，但不要小于 1:1，也不要超过上限
+      const target = clamp(Math.max(lbState.fit * 2, 1), LB_MIN, LB_MAX);
+      lbZoomAt(target, cx, cy);
+    } else {
+      // 缩回适应屏幕（居中）
+      lbFit();
+    }
+  });
+
+  // 点空白处关闭（点图上不关）。用 pointerdown+up 同点判定，避免拖拽结束误关。
+  let downPt = null;
+  lb.addEventListener("pointerdown", (e) => { downPt = { x: e.clientX, y: e.clientY, t: e.target }; });
+  lb.addEventListener("click", (e) => {
+    if (lb.hidden) return;
+    if (e.target !== lb) return;                 // 只认空白处
+    if (downPt && downPt.t !== lb) return;       // 按下时在图上 → 这是一次拖拽/点击图，不关
+    if (downPt && (Math.abs(e.clientX - downPt.x) > 4 || Math.abs(e.clientY - downPt.y) > 4)) return;
+    closeLightbox();
+  });
+}
+try { window.addEventListener("keydown", (e) => { if (e.key === "Escape" && lb && !lb.hidden) closeLightbox(); }); } catch { /* 忽略 */ }
 
 // ── 主渲染：按阶段分派 ──
 function render(data) {
