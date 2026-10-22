@@ -54,7 +54,7 @@ comfyui(action="canvas", op="organize")   # 再排（不要主动重排——尊
 
 | 何时读 | 子文档 |
 |---|---|
-| 要看/改人正在看的画布：读 ops 全表、投影 get、check/trace/outline、patch 事务、排布、画布执行 / 复制 / 视觉标记 | `references/canvas.md` |
+| 要看/改人正在看的画布：读 ops 全表、投影 get、check/trace/outline、patch 事务、排布（含组标题 30px 与真实尺寸纪律）、画布执行 / 复制 / 视觉标记 | `references/canvas.md` |
 | 生图与提交：submit 三形态、inputs 注入、任务桥与回执、mode 分流（auto/canvas/backend） | `references/submit.md` |
 | 服务管理：起停、环境检查、就绪等待、未安装分流、本体更新 | `references/service.md` |
 | 副驾驶（共编）与行为准则：大动作/小动作尺度、锁/高亮、开关细则 | `references/copilot.md` |

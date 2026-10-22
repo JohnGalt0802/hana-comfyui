@@ -143,6 +143,21 @@ comfyui(action="canvas", op="patch", edits=[
 
 底层通道：桥 op `canvas.organize` / `canvas.commands` / `canvas.commandShape`（前端扩展执行 `app.extensionManager.command.execute(id)`；实测入口名是 `execute`，不是 `executeCommand`）。
 
+### 排布硬约束（2026-10-23 两次实测事故，按顺序照做）
+
+手工用 `addNode` / `moveNode` 摆位置时，下面五条任何一条漏了都会得到「节点重叠 / 盖住组标题 / 节点出框」：
+
+1. **组框标题要留 ≥ 40 画布单位。** `setGroup(nodeIds=[…])` 自动算的框只外扩 `GROUP_PAD=20`，而组标题条约 30px 高——节点顶边贴上去标题就被压。做法：显式给 `bounds`：`setGroup(index=…, bounds=[x, y, w, h])`，且 `y ≤ min(节点 y) − 40`。
+2. **`get` 报的 `size` 是展开前的值，不能当真实尺寸用。** 节点会被 widget 撑高（长路径、multiline 文本、widget 多的节点），也会被长中文标题撑宽。实测：`MOSSLLMAutoLoad` 报 270×178、实际渲染 390×300；`PromptExpand` 报 400×286、实际 371×432；`ShowText` 报 428×647、实际 444×681；`ComfySwitchNode` 报 270×78、被中文长标题撑到 430 宽。照 `size` 做数学排布 = 必然重叠。
+3. **先移完所有节点，最后设 bounds，然后不再动。** 前端会在节点移动后把组框重算为 `节点包围盒 + 20`，会把你刚设好的 bounds 覆盖掉。正确顺序：`moveNode` × N → `setGroup(bounds)` → 只截图核对，不再 `moveNode`。
+4. **出框判据（可逐项核）：** 对每个节点，`pos.x ≥ 框.x + 20`、`pos.x + 实际宽 ≤ 框.x + 框.w − 20`、`pos.y ≥ 框.y + 40`（留标题）、`pos.y + 实际高 ≤ 框.y + 框.h − 20`。四条全过才算不出框。
+5. **必须目视闭环。** `op="check"` 只查悬空 / 未接 / mute·bypass，**不查重叠、不查出框、不查压标题**。改完要么截画布图，要么用工作区原生窗打开画布看一眼，按画面调一轮；别拿返回值当验收。
+
+### 排布工作的两个坑（同次踩到）
+
+- **备份文件别放 `workflows/` 目录。** `*.json.bak-xxx` 这类自定义后缀会被工作流列表当成一个工作流条目，`loadWorkflowFile` 也可能把当前页的身份改成它，后续 `save` 就会写进备份名而不是正式文件。备份放 `_temp` 或只用前端自带的 `.bak.json`。
+- **交付前核对 `save` 的落点。** 结果里的 `saved` 字段就是你写进了哪个文件；如果它带 `.bak-xxx` 或 `(2)` 后缀，说明页身份不对，要先修正再交。
+
 ## 写操作纪律
 
 - 写入类 op 默认关闸：设置页「允许 agent 修改画布」打开才能写；且目标画布须已开副驾驶（v2 硬约束，见上）；页面不在线写不了。
