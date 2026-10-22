@@ -2097,6 +2097,75 @@ function runStream(exe, args, { cwd = null, timeoutMs = GIT_TIMEOUT_MS, onLine =
   });
 }
 
+// ── 代理解析（2026-10-23）──────────────────────────────────────
+// 实测事故：中继跑 git fetch 连续两次都在 21s 后报 "Could not connect to server"，
+//   而同一台机上命令行 git ls-remote 只要 1.2s。
+//   21s 是 Windows TCP SYN 重试耗尽的默认时间 → 说明流量在直连 github.com（被静默丢包），
+//   根本没走代理。中继跑在宿主沙箱里，App 进程未必带 HTTP_PROXY/HTTPS_PROXY
+//   （实测注册表用户级只有 NO_PROXY），中继的 git 也可能读不到 ~/.gitconfig。
+// 对策：不依赖任何隐式配置，给网络类 git 命令显式带 -c http.proxy。
+//   来源优先级：进程环境 → 系统代理（注册表 Internet Settings）→ 空（不加，保持原行为）。
+let proxyCache = { at: 0, url: "", logged: false };
+function resolveProxyUrl() {
+  const now = Date.now();
+  if (now - proxyCache.at < 30_000) return proxyCache.url;
+  const pick = (v) => (typeof v === "string" && /^https?:\/\//i.test(v.trim()) ? v.trim() : "");
+  let url = pick(process.env.HTTPS_PROXY) || pick(process.env.HTTP_PROXY)
+    || pick(process.env.https_proxy) || pick(process.env.http_proxy) || "";
+  if (!url) {
+    try {
+      const r = spawnSync("reg", ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyServer"], { windowsHide: true, encoding: "utf8", timeout: 4000 });
+      const m = String((r && r.stdout) || "").match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+      if (m) {
+        const v = m[1].trim();
+        if (/^https?:\/\//i.test(v)) url = v;
+        else if (/^[\w.-]+:\d+$/.test(v)) url = "http://" + v;
+      }
+    } catch { /* 忽略 */ }
+  }
+  proxyCache = { at: now, url, logged: proxyCache.logged && url === proxyCache.url };
+  return url;
+}
+
+// 只给真正走网络的 git 子命令注入代理；本地命令（rev-parse / status …）不加。
+const GIT_NET_SUBCMDS = new Set(["fetch", "pull", "push", "clone", "ls-remote", "submodule"]);
+function withGitProxy(args) {
+  if (!Array.isArray(args)) return args;
+  if (!args.some((a) => typeof a === "string" && GIT_NET_SUBCMDS.has(a))) return args;
+  const proxy = resolveProxyUrl();
+  if (!proxy) return args;
+  if (!proxyCache.logged) {
+    proxyCache.logged = true;
+    pushUpdateLog(`[代理] 网络类 git 命令显式走 ${proxy}`);
+  }
+  return ["-c", `http.proxy=${proxy}`, "-c", `https.proxy=${proxy}`, ...args];
+}
+const GIT_EXE_RE = /(^|[\\/])git(\.exe)?$/i;
+
+// ── 网络类失败自动重试（2026-10-23）──────────────────────────────
+// 背景：GitHub 链路会间歇性抖动。实测 2026-10-23 05:34：fetch 在
+//   「Could not connect to server」上耗 21s 后判失败；而 20 秒后同样的 fetch 1.6s 就通了。
+//   更新流程偏偏是「先停服务再 fetch」，一次抖动就把整个更新打成失败，还白停一次服务。
+// 口径：只重试「网络类」失败（连接/解析/超时/TLS/传输中断）；
+//   本地冲突、认证、权限类失败一律不重试——重试也过不去，只会把真因拖成超时。
+const NET_RETRY_RE = /Could not connect|Failed to connect|Could not resolve host|Connection (reset|refused|timed out)|Operation timed out|early EOF|RPC failed|TLS handshake|SSL|i\/o timeout/i;
+async function runStreamNet(exe, args, opts = {}, tries = 3) {
+  const n = Math.max(1, Math.min(4, tries | 0));
+  let last = null;
+  for (let i = 1; i <= n; i += 1) {
+    const effArgs = GIT_EXE_RE.test(String(exe || "")) ? withGitProxy(args) : args;
+    last = await runStream(exe, effArgs, opts);
+    if (last.ok) return last;
+    const text = `${last.all || ""}\n${last.tail || ""}`;
+    if (i >= n || !NET_RETRY_RE.test(text)) return last;
+    const waitMs = 2000 * i;
+    const lastLine = String(last.tail || "").split("\n").filter(Boolean).slice(-1)[0] || "";
+    pushUpdateLog(`[重试] 网络类失败，${waitMs}ms 后重试（第 ${i + 1}/${n} 次）：${lastLine.slice(0, 160)}`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  return last;
+}
+
 // 仓库信息（未跟踪文件不算 dirty，否则 requirements.core.txt 这类会一直报脏）
 function gitInfo(git, repoDir) {
   const g = (args) => runExe(git, ["-C", repoDir, ...args], 15_000);
@@ -2277,7 +2346,7 @@ async function updateByCheckoutTag(ctx, step) {
 
 // 分支路径：pull --ff-only。返回 false 表示「不在分支上」，调用方可改走 tag 路径重试；其它失败直接抛。
 async function pullOnce(ctx, step) {
-  const p = await runStream(ctx.git.path, ["-C", ctx.repoDir, "pull", "--ff-only"], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING });
+  const p = await runStreamNet(ctx.git.path, ["-C", ctx.repoDir, "pull", "--ff-only"], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING }, 3);
   step("拉取更新", p.ok, p.tail);
   if (p.ok) return true;
   const text = `${p.all || ""}\n${p.tail || ""}`;
@@ -2358,7 +2427,7 @@ async function checkUpdate(force = false) {
   const updatePath = updatePathOf(rs, true);
   const pathNote = updatePathNote(rs, true);
   // detached 要拿标签，分支要 prunes 远端引用：都要 --tags（便携版靠 tag 定位版本）
-  const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "--tags", "origin"], { timeoutMs: GIT_TIMEOUT_MS });
+  const f = await runStreamNet(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "--tags", "origin"], { timeoutMs: GIT_TIMEOUT_MS }, 2);
   if (!f.ok) {
     const out = {
       ok: false, isGit: true, local,
@@ -2462,7 +2531,7 @@ function startUpdateJob() {
       // 2) fetch（--tags：便携版靠 tag 定位版本，必须把标签一起拉下来）
       updateProc.phase = "fetching"; saveUpdateState();
       pushUpdateLog("git fetch --prune --tags origin …");
-      const f = await runStream(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "--tags", "origin"], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING });
+      const f = await runStreamNet(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "--tags", "origin"], { timeoutMs: GIT_TIMEOUT_MS, all: PIP_ALL_RING }, 3);
       step("抓取远端", f.ok, f.ok ? null : f.tail);
       if (!f.ok) throw new Error("git fetch 失败（网络或镜像不可用）");
       // 3) 代码更新：detached → 切最新 tag；分支 → pull（pull 报「不在分支」则回退 tag 重试一次）
