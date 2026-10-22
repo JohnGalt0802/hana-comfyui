@@ -4520,8 +4520,10 @@ function historyNodeStyleEnsure() {
 /* 2026-10-15：中性灰底跟随明暗（内条的语义色 --hnode-bc 不动）。 */
 :root { --hnode-dim: rgba(0,0,0,.22); }
 :root.dark-theme { --hnode-dim: rgba(255,255,255,.16); }
-.hnode-bars { display:flex; flex-direction:column; gap:1.5px; align-items:stretch; justify-content:center; flex:1 1 auto; min-height:0; }
-.hnode-bar { display:block; flex:1 1 0; min-height:2px; border-radius:2px; background:var(--hnode-dim, ${HNODE_BAR_DIM}); } /* 3b（2026-10-13）：内条圆角 1px→2px */
+/* 2026-10-23：gap / 条最小高随档位走变量；overflow:hidden 兜底——条多时宁可裁掉一点，
+   也不许溢出外框（缩到最小档「蓝框被顶出去」就是这么来的）。 */
+.hnode-bars { display:flex; flex-direction:column; gap:var(--hnode-gap, 1.5px); align-items:stretch; justify-content:center; flex:1 1 auto; min-height:0; overflow:hidden; }
+.hnode-bar { display:block; flex:1 1 0; min-height:var(--hnode-barmin, 2px); border-radius:2px; background:var(--hnode-dim, ${HNODE_BAR_DIM}); } /* 3b（2026-10-13）：内条圆角 1px→2px */
 .hnode-bar.hnode-bar-on { background:var(--hnode-bc, #5aa0d8); filter:brightness(1.08); } /* 3a修（2026-10-13）：去掉内条 5px 光晕 + 降亮度 1.15→1.08，外框始终是视觉主线（原亮条盖过外框） */
 `;
   document.head.appendChild(style);
@@ -6168,8 +6170,8 @@ function historyTreeStyleEnsure() {
   position: absolute; transform: translate(-50%, -50%);
   display: flex; flex-direction: column; align-items: stretch;
   width: var(--nw, 10px); min-width: 6px; height: var(--htr-node-h, 22px); min-height: var(--htr-node-h, 22px); /* 2026-10-22：高改由变量控制（随缩放），旧值 22 写死 */
-  padding: 2px 0; margin: 0; box-sizing: border-box; /* 3a修（2026-10-13）：横向 padding 1.5px→0，内条出血贴外框内侧 */
-  border: 2px solid color-mix(in oklab, var(--htr-c, #5aa0d8) 60%, transparent); border-style: solid; border-radius: 4.5px; /* 3a修：统一 2px，与框节点同口径 */ /* 第8条：border-color 半透明 → 发光描边 */
+  padding: var(--htr-pad, 2px) 0; margin: 0; box-sizing: border-box; /* 3a修（2026-10-13）：横向 padding 1.5px→0，内条出血贴外框内侧 */
+  border: var(--htr-bw, 2px) solid color-mix(in oklab, var(--htr-c, #5aa0d8) 60%, transparent); border-style: solid; border-radius: var(--htr-br, 4.5px); /* 2026-10-23：边框/圆角随缩放走变量（最小档 2px 边框会吃掉节点大半宽，内条把框顶出去） */ /* 3a修：统一 2px，与框节点同口径 */ /* 第8条：border-color 半透明 → 发光描边 */
   background: var(--htr-node-bg); cursor: pointer; z-index: 1; /* 连线层之下（.htr-edges z-index:0） */ /* 2026-10-14：底色不透明——连线经过节点矩形时被遮住，不再透出 */
   /* 第8条（2026-10-13）：常态外光晕加强（固定 10px / 65%，与框同口径） */
   box-shadow: 0 0 10px color-mix(in oklab, var(--htr-c, #5aa0d8) 65%, transparent);
@@ -6185,11 +6187,11 @@ function historyTreeStyleEnsure() {
   border-radius: 6px;
 }
 /* 密档降级（同框口径）；3a修：不再改 border-width */
-#${HISTORY_TREE_ID} .node[data-tight] { padding: 1px 0; border-radius: 3px; }
+#${HISTORY_TREE_ID} .node[data-tight] { padding: var(--htr-pad, 1px) 0; border-radius: var(--htr-br, 3px); }
 /* 合并提交加粗（外框加粗 + 强光晕，同框口径） */
 #${HISTORY_TREE_ID} .node.htr-tick-bulge {
   width: var(--nw-bulge, calc(var(--nw, 10px) + 10px)); /* 第8条：多块宽由 JS 算好（min(nw+10, colW-3)），永不超格 */
-  border-width: 2.5px;
+  border-width: var(--htr-bw-bulge, 2.5px); /* 2026-10-23：随缩放，小档不再用 2.5px 硬值 */
   box-shadow: 0 0 12px color-mix(in oklab, var(--htr-c, #5aa0d8) 85%, transparent); /* 第8条：合并光晕更亮 */
 }
 /* ×N 徽标（同框口径） */
@@ -6556,6 +6558,20 @@ function historyTreeRenderTree(entries) {
   const contentH = Math.max(46, graph.rows * laneH + 6);
   const H = Math.min(200, contentH); // 视口高上限 200（面板不占满屏）
   historyTreeGeom = { colW, laneH, nodeH, W, H: contentH, rightPad };
+  // 2026-10-23：外壳尺寸随档位一起缩（宽松 / 紧凑 / 极小）。
+  // 不这么干的话，最小档节点只有 ~6×13px，2px 边框×2 就吃掉一半宽度，内条会把框顶出去。
+  const tightLvl = nodeH >= 18 ? 0 : nodeH >= 12 ? 1 : 2;
+  const bwPx = tightLvl === 0 ? 2 : tightLvl === 1 ? 1.5 : 1;
+  const padPx = tightLvl === 0 ? 2 : 1;
+  const brPx = tightLvl === 0 ? 4.5 : tightLvl === 1 ? 3 : 2.5;
+  const gapPx = tightLvl === 0 ? 1.5 : tightLvl === 1 ? 1 : 0.5;
+  const barMinPx = tightLvl === 0 ? 2 : tightLvl === 1 ? 1.5 : 1;
+  tree.style.setProperty("--htr-bw", bwPx + "px");
+  tree.style.setProperty("--htr-bw-bulge", (bwPx + 0.5) + "px");
+  tree.style.setProperty("--htr-pad", padPx + "px");
+  tree.style.setProperty("--htr-br", brPx + "px");
+  tree.style.setProperty("--hnode-gap", gapPx + "px");
+  tree.style.setProperty("--hnode-barmin", barMinPx + "px");
   tree.style.width = W + "px";
   tree.style.height = contentH + "px";
   if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 视口高封顶（内容可拖/滚）
