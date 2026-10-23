@@ -721,9 +721,19 @@ function renderUpdateStatus(st) {
     ? chip(`进行中 ${updStartedAt ? fmtAgo(Date.now() - updStartedAt) : ""}`.trim(), "warn")
     : (st.phase === "failed" ? chip("失败", "bad") : (st.phase === "done" ? chip("已完成", "ok") : chip(phaseText)));
   // 本地 / 远端 分两行（2026-10-16）：原先一行「本地 → 远端」在窄栏里横向溢出被截。
-  if (st.before) $("u-local").textContent = fmtVer(st.before);
+  // 2026-10-23 修（用户报「状态已完成但本地还是旧版」）：原来「本地」固定取 before（更新前的快照）、
+  // 「远端」取 after，语义错位——更新一完成就是「本地=旧版 / 远端=新版 / 状态=已完成」，
+  // 看起来像没更新成功。现在「本地」取当前实际 HEAD（after 优先），after 只给「远端」做空值兜底。
+  const curVer = st.after || st.before;
+  if (curVer) $("u-local").textContent = fmtVer(curVer);
   const remoteEl = $("u-remote");
-  if (remoteEl) remoteEl.textContent = st.after ? fmtVer(st.after) : "—";
+  if (remoteEl) {
+    // 注意：不要每轮无条件覆盖（轮询 1.5s 一次，会把「检查更新」写进去的远端版本冲掉）。
+    // 只在「还没拿到过远端」时用 after 补一次，其余保持检查结果。
+    const shown = String(remoteEl.textContent || "").trim();
+    if (st.after && (!shown || shown === "—")) remoteEl.textContent = fmtVer(st.after);
+    else if (!st.after && !shown) remoteEl.textContent = "—";
+  }
   const steps = (st.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}${s.detail ? `：${String(s.detail).split("\n").slice(-1)[0]}` : ""}`);
   // 日志尾给到 30 行：git pull / pip install 的输出更有参考价值
   $("u-log").textContent = [...steps, ...(st.logTail || []).slice(-30)].filter(Boolean).join("\n");

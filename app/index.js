@@ -5176,7 +5176,9 @@ export default defineApp(async (sdk) => {
   //（应答端在 app/ui/workspace.js 的 setupKeepalivePokeListener）。
   const POKE_INTERVAL_MS = 10_000; // 踹周期
   const POKE_TIMEOUT_MS = 10_000;  // 单发超时（超时记 state="timeout"，recvAt/deltaMs 记 null）
-  const POKE_DIR = "D:/HanakoWorks/ComfyUI/_temp/keepalive-probe"; // 实验产物目录（目录不存在则创建）
+  // 2026-10-23：原来写死了开发机的一个绝对路径（项目 _temp 下）。发布包不该带本机路径，
+  // 也不该在别人机器上凭空建别的盘符目录。改到 app-data 下，双路对比语义保留（两个不同子目录）。
+  const POKE_DIR = join(dataDir, "keepalive-probe-trace"); // 实验产物目录（目录不存在则创建）
   const APP_POKE_DIR = join(dataDir, "keepalive-probe"); // 落盘双路保底：app-data 侧目录（同名 basename 文件）
   const keepaliveProbes = new Map(); // windowId → { timer, seq, reg }；防守：同一窗口仅一个循环（防重复叠加）
 
