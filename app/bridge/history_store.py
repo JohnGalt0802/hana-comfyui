@@ -687,8 +687,12 @@ def history_key(name, workflow_id=None, user_dir=None, path=None, temporary=None
         return _resolve_val(wid, key)
 
     # ③ 恰一个正式 path 消失 → 单张改名 → 跟随（键不变）
+    # 2026-10-24 护栏：仅当该 id 只登记过一条身份时才判「改名跟随」。
+    # 为什么：多个工作流文件可共享同一 id（同源派生，例如 5 个 minimax_h3_* 共用 e3f2b845）。
+    # 其中某个旧文件被删除/移走后，打开另一个文件会被误判成「改名」，把两段不同历史并进同一目录。
+    # 取舍：宁可多拆一个目录（mint sideId），也不要误并两段历史。
     missing = [k for k in rec if k != TEMP_IDENTITY and not _identity_file_exists(user_dir, k)]
-    if len(missing) == 1:
+    if len(rec) <= 1 and len(missing) == 1:
         key = rec.pop(missing[0])
         rec[identity] = key
         claims[wid] = rec
@@ -1211,7 +1215,7 @@ def commit(body, user_dir, workflow_id=None, path=None, temporary=None):
             )
             try:
                 os.makedirs(dir_path, exist_ok=True)
-                _write_meta_file(dir_path, workflow_id, workflow)
+                _write_meta_file(dir_path, workflow_id, workflow, path=path)
                 with open(index_path, "a", encoding="utf-8", newline="") as fh:
                     fh.write(merge_line + "\n")
             except OSError as exc:
@@ -1234,12 +1238,13 @@ def commit(body, user_dir, workflow_id=None, path=None, temporary=None):
         sig=sig,
         workflow_id=workflow_id,
         workflow_name=workflow,
+        path=path,
     )
 
 
 def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, source="unknown",
                  blocks=None, kind="run", parent=None, head_graph=None, sig=None,
-                 workflow_id=None, workflow_name=None):
+                 workflow_id=None, workflow_name=None, path=None):
     """新建一个提交节点：算 delta → 写快照 → 追加索引主行。
     commit 的「新建」分支与 save_commit 共用（kind/promptId/parent/delta 由调用方给定）。
     返回 {ok, status, merged:False, seq, file, dir}；体积超限 → 413（不写盘、不建目录）。
@@ -1290,7 +1295,7 @@ def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, 
     # 目录不存在就递归创建（在体积防护之后，超限不落任何盘上痕迹）
     try:
         os.makedirs(dir_path, exist_ok=True)
-        _write_meta_file(dir_path, workflow_id, workflow_name)
+        _write_meta_file(dir_path, workflow_id, workflow_name, path=path)
     except OSError as exc:
         return {"ok": False, "status": 500, "error": "创建历史目录失败：%s" % exc}
 
@@ -1389,6 +1394,7 @@ def save_commit(body, user_dir, workflow_id=None, path=None, temporary=None):
         sig=graph_sig_ignoring_seed(b.get("graph")),
         workflow_id=workflow_id,
         workflow_name=workflow,
+        path=path,
     )
 
 

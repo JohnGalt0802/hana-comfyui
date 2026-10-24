@@ -1882,6 +1882,21 @@ class TestHistoryKey(TempRootTestCase):
         out2 = hs.commit({"workflow": "无 id 画布", "graph": self.G_BASE, "promptId": "p2"}, self.root)
         self.assertFalse(os.path.exists(os.path.join(out2["dir"], hs.META_FILE_NAME)))
 
+    # 2026-10-24：meta 补 path —— 写入时带上传入的画布路径，供事后核对目录归属
+    def test_meta_file_records_path(self):
+        out = hs.commit({"workflow": "画布A", "graph": self.G_BASE, "promptId": "p1"},
+                        self.root, self.UUID, path="workflows/A.json")
+        self.assertTrue(out["ok"])
+        with open(os.path.join(out["dir"], hs.META_FILE_NAME), encoding="utf-8") as fh:
+            meta = json.loads(fh.read())
+        self.assertEqual(meta.get("path"), "workflows/A.json")
+        # 不传 path → 不带该字段（不凭空造 path）
+        out2 = hs.commit({"workflow": "画布B", "graph": self.G_BASE, "promptId": "p2"},
+                         self.root, self.UUID2)
+        with open(os.path.join(out2["dir"], hs.META_FILE_NAME), encoding="utf-8") as fh:
+            meta2 = json.loads(fh.read())
+        self.assertNotIn("path", meta2)
+
     # ⑫ 向后兼容：workflow_id 缺省 → 落名键目录（与改前完全一致）
     def test_default_no_workflow_id_writes_name_dir(self):
         out = hs.commit({"workflow": "我的 画布", "graph": self.G_BASE, "promptId": "p1"}, self.root)
@@ -1918,6 +1933,44 @@ class TestHistoryKey(TempRootTestCase):
         d2 = hs.resolve_history_dir(self.root, "新名", self.UUID, path=new)
         self.assertEqual(d1, d2)
         self.assertEqual(os.path.basename(d1), self.UUID)
+
+    # ⑯ 2026-10-24 护栏：该 id 已登记多条身份时，即使恰一个 path 消失也不判改名（改 mint）
+    # 背景：多个工作流文件可共享同一 id（同源派生，例如 5 个 minimax_h3_* 共用 e3f2b845）。
+    #       其中一个旧文件被删后，打开另一个文件会被误判成「改名跟随」接管 primary 目录，
+    #       两段不同历史并进同一目录。取舍：宁可多拆一个目录，也不要误并。
+    def test_multi_identity_never_follows(self):
+        pa = "workflows/a.json"
+        pb = "workflows/b.json"
+        pc = "workflows/c.json"
+        self.make_file(pa)
+        self.make_file(pb)
+        primary = hs.history_key("A", self.UUID, self.root, pa)   # primary（键 = id）
+        side = hs.history_key("B", self.UUID, self.root, pb)      # mint sideId
+        self.assertEqual(primary, self.UUID)
+        self.assertNotEqual(side, self.UUID)
+        # 删掉 a：恰一个正式 path 消失，但该 id 已有多条登记 → 护栏拦下，不走③
+        os.remove(os.path.join(self.root, pa))
+        self.make_file(pc)
+        kc = hs.history_key("C", self.UUID, self.root, pc)
+        self.assertNotEqual(kc, primary, "不该接管 primary（会误并两段历史）")
+        self.assertNotEqual(kc, side)
+        self.assertTrue(hs.is_valid_uuid(kc))
+        rec = self.read_claims()[self.UUID]
+        self.assertEqual(len(rec), 3)  # a(primary) + b(side) + c(新 side)
+        self.assertEqual(rec[pc], kc)
+
+    # ⑯ 对照：该 id 只有一条登记时，改名仍然跟随（护栏不误伤原有能力）
+    def test_single_identity_still_follows(self):
+        pa = "workflows/only.json"
+        pb = "workflows/renamed.json"
+        self.make_file(pa)
+        k1 = hs.history_key("only", self.UUID, self.root, pa)
+        self.assertEqual(k1, self.UUID)
+        os.remove(os.path.join(self.root, pa))
+        self.make_file(pb)
+        k2 = hs.history_key("renamed", self.UUID, self.root, pb)
+        self.assertEqual(k2, k1, "单条登记时必须继续跟随改名")
+        self.assertEqual(self.read_claims()[self.UUID], {pb: "primary"})
 
 
 if __name__ == "__main__":
