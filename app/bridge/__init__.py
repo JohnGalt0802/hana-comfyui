@@ -118,7 +118,8 @@ except ValueError:
 # 2026-10-19（提交树块并集 → 活图块名，与提交历史框同口径）：对齐新活动桥 hana-bridge-2610192344。
 # 2026-10-23（后端 HEAD 持久化：.head.json + history-head-set；parent 由后端定）：对齐新活动桥 hana-bridge-23033000。
 # 2026-10-24（提交身份与图同一时刻捕获：修「提交期间切画布 → 快照写进另一张画布历史」）：对齐新活动桥 hana-bridge-18133900。
-BRIDGE_BUILD_TAG = "2026-10-24 hana-bridge-18133900"
+# 2026-10-24（同类残留：出图产物回填 / 回跳写 HEAD 也用捕获身份）：对齐新活动桥 hana-bridge-18255100。
+BRIDGE_BUILD_TAG = "2026-10-24 hana-bridge-18255100"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}

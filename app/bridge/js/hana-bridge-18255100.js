@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-24 hana-bridge-18133900";
+const BUILD_TAG = "2026-10-24 hana-bridge-18255100";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -2954,6 +2954,29 @@ function reportHistoryMigrate(from, to) {
 const HISTORY_COMMIT_PATH = "/hana_bridge/history-commit";
 let queuePromptCaptureInstalled = false;
 
+// 2026-10-24：提交 → 出图产物的身份接力。
+// 出图产物回填（reportHistoryImages）发生在 execution_success，距提交数秒到数分钟；
+// 那时现取工作流名，切了画布就会解析到另一张画布的目录 → 按 promptId 查不到 → 404 丢缩略图
+//（不会写错历史，但图挂不上）；而且它重试 8 次、每次重新现取，等于 8 次都可能落在错的画布上。
+// 修法与提交一致：提交那一刻把身份记下来，回填时按 promptId 取回。
+const commitIdentityByPromptId = new Map(); // promptId → { identity, at }
+const COMMIT_IDENTITY_TTL_MS = 10 * 60 * 1000;
+
+function rememberCommitIdentity(promptId, identity) {
+  if (!promptId || !identity) return;
+  const now = Date.now();
+  // 顺带清理过期项（批量出图时可能长期不触发清理，这里每次写入扫一遍）
+  for (const [k, v] of commitIdentityByPromptId) {
+    if (now - v.at > COMMIT_IDENTITY_TTL_MS) commitIdentityByPromptId.delete(k);
+  }
+  commitIdentityByPromptId.set(promptId, { identity, at: now });
+}
+
+function commitIdentityOf(promptId) {
+  const hit = promptId ? commitIdentityByPromptId.get(promptId) : null;
+  return hit ? hit.identity : null;
+}
+
 // 安装常驻包装（幂等）。在 setup() 里调用一次。
 function installQueuePromptCapture() {
   if (queuePromptCaptureInstalled) return;
@@ -2994,6 +3017,8 @@ function installQueuePromptCapture() {
         } catch (err) {
           console.warn(LOG_TAG, "提交快照块归属计算失败（不影响上报）", err);
         }
+        // 2026-10-24：记下 promptId → 身份，供出图产物回填时取回（见 commitIdentityOf）
+        rememberCommitIdentity(promptId, identity);
         void reportHistoryCommit({ graph, promptId, blocks, source: sourceSnap, identity });
       }
     } catch (err) {
@@ -3196,11 +3221,15 @@ async function fetchHistoryImages(promptId, attempt) {
 async function reportHistoryImages(promptId, images, attempt) {
   const n = attempt || 0;
   try {
+    // 2026-10-24：身份优先用提交时记下的那一份（见 rememberCommitIdentity）。
+    const identity = commitIdentityOf(promptId);
     let workflow = null;
-    try { workflow = currentWorkflowInfo().name; } catch { workflow = null; }
+    try {
+      workflow = identity && identity.name ? identity.name : currentWorkflowInfo().name;
+    } catch { workflow = null; }
     const resp = await postJson(HISTORY_ATTACH_PATH, withWorkflowId({
       workflow, promptId, images, at: new Date().toISOString(),
-    }));
+    }, identity));
     // 2026-10-22 修：上报成功后必须通知两处 UI 重读，否则新图不会及时出现在
     // 「提交历史框」和「提交树」的提交节点上 —— 它们只在「打开 / 新提交 / 展开」时 fetch，
     // 而上报发生在出图完成后，早过了提交那一刻。
@@ -5795,6 +5824,9 @@ async function historyRollbackExecute() {
     if (typeof app.loadGraphData !== "function") throw new Error("前端没有 app.loadGraphData");
     const aw = activeWorkflowObj(); // 当前活动页对象（同 loadWorkflowFile L1342 的取法）
     if (!aw) throw new Error("取不到当前活动页对象（activeWorkflowObj() 为空）");
+    // 2026-10-24：身份必须在「换图之前」捕获 —— loadGraphData 会替换 app.graph（含 graph.id），
+    // 之后 currentWorkflowId()/currentWorkflowPath() 可能已指向快照里的旧身份。
+    const identity = captureWorkflowIdentity();
     const snap = await historyFetchSnapshot(sel);
     const seqLabel = "#" + String(snap.seq != null ? snap.seq : (sel && sel.seq) != null ? sel.seq : "?").padStart(3, "0");
     // 原子性依据（实现前复核）：loadGraphData 对「非法入参/装载中抛错」**先于**画布变更返回/抛出 ——
@@ -5823,10 +5855,10 @@ async function historyRollbackExecute() {
     if (backSeq != null) {
       try {
         const resp = await postJson(HISTORY_HEAD_SET_PATH, withWorkflowId({
-          workflow: currentWorkflowInfo().name,
+          workflow: identity && identity.name ? identity.name : currentWorkflowInfo().name,
           seq: backSeq,
           at: backAt != null ? backAt : new Date().toISOString(),
-        }));
+        }, identity));
         if (!resp || resp.ok !== true) {
           // postJson 只在网络层抛错；HTTP 4xx/5xx 会正常 resolve，这里也要留痕（不当成功）。
           console.warn(LOG_TAG, "回跳后写后端 HEAD 失败", resp && resp.status);
