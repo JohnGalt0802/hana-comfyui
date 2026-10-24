@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-23 hana-bridge-23033000";
+const BUILD_TAG = "2026-10-24 hana-bridge-18133900";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -276,15 +276,29 @@ function currentWorkflowPath() {
   } catch { return null; }
 }
 
+// 2026-10-24：一次性捕获「工作流身份」快照（name/id/path/temporary 同时取，同步无 await）。
+// 为什么必须捕获：提交链路是「抓图 → await 原生 queuePrompt → 上报」，上报时若再用
+// current*() 现取身份，而用户在 await 期间切了画布，就会「图归 A、名字归 B」，把快照写进
+// 另一张画布的历史（2026-10-24 串台事故：Qwen 图落进 moss-image-SFT综合）。
+function captureWorkflowIdentity() {
+  let name = null, id = null, path = null, temporary = false;
+  try { name = currentWorkflowInfo().name; } catch { name = null; }
+  try { id = currentWorkflowId(); } catch { id = null; }
+  try { path = currentWorkflowPath(); } catch { path = null; }
+  try { temporary = currentWorkflowTemporary() === true; } catch { temporary = false; }
+  return { name, id, path, temporary };
+}
+
 // 给 history 类请求体/查询补 workflowId + workflowPath + workflowTemporary
 // （与既有 workflow 名并存；后端优先用 id/identity 判键，缺省回退名）。
-function withWorkflowId(payload) {
-  const id = currentWorkflowId();
+// identity：可选，传入 captureWorkflowIdentity() 的结果 → 用捕获值，不再现取。
+function withWorkflowId(payload, identity) {
+  const id = identity ? identity.id : currentWorkflowId();
   if (!id) return payload;
   const out = Object.assign({}, payload, { workflowId: id });
-  const p = currentWorkflowPath();
+  const p = identity ? identity.path : currentWorkflowPath();
   if (p) out.workflowPath = p;
-  out.workflowTemporary = currentWorkflowTemporary();
+  out.workflowTemporary = identity ? identity.temporary === true : currentWorkflowTemporary();
   return out;
 }
 
@@ -2951,10 +2965,14 @@ function installQueuePromptCapture() {
   api.queuePrompt = async function (...callArgs) {
     // 抓图：调用原函数「之前」，抓当前画布 UI 格式 JSON。
     // 复用桥里已有的序列化路径 —— canvas.get op 就是 app.graph.toJSON()（第 1171 行），不另写一套。
+    // 2026-10-24：图与身份（identity）在同一同步块里抓，中间无 await；source 也一并快照。
     let graph = null;
+    let identity = null;
+    const sourceSnap = historyCommitSource;
     try {
       if (app && app.graph && typeof app.graph.toJSON === "function") {
         graph = app.graph.toJSON();
+        identity = captureWorkflowIdentity();
       }
     } catch (err) {
       console.warn(LOG_TAG, "提交前抓画布失败（不影响提交）", err);
@@ -2976,7 +2994,7 @@ function installQueuePromptCapture() {
         } catch (err) {
           console.warn(LOG_TAG, "提交快照块归属计算失败（不影响上报）", err);
         }
-        void reportHistoryCommit({ graph, promptId, blocks, source: historyCommitSource });
+        void reportHistoryCommit({ graph, promptId, blocks, source: sourceSnap, identity });
       }
     } catch (err) {
       console.warn(LOG_TAG, "提交历史上报失败（不影响提交）", err);
@@ -3013,11 +3031,13 @@ function historyPageKey() {
 // 2026-10-23 修（HEAD 移交后端持久化，见 docs/方案-修复提交图泳道与HEAD-20261023.md §3.3）：
 //   父节点不再由前端决定。用户提交路径不往 body 写 parent，后端按 <history_dir>/.head.json 定链；
 //   调用方显式传 parent（agent 通道等）才原样透传。
-async function reportHistoryCommit({ graph, promptId, blocks, source = "user", kind = "run", parent = null }) {
+async function reportHistoryCommit({ graph, promptId, blocks, source = "user", kind = "run", parent = null, identity = null }) {
   try {
+    // 2026-10-24：身份优先用调用方在「抓图那一刻」捕获的快照（identity），缺省才现取。
+    // 现取等于在 await 之后取，提交期间切画布就会把快照写进另一张画布的历史。
     let workflow = null;
     try {
-      workflow = currentWorkflowInfo().name;
+      workflow = identity && identity.name ? identity.name : currentWorkflowInfo().name;
     } catch {
       workflow = null;
     }
@@ -3036,7 +3056,7 @@ async function reportHistoryCommit({ graph, promptId, blocks, source = "user", k
     // P2-F2：块归属（[{name, source:"group"|"role", nodeIds:[…]}]）随快照上报；
     // 仅在算出数组时携带 —— null / 计算失败 → 不带字段（Python 端快照同样省略，读回 null）。
     if (Array.isArray(blocks)) body.blocks = blocks;
-    const resp = await postJson(HISTORY_COMMIT_PATH, withWorkflowId(body));
+    const resp = await postJson(HISTORY_COMMIT_PATH, withWorkflowId(body, identity));
     // P5b：读响应判合并。HEAD 不论合并与否都由后端 .head.json 维护，前端只负责刷新提交树。
     let data = null;
     try {

@@ -1,5 +1,5 @@
 // app/lib/commit-graph-lanes.test.mjs
-// 断言口径：与桥内联版 hana-bridge-23033000.js 的 assignLanesRaw / countCrossings /
+// 断言口径：与桥内联版 hana-bridge-18133900.js 的 assignLanesRaw / countCrossings /
 // countLaneHops / scoreOf / commitGraphLanes 逐条对齐（2026-10-23 同步）。
 // 规则：初始泳道奇数次分支往下、偶数次往上；非初始泳道按在初始泳道上下方决定方向；
 //       新分支紧邻父泳道插入，其余泳道平移一格；row = lane（全量显示）；cost 仅诊断不参与重排。
