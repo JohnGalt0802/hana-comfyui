@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-24 hana-bridge-18255100";
+const BUILD_TAG = "2026-10-25 hana-bridge-21143500";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -6604,12 +6604,16 @@ function historyTreeRenderTree(entries) {
   // 目的：最右侧的提交节点能被拖到面板中间（否则它永远贴在右边缘，改不了、看不全上下文）。
   // 留白 = clientWidth/2 刚好够把最右节点滚到中线。
   const rightPad = Math.max(24, ((historyTreeCanvasEl && historyTreeCanvasEl.clientWidth) || 320) / 2);
-  const W = cols * colW + rightPad;
+  // 2026-10-24：左侧留白 —— 泳道基准线（0~18px）与序号（22px 起）占的宽度。
+  // 原实现第一列节点中心在 0.5*colW，节点半宽直接压住序号（用户报「泳道数字和提交节点撞车」）。
+  // 现在所有列坐标整体右移 axisW，节点落在序号右侧。
+  const axisW = 34;
+  const W = axisW + cols * colW + rightPad;
   // 2026-10-12：内容高 = 全量泳道（rows=laneCount）；视口（.tcanvas）高封顶 ≤200，多的靠拖/滚查看。
   // .lanes 取内容全高 → 连线层（height:100%）不被截，SVG 也不再被 300×150 缺省视口裁。
   const contentH = Math.max(46, graph.rows * laneH + 6);
   const H = Math.min(200, contentH); // 视口高上限 200（面板不占满屏）
-  historyTreeGeom = { colW, laneH, nodeH, W, H: contentH, rightPad };
+  historyTreeGeom = { colW, laneH, nodeH, W, H: contentH, rightPad, axisW };
   // 2026-10-23：外壳尺寸随档位一起缩（宽松 / 紧凑 / 极小）。
   // 不这么干的话，最小档节点只有 ~6×13px，2px 边框×2 就吃掉一半宽度，内条会把框顶出去。
   const tightLvl = nodeH >= 18 ? 0 : nodeH >= 12 ? 1 : 2;
@@ -6687,7 +6691,7 @@ function historyTreeRenderTree(entries) {
     node.style.setProperty("--htr-c", srcColor); // 外框色 = 谁
     node.style.borderStyle = historyTickBorderStyle(ent && ent.kind); // 外框线型 = 操作
     const xx = xOf.get(nd.seq);
-    node.style.left = ((xx == null ? 0 : xx) + 0.5) * colW + "px";
+    node.style.left = axisW + ((xx == null ? 0 : xx) + 0.5) * colW + "px";
     node.style.top = nd.row * laneH + laneH / 2 + 3 + "px";
     node.style.setProperty("--nw", nw + "px");
     node.style.setProperty("--nw-bulge", nwBulge + "px"); // 第7条：多块宽（已 clamp colW-2）
@@ -6746,14 +6750,14 @@ function historyTreeRenderTree(entries) {
       const hseq = head && xOf.has(head.seq) ? head.seq : null;
       if (hseq != null) {
         const hnd = (graph.nodes || []).find((n) => n && n.seq === hseq);
-        const cxp = (xOf.get(hseq) + 0.5) * colW;
+        const cxp = axisW + (xOf.get(hseq) + 0.5) * colW;
         const cyp = hnd ? hnd.row * laneH + laneH / 2 : contentH / 2;
         const maxL = Math.max(0, Math.max(W, c.scrollWidth || 0) - c.clientWidth);
         const maxT = Math.max(0, contentH - c.clientHeight);
         c.scrollLeft = Math.max(0, Math.min(maxL, cxp - c.clientWidth / 2));
         c.scrollTop = Math.max(0, Math.min(maxT, cyp - c.clientHeight / 2));
       } else {
-        const contentOnly = cols * colW;   // 不含右侧留白的内容宽
+        const contentOnly = axisW + cols * colW;   // 不含右侧留白的内容宽
         c.scrollLeft = Math.max(0, contentOnly - c.clientWidth);
       }
     }
@@ -7284,6 +7288,7 @@ function historyTreeDrawEdges(nodeEls, graph) {
 
     // ── 几何 ────────────────────────────────────────────────────────────
     let cw = (geom && geom.colW) || 40;
+    const axW = (geom && typeof geom.axisW === "number") ? geom.axisW : 34;
     if (!(cw >= 12)) cw = 40;
     const lh = (geom && geom.laneH) || 36;
     const nh = (geom && geom.nodeH) || 22;
@@ -7402,8 +7407,8 @@ function historyTreeDrawEdges(nodeEls, graph) {
         });
         continue;
       }
-      const pCol = Math.round(pcx / cw - 0.5);
-      const cCol = Math.round(ccx / cw - 0.5);
+      const pCol = Math.round((pcx - axW) / cw - 0.5);
+      const cCol = Math.round((ccx - axW) / cw - 0.5);
       let gapIdx;
       if (cCol > pCol) gapIdx = pCol + 1;
       else if (cCol < pCol) gapIdx = pCol;
@@ -7415,7 +7420,7 @@ function historyTreeDrawEdges(nodeEls, graph) {
         lo: Math.min(pRow, cRow), hi: Math.max(pRow, cRow),
         pts: [
           { x: pcx, y: yP }, { x: pcx, y: yA },
-          { x: gapIdx * cw, y: yA }, { x: gapIdx * cw, y: yB },
+          { x: axW + gapIdx * cw, y: yA }, { x: axW + gapIdx * cw, y: yB },
           { x: ccx, y: yB }, { x: ccx, y: yC },
         ],
       });
@@ -7443,7 +7448,7 @@ function historyTreeDrawEdges(nodeEls, graph) {
       const n = Math.max(1, Math.min(maxTracks, trackEnd.length));
       for (const e of list) {
         const off = (e.track - (n - 1) / 2) * TRACK_GAP;
-        const gx = e.gapIdx * cw + off;
+        const gx = axW + e.gapIdx * cw + off;
         e.pts[2].x = gx;
         e.pts[3].x = gx;
       }
