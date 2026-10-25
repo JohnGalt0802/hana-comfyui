@@ -76,8 +76,12 @@ _KINDS = ("run", "save")
 #   · 结果输出为 **8 位小写十六进制**（左补 0）
 _FNV_OFFSET_BASIS = 2166136261
 _FNV_PRIME = 16777619
-# seed 类 widget 名（seed / noise_seed / rand_seed …）
-_SEED_WIDGET_RE = re.compile("seed", re.IGNORECASE)
+# 签名的 seed 忽略名单（**精确名**，不做子串匹配；与种子快照 _seed_values 同口径）。
+# 2026-10-26（v4 修 bug）：原先是 re.compile("seed") 子串匹配，把 seed_mode /
+# noise_seed_strength 这类含 seed 字样的普通参数也一并忽略 → 改这些参数签名不变、
+# 被误判成「图没变」而合并。改为白名单精确匹配后，只有 seed / noise_seed 被忽略。
+_SEED_WIDGET_NAMES = ("seed", "noise_seed")
+_SEED_WIDGET_SET = frozenset(_SEED_WIDGET_NAMES)
 
 
 def _is_plain_object(v):
@@ -140,7 +144,7 @@ def _widgets_part(node):
     out = []
     if named and len(named) > 0:
         for k in named.keys():
-            if _SEED_WIDGET_RE.search(k):
+            if k in _SEED_WIDGET_SET:
                 continue
             out.append("%s=%s;" % (k, _canon_value(named[k])))
         return "".join(out)
@@ -150,7 +154,7 @@ def _widgets_part(node):
             out.append("widget_%d=%s;" % (i, _canon_value(val)))
     elif isinstance(wv, dict):
         for k in wv.keys():
-            if _SEED_WIDGET_RE.search(k):
+            if k in _SEED_WIDGET_SET:
                 continue
             out.append("%s=%s;" % (k, _canon_value(wv[k])))
     return "".join(out)
@@ -235,18 +239,58 @@ def _link_desc(ep, by_id):
     return {"from": _link_end(ep[0], ep[1], by_id), "to": _link_end(ep[2], ep[3], by_id)}
 
 
-def graph_sig_ignoring_seed(graph):
-    """归一化画布签名（忽略 seed 类 widget；v2 起纳入连线端点对；v3 起纳入节点 mode）。
-    口径（v3）：节点部分 = 按 graph.nodes 顺序，逐节点 type + "|" + mode + "|" + widget 段，
-    各节点段先 fnv1a，再以 "|" 串接；连线部分 = 全部端点串
-    （`originId:originSlot>targetId:targetSlot`）排序后以 "," 拼接；
-    最终 `"v3:" + fnv1a(节点部分 + "#L#" + 连线部分)`，输出 8 位小写 hex。
-    与桥 js graphSignature() 同族但更简化（不含 title/位置；不含节点 id）。
-    口径版本前缀：旧数据无前缀 / 旧版本前缀 → 判为不可比 → 不合并（一次性代价）。
+def _groups_part(graph):
+    """签名的分组框部分：按 graph.groups 顺序，每个框出一段 `{title}|{color}|{bounding}`，
+    每段先 fnv1a，再以 "|" 串接（与 nodes_part 同构）。
 
-    2026-10-26（v2 → v3）：纳入 mode。原先不含 mode 导致 bypass(=4) / mute(=2) 不参与签名，
-    关掉一个模块后签名不变 → 被判成「图没变」而合并到上一个节点，用户报「bypass 也算合并」。
-    mode 缺失 / 非数字 → 按 0（正常）处理。
+    规范化**直接复用** delta 侧的 _canon_group_color / _canon_group_bounding，
+    保证「签名判定图变没变」与「delta 报哪个字段变了」两套口径不会分叉：
+      · title 缺失 → ""（str 化，不做 strip；与 _groups_by_title 对齐）
+      · color  → 去首尾空白 + 小写；非字符串 → ""
+      · bounding → 逐项 _canon_value 后紧凑 JSON；非数组/缺失 → ""
+    非对象框项剔除（与 _groups_by_title 一致）；groups 非数组 → ""。
+    """
+    g = graph if isinstance(graph, dict) else {}
+    groups = g.get("groups") if isinstance(g.get("groups"), list) else []
+    parts = []
+    for item in groups:
+        if not isinstance(item, dict):
+            continue
+        t = "" if item.get("title") is None else str(item.get("title"))
+        parts.append(
+            _fnv1a_hex(
+                "%s|%s|%s"
+                % (t, _canon_group_color(item.get("color")), _canon_group_bounding(item.get("bounding")))
+            )
+        )
+    return "|".join(parts)
+
+
+def graph_sig_ignoring_seed(graph):
+    """归一化画布签名（忽略 seed 类 widget；v2 纳入连线端点对；v3 纳入节点 mode；
+    v4 纳入分组框 + 节点 explicit title）。
+
+    口径（v4）：
+      nodes_part  = 每个节点 fnv1a("{type}|{mode}|{title}|{widgets}")，按 graph.nodes 顺序以 "|" 连接；
+                    v4 起节点段含 **explicit title**（取值口径 = _explicit_title：只认非空字符串 title，
+                    缺失/空串均归一为 ""）。**不用 _node_title** —— 那个会用 type 兜底，
+                    会让「纯改 type」被重复计入成 title 变化，与 delta 侧口径分叉。
+      groups_part = 每个框 fnv1a("{title}|{color}|{bounding}")，按 graph.groups 顺序以 "|" 连接
+      links_part  = 全部端点串（`originId:originSlot>targetId:targetSlot`）排序后以 "," 拼接
+      结果        = "v4:" + fnv1a(nodes_part + "#G#" + groups_part + "#L#" + links_part)，8 位小写 hex
+    与桥 js graphSignature() 同族但更简化（不含位置；不含节点 id）。
+    口径版本前缀：旧数据无前缀 / v2:/v3: 前缀 → 判为不可比 → 不合并（一次性代价）。
+
+    · v2（2026-10-26）：纳入 mode。原先不含 mode 导致 bypass(=4) / mute(=2) 不参与签名，
+      关掉一个模块后签名不变 → 被判成「图没变」而合并，用户报「bypass 也算合并」。
+      mode 缺失 / 非数字 → 按 0（正常）处理。
+    · v3（2026-10-26）：节点 mode 同上（并入），保持。
+    · v4（2026-10-26）：纳入 groups（框名 / 框色 / 框范围）。原先不含 groups，
+      只改框颜色/框名/框范围时签名不变 → 合并 → delta 根本不生成 → 色条永远不亮（John 报的原始症状）。
+      框名单列进签名：改框名也是一次真实改动。
+      同日补：节点段加 explicit title。delta 已把「改节点名」记为 fields:["title"]，
+      但签名不含 title 时改名的 run 仍会被合并 → delta 根本不产生，等于白记。
+      取名口径与 delta 侧完全一致（同一个 _explicit_title）；未发布，故直接并入 v4，不升版本号。
     """
     g = graph if isinstance(graph, dict) else {}
     nodes = g.get("nodes") if isinstance(g.get("nodes"), list) else []
@@ -256,8 +300,9 @@ def graph_sig_ignoring_seed(graph):
             continue
         typ = "" if n.get("type") is None else str(n.get("type"))
         mode = _node_mode(n)
-        parts.append(_fnv1a_hex("%s|%s|%s" % (typ, mode, _widgets_part(n))))
-    return "v3:" + _fnv1a_hex("|".join(parts) + "#L#" + _links_part(g))
+        parts.append(_fnv1a_hex("%s|%s|%s|%s" % (typ, mode, _explicit_title(n), _widgets_part(n))))
+    payload = "|".join(parts) + "#G#" + _groups_part(g) + "#L#" + _links_part(g)
+    return "v4:" + _fnv1a_hex(payload)
 
 
 def _index_nodes_by_id(graph):
@@ -282,6 +327,13 @@ def _node_title(n):
     return "" if n.get("type") is None else str(n.get("type"))
 
 
+def _explicit_title(n):
+    """节点显式名（只认非空字符串 title，不拿 type 兜底）；供「改名」判定区分
+    「真取名」与「名字就是 type」。"""
+    t = n.get("title")
+    return t if isinstance(t, str) and t else ""
+
+
 def _widget_entries(node):
     """返回 (names|None, values)：named 优先命名，否则位置命名 widget_<i>。"""
     named = node.get("widgets_values_named")
@@ -298,10 +350,10 @@ def _widget_entries(node):
     return (None, [])
 
 
-# 2026-10-26：种子快照的命中名（精确匹配，不做子串猜测）。
+# 2026-10-26：种子快照的命中名（精确匹配，不做子串猜测）—— 复用文件顶部定义的
+# _SEED_WIDGET_NAMES（与签名忽略名单同一份，避免两套口径）。
 # seed / noise_seed 是签名的忽略项（见 graph_sig_ignoring_seed），因此改种子仍合并进同一节点；
 # 合并行单独存一份 seeds，读侧覆盖到主行 → 悬停能看到「这个节点最新一次执行用的种子」。
-_SEED_WIDGET_NAMES = ("seed", "noise_seed")
 
 
 def _seed_values(graph):
@@ -363,12 +415,96 @@ def _node_mode(n):
         return 0
 
 
+# ── 分组框归一化（delta 的 groups 维度用；2026-10-26）──────────────────────
+# 框字段固定三种：color（框颜色）/ title（框名）/ bounding（框范围 x,y,w,h）。
+# 快照里分组真实形态（2026-10-26 实测 0246-f0f6fb81.json）：
+#   {"id":1, "title":"① 模型加载｜MOSS 权重", "bounding":[11,-100,398.89737130223807,349.751277854283],
+#    "color":"#3f789e", "flags":{}}
+# 匹配口径：按 title 对齐（同 title 视为同一个框）；标题被改 → removed(旧名) + added(新名）。
+
+
+def _canon_group_color(v):
+    """框颜色规范化：非字符串 → ""；字符串去首尾空白并小写（#3F789E 与 #3f789e 视为同色）。"""
+    if not isinstance(v, str):
+        return ""
+    return v.strip().lower()
+
+
+def _canon_group_bounding(v):
+    """框范围规范化：数组逐项过 _canon_value（整数型 float → "11"，与 JS String(Number) 同串）
+    后按紧凑 JSON 串比较；非数组 → ""（缺失与非法同形）。
+
+    为何不用「保留 N 位小数」：Python 的 "%.3f" 是 round-half-even、JS 的 toFixed 是
+    round-half-up，在恰好 0.0005 这类 tie 上会给不同串（如 0.0625 → "0.062" vs "0.063"），
+    跨语言就不一致了。_canon_value 两侧算法（最短往返 repr / Number.toString）等价，无此问题。
+    """
+    if not isinstance(v, (list, tuple)):
+        return ""
+    return _canon_value([_canon_value(x) for x in v])
+
+
+def _changed_group_fields(a, b):
+    """同 title 两框的字段变化名（固定顺序 color → bounding）。
+    title 不参与：匹配本身就是按 title 对齐，改名的框走 removed+added 而非 changed。"""
+    fields = []
+    if _canon_group_color(a.get("color")) != _canon_group_color(b.get("color")):
+        fields.append("color")
+    if _canon_group_bounding(a.get("bounding")) != _canon_group_bounding(b.get("bounding")):
+        fields.append("bounding")
+    return fields
+
+
+def _groups_by_title(graph):
+    """graph.groups → {title: [框…]}（同一 title 出现多次时按出现顺序成对比较）。
+    非 dict / groups 非数组 → {}；非对象项剔除。"""
+    g = graph if isinstance(graph, dict) else {}
+    groups = g.get("groups") if isinstance(g.get("groups"), list) else []
+    out = {}
+    for item in groups:
+        if not isinstance(item, dict):
+            continue
+        t = "" if item.get("title") is None else str(item.get("title"))
+        out.setdefault(t, []).append(item)
+    return out
+
+
+def _delta_groups(prev_graph, next_graph):
+    """框级变化：{changed:[{name,fields}], added:[{name}], removed:[{name}]}（按 name 排序）。"""
+    g_prev = _groups_by_title(prev_graph)
+    g_next = _groups_by_title(next_graph)
+    changed = []
+    added = []
+    removed = []
+    for t, nlist in g_next.items():
+        plist = g_prev.get(t, [])
+        for i, nb in enumerate(nlist):
+            ab = plist[i] if i < len(plist) else None
+            if ab is None:
+                added.append({"name": t})
+                continue
+            fields = _changed_group_fields(ab, nb)
+            if fields:
+                changed.append({"name": t, "fields": fields})
+    for t, plist in g_prev.items():
+        for _ in range(len(g_next.get(t, [])), len(plist)):
+            removed.append({"name": t})
+    changed.sort(key=lambda x: x["name"])
+    added.sort(key=lambda x: x["name"])
+    removed.sort(key=lambda x: x["name"])
+    return {"changed": changed, "added": added, "removed": removed}
+
+
 def compute_delta(prev_graph, next_graph):
-    """对比两画布（UI 格式），相对 prev 算四类变化（节点三类 + 连线一类）。
+    """对比两画布（UI 格式），相对 prev 算五类变化（节点三类 + 连线一类 + 分组框一类）。
     prev_graph 为 None/非法 → 返回 None。
     返回 {"changed":[{id,title,fields}], "added":[{id,title}], "removed":[{id,title}],
-          "links":{"added":[{from:{type,slot},to:{type,slot}}], "removed":[...]}}。
-    连线身份 = 端点串 `originId:originSlot>targetId:targetSlot`；改接自然表达为 removed+added。"""
+          "links":{"added":[{from:{type,slot},to:{type,slot}}], "removed":[...]},
+          "groups":{"changed":[{name,fields}], "added":[{name}], "removed":[{name}]}}。
+    连线身份 = 端点串 `originId:originSlot>targetId:targetSlot`；改接自然表达为 removed+added。
+    groups（2026-10-26）：按 title 对齐比 color / bounding；fields 取值固定为
+    color / title / bounding（title 只在改名时体现为 removed+added，故不会出现在 fields 里）。
+    节点 changed 的 fields 可取：type / mode / title / widget 名（2026-10-26 起含 title）。
+    三个数组恒存在，可为空。"""
     if not isinstance(prev_graph, dict):
         return None
     prev = _index_nodes_by_id(prev_graph)
@@ -407,6 +543,12 @@ def compute_delta(prev_graph, next_graph):
         # 修前只比 type + widget → 关掉一个模块不算改动，节点色条不亮、也不进 changed。
         if _node_mode(a) != _node_mode(b):
             fields.append("mode")
+        # 2026-10-26（v4）：节点改名算一次真实改动（John 定）。
+        # 口径：_node_title（title 非空用 title，否则用 type）不一致 且 至少一侧有显式 title。
+        # 为何加「至少一侧有显式 title」这半句：节点没起名时 _node_title 就是 type，
+        # 纯改 type 会让两个字段同时命中 → 悬停气泡变成「（类型、名字）」冗余（且会破现有用例）。
+        if _node_title(a) != _node_title(b) and (_explicit_title(a) or _explicit_title(b)):
+            fields.append("title")
         fields.extend(_changed_widget_names(a, b))
         if fields:
             changed.append({"id": b.get("id"), "title": _node_title(b), "fields": fields})
@@ -421,6 +563,7 @@ def compute_delta(prev_graph, next_graph):
             "added": [_link_desc(link_next[k], nxt) for k in links_added],
             "removed": [_link_desc(link_prev[k], prev) for k in links_removed],
         },
+        "groups": _delta_groups(prev_graph, next_graph),
     }
 
 
@@ -1677,13 +1820,18 @@ def migrate_history(from_name, to_name, user_dir):
 def _block_names_for_entry(entry):
     """一条 entry「碰过」的框名列表（只读计算，不改索引磁盘内容）。
 
-    判定：一条提交碰过框 B ⟺ delta 的 changed/added/removed 里任一节点 id ∈ B.nodeIds。
+    两条并列判据（任一成立即命中）：
+      ① 节点级：delta 的 changed/added/removed 里任一节点 id ∈ B.nodeIds；
+      ② 框级（2026-10-26 新增）：delta.groups.changed 里的框名 == B.name；
+         delta.groups.added 里的框名 == B.name 也算命中（新框通常也在 blocks 里，不在就自然落空）。
+         delta.groups.removed **不算命中**（那个框已不在画布上，没有小条可亮）。
     三种返回值（blockNames 字段语义）：
       · None     —— **无法判定**：旧数据（delta 非 dict），或 blocks 非 list，
                     或 blocks 里任一项缺 nodeIds / nodeIds 非数组；
       · []       —— 有数据但没碰任何框（delta + blocks 完整，无一命中）；
       · [名字…]  —— 命中的框名列表（按 blocks 顺序，name 缺省补 ""）。
     id 一律 str 后比较（索引里 nodeIds 是 number，delta 里可能 number/string，统一避类型坑）。
+    旧条目没有 delta.groups → 框级判据空集，行为与加本维度前完全一致。
     """
     e = entry if isinstance(entry, dict) else {}
     delta = e.get("delta")
@@ -1703,6 +1851,20 @@ def _block_names_for_entry(entry):
             nid = x.get("id")
             if nid is not None:
                 hit_ids.add(str(nid))
+    # 框级命中集：groups.changed + groups.added（removed 不算）
+    hit_group_names = set()
+    groups = delta.get("groups")
+    if isinstance(groups, dict):
+        for gk in ("changed", "added"):
+            items = groups.get(gk)
+            if not isinstance(items, list):
+                continue
+            for x in items:
+                if not isinstance(x, dict):
+                    continue
+                nm = x.get("name")
+                if nm is not None:
+                    hit_group_names.add(str(nm))
     names = []
     for b in blocks:
         if not isinstance(b, dict):
@@ -1710,8 +1872,9 @@ def _block_names_for_entry(entry):
         ids = b.get("nodeIds")
         if not isinstance(ids, list):
             return None  # 有块但无 nodeIds = 旧数据（无法判定）
-        if any(str(i) in hit_ids for i in ids):
-            names.append("" if b.get("name") is None else str(b.get("name")))
+        bname = "" if b.get("name") is None else str(b.get("name"))
+        if any(str(i) in hit_ids for i in ids) or (bname in hit_group_names):
+            names.append(bname)
     return names
 
 

@@ -378,10 +378,10 @@ const SIG_GRAPH = {
   links: [[1, 1, 0, 2, 0, "MODEL"]],
 };
 
-test("graphSigIgnoringSeed：稳定 hex（v3 前缀 + 8 位），且与固定期望一致", () => {
+test("graphSigIgnoringSeed：稳定 hex（v4 前缀 + 8 位），且与固定期望一致", () => {
   const sig = graphSigIgnoringSeed(SIG_GRAPH);
-  assert.match(sig, /^v3:[0-9a-f]{8}$/);
-  assert.equal(sig, "v3:b832eb61"); // 跨语言一致基准（Python 侧同值，v3 起纳入 mode）
+  assert.match(sig, /^v4:[0-9a-f]{8}$/);
+  assert.equal(sig, "v4:b740be6d"); // 跨语言一致基准（Python 侧同值；v4 = groups + 节点 explicit title）
   assert.equal(graphSigIgnoringSeed(SIG_GRAPH), sig); // 幂等
 });
 
@@ -567,7 +567,7 @@ test("graphSigIgnoringSeed：跨语言 fixture 与 Python 侧同串", () => {
       { id: 2, type: "KSampler", widgets_values_named: { seed: 123, sampler_name: "euler", steps: 20 } },
     ],
   };
-  assert.equal(graphSigIgnoringSeed(fixture), "v3:dd0db49c");
+  assert.equal(graphSigIgnoringSeed(fixture), "v4:9c90ed0e");
 });
 
 // ── 17. P5a：组合（新字段落索引行 → 解析 → normalizeEntry 读回）───────────
@@ -647,4 +647,296 @@ test("种子快照：跨语言一致（buildIndexLine → parseIndex → normali
   assert.deepEqual(normalizeEntry(entries[0]).seeds, [
     { title: "KSampler", name: "seed", value: "333" },
   ]);
+});
+
+// ── 19. 2026-10-26：delta 增加 groups 维度（框颜色 / 框名 / 框范围）────────────
+// 匹配口径：按 title 对齐；fields 固定 color / bounding（改名走 removed+added）。
+// 与 Python 侧 TestGroupDelta 逐条对应。
+const groupOf = ({ title = "G", color = "#3f789e", bounding = [11, -100, 398.89737130223807, 349.751277854283] } = {}) => ({
+  id: 1,
+  title,
+  color,
+  bounding,
+  flags: {},
+});
+const graphOf = ({ groups = [], nodes } = {}) => ({
+  nodes: nodes || [
+    { id: 1, type: "KSampler", widgets_values_named: { seed: 1, steps: 20 } },
+    { id: 2, type: "VAEDecode" },
+  ],
+  links: [],
+  groups,
+});
+
+test("computeDelta：groups 键恒存在（可为三个空数组）；prev 非法仍返回 null", () => {
+  const d = computeDelta(graphOf(), graphOf());
+  assert.deepEqual(d.groups, { changed: [], added: [], removed: [] });
+  assert.equal(computeDelta(null, graphOf()), null);
+  // 图里没有 groups 键 → 三组空，不报错
+  assert.deepEqual(computeDelta({ nodes: [] }, { nodes: [] }).groups, { changed: [], added: [], removed: [] });
+});
+
+test("computeDelta：只改框颜色（节点零改动）→ groups.changed 含该框 + fields 含 color", () => {
+  const prev = graphOf({ groups: [groupOf({ color: "#3f789e" })] });
+  const next = graphOf({ groups: [groupOf({ color: "#a85a5a" })] });
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.changed, []);
+  assert.deepEqual(d.added, []);
+  assert.deepEqual(d.removed, []);
+  assert.deepEqual(d.groups.changed, [{ name: "G", fields: ["color"] }]);
+  assert.deepEqual(d.groups.added, []);
+  assert.deepEqual(d.groups.removed, []);
+  // 大小写差异不算变色
+  assert.deepEqual(computeDelta(prev, graphOf({ groups: [groupOf({ color: "#3F789E" })] })).groups.changed, []);
+});
+
+test("computeDelta：只改框名 → removed(旧) + added(新)，changed 不含", () => {
+  const prev = graphOf({ groups: [groupOf({ title: "旧名" })] });
+  const next = graphOf({ groups: [groupOf({ title: "新名" })] });
+  const g = computeDelta(prev, next).groups;
+  assert.deepEqual(g.changed, []);
+  assert.deepEqual(g.removed, [{ name: "旧名" }]);
+  assert.deepEqual(g.added, [{ name: "新名" }]);
+});
+
+test("computeDelta：只改框范围 → fields 含 bounding；整数型 float / -0 不算变化", () => {
+  const prev = graphOf({ groups: [groupOf({ bounding: [0, 0, 100, 200] })] });
+  const next = graphOf({ groups: [groupOf({ bounding: [0, 0, 101, 200] })] });
+  assert.deepEqual(computeDelta(prev, next).groups.changed, [{ name: "G", fields: ["bounding"] }]);
+  const a = graphOf({ groups: [groupOf({ bounding: [11, -100, 398.897, 349.751] })] });
+  const b = graphOf({ groups: [groupOf({ bounding: [11.0, -100.0, 398.897, 349.751] })] });
+  assert.deepEqual(computeDelta(a, b).groups.changed, []);
+  const z = graphOf({ groups: [groupOf({ bounding: [-0, 0, 10, 10] })] });
+  const z2 = graphOf({ groups: [groupOf({ bounding: [0, 0, 10, 10] })] });
+  assert.deepEqual(computeDelta(z, z2).groups.changed, []);
+  // 真实几何位移仍算变化
+  const c = graphOf({ groups: [groupOf({ bounding: [11, -100, 398.897, 349.751] })] });
+  const d2 = graphOf({ groups: [groupOf({ bounding: [11, -100, 398.898, 349.751] })] });
+  assert.deepEqual(computeDelta(c, d2).groups.changed, [{ name: "G", fields: ["bounding"] }]);
+});
+
+test("computeDelta：颜色 + 范围同时改 → fields 两项（顺序 color → bounding）", () => {
+  const prev = graphOf({ groups: [groupOf({ color: "#3f789e", bounding: [0, 0, 10, 10] })] });
+  const next = graphOf({ groups: [groupOf({ color: "#ffffff", bounding: [0, 0, 20, 10] })] });
+  assert.deepEqual(computeDelta(prev, next).groups.changed, [
+    { name: "G", fields: ["color", "bounding"] },
+  ]);
+});
+
+test("computeDelta：框和节点都没变 → groups 三组全空，且原有 changed 仍为空", () => {
+  const d = computeDelta(graphOf({ groups: [groupOf()] }), graphOf({ groups: [groupOf()] }));
+  assert.deepEqual(d.changed, []);
+  assert.deepEqual(d.groups, { changed: [], added: [], removed: [] });
+});
+
+test("computeDelta：框变了 + 节点也变了 → 两组都记", () => {
+  const prev = graphOf({ groups: [groupOf({ color: "#3f789e" })] });
+  const next = graphOf({
+    groups: [groupOf({ color: "#a85a5a" })],
+    nodes: [
+      { id: 1, type: "KSampler", widgets_values_named: { seed: 1, steps: 30 } },
+      { id: 2, type: "VAEDecode" },
+    ],
+  });
+  const d = computeDelta(prev, next);
+  assert.deepEqual(d.changed, [{ id: 1, title: "KSampler", fields: ["steps"] }]);
+  assert.deepEqual(d.groups.changed, [{ name: "G", fields: ["color"] }]);
+});
+
+test("computeDelta：多框按 name 排序；added/removed 各自独立", () => {
+  const prev = graphOf({ groups: [groupOf({ title: "Z", color: "#111111" }), groupOf({ title: "A", color: "#222222" })] });
+  const next = graphOf({ groups: [groupOf({ title: "Z", color: "#333333" }), groupOf({ title: "A", color: "#444444" }), groupOf({ title: "B" })] });
+  const g = computeDelta(prev, next).groups;
+  assert.deepEqual(g.changed, [
+    { name: "A", fields: ["color"] },
+    { name: "Z", fields: ["color"] },
+  ]);
+  assert.deepEqual(g.added, [{ name: "B" }]);
+  assert.deepEqual(g.removed, []);
+  // 删框：removed 单独出现，不进 changed
+  assert.deepEqual(computeDelta(next, prev).groups.removed, [{ name: "B" }]);
+});
+
+test("computeDelta：groups 跨语言同串（同一 fixture 的 groups 段一致）", () => {
+  // 该 fixture 的期望值同时被 Python 侧 TestGroupDelta 校验（同输入 → 同输出）
+  const prev = graphOf({ groups: [groupOf({ title: "④ 采样", color: "#b58b2a", bounding: [0, 0, 10, 10] })] });
+  const next = graphOf({ groups: [groupOf({ title: "④ 采样", color: "#a1309b", bounding: [0, 0, 10, 12] })] });
+  assert.equal(JSON.stringify(computeDelta(prev, next).groups),
+    JSON.stringify({ changed: [{ name: "④ 采样", fields: ["color", "bounding"] }], added: [], removed: [] }));
+});
+
+// ── 20. 2026-10-26（v4）：分组框进签名 + seed 精确忽略 + 节点改名算改动 ────
+// 与 Python 侧 TestP5Purity 的 test_graph_sig_v4_* / test_graph_sig_seed_ignore_exact_names_only /
+// test_compute_delta_node_title_change 逐条对应。
+const sigBase = () => ({
+  nodes: [
+    { id: 1, type: "KSampler", widgets_values_named: { seed: 1, steps: 20 } },
+    { id: 2, type: "VAEDecode" },
+  ],
+  links: [],
+  groups: [{ id: 1, title: "G", color: "#3f789e", bounding: [11, -100, 398.897, 349.751], flags: {} }],
+});
+
+test("graphSigIgnoringSeed：v4 只改框颜色 → 签名变化（修「色条永不亮」核心用例）", () => {
+  const base = sigBase();
+  const s0 = graphSigIgnoringSeed(base);
+  const recolored = sigBase();
+  recolored.groups[0].color = "#a85a5a";
+  const s1 = graphSigIgnoringSeed(recolored);
+  assert.match(s1, /^v4:[0-9a-f]{8}$/);
+  assert.notEqual(s1, s0, "只改框颜色应改签名");
+  // 颜色大小写规范化后同色 → 签名不变（复用 canonGroupColor）
+  const sameCase = sigBase();
+  sameCase.groups[0].color = "#3F789E";
+  assert.equal(graphSigIgnoringSeed(sameCase), s0);
+});
+
+test("graphSigIgnoringSeed：v4 只改框范围 → 签名变化", () => {
+  const base = sigBase();
+  const s0 = graphSigIgnoringSeed(base);
+  const moved = sigBase();
+  moved.groups[0].bounding = [11, -100, 399.897, 349.751];
+  assert.notEqual(graphSigIgnoringSeed(moved), s0, "只改框范围应改签名");
+  // 整数型 float 同值 → 不变（复用 canonGroupBounding）
+  const sameVal = sigBase();
+  sameVal.groups[0].bounding = [11.0, -100.0, 398.897, 349.751];
+  assert.equal(graphSigIgnoringSeed(sameVal), s0);
+});
+
+test("graphSigIgnoringSeed：v4 只改框名 → 签名变化", () => {
+  const base = sigBase();
+  const s0 = graphSigIgnoringSeed(base);
+  const renamed = sigBase();
+  renamed.groups[0].title = "H";
+  assert.notEqual(graphSigIgnoringSeed(renamed), s0, "只改框名应改签名");
+});
+
+test("graphSigIgnoringSeed：v4 框全没变 → 签名不变；groups 缺失与 [] 同串", () => {
+  const base = sigBase();
+  const s0 = graphSigIgnoringSeed(base);
+  assert.equal(graphSigIgnoringSeed(sigBase()), s0);
+  const noGroups = sigBase();
+  delete noGroups.groups;
+  const emptyGroups = sigBase();
+  emptyGroups.groups = [];
+  assert.equal(graphSigIgnoringSeed(noGroups), graphSigIgnoringSeed(emptyGroups));
+  // 非对象框项剔除（与 groupsByTitle 一致）
+  const junk = sigBase();
+  junk.groups = ["bad", null, base.groups[0]];
+  assert.equal(graphSigIgnoringSeed(junk), s0);
+});
+
+test("graphSigIgnoringSeed：v4 框顺序参与签名；缺字段按空串参与", () => {
+  const base = sigBase();
+  base.groups = [
+    { id: 1, title: "A", color: "#111111", bounding: [0, 0, 10, 10] },
+    { id: 2, title: "B", color: "#222222", bounding: [0, 0, 20, 20] },
+  ];
+  const s0 = graphSigIgnoringSeed(base);
+  const swapped = sigBase();
+  swapped.groups = [base.groups[1], base.groups[0]];
+  assert.notEqual(graphSigIgnoringSeed(swapped), s0, "框顺序应参与签名");
+  const bare = sigBase();
+  bare.groups = [{ id: 1, title: "A", color: "#111111", bounding: [0, 0, 10, 10] }, { id: 2 }];
+  const sBare = graphSigIgnoringSeed(bare);
+  assert.match(sBare, /^v4:[0-9a-f]{8}$/);
+  assert.notEqual(sBare, s0);
+  // bounding 非法与缺失同形
+  const bad = sigBase();
+  bad.groups = [bare.groups[0], { id: 2, bounding: "not-an-array" }];
+  assert.equal(graphSigIgnoringSeed(bad), sBare);
+});
+
+test("graphSigIgnoringSeed：seed / noise_seed 忽略，seed_mode 变化必须改签名（子串 bug 已修）", () => {
+  const base = { nodes: [{ id: 1, type: "KSampler", widgets_values_named: { seed: 1, noise_seed: 2, seed_mode: "randomize", steps: 20 } }] };
+  const s0 = graphSigIgnoringSeed(base);
+  const seedChanged = { nodes: [{ id: 1, type: "KSampler", widgets_values_named: { seed: 999999, noise_seed: 2, seed_mode: "randomize", steps: 20 } }] };
+  assert.equal(graphSigIgnoringSeed(seedChanged), s0, "seed 变化应忽略");
+  const noiseChanged = { nodes: [{ id: 1, type: "KSampler", widgets_values_named: { seed: 1, noise_seed: 888888, seed_mode: "randomize", steps: 20 } }] };
+  assert.equal(graphSigIgnoringSeed(noiseChanged), s0, "noise_seed 变化应忽略");
+  const modeChanged = { nodes: [{ id: 1, type: "KSampler", widgets_values_named: { seed: 1, noise_seed: 2, seed_mode: "fixed", steps: 20 } }] };
+  assert.notEqual(graphSigIgnoringSeed(modeChanged), s0, "seed_mode 变化必须改签名");
+  // dict 型 widgets_values 同口径
+  const baseD = { nodes: [{ id: 1, type: "K", widgets_values: { seed: 1, seed_mode: "randomize" } }] };
+  const sd0 = graphSigIgnoringSeed(baseD);
+  assert.equal(graphSigIgnoringSeed({ nodes: [{ id: 1, type: "K", widgets_values: { seed: 5, seed_mode: "randomize" } }] }), sd0);
+  assert.notEqual(graphSigIgnoringSeed({ nodes: [{ id: 1, type: "K", widgets_values: { seed: 1, seed_mode: "fixed" } }] }), sd0);
+});
+
+test("graphSigIgnoringSeed：v4 节点 explicit title 进签名（只改名也改签名）", () => {
+  const makeBase = () => ({
+    nodes: [
+      { id: 1, type: "KSampler", title: "旧名", widgets_values_named: { seed: 1, steps: 20 } },
+      { id: 2, type: "VAEDecode" },
+    ],
+    links: [],
+    groups: [{ id: 1, title: "G", color: "#3f789e", bounding: [11, -100, 398.897, 349.751], flags: {} }],
+  });
+  const base = makeBase();
+  const s0 = graphSigIgnoringSeed(base);
+  const renamed = makeBase();
+  renamed.nodes[0].title = "新名";
+  const s1 = graphSigIgnoringSeed(renamed);
+  assert.match(s1, /^v4:[0-9a-f]{8}$/);
+  assert.notEqual(s1, s0, "只改节点 title 应改签名");
+  // 删名（有 → 无）也改签名
+  const unnamed = makeBase();
+  delete unnamed.nodes[0].title;
+  assert.notEqual(graphSigIgnoringSeed(unnamed), s0, "删名应改签名");
+});
+
+test("graphSigIgnoringSeed：v4 节点 title 缺失与空串等价；非法 title 归空串", () => {
+  const plain = () => ({
+    nodes: [{ id: 1, type: "KSampler", widgets_values_named: { seed: 1, steps: 20 } }],
+    links: [],
+    groups: [],
+  });
+  const s0 = graphSigIgnoringSeed(plain());
+  const missing = plain();
+  delete missing.nodes[0].title;
+  const empty = plain();
+  empty.nodes[0].title = "";
+  assert.equal(graphSigIgnoringSeed(missing), s0);
+  assert.equal(graphSigIgnoringSeed(empty), s0);
+  assert.equal(graphSigIgnoringSeed(missing), graphSigIgnoringSeed(empty));
+  // 非字符串 title（null / 数字 / 对象 / 数组）归 ""（explicitTitle 只认非空 str）
+  for (const bad of [null, 123, {}, []]) {
+    const g = plain();
+    g.nodes[0].title = bad;
+    assert.equal(graphSigIgnoringSeed(g), s0, `非法 title ${JSON.stringify(bad)} 应归空串`);
+  }
+});
+
+test("graphSigIgnoringSeed：v4 用 explicitTitle（不用 nodeTitle），纯改 type 不重复计 title", () => {
+  const a = { nodes: [{ id: 1, type: "A", title: "同名", widgets_values: [1] }] };
+  const b = { nodes: [{ id: 1, type: "B", title: "同名", widgets_values: [1] }] };
+  assert.notEqual(graphSigIgnoringSeed(a), graphSigIgnoringSeed(b));
+  // 两侧都无 title 时节点段 title 位恒为 ""（补空串 title 不改签名）
+  const c = { nodes: [{ id: 1, type: "A", widgets_values: [1] }] };
+  const c2 = { nodes: [{ id: 1, type: "A", title: "", widgets_values: [1] }] };
+  assert.equal(graphSigIgnoringSeed(c), graphSigIgnoringSeed(c2));
+});
+
+test("computeDelta：只改节点 title → changed 含 fields:[\"title\"]", () => {
+  const prev = { nodes: [{ id: 1, type: "KSampler", title: "旧名", widgets_values_named: { seed: 1, steps: 20 } }] };
+  const next = { nodes: [{ id: 1, type: "KSampler", title: "新名", widgets_values_named: { seed: 1, steps: 20 } }] };
+  assert.deepEqual(computeDelta(prev, next).changed, [{ id: 1, title: "新名", fields: ["title"] }]);
+  // 起名 / 删名也算
+  const noTitle = { nodes: [{ id: 1, type: "KSampler", widgets_values_named: { steps: 20 } }] };
+  const named = { nodes: [{ id: 1, type: "KSampler", title: "甲", widgets_values_named: { steps: 20 } }] };
+  assert.deepEqual(computeDelta(noTitle, named).changed, [{ id: 1, title: "甲", fields: ["title"] }]);
+  assert.deepEqual(computeDelta(named, noTitle).changed, [{ id: 1, title: "KSampler", fields: ["title"] }]);
+  // 纯改 type（两侧无显式 title）→ 只报 type
+  assert.deepEqual(
+    computeDelta({ nodes: [{ id: 1, type: "A" }] }, { nodes: [{ id: 1, type: "B" }] }).changed,
+    [{ id: 1, title: "B", fields: ["type"] }],
+  );
+  // title + widgets 同时变 → 顺序 title → widget
+  assert.deepEqual(
+    computeDelta(
+      { nodes: [{ id: 1, type: "A", title: "x", widgets_values_named: { steps: 1 } }] },
+      { nodes: [{ id: 1, type: "A", title: "y", widgets_values_named: { steps: 2 } }] },
+    ).changed,
+    [{ id: 1, title: "y", fields: ["title", "steps"] }],
+  );
 });

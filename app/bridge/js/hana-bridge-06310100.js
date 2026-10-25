@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-26 hana-bridge-05292400";
+const BUILD_TAG = "2026-10-26 hana-bridge-06310100";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -4507,7 +4507,7 @@ function historyTickChangedNames(ent) {
 // 2026-10-26：字段名 → 中文标签（悬停气泡「改动」行的括号内容）。
 // 未知名字原样输出；widget_N 位置参数 → 「参数N」。
 const HISTORY_FIELD_LABELS = {
-  mode: "状态", type: "类型",
+  mode: "状态", type: "类型", title: "名字",
   steps: "步数", cfg: "CFG", denoise: "降噪", seed: "种子", noise_seed: "种子",
   sampler_name: "采样器", scheduler: "调度器", text: "文本",
   width: "宽", height: "高", batch_size: "批次数", length: "长度",
@@ -4515,14 +4515,28 @@ const HISTORY_FIELD_LABELS = {
   lora_name: "LoRA", ckpt_name: "模型", vae_name: "VAE", clip_name: "CLIP",
   clip_name1: "CLIP1", clip_name2: "CLIP2", clip_name3: "CLIP3", model_name: "模型",
   prompt: "提示词", negative: "反向提示",
+  // 2026-10-26（任务 B）：补 ComfyUI 常见 widget 名。此前 control_after_generate / image / mask /
+  // filename_prefix 等一律原样露出英文原名，气泡里可读性差。未命中的仍原样输出（不发明中文）。
+  control_after_generate: "生成后控制", filename_prefix: "文件名前缀",
+  image: "图像", mask: "遮罩", grow_mask_by: "遮罩扩展",
+  upscale_method: "放大算法", scale_by: "缩放倍数", megapixels: "百万像素",
+  weight: "权重", start_at_step: "起始步", end_at_step: "结束步",
+  return_with_leftover_noise: "保留残余噪声", add_noise: "加噪", noise_type: "噪声类型",
+  shift: "位移", sampler: "采样器", sigmas: "噪声表",
+  vae: "vae", clip: "clip", model: "模型",
 };
+// 2026-10-26（任务 B）：标签过长（> 12 字符）截断，避免括号内容把气泡撑爆。
+// 只截显示，不改映射表（原名本来就 >12 的同样截）。
+const HISTORY_FIELD_LABEL_MAX = 12;
 function historyFieldLabel(f) {
   const k = String(f == null ? "" : f).trim();
   if (!k) return "";
-  if (HISTORY_FIELD_LABELS[k]) return HISTORY_FIELD_LABELS[k];
-  const m = /^widget_(\d+)$/.exec(k);
-  if (m) return "参数" + Number(m[1]);
-  return k;
+  let out = HISTORY_FIELD_LABELS[k];
+  if (!out) {
+    const m = /^widget_(\d+)$/.exec(k);
+    out = m ? "参数" + Number(m[1]) : k;
+  }
+  return out.length > HISTORY_FIELD_LABEL_MAX ? out.slice(0, HISTORY_FIELD_LABEL_MAX) + "…" : out;
 }
 
 // ── 2026-10-15 缺口一：提交变动符号（刻度 / 树节点共用）────────────────────────
@@ -4595,6 +4609,13 @@ function historyNodeStyleEnsure() {
 .hnode-bars { display:flex; flex-direction:column; gap:var(--hnode-gap, 1.5px); align-items:stretch; justify-content:center; flex:1 1 auto; min-height:0; overflow:hidden; }
 .hnode-bar { display:block; flex:1 1 0; min-height:var(--hnode-barmin, 2px); border-radius:2px; background:var(--hnode-dim, ${HNODE_BAR_DIM}); } /* 3b（2026-10-13）：内条圆角 1px→2px */
 .hnode-bar.hnode-bar-on { background:var(--hnode-bc, #5aa0d8); filter:brightness(1.08); } /* 3a修（2026-10-13）：去掉内条 5px 光晕 + 降亮度 1.15→1.08，外框始终是视觉主线（原亮条盖过外框） */
+/* 2026-10-26（任务 A）：提交树节点的内条堆改横向分段（只加在提交树上，历史刻度 .hhb-tick 仍竖排）。
+   为什么：竖排要 6×(barmin 1) + 5×(gap .5) = 8.5px，而 nodeH 11/12 扣掉边框(2×1~1.5)与内边距(2×1)
+   后内高只剩 7px → overflow:hidden 把末尾 2~3 根裁掉，表现为「改了第 6 个框却一根都不亮」。
+   横排：段数 = 框数，顺序仍按 globalBlocks（构建时就是那个顺序）。
+   gap 反算：内容宽 20 - 2×2(边框) = 16px，若 gap=1.5 则 (16-7.5)/6 = 1.42px < 1.5px，故横向 gap 压到 0。 */
+.hnode-bars-row { flex-direction: row; gap: 0; align-items: stretch; justify-content: flex-start; width: 100%; height: 100%; overflow: hidden; }
+.hnode-bars-row .hnode-bar { flex: 1 1 0; min-width: 1px; min-height: 0; height: 100%; border-radius: 1px; }
 `;
   document.head.appendChild(style);
 }
@@ -6349,6 +6370,16 @@ function historyTreeStyleEnsure() {
   box-shadow: 0 1px 3px var(--htr-badge-sh); pointer-events: none;
 }
 #${HISTORY_TREE_ID} .node:hover .htr-runs { display: inline-block; }
+/* 2026-10-26（任务 A）：窄列降级点 —— colW < 10 时 ×N 文字放不下，改画一个 2px 方点。
+   定位沿用 .htr-runs 的右上角外沿（top:-6px / right:-8px），叠加 z-index 保证不被内条堆盖住；
+   颜色走 --htr-sub（低存在感）；title 由 JS 挂「合并 N 次」（原生 tooltip，徽标是子元素可单独挂）。 */
+#${HISTORY_TREE_ID} .htr-runs-dot {
+  position: absolute; top: -5px; right: -5px; z-index: 2;
+  width: 2px; height: 2px; border-radius: 1px; background: var(--htr-sub);
+  /* 必须 auto 而非 none：pointer-events:none 的元素不参与命中测试，原生 title 不会弹。
+     dot 在节点内部，点击/悬停依旧冒泡到 .node（mouseenter 进子元素不重触发），交互零变化。 */
+  pointer-events: auto;
+}
 /* 2026-10-15 缺口一：变动符号（节点 ＋n/－n、连线 ⇄n）—— 常显小徽标，挂节点下方（×N 占上方，同框口径） */
 #${HISTORY_TREE_ID} .htr-delta {
   position: absolute; top: auto; bottom: -7px; left: -8px; font-size: 8.5px; font-weight: 700; line-height: 11px;
@@ -7098,14 +7129,39 @@ function historyTreeRenderTree(entries) {
     // 统一母题内条堆：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰
     // 同 A：内条槽位与颜色取该提交自己的快照
     const _specB = historyBarsSpecFor(ent, globalBlocks, liveColors, singleBar);
-    node.appendChild(historyBarsBuild(_specB.names, _specB.fromHistory ? _specB.hitSet : hitSet,
-                                      _specB.colorMap, _specB.singleBar));
-    // ×N 徽标（合并提交；colW < 10 不渲染）
-    if (runsN > 1 && colW >= 10) {
-      const badge = document.createElement("span");
-      badge.className = "htr-runs";
-      badge.textContent = "×" + runsN;
-      node.appendChild(badge);
+    // 2026-10-26（任务 A）：提交树内条堆改横向分段（.hnode-bars-row）；历史刻度（historyBarTickMake）不加这个类，仍竖排。
+    // 槽位顺序不动：historyBarsBuild 按 _specB.names 顺序 for，_specB.names 就是 globalBlocks 顺序，横排只换排布方向。
+    const _barsEl = historyBarsBuild(_specB.names, _specB.fromHistory ? _specB.hitSet : hitSet,
+                                     _specB.colorMap, _specB.singleBar);
+    _barsEl.classList.add("hnode-bars-row");
+    // 2026-10-26（任务 B）兜底可辨性：横向也挤到无法分辨（可用宽度 / 框数 < 1px）时，只画「碰过的」段，
+    // 未碰的框不占位（DOM 顺序天然保留 globalBlocks 顺序）。可用宽度 = 本节点真实内容宽 = baseW - 左右边框（横向 padding 为 0）。
+    // 合并节点（.htr-tick-bulge）边框是 bwPx + 0.5，兜底判定要用实际值，不能拿基础值凑。
+    const _barBw = runsN > 1 ? bwPx + 0.5 : bwPx;
+    const _barAvail = Math.max(0, baseW - _barBw * 2);
+    const _barN = _barsEl.childElementCount;
+    if (_barN > 0 && _barAvail / _barN < 1) {
+      node.dataset.barsCompact = "1";
+      for (const _barEl of Array.from(_barsEl.children)) {
+        if (!_barEl.classList.contains("hnode-bar-on")) _barEl.remove();
+      }
+    }
+    node.appendChild(_barsEl);
+    // ×N 徽标（合并提交）。2026-10-26（任务 A）三级降级：
+    //   colW >= 10 → 照旧显示「×N」；6 <= colW < 10 → 画 2px 方点（title 挂「合并 N 次」）；
+    //   colW < 6 → 点都放不下，不画任何东西（次数由悬停气泡的「合并 N 次」行兼底，见任务 D）。
+    if (runsN > 1) {
+      if (colW >= 10) {
+        const badge = document.createElement("span");
+        badge.className = "htr-runs";
+        badge.textContent = "×" + runsN;
+        node.appendChild(badge);
+      } else if (colW >= 6) {
+        const dot = document.createElement("span");
+        dot.className = "htr-runs-dot";
+        dot.title = "合并 " + runsN + " 次"; // 徽标是子元素，可单独挂原生 title（节点本身 node.title = ""）
+        node.appendChild(dot);
+      }
     }
     // 2026-10-15 缺口一：变动符号（节点 ＋n/－n + 连线 ⇄n）—— 同刻度口径，挂节点左上角。
     const deltaTxt = historyDeltaSymbolText(ent);
@@ -8088,6 +8144,26 @@ function historyTreeBubbleShow(tick, ent) {
       b.appendChild(row);
     }
   }
+  // 2026-10-26（任务 D）：合并次数稳定出口 —— 不看 colW、不看节点宽，气泡里无条件给一行。
+  // 节点上的 ×N / 方点会随列宽降级甚至消失，这一行不会。
+  // 放在 delta 各组之后（先看改了什么，再看这条提交合了几次）；rendered 已在上方算完，不受影响。
+  const runs = ent && Array.isArray(ent.runs) ? ent.runs : [];
+  if (runs.length > 1) {
+    const row = document.createElement("div");
+    row.className = "htr-bub-row";
+    const tg = document.createElement("span");
+    tg.className = "htr-bub-tag";
+    tg.textContent = "合并";
+    const vl = document.createElement("div");
+    vl.className = "htr-bub-items";
+    vl.textContent = runs.length + " 次";
+    row.title = "合并 " + runs.length + " 次";
+    row.append(tg, vl);
+    b.appendChild(row);
+  }
+  // 注（2026-10-26）：原计划的「旧框名已不存在」提示行已撤回（未实现，也不要重加）—— 前提不成立：
+  // historyBarsSpecFor 用每条提交自己快照的 ent.blocks[].name 作条槽（fromHistory: true），
+  // 每个提交的色条数本来就等于它自己那个时刻的框数，与当前活图框名无关，不存在「对不上」。
   // 先隐藏挂入：需要 offsetWidth/offsetHeight 才能算定位
   b.style.visibility = "hidden";
   b.style.left = "0px";

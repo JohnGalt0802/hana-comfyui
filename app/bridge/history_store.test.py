@@ -584,8 +584,8 @@ class TestP5Purity(TempRootTestCase):
 
     def test_graph_sig_ignoring_seed_stable(self):
         sig = hs.graph_sig_ignoring_seed(self.SIG_GRAPH)
-        self.assertRegex(sig, r"^v3:[0-9a-f]{8}$")
-        self.assertEqual(sig, "v3:b832eb61")  # 跨语言一致基准（JS 侧同值，v3 起纳入 mode）
+        self.assertRegex(sig, r"^v4:[0-9a-f]{8}$")
+        self.assertEqual(sig, "v4:b740be6d")  # 跨语言一致基准（JS 侧同值；v4 = groups + 节点 explicit title）
         self.assertEqual(hs.graph_sig_ignoring_seed(self.SIG_GRAPH), sig)
 
     def test_graph_sig_v3_mode_sensitive(self):
@@ -699,6 +699,34 @@ class TestP5Purity(TempRootTestCase):
         self.assertIsNone(hs.compute_delta("x", {}))
         self.assertIsNone(hs.compute_delta([], {}))
 
+    # ── 2026-10-26（v4）：delta 把节点改名记为改动 ──────────────────────
+    def test_compute_delta_node_title_change(self):
+        """只改节点 title（type / widgets 全不动）→ changed 含 fields:["title"]。
+
+        John 已定「改节点 title 算一次真实改动」；悬停气泡会把 title 映射成「名字」。
+        """
+        prev = {"nodes": [{"id": 1, "type": "KSampler", "title": "旧名",
+                           "widgets_values_named": {"seed": 1, "steps": 20}}]}
+        nxt = {"nodes": [{"id": 1, "type": "KSampler", "title": "新名",
+                          "widgets_values_named": {"seed": 1, "steps": 20}}]}
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["changed"], [{"id": 1, "title": "新名", "fields": ["title"]}])
+        # 起名 / 删名（title 从无到有、从有到无）也算改名
+        no_title = {"nodes": [{"id": 1, "type": "KSampler", "widgets_values_named": {"steps": 20}}]}
+        named = {"nodes": [{"id": 1, "type": "KSampler", "title": "甲", "widgets_values_named": {"steps": 20}}]}
+        self.assertEqual(hs.compute_delta(no_title, named)["changed"],
+                         [{"id": 1, "title": "甲", "fields": ["title"]}])
+        self.assertEqual(hs.compute_delta(named, no_title)["changed"],
+                         [{"id": 1, "title": "KSampler", "fields": ["title"]}])
+        # 纯改 type（两侧都没显式 title）→ 只报 type，不重复报 title
+        a = {"nodes": [{"id": 1, "type": "A"}]}
+        b = {"nodes": [{"id": 1, "type": "B"}]}
+        self.assertEqual(hs.compute_delta(a, b)["changed"], [{"id": 1, "title": "B", "fields": ["type"]}])
+        # title 与 widgets 同时变 → title 在列表里（顺序 type → mode → title → widgets）
+        c = {"nodes": [{"id": 1, "type": "A", "title": "x", "widgets_values_named": {"steps": 1}}]}
+        e = {"nodes": [{"id": 1, "type": "A", "title": "y", "widgets_values_named": {"steps": 2}}]}
+        self.assertEqual(hs.compute_delta(c, e)["changed"], [{"id": 1, "title": "y", "fields": ["title", "steps"]}])
+
     def test_should_merge_with_head(self):
         self.assertTrue(hs.should_merge_with_head("abc", "abc"))
         self.assertFalse(hs.should_merge_with_head("abc", "abd"))
@@ -732,7 +760,194 @@ class TestP5Purity(TempRootTestCase):
             {"id": 1, "type": "PrimitiveInt", "widgets_values": [1024]},
             {"id": 2, "type": "KSampler", "widgets_values_named": {"seed": 123, "sampler_name": "euler", "steps": 20}},
         ]}
-        self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "v3:dd0db49c")
+        self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "v4:9c90ed0e")
+
+    # ── 2026-10-26（v4）：groups 进签名 ─────────────────────────────────
+    @staticmethod
+    def _sig_base():
+        return {
+            "nodes": [
+                {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 20}},
+                {"id": 2, "type": "VAEDecode"},
+            ],
+            "links": [],
+            "groups": [{"id": 1, "title": "G", "color": "#3f789e", "bounding": [11, -100, 398.897, 349.751], "flags": {}}],
+        }
+
+    def test_graph_sig_v4_group_color_change(self):
+        """只改框颜色（节点完全不动）→ 签名必须变。
+
+        这是本版修的原始症状：修前签名不含 groups → 只改框色被判成「图没变」→ 合并
+        → delta 不生成 → 色条永远不亮。
+        """
+        import copy
+
+        base = self._sig_base()
+        s0 = hs.graph_sig_ignoring_seed(base)
+        recolored = copy.deepcopy(base)
+        recolored["groups"][0]["color"] = "#a85a5a"
+        s1 = hs.graph_sig_ignoring_seed(recolored)
+        self.assertRegex(s1, r"^v4:[0-9a-f]{8}$")
+        self.assertNotEqual(s1, s0, "只改框颜色应改签名")
+        # 颜色大小写差异规范化后同色 → 签名不变（与 delta 侧 _canon_group_color 同口径）
+        same_case = copy.deepcopy(base)
+        same_case["groups"][0]["color"] = "#3F789E"
+        self.assertEqual(hs.graph_sig_ignoring_seed(same_case), s0)
+
+    def test_graph_sig_v4_group_bounding_change(self):
+        """只改框范围（bounding 微移 1px）→ 签名必须变。"""
+        import copy
+
+        base = self._sig_base()
+        s0 = hs.graph_sig_ignoring_seed(base)
+        moved = copy.deepcopy(base)
+        moved["groups"][0]["bounding"] = [11, -100, 399.897, 349.751]
+        s1 = hs.graph_sig_ignoring_seed(moved)
+        self.assertNotEqual(s1, s0, "只改框范围应改签名")
+        # 整数型 float 与整数同值 → 签名不变（_canon_group_bounding 口径）
+        same_val = copy.deepcopy(base)
+        same_val["groups"][0]["bounding"] = [11.0, -100.0, 398.897, 349.751]
+        self.assertEqual(hs.graph_sig_ignoring_seed(same_val), s0)
+
+    def test_graph_sig_v4_group_title_change(self):
+        """只改框名 → 签名必须变（改框名也是一次真实改动）。"""
+        import copy
+
+        base = self._sig_base()
+        s0 = hs.graph_sig_ignoring_seed(base)
+        renamed = copy.deepcopy(base)
+        renamed["groups"][0]["title"] = "H"
+        s1 = hs.graph_sig_ignoring_seed(renamed)
+        self.assertNotEqual(s1, s0, "只改框名应改签名")
+
+    def test_graph_sig_v4_group_unchanged(self):
+        """框全都没变 → 签名不变；无 groups 键与 groups:[] 同串；非对象框项被忽略。"""
+        import copy
+
+        base = self._sig_base()
+        s0 = hs.graph_sig_ignoring_seed(base)
+        self.assertEqual(hs.graph_sig_ignoring_seed(copy.deepcopy(base)), s0)
+        # groups 缺失 / 空数组 → groups_part 同为 ""（不因键缺失改签名）
+        no_groups = copy.deepcopy(base)
+        no_groups.pop("groups")
+        empty_groups = copy.deepcopy(base)
+        empty_groups["groups"] = []
+        self.assertEqual(hs.graph_sig_ignoring_seed(no_groups), hs.graph_sig_ignoring_seed(empty_groups))
+        # 非对象框项剔除（与 _groups_by_title 一致）
+        junk = copy.deepcopy(base)
+        junk["groups"] = ["bad", None, base["groups"][0]]
+        self.assertEqual(hs.graph_sig_ignoring_seed(junk), s0)
+
+    def test_graph_sig_v4_group_order_and_missing_fields(self):
+        """框顺序参与签名（按 graph.groups 顺序）；title/bounding 缺失按 "" 处理。"""
+        import copy
+
+        base = self._sig_base()
+        base["groups"] = [
+            {"id": 1, "title": "A", "color": "#111111", "bounding": [0, 0, 10, 10]},
+            {"id": 2, "title": "B", "color": "#222222", "bounding": [0, 0, 20, 20]},
+        ]
+        s0 = hs.graph_sig_ignoring_seed(base)
+        swapped = copy.deepcopy(base)
+        swapped["groups"] = list(reversed(swapped["groups"]))
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(swapped), s0, "框顺序应参与签名")
+        # 缺 title / 缺 color / 非法 bounding → 各自按 "" 参与，不报错
+        bare = copy.deepcopy(base)
+        bare["groups"] = [{"id": 1, "title": "A", "color": "#111111", "bounding": [0, 0, 10, 10]},
+                          {"id": 2}]
+        s_bare = hs.graph_sig_ignoring_seed(bare)
+        self.assertRegex(s_bare, r"^v4:[0-9a-f]{8}$")
+        self.assertNotEqual(s_bare, s0)
+        # bounding 非法 vs 缺失 → 同串（都归 ""）
+        bad = copy.deepcopy(bare)
+        bad["groups"][1]["bounding"] = "not-an-array"
+        self.assertEqual(hs.graph_sig_ignoring_seed(bad), s_bare)
+
+    # ── 2026-10-26（v4 补）：节点 explicit title 进签名 ────────────────
+    def test_graph_sig_v4_node_title_change(self):
+        """只改节点 title（type / mode / widgets 全不动）→ 签名必须变。
+
+        修前：delta 已把改名记为 fields:["title"]，但签名不含 title → kind=run 的
+        改名仍被判成「图没变」而合并 → delta 根本不生成，等于白记。
+        """
+        import copy
+
+        base = self._sig_base()
+        base["nodes"][0]["title"] = "旧名"
+        s0 = hs.graph_sig_ignoring_seed(base)
+        renamed = copy.deepcopy(base)
+        renamed["nodes"][0]["title"] = "新名"
+        s1 = hs.graph_sig_ignoring_seed(renamed)
+        self.assertRegex(s1, r"^v4:[0-9a-f]{8}$")
+        self.assertNotEqual(s1, s0, "只改节点 title 应改签名")
+        # 删名（有 → 无）同样改签名
+        unnamed = copy.deepcopy(base)
+        unnamed["nodes"][0].pop("title")
+        s_unnamed = hs.graph_sig_ignoring_seed(unnamed)
+        self.assertNotEqual(s_unnamed, s0, "删名应改签名")
+
+    def test_graph_sig_v4_node_title_missing_equals_empty(self):
+        """节点 title 缺失与空串等价（都归 ""）；非法 title（非字符串）同样归 ""。"""
+        import copy
+
+        plain = self._sig_base()
+        s_plain = hs.graph_sig_ignoring_seed(plain)
+        missing = copy.deepcopy(plain)
+        missing["nodes"][0].pop("title", None)
+        empty = copy.deepcopy(plain)
+        empty["nodes"][0]["title"] = ""
+        self.assertEqual(hs.graph_sig_ignoring_seed(missing), s_plain)
+        self.assertEqual(hs.graph_sig_ignoring_seed(empty), s_plain)
+        self.assertEqual(hs.graph_sig_ignoring_seed(missing), hs.graph_sig_ignoring_seed(empty))
+        for bad in (None, 123, {}, []):
+            g = copy.deepcopy(plain)
+            g["nodes"][0]["title"] = bad
+            self.assertEqual(hs.graph_sig_ignoring_seed(g), s_plain, "非法 title %r 应归空串" % (bad,))
+
+    def test_graph_sig_v4_pure_type_change_uses_explicit_title(self):
+        """签名用 _explicit_title（不用 _node_title）：显式 title 相同、只换 type → 只差在 type 位。"""
+        import copy
+
+        a = {"nodes": [{"id": 1, "type": "A", "title": "同名", "widgets_values": [1]}]}
+        b = copy.deepcopy(a)
+        b["nodes"][0]["type"] = "B"
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(a), hs.graph_sig_ignoring_seed(b))
+        # 两侧都无 title 时，节点段 title 位恒为 ""（补一个空串 title 不改签名）
+        c = {"nodes": [{"id": 1, "type": "A", "widgets_values": [1]}]}
+        c2 = copy.deepcopy(c)
+        c2["nodes"][0]["title"] = ""
+        self.assertEqual(hs.graph_sig_ignoring_seed(c), hs.graph_sig_ignoring_seed(c2))
+
+    # ── 2026-10-26（v4）：seed 忽略改精确匹配 ────────────────────────────
+    def test_graph_sig_seed_ignore_exact_names_only(self):
+        """seed / noise_seed 忽略；seed_mode 等含 seed 字样的普通参数**必须**参与签名。
+
+        修前 _SEED_WIDGET_RE = re.compile("seed") 是子串匹配，seed_mode 被静默吞掉；
+        种子快照那边用的是精确名 ("seed", "noise_seed")，两边口径不一致。
+        """
+        import copy
+
+        base = {"nodes": [{"id": 1, "type": "KSampler",
+                           "widgets_values_named": {"seed": 1, "noise_seed": 2, "seed_mode": "randomize", "steps": 20}}]}
+        s0 = hs.graph_sig_ignoring_seed(base)
+        seed_changed = copy.deepcopy(base)
+        seed_changed["nodes"][0]["widgets_values_named"]["seed"] = 999999
+        self.assertEqual(hs.graph_sig_ignoring_seed(seed_changed), s0, "seed 变化应忽略")
+        noise_changed = copy.deepcopy(base)
+        noise_changed["nodes"][0]["widgets_values_named"]["noise_seed"] = 888888
+        self.assertEqual(hs.graph_sig_ignoring_seed(noise_changed), s0, "noise_seed 变化应忽略")
+        mode_changed = copy.deepcopy(base)
+        mode_changed["nodes"][0]["widgets_values_named"]["seed_mode"] = "fixed"
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(mode_changed), s0, "seed_mode 变化必须改签名（子串 bug 已修）")
+        # dict 型 widgets_values 上的同名忽略 / 敏感性一致
+        base_d = {"nodes": [{"id": 1, "type": "K", "widgets_values": {"seed": 1, "seed_mode": "randomize"}}]}
+        sd0 = hs.graph_sig_ignoring_seed(base_d)
+        d_seed = copy.deepcopy(base_d)
+        d_seed["nodes"][0]["widgets_values"]["seed"] = 5
+        self.assertEqual(hs.graph_sig_ignoring_seed(d_seed), sd0)
+        d_mode = copy.deepcopy(base_d)
+        d_mode["nodes"][0]["widgets_values"]["seed_mode"] = "fixed"
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(d_mode), sd0)
 
 
 class TestP5bWiring(TempRootTestCase):
@@ -1644,6 +1859,270 @@ class TestBlockNames(TempRootTestCase):
         with open(path, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), before)
         self.assertNotIn("blockNames", before)
+
+
+class TestGroupDelta(TempRootTestCase):
+    """2026-10-26：delta 增加 groups 维度（框颜色 / 框名 / 框范围）+ 框级命中。
+
+    匹配口径：按 title 对齐；fields 固定 color / bounding（改名走 removed+added）。
+    全部落 tempfile，不碰真实 .history。
+    """
+
+    WF = "wf"
+
+    @staticmethod
+    def graph(groups=None, nodes=None):
+        return {
+            "nodes": nodes if nodes is not None else [
+                {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 20}},
+                {"id": 2, "type": "VAEDecode"},
+            ],
+            "links": [],
+            "groups": groups if groups is not None else [],
+        }
+
+    @staticmethod
+    def group(title="G", color="#3f789e", bounding=None):
+        return {"id": 1, "title": title, "color": color,
+                "bounding": bounding if bounding is not None else [11, -100, 398.89737130223807, 349.751277854283],
+                "flags": {}}
+
+    def blocks_of(self, *pairs):
+        return [{"name": n, "source": "group", "nodeIds": list(ids)} for n, ids in pairs]
+
+    def block_names(self, entries):
+        path = os.path.join(self.root, "workflows", ".history", self.WF, hs.INDEX_FILE_NAME)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n")
+        listed = hs.list_commits(self.WF, self.root)
+        self.assertTrue(listed["ok"])
+        return [e.get("blockNames") for e in listed["entries"]]
+
+    @staticmethod
+    def entry(seq, blocks, delta):
+        return {"seq": seq, "file": "%04d-p%d.json" % (seq, seq), "promptId": "p%d" % seq,
+                "at": "2026-10-26T00:00:00.000Z", "source": "user", "kind": "run",
+                "blocks": blocks, "delta": delta}
+
+    # ── 契约形状 ────────────────────────────────────────────────────────
+    def test_groups_key_always_present(self):
+        d = hs.compute_delta(self.graph(), self.graph())
+        self.assertIn("groups", d)
+        self.assertEqual(d["groups"], {"changed": [], "added": [], "removed": []})
+        # prev 非法 → 整体 None（维持现状）
+        self.assertIsNone(hs.compute_delta(None, self.graph()))
+        # 图里没有 groups 键 → groups 三组空（不报错）
+        self.assertEqual(hs.compute_delta({"nodes": []}, {"nodes": []})["groups"],
+                         {"changed": [], "added": [], "removed": []})
+
+    # ① 只改框颜色（节点完全不动）
+    def test_color_only(self):
+        prev = self.graph(groups=[self.group(color="#3f789e")])
+        nxt = self.graph(groups=[self.group(color="#a85a5a")])
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["changed"], [])
+        self.assertEqual(d["added"], [])
+        self.assertEqual(d["removed"], [])
+        self.assertEqual(d["groups"]["changed"], [{"name": "G", "fields": ["color"]}])
+        self.assertEqual(d["groups"]["added"], [])
+        self.assertEqual(d["groups"]["removed"], [])
+        # 大小写差异不算变色（规范化后同串）
+        same = self.graph(groups=[self.group(color="#3F789E")])
+        self.assertEqual(hs.compute_delta(prev, same)["groups"]["changed"], [])
+
+    # ② 只改框名 → removed(旧) + added(新)，changed 不含
+    def test_rename_only(self):
+        prev = self.graph(groups=[self.group(title="旧名")])
+        nxt = self.graph(groups=[self.group(title="新名")])
+        g = hs.compute_delta(prev, nxt)["groups"]
+        self.assertEqual(g["changed"], [])
+        self.assertEqual(g["removed"], [{"name": "旧名"}])
+        self.assertEqual(g["added"], [{"name": "新名"}])
+
+    # ③ 只改框范围 → fields 含 bounding
+    def test_bounding_only(self):
+        prev = self.graph(groups=[self.group(bounding=[0, 0, 100, 200])])
+        nxt = self.graph(groups=[self.group(bounding=[0, 0, 101, 200])])
+        g = hs.compute_delta(prev, nxt)["groups"]
+        self.assertEqual(g["changed"], [{"name": "G", "fields": ["bounding"]}])
+        # 数值规范化（整数型 float 不用小数尾巴）：11.0 与 11、-0.0 与 0 不算变化
+        a = self.graph(groups=[self.group(bounding=[11, -100, 398.897, 349.751])])
+        b = self.graph(groups=[self.group(bounding=[11.0, -100.0, 398.897, 349.751])])
+        self.assertEqual(hs.compute_delta(a, b)["groups"]["changed"], [])
+        z = self.graph(groups=[self.group(bounding=[-0.0, 0.0, 10, 10])])
+        z2 = self.graph(groups=[self.group(bounding=[0, 0, 10, 10])])
+        self.assertEqual(hs.compute_delta(z, z2)["groups"]["changed"], [])
+        # 真实几何位移仍然算变化（不能把任何小数差都当尾差吞掉）
+        c = self.graph(groups=[self.group(bounding=[11, -100, 398.897, 349.751])])
+        d2 = self.graph(groups=[self.group(bounding=[11, -100, 398.898, 349.751])])
+        self.assertEqual(hs.compute_delta(c, d2)["groups"]["changed"],
+                         [{"name": "G", "fields": ["bounding"]}])
+
+    # 颜色 + 范围同时改 → fields 两个都在（顺序 color → bounding）
+    def test_color_and_bounding_together(self):
+        prev = self.graph(groups=[self.group(color="#3f789e", bounding=[0, 0, 10, 10])])
+        nxt = self.graph(groups=[self.group(color="#ffffff", bounding=[0, 0, 20, 10])])
+        self.assertEqual(hs.compute_delta(prev, nxt)["groups"]["changed"],
+                         [{"name": "G", "fields": ["color", "bounding"]}])
+
+    # ④ 框和节点都没变 → groups 三组全空，且原有 changed 仍为空
+    def test_no_change_keeps_node_delta_empty(self):
+        prev = self.graph(groups=[self.group()])
+        nxt = self.graph(groups=[self.group()])
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["changed"], [])
+        self.assertEqual(d["groups"], {"changed": [], "added": [], "removed": []})
+
+    # ⑤ 框变了 + 节点也变了 → 两组都记；blockNames 取并集
+    def test_node_and_group_both_changed(self):
+        prev = self.graph(groups=[self.group(color="#3f789e")])
+        nxt = self.graph(groups=[self.group(color="#a85a5a")], nodes=[
+            {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 30}},
+            {"id": 2, "type": "VAEDecode"},
+        ])
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["changed"], [{"id": 1, "title": "KSampler", "fields": ["steps"]}])
+        self.assertEqual(d["groups"]["changed"], [{"name": "G", "fields": ["color"]}])
+        blocks = self.blocks_of(("G", [1]), ("H", [2]))
+        self.assertEqual(self.block_names([self.entry(1, blocks, d)]), [["G"]])
+        # 节点只碰 H、框只碰 G → 并集两个都亮
+        d2 = hs.compute_delta(prev, self.graph(groups=[self.group(color="#a85a5a")], nodes=[
+            {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 1, "steps": 20}},
+            {"id": 2, "type": "VAEDecode2"},
+        ]))
+        self.assertEqual(d2["changed"], [{"id": 2, "title": "VAEDecode2", "fields": ["type"]}])
+        self.assertEqual(self.block_names([self.entry(1, blocks, d2)]), [["G", "H"]])
+
+    # 框级命中：只改框色（节点零改动）→ blockNames 命中该框
+    def test_block_names_hit_by_group_change_only(self):
+        prev = self.graph(groups=[self.group(color="#3f789e")])
+        nxt = self.graph(groups=[self.group(color="#a85a5a")])
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["changed"], [])  # 节点确实一个都没动
+        blocks = self.blocks_of(("G", [1, 2]), ("H", [99]))
+        self.assertEqual(self.block_names([self.entry(1, blocks, d)]), [["G"]])
+
+    # added 的框：在 blocks 里 → 命中；不在 blocks 里 → 忽略
+    def test_block_names_added_group(self):
+        prev = self.graph(groups=[])
+        nxt = self.graph(groups=[self.group(title="新框")])
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["groups"]["added"], [{"name": "新框"}])
+        self.assertEqual(self.block_names([self.entry(1, self.blocks_of(("新框", [1])), d)]), [["新框"]])
+        self.assertEqual(self.block_names([self.entry(2, self.blocks_of(("别的框", [1])), d)]), [[]])
+
+    # removed 的框：不算命中（框已不在画布，没有小条可亮）
+    def test_block_names_removed_group_not_hit(self):
+        prev = self.graph(groups=[self.group(title="旧框")])
+        nxt = self.graph(groups=[])
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["groups"]["removed"], [{"name": "旧框"}])
+        self.assertEqual(self.block_names([self.entry(1, self.blocks_of(("旧框", [1])), d)]), [[]])
+
+    # ⑥ 旧条目（delta 无 groups 键）→ 行为与加本维度前完全一致
+    def test_legacy_delta_without_groups_unchanged(self):
+        blocks = self.blocks_of(("A", [1]), ("B", [2]))
+        # 无 groups 键 + 节点 id 命中 → 照旧命中
+        self.assertEqual(self.block_names([self.entry(1, blocks, {
+            "changed": [{"id": 1}], "added": [], "removed": []})]), [["A"]])
+        # 无 groups 键 + 节点 id 未命中 → []（不是 None）
+        self.assertEqual(self.block_names([self.entry(2, blocks, {
+            "changed": [{"id": 99}], "added": [], "removed": []})]), [[]])
+        # groups 形态异常（非 dict）→ 忽略框级判据，不影响原判据
+        self.assertEqual(self.block_names([self.entry(3, blocks, {
+            "changed": [{"id": 2}], "added": [], "removed": [], "groups": "x"})]), [["B"]])
+        # 三态不变：旧数据 delta 非 dict → None
+        self.assertEqual(self.block_names([{"seq": 4, "file": "0004-p4.json", "promptId": "p4",
+                                           "blocks": blocks}]), [None])
+
+    # 端到端：真实 commit 只改框色 → 索引行带 groups → blockNames 命中
+    # 2026-10-26（v4）：签名已纳入 groups，框色改动本身就是一次真改动 → kind=run 也不会合并；
+    # 本用例仍用 kind=save 只是因为它是「必走新建节点」的最稳路径（见下一个用例的 kind=run 验证）。
+    def test_commit_flow_group_color_only(self):
+        g1 = self.graph(groups=[self.group(color="#3f789e")])
+        g2 = self.graph(groups=[self.group(color="#a85a5a")])
+        blocks = self.blocks_of(("G", [1, 2]))
+        self.commit({"workflow": "wfg", "graph": g1, "promptId": "p1", "blocks": blocks})
+        out = self.commit({"workflow": "wfg", "graph": g2, "promptId": "p2", "blocks": blocks, "kind": "save"})
+        self.assertFalse(out.get("merged"))
+        listed = hs.list_commits("wfg", self.root)
+        self.assertEqual(len(listed["entries"]), 2)
+        self.assertIsNone(listed["entries"][0]["blockNames"])
+        self.assertEqual(listed["entries"][1]["blockNames"], ["G"])
+        # 索引行确实带 groups（落盘可查）
+        path = os.path.join(self.root, "workflows", ".history", "wfg", hs.INDEX_FILE_NAME)
+        with open(path, encoding="utf-8") as fh:
+            rows = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+        self.assertEqual(rows[1]["delta"]["groups"]["changed"], [{"name": "G", "fields": ["color"]}])
+
+    # 多个框：按 blocks 顺序输出，不重不漏
+    def test_multiple_groups_ordered_by_blocks(self):
+        prev = self.graph(groups=[self.group(title="Z", color="#111111"), self.group(title="A", color="#222222")])
+        nxt = self.graph(groups=[self.group(title="Z", color="#333333"), self.group(title="A", color="#444444")])
+        d = hs.compute_delta(prev, nxt)
+        self.assertEqual(d["groups"]["changed"],
+                         [{"name": "A", "fields": ["color"]}, {"name": "Z", "fields": ["color"]}])
+        blocks = self.blocks_of(("Z", [1]), ("A", [2]))
+        self.assertEqual(self.block_names([self.entry(1, blocks, d)]), [["Z", "A"]])
+
+    # ⑦ 端到端（v4 核心）：只改框颜色 + kind=run → **不再合并**，产生新节点且 delta.groups 有内容
+    # 修前：签名不含 groups → 只改框色时 sig 不变 → 走 merge 分支 → delta 根本不生成 → 色条永远不亮。
+    def test_commit_run_group_color_only_not_merged(self):
+        g1 = self.graph(groups=[self.group(color="#3f789e")])
+        g2 = self.graph(groups=[self.group(color="#a85a5a")])
+        blocks = self.blocks_of(("G", [1, 2]))
+        out1 = self.commit({"workflow": "wfrun", "graph": g1, "promptId": "p1", "blocks": blocks, "kind": "run"})
+        self.assertTrue(out1["ok"])
+        self.assertFalse(out1.get("merged"))
+        out2 = self.commit({"workflow": "wfrun", "graph": g2, "promptId": "p2", "blocks": blocks, "kind": "run"})
+        self.assertTrue(out2["ok"])
+        self.assertFalse(out2.get("merged"), "只改框颜色不应被判成「图没变」而合并")
+        # 索引里多一行主行（不是 mergeInto 行），且该行 delta.groups.changed 有内容
+        path = os.path.join(self.root, "workflows", ".history", "wfrun", hs.INDEX_FILE_NAME)
+        with open(path, encoding="utf-8") as fh:
+            rows = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("mergeInto", rows[1])
+        self.assertEqual(rows[1]["parent"], 1)
+        self.assertEqual(rows[1]["delta"]["groups"]["changed"], [{"name": "G", "fields": ["color"]}])
+        # list_commits 两条主行，后一条 blockNames 命中该框（色条能亮）
+        listed = hs.list_commits("wfrun", self.root)
+        self.assertEqual(len(listed["entries"]), 2)
+        self.assertIsNone(listed["entries"][0]["blockNames"])
+        self.assertEqual(listed["entries"][1]["blockNames"], ["G"])
+
+    # ⑧ 端到端（v4 补）：只改节点名 + kind=run → **不再合并**，新节点且 delta.changed 含 fields:["title"]
+    # 修前：delta 已能记 title，但签名不含 title → run 改名走 merge 分支 → delta 根本不生成。
+    def test_commit_run_node_rename_not_merged(self):
+        g1 = self.graph(nodes=[
+            {"id": 1, "type": "KSampler", "title": "旧名", "widgets_values_named": {"seed": 1, "steps": 20}},
+            {"id": 2, "type": "VAEDecode"},
+        ])
+        g2 = self.graph(nodes=[
+            {"id": 1, "type": "KSampler", "title": "新名", "widgets_values_named": {"seed": 1, "steps": 20}},
+            {"id": 2, "type": "VAEDecode"},
+        ])
+        out1 = self.commit({"workflow": "wfname", "graph": g1, "promptId": "n1", "kind": "run"})
+        self.assertTrue(out1["ok"])
+        self.assertFalse(out1.get("merged"))
+        out2 = self.commit({"workflow": "wfname", "graph": g2, "promptId": "n2", "kind": "run"})
+        self.assertTrue(out2["ok"])
+        self.assertFalse(out2.get("merged"), "只改节点名不应被判成「图没变」而合并")
+        # 索引里多一行主行（非 mergeInto），parent=1，delta.changed 含 fields:["title"]
+        path = os.path.join(self.root, "workflows", ".history", "wfname", hs.INDEX_FILE_NAME)
+        with open(path, encoding="utf-8") as fh:
+            rows = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("mergeInto", rows[1])
+        self.assertEqual(rows[1]["parent"], 1)
+        self.assertEqual(rows[1]["delta"]["changed"],
+                         [{"id": 1, "title": "新名", "fields": ["title"]}])
+        # 两次的 sig 必须不同
+        self.assertNotEqual(rows[0]["sig"], rows[1]["sig"])
+        self.assertRegex(rows[1]["sig"], r"^v4:[0-9a-f]{8}$")
+        # list_commits 两条主行
+        self.assertEqual(len(hs.list_commits("wfname", self.root)["entries"]), 2)
 
 
 class TestMigrateHistory(TempRootTestCase):

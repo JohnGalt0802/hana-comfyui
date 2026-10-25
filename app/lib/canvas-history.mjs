@@ -231,8 +231,10 @@ function canonJson(v) {
   return "null";
 }
 
-// seed 类 widget 名（seed / noise_seed / rand_seed …）
-const SEED_WIDGET_RE = /seed/i;
+// seed 忽略名单（**精确名**，不做子串匹配；与 Python _SEED_WIDGET_NAMES / 种子快照同口径）。
+// 2026-10-26（v4 修 bug）：原先是 /seed/i 子串匹配，把 seed_mode / noise_seed_strength
+// 这类含 seed 字样的普通参数也一并忽略 → 改这些参数签名不变、被误判成「图没变」而合并。
+const SEED_WIDGET_NAMES = new Set(["seed", "noise_seed"]);
 
 /** 节点 widget 段串：优先 widgets_values_named（可按名跳过 seed 类）；否则按位置 widgets_values。 */
 function widgetsPart(node) {
@@ -240,7 +242,7 @@ function widgetsPart(node) {
   let out = "";
   if (named && Object.keys(named).length) {
     for (const k of Object.keys(named)) {
-      if (SEED_WIDGET_RE.test(k)) continue;
+      if (SEED_WIDGET_NAMES.has(k)) continue;
       out += `${k}=${canonValue(named[k])};`;
     }
     return out;
@@ -250,7 +252,7 @@ function widgetsPart(node) {
     for (let i = 0; i < wv.length; i++) out += `widget_${i}=${canonValue(wv[i])};`;
   } else if (isPlainObject(wv)) {
     for (const k of Object.keys(wv)) {
-      if (SEED_WIDGET_RE.test(k)) continue;
+      if (SEED_WIDGET_NAMES.has(k)) continue;
       out += `${k}=${canonValue(wv[k])};`;
     }
   }
@@ -332,14 +334,29 @@ function linkDesc(ep, byId) {
 }
 
 /**
- * 归一化画布签名（忽略 seed 类 widget；v2 起纳入连线端点对）。
- * 口径（v2）：节点部分 = 按 `graph.nodes` 数组顺序，逐节点 `type + "|" + widget 段`，各节点段先
- * fnv1a，再以 "|" 串接；连线部分 = 全部端点串（`originId:originSlot>targetId:targetSlot`）
- * 排序后以 "," 拼接；最终 `"v2:" + fnv1a(节点部分 + "#L#" + 连线部分)`，输出 8 位小写 hex。
- * 与桥 js `graphSignature()` 同族但**更简化**（不含 mode/title/位置；不含节点 id）。
- * 口径版本前缀：旧数据无 `v2:` 前缀 → 判为不可比 → 不合并（一次性代价）。
+ * 归一化画布签名（忽略 seed 类 widget；v2 纳入连线端点对；v3 纳入节点 mode；
+ * v4 纳入分组框 + 节点 explicit title）。
+ *
+ * 口径（v4，与 Python graph_sig_ignoring_seed 逐字同源）：
+ *   nodesPart  = 每个节点 fnv1a(`${type}|${mode}|${title}|${widgetsPart(n)}`)，按 graph.nodes 顺序以 "|" 连接；
+ *                v4 起节点段含 **explicit title**（取值口径 = explicitTitle：只认非空字符串 title，
+ *                缺失/空串均归一为 ""）。**不用 nodeTitle** —— 那个用 type 兜底，会让「纯改 type」
+ *                被重复计入成 title 变化，与 delta 侧口径分叉。
+ *   groupsPart = 每个框 fnv1a(`${title}|${color}|${bounding}`)，按 graph.groups 顺序以 "|" 连接
+ *   linksPart  = 全部端点串（`originId:originSlot>targetId:targetSlot`）排序后以 "," 拼接
+ *   结果       = `v4:` + fnv1a(nodesPart + "#G#" + groupsPart + "#L#" + linksPart)，8 位小写 hex
+ * 与桥 js `graphSignature()` 同族但更简化（不含位置；不含节点 id）。
+ * 口径版本前缀：旧数据无前缀 / v2: / v3: → 判为不可比 → 不合并（一次性代价）。
+ *
+ * 2026-10-26（v2 → v3）：纳入 mode。原先不含 mode 导致 bypass(=4) / mute(=2) 不参与签名，
+ * 关掉一个模块后签名不变 → 被判成「图没变」而合并。mode 缺失 / 非数字 → 按 0。
+ * 2026-10-26（v3 → v4）：纳入 groups（框名 / 框色 / 框范围）。原先不含 groups，只改框颜色
+ * 时签名不变 → 合并 → delta 不生成 → 色条永远不亮。
+ * 2026-10-26（同日补进 v4）：节点段加 explicit title。delta 已把「改节点名」记为 fields:["title"]，
+ * 但签名不含 title 时改名的 run 仍会被合并 → delta 根本不产生，等于白记。
+ * 取名口径与 delta 侧完全一致（同一个 explicitTitle）；未发布，故不升版本号。
  * @param {object} graph UI 格式画布
- * @returns {string} `v2:` + 8 位 hex
+ * @returns {string} `v4:` + 8 位 hex
  */
 export function graphSigIgnoringSeed(graph) {
   const g = isPlainObject(graph) ? graph : {};
@@ -352,9 +369,10 @@ export function graphSigIgnoringSeed(graph) {
     // 关掉一个模块后签名不变 → 被判成「图没变」而合并。mode 缺失 / 非数字 → 按 0。
     const modeRaw = Number(n.mode == null ? 0 : n.mode);
     const mode = Number.isFinite(modeRaw) ? Math.trunc(modeRaw) : 0;
-    parts.push(fnv1aHex(`${type}|${mode}|${widgetsPart(n)}`));
+    parts.push(fnv1aHex(`${type}|${mode}|${explicitTitle(n)}|${widgetsPart(n)}`));
   }
-  return `v3:${fnv1aHex(parts.join("|") + "#L#" + linksPart(g))}`;
+  const payload = `${parts.join("|")}#G#${groupsPart(g)}#L#${linksPart(g)}`;
+  return `v4:${fnv1aHex(payload)}`;
 }
 
 /** id → 节点（跳过无 id / 非对象）。 */
@@ -373,6 +391,12 @@ function indexNodesById(graph) {
 function nodeTitle(n) {
   if (typeof n.title === "string" && n.title) return n.title;
   return n.type == null ? "" : String(n.type);
+}
+
+/** 节点显式名（只认非空字符串 title，不拿 type 兜底）；供「改名」判定区分
+ * 「真取名」与「名字就是 type」。与 Python _explicit_title 同口径。 */
+function explicitTitle(n) {
+  return typeof n.title === "string" && n.title ? n.title : "";
 }
 
 /** 节点 widget 名/值对（named 优先命名，否则位置命名 widget_<i>）。 */
@@ -417,11 +441,115 @@ function cmpId(a, b) {
   return sa < sb ? -1 : sa > sb ? 1 : 0;
 }
 
+// ── 分组框归一化（delta 的 groups 维度用；2026-10-26）──────────────────────
+// 框字段固定三种：color（框颜色）/ title（框名）/ bounding（框范围 x,y,w,h）。
+// 快照里分组真实形态（实测 0246-f0f6fb81.json 的 graph.groups）：
+//   {"id":1, "title":"① 模型加载｜MOSS 权重", "bounding":[11,-100,398.897...,349.751...],
+//    "color":"#3f789e", "flags":{}}
+// 匹配口径：按 title 对齐（同 title 视为同一个框）；标题被改 → removed(旧名) + added(新名）。
+
+/** 框颜色规范化：非字符串 → ""；字符串去首尾空白并小写（#3F789E 与 #3f789e 视为同色）。 */
+function canonGroupColor(v) {
+  return typeof v === "string" ? v.trim().toLowerCase() : "";
+}
+
 /**
- * 对比两画布（UI 格式），相对 prev 算四类变化（节点三类 + 连线一类）。
+ * 框范围规范化：数组逐项过 canonValue（String(Number)，与 Python _canon_value 同串）
+ * 后按紧凑 JSON 串比较；非数组 → ""（缺失与非法同形）。
+ *
+ * 为何不用「保留 N 位小数」：Python "%.3f" 是 round-half-even、JS toFixed 是 round-half-up，
+ * 在恰好 0.0005 这类 tie 上会给不同串（0.0625 → "0.062" vs "0.063"），跨语言就不一致了。
+ * canonValue 两侧算法（最短往返 / Number.toString）等价，无此问题。
+ */
+function canonGroupBounding(v) {
+  if (!Array.isArray(v)) return "";
+  return canonValue(v.map(canonValue));
+}
+
+/** 同 title 两框的字段变化名（固定顺序 color → bounding；title 不参与，改名走 removed+added）。 */
+function changedGroupFields(a, b) {
+  const fields = [];
+  if (canonGroupColor(a.color) !== canonGroupColor(b.color)) fields.push("color");
+  if (canonGroupBounding(a.bounding) !== canonGroupBounding(b.bounding)) fields.push("bounding");
+  return fields;
+}
+
+/**
+ * 签名的分组框部分（v4）：按 graph.groups 顺序，每个框出一段 `${title}|${color}|${bounding}`，
+ * 每段先 fnv1a，再以 "|" 串接（与 nodesPart 同构）。
+ *
+ * 规范化**直接复用** delta 侧的 canonGroupColor / canonGroupBounding（与 Python 复用
+ * _canon_group_color / _canon_group_bounding 对应），保证签名与 delta 口径不会分叉：
+ *   · title 缺失 → ""（String 化，不做 trim；与 groupsByTitle 对齐）
+ *   · color   → 去首尾空白 + 小写；非字符串 → ""
+ *   · bounding→ 逐项 canonValue 后紧凑 JSON；非数组/缺失 → ""
+ * 非对象框项剔除（与 groupsByTitle 一致）；groups 非数组 → ""。
+ */
+function groupsPart(graph) {
+  const g = isPlainObject(graph) ? graph : {};
+  const groups = Array.isArray(g.groups) ? g.groups : [];
+  const parts = [];
+  for (const item of groups) {
+    if (!isPlainObject(item)) continue;
+    const t = item.title == null ? "" : String(item.title);
+    parts.push(fnv1aHex(`${t}|${canonGroupColor(item.color)}|${canonGroupBounding(item.bounding)}`));
+  }
+  return parts.join("|");
+}
+
+/** graph.groups → Map<title, 框[]>（同一 title 出现多次时按出现顺序成对比较）。 */
+function groupsByTitle(graph) {
+  const g = isPlainObject(graph) ? graph : {};
+  const groups = Array.isArray(g.groups) ? g.groups : [];
+  const out = new Map();
+  for (const item of groups) {
+    if (!isPlainObject(item)) continue;
+    const t = item.title == null ? "" : String(item.title);
+    if (!out.has(t)) out.set(t, []);
+    out.get(t).push(item);
+  }
+  return out;
+}
+
+/** 框级变化：{changed:[{name,fields}], added:[{name}], removed:[{name}]}（按 name 排序）。 */
+function deltaGroups(prevGraph, nextGraph) {
+  const gPrev = groupsByTitle(prevGraph);
+  const gNext = groupsByTitle(nextGraph);
+  const changed = [];
+  const added = [];
+  const removed = [];
+  for (const [t, nlist] of gNext) {
+    const plist = gPrev.get(t) || [];
+    for (let i = 0; i < nlist.length; i++) {
+      const ab = i < plist.length ? plist[i] : null;
+      if (!ab) {
+        added.push({ name: t });
+        continue;
+      }
+      const fields = changedGroupFields(ab, nlist[i]);
+      if (fields.length) changed.push({ name: t, fields });
+    }
+  }
+  for (const [t, plist] of gPrev) {
+    const nlen = (gNext.get(t) || []).length;
+    for (let i = nlen; i < plist.length; i++) removed.push({ name: t });
+  }
+  const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  changed.sort(byName);
+  added.sort(byName);
+  removed.sort(byName);
+  return { changed, added, removed };
+}
+
+/**
+ * 对比两画布（UI 格式），相对 prev 算五类变化（节点三类 + 连线一类 + 分组框一类）。
  * @param {object} prevGraph 父画布（null/非法 → 返回 null）
  * @param {object} nextGraph 本画布
- * @returns {{changed:{id:*,title:string,fields:string[]}[], added:{id:*,title:string}[], removed:{id:*,title:string}[], links:{added:{from:{type:string,slot:*},to:{type:string,slot:*}}[], removed:{from:{type:string,slot:*},to:{type:string,slot:*}}[]}}|null}
+ * @returns {{changed:{id:*,title:string,fields:string[]}[], added:{id:*,title:string}[], removed:{id:*,title:string}[], links:{added:{from:{type:string,slot:*},to:{type:string,slot:*}}[], removed:{from:{type:string,slot:*},to:{type:string,slot:*}}[]}, groups:{changed:{name:string,fields:string[]}[], added:{name:string}[], removed:{name:string}[]}}|null}
+ *
+ * groups（2026-10-26）：按 title 对齐比 color / bounding；fields 取值固定为
+ * color / title / bounding（title 只在改名时体现为 removed+added，故不会出现在 fields 里）。
+ * 三个数组恒存在，可为空。
  */
 export function computeDelta(prevGraph, nextGraph) {
   if (!isPlainObject(prevGraph)) return null;
@@ -447,6 +575,15 @@ export function computeDelta(prevGraph, nextGraph) {
     const ta = a.type == null ? "" : String(a.type);
     const tb = b.type == null ? "" : String(b.type);
     if (ta !== tb) fields.push("type");
+    // 2026-10-26：mode 参与改动判定（bypass=4 / mute=2）；v4 起 title 改名也算改动。
+    const ma = Number(a.mode == null ? 0 : a.mode);
+    const mb = Number(b.mode == null ? 0 : b.mode);
+    const nmA = Number.isFinite(ma) ? Math.trunc(ma) : 0;
+    const nmB = Number.isFinite(mb) ? Math.trunc(mb) : 0;
+    if (nmA !== nmB) fields.push("mode");
+    // _node_title 口径 = title 非空用 title，否则用 type；加 explicitTitle 半句是为了
+    // 不在纯改 type 时重复报「类型、名字」（两侧都没显式名时名字就是 type）。
+    if (nodeTitle(a) !== nodeTitle(b) && (explicitTitle(a) || explicitTitle(b))) fields.push("title");
     for (const name of changedWidgetNames(a, b)) fields.push(name);
     if (fields.length) changed.push({ id: b.id, title: nodeTitle(b), fields });
   }
@@ -461,6 +598,7 @@ export function computeDelta(prevGraph, nextGraph) {
       added: linksAddedKeys.map((k) => linkDesc(linkNext.get(k), next)),
       removed: linksRemovedKeys.map((k) => linkDesc(linkPrev.get(k), prev)),
     },
+    groups: deltaGroups(prevGraph, nextGraph),
   };
 }
 
