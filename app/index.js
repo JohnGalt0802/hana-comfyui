@@ -20,6 +20,7 @@ import { defineApp } from "./sdk/app-contract/server-client.js";
 import { createHash, randomInt, randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { projectGraph } from "./lib/canvas-project.mjs";
 import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
 import { outlineGraph } from "./lib/canvas-outline.mjs";
@@ -36,10 +37,18 @@ const APP_ID = "comfyui-hana";
 //   2026-10-09：卡片功能恢复——任务卡（task.html，submit/queue 回执 details.card）与环境检查卡
 //     （envcheck.html，卡按钮路由 /comfyui-hana/backend/{envcheck,clear,wait} 一并恢复）；
 //     流内卡走工具回执通道，不注册 contributes.cards（卡片中心零新增）。
-// 版本号：**必须与 manifest.json 的 version 一致**（两处分开存是历史原因，
-// 不一致会导致 status / health 报旧版本，面板显示对不上实际安装）。
-// 2026-10-21：曾因 manifest 升 0.13.3 而此处留 0.13.1，状态页显示 v0.13.1。
-const APP_VERSION = "0.13.3";
+// 版本号：**改为启动时读 manifest.json**（2026-10-24）。
+// 原先是两处分开存、靠人手工对齐，已漏过两次（0.13.1 对 0.13.3、0.13.3 对 0.14.5），
+// 导致 status / health 报旧版本、面板显示与实际安装对不上。现在只有 manifest 一个真相源。
+const APP_VERSION = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const v = JSON.parse(readFileSync(join(here, "manifest.json"), "utf8")).version;
+    return typeof v === "string" && v.trim() ? v.trim() : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
 const RELAY_ENTRY = "runtime/comfy-relay.mjs";
 const BACKEND = Object.freeze({ host: "127.0.0.1", port: 8188 });
 const RELAY_CLIENT_ID_PREFIX = "comfyui-hana-relay"; // 中继 /ws 订阅与提交共用（ComfyUI 只把执行事件发给提交方 client_id）
