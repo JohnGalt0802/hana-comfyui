@@ -1632,6 +1632,51 @@ def _block_names_for_entry(entry):
 
 
 # ── 11. 查询 ────────────────────────────────────────────────────────────────
+# 2026-10-26：list 响应瘦身（只改读取侧输出，不动索引解析口径、不写盘）。
+# 起因（实测）：history-list 182 条 entry 共 427.3 KB，runs 177.8 KB（1184 个 run，
+# 字段 promptId 43.9 / images 70.3 / at 30.1）、blocks 93.8 KB（nodeIds 22.3）。
+# 前端对 runs 只用 promptId 与「有没有图」，对 blocks 只用 name/title/source/color。
+# blocks 瘦身后允许保留的键（按此顺序挑选；**只留实际存在的键**，不补 null）
+_BLOCK_SLIM_KEYS = ("name", "title", "source", "color")
+
+
+def _slim_runs(runs):
+    """runs → [{promptId, imageCount}]（list 响应专用精简形态）。
+
+    丢 at 与 images 明细（明细已由调用方扁平合并进 entry.images，气泡缩略图走那份）；
+    imageCount = 原 images 数组长度（前端只需知道「有没有图 / 几张」）。
+    """
+    out = []
+    for r in runs if isinstance(runs, list) else []:
+        if not isinstance(r, dict):
+            continue
+        imgs = r.get("images")
+        out.append(
+            {
+                "promptId": None if r.get("promptId") is None else str(r.get("promptId")),
+                "imageCount": len(imgs) if isinstance(imgs, list) else 0,
+            }
+        )
+    return out
+
+
+def _slim_blocks(blocks):
+    """blocks → 去 nodeIds 的摘要（list 响应专用精简形态）。
+
+    取**索引行原值**逐个挑 name/title/source/color 中实际存在的键：不存在的键不写
+    （区别于 normalize_entry 的规范化补全——那份仍用于 blockNames 等内部计算）。
+    非数组 → []；非对象块剔除；值原样保留（color 可能是 null 颜色占位，非本层负责）。
+    """
+    if not isinstance(blocks, list):
+        return []
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        out.append({k: b[k] for k in _BLOCK_SLIM_KEYS if k in b})
+    return out
+
+
 def list_commits(workflow, user_dir, workflow_id=None, path=None, temporary=None):
     """读某工作流的索引。目录不存在 → 空 entries（ok=True）；索引坏行只计数不抛异常。
 
@@ -1641,8 +1686,10 @@ def list_commits(workflow, user_dir, workflow_id=None, path=None, temporary=None
     P5b：折叠 mergeInto 行 + 新字段。每条主行 entry **只读合并**（不写回索引磁盘）：
       · parent/kind/sig/delta —— 由 normalize_entry 缺省补全（旧条目兼容）
       · runs   —— 该节点的全部 run（主行 promptId + 各 mergeInto 行的 promptId +
-                  sidecar 里其余 run），去重排序；每 run 的 images 由 sidecar 提供
-      · images —— runs 里所有 images 的扁平合并
+                  sidecar 里其余 run），去重排序；2026-10-26 起响应里**瘦身为**
+                  {promptId, imageCount}（丢 at 与 images 明细）
+      · images —— 全部 run 的 images 扁平合并（**原样保留**，气泡缩略图用）
+      · blocks —— 2026-10-26 起响应里只留 name/title/source/color 中实际存在的键（去 nodeIds）
       · blockNames —— P6 框视角：该提交碰过的框名列表（null=无法判定；[]=没碰任何框）
     mergeInto 行**不单独成 entry**（其 promptId 并入目标节点的 runs）。
     """
@@ -1680,8 +1727,12 @@ def list_commits(workflow, user_dir, workflow_id=None, path=None, temporary=None
         sidecar_runs = _read_sidecar_runs(dir_path, snapshot_file) if snapshot_file else []
         seq_key = _to_int(e.get("seq"), None)
         rows = merge_rows.get(seq_key, []) if seq_key is not None else []
-        norm["runs"] = _node_runs(e, sidecar_runs, rows)
-        norm["images"] = _merge_images([], [im for r in norm["runs"] for im in r["images"]])
+        full_runs = _node_runs(e, sidecar_runs, rows)
+        # entry.images 由**完整 runs** 扁平合并（气泡缩略图仍用它，故必须先于瘦身取）
+        norm["images"] = _merge_images([], [im for r in full_runs for im in r["images"]])
+        # 2026-10-26 响应瘦身：runs → {promptId, imageCount}；blocks 去 nodeIds 且不补空键
+        norm["runs"] = _slim_runs(full_runs)
+        norm["blocks"] = _slim_blocks(e.get("blocks"))
         out_entries.append(norm)
     return {
         "ok": True,

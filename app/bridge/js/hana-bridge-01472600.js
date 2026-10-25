@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-25 hana-bridge-21143500";
+const BUILD_TAG = "2026-10-26 hana-bridge-01472600";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -3285,12 +3285,12 @@ async function syncOrphanImages() {
     const ld = await lr.json();
     if (!ld || ld.ok !== true) return;
     const entries = Array.isArray(ld.entries) ? ld.entries : [];
-    // 已绑上图的 promptId 集合（entry.runs[].images 非空 或 entry.images 非空）
+    // 已绑上图的 promptId 集合（runs 项已瘦身：只有 promptId + imageCount，无 images / at）
     const bound = new Set();
     for (const e of entries) {
       const runs = Array.isArray(e.runs) ? e.runs : [];
       for (const r of runs) {
-        if (r && r.promptId && Array.isArray(r.images) && r.images.length) bound.add(String(r.promptId));
+        if (r && r.promptId && Number(r.imageCount) > 0) bound.add(String(r.promptId));
       }
     }
     // ② /history 里最近的运行
@@ -5008,7 +5008,16 @@ async function historyBarLoad(reqId, ctx, countEl) {
           return bn.includes(curBlock);
         })
       : entries;
-    if (countEl) countEl.textContent = shown.length + " 次提交";
+    // D6（2026-10-26）：历史框同步隐藏 —— 读隐藏集合 → sanitizeHidden → applyHidden 得 visibleShown。
+    // 后续刻度渲染 / 时间标签 / 计数一律用 visibleShown。
+    // 注：历史框按时间轴平铺、不看 parent（applyHidden 改写的 parent 对它无副作用）；
+    //     但 applyHidden 会浅拷贝并保留 seq，seq 完整性得到保证。
+    // 2026-10-26 口径统一：headSeq 传 historyTreeHead.seq（原为 null）—— HEAD 在任何视图里都不允许隐藏，
+    // 否则会出现「树里还在、历史框里没了」的不一致。
+    const hiddenRaw = historyHiddenGet();
+    const hiddenSet = sanitizeHidden(hiddenRaw, shown, historyTreeHead && historyTreeHead.seq);
+    const visibleShown = hiddenSet.size ? applyHidden(shown, hiddenSet) : shown;
+    if (countEl) countEl.textContent = visibleShown.length + " 次提交";
     if (!axis) return;
     axis.textContent = "";
     if (times) times.textContent = "";
@@ -5027,10 +5036,10 @@ async function historyBarLoad(reqId, ctx, countEl) {
           if (nm && !seen.has(nm)) { seen.add(nm); allBlocks.push(nm); }
         }
       } else {
-        // 活图取不到（无画布 / 异常）→ 退回旧行为：shown 的块名并集，保证不炸。
+        // 活图取不到（无画布 / 异常）→ 退回旧行为：visibleShown 的块名并集，保证不炸。
         allBlocks = [];
         const seen = new Set();
-        for (const ent of shown) {
+        for (const ent of visibleShown) {
           const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
           for (const b of bl) {
             const nm = b && b.name != null ? String(b.name) : "";
@@ -5042,7 +5051,7 @@ async function historyBarLoad(reqId, ctx, countEl) {
       ctx.colorMap = historyLiveBlockColors(liveBlocks || undefined);
       ctx.singleBar = allBlocks.length === 0;
     }
-    if (!shown.length) {
+    if (!visibleShown.length) {
       const empty = document.createElement("div");
       empty.className = "hhb-empty";
       empty.textContent = curBlock ? "这个块没有提交记录" : "这个工作流还没有提交记录";
@@ -5050,7 +5059,7 @@ async function historyBarLoad(reqId, ctx, countEl) {
       return;
     }
     // 宽度自适应（定稿卡数值）：少时加宽（≤44）、多时定宽（≥11）+ 横滚；刻度随之缩窄。
-    const n = shown.length;
+    const n = visibleShown.length;
     const availW = axis.clientWidth || 0;
     const colW = Math.min(72, Math.max(22, availW / n)); // 第8条（2026-10-13）：下限 11→22（面板可横滚 → 密档不压缩 colW，靠溢出滚动）
     let tw = Math.min(24, Math.max(5, colW * 0.5)); // 第8条：单块更瘦（系数 0.72→0.5，下限 4→5）
@@ -5060,7 +5069,7 @@ async function historyBarLoad(reqId, ctx, countEl) {
     axis.style.gap = gap + "px";
     if (ctx) ctx.colW = colW;
     // 刻度左旧右新：按 entries 原序（索引本身按 seq/时间递增）直接 append
-    for (const ent of shown) {
+    for (const ent of visibleShown) {
       const tick = historyBarTickMake(reqId, ent, ctx);
       tick.style.setProperty("--hhb-tw", tw + "px");
       tick.style.setProperty("--hhb-tw-bulge", twBulge + "px"); // 第7条：多块宽（已 clamp colW-2）
@@ -5072,9 +5081,9 @@ async function historyBarLoad(reqId, ctx, countEl) {
     // 轴下：左端最早时间 / 右端最新时间（historyFmtTime）
     if (times) {
       const first = document.createElement("span");
-      first.textContent = historyFmtTime(shown[0] && shown[0].at);
+      first.textContent = historyFmtTime(visibleShown[0] && visibleShown[0].at);
       const last = document.createElement("span");
-      last.textContent = historyFmtTime(shown[shown.length - 1] && shown[shown.length - 1].at);
+      last.textContent = historyFmtTime(visibleShown[visibleShown.length - 1] && visibleShown[visibleShown.length - 1].at);
       times.append(first, last);
     }
   } catch (err) {
@@ -6048,6 +6057,9 @@ function historyTreeViewSet(m) {
 let historyTreeOpen = false; // 展开态（内存镜像；持久化走 historyTreeState*）
 let historyTreeReqId = 0; // 竞态哨兵：重渲染/收起后递增，在途旧响应作废
 let historyTreeEntries = []; // 最近一次成功 fetch 的 entries（resize 重画连线用，不 refetch）
+// D4（2026-10-26）：最近一次渲染实际画出来的 entries（已剔除隐藏项 + parent 已短路重挂）。
+// historyTreeDrawEdges 优先用它，保证连线与节点同一份数据；null = 还没渲染过 → 回退 historyTreeEntries。
+let historyTreeShownEntries = null;
 // 2026-10-23：后端 HEAD（history-list 响应的 data.head），小黄点数据源。展开/收起时都更新。
 let historyTreeHead = null;
 // 2026-10-23（用户定）：首次渲染把 HEAD 滚到视口中间（他反馈「新开画布看不见节点在哪，得找」）。
@@ -6209,13 +6221,22 @@ function historyTreeStyleEnsure() {
    现：只留左侧 18px 一段作泳道标识，右边整条不再画 → 竖线与它碰不上。 */
 #${HISTORY_TREE_ID} .htr-laneaxis {
   position: absolute; left: 0; width: 18px; height: 1px;
-  background: var(--htr-lane); pointer-events: none;
+  background: var(--htr-lane);
+  /* 2026-10-26（D6）：泳道右键入口 —— 1px 线太难点，pointer-events 放开 + ::before 撑整行高命中区；
+     可见部分仍是那 1px 短标记（视觉零变化，只扩大命中）。 */
+  pointer-events: auto; cursor: context-menu;
+}
+#${HISTORY_TREE_ID} .htr-laneaxis::before {
+  content: "";
+  position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 18px; height: var(--htr-lane-hot, 18px);
 }
 /* 泳道序号：贴在左侧标记右边，跟着内容一起横滚（说明该行是第几条泳道） */
 #${HISTORY_TREE_ID} .htr-laneaxis::after {
   content: attr(data-lane);
   position: absolute; left: 22px; top: -5px;
   font-size: 9px; line-height: 1; color: var(--htr-sub); opacity: .5;
+  pointer-events: none; /* 2026-10-26：序号只是标注，不参与命中（否则会抢最左侧节点的右键） */
 }
 /* 节点（统一母题）：外框 = 线型(操作)+色(谁)；内条堆 = 本次碰过的画布框（框色，见 .hnode-bar） */
 #${HISTORY_TREE_ID} .node {
@@ -6330,6 +6351,31 @@ function historyTreeStyleEnsure() {
 }
 #${HISTORY_TREE_ID} .htr-shots-img.single { width: 100%; max-width: 720px; height: auto; max-height: 340px; object-fit: contain; } /* 限宽树浮层内单图自适应；同 .hhb-thumb-img 观感 */
 #${HISTORY_TREE_ID} .htr-shots-img.multi { width: 240px; height: auto; max-height: 340px; object-fit: contain; } /* 同 .hhb-thumb-strip .hhb-thumb-img */
+/* 2026-10-26（D6）：自绘右键菜单（隐藏节点 / 隐藏本行）。
+   挂 document.body（position:fixed），不挂在树容器内 —— 避免被 .tcanvas 的 overflow 裁切。
+   皮肤沿用 .htr-bubble 家族变量；z-index 10002（> 树 9990，< 回跳确认框 10003）。 */
+.htr-menu {
+  position: fixed; z-index: 10002; min-width: 150px; max-width: 260px;
+  background: var(--htr-bubble-bg); color: var(--htr-bubble-fg);
+  border: 1px solid var(--htr-bubble-line); border-radius: 9px;
+  box-shadow: 0 8px 26px var(--htr-bubble-sh);
+  padding: 4px; font-size: 12px; line-height: 1.45;
+  pointer-events: auto; user-select: none;
+}
+.htr-menu-title {
+  padding: 3px 8px 5px; margin-bottom: 3px;
+  color: var(--htr-sub); font-size: 11px;
+  border-bottom: 1px solid var(--htr-bubble-line);
+}
+.htr-menu-item {
+  display: block; width: 100%; text-align: left;
+  background: transparent; border: 0; border-radius: 6px;
+  color: var(--htr-bubble-fg); font: inherit; padding: 5px 8px; cursor: pointer; white-space: nowrap;
+}
+.htr-menu-item:hover { background: var(--htr-btn-bg-h); }
+.htr-menu-item[disabled] { color: var(--htr-sub); opacity: .6; cursor: default; }
+.htr-menu-item[disabled]:hover { background: transparent; }
+.htr-menu-hint { display: block; margin-top: 1px; color: var(--htr-sub); font-size: 10.5px; white-space: normal; }
 `;
   document.head.appendChild(style);
   historyNodeStyleEnsure(); // 统一母题内条堆（两视图共用）
@@ -6460,6 +6506,162 @@ function scoreOf(entries, laneOfSeq, xOfSeq) {
 
 
 
+// ── W2 隐藏节点（桥内内联版，逻辑与 app/lib/history-hide.mjs 逐条一致）────────────
+// 镜像：app/lib/history-hide.mjs，改一处必须同改两处。
+// CSP 下桥内不能 import ESM（同 W1 泳道算法），故必须内联；严禁改为 import。
+//
+// 语义定格：**短路隐藏** —— 隐藏 A 时，把 A 的所有子节点的 parent 改挂到 A 的 parent
+// （即最近的可见祖先），再把 A 从输出里剔除。理由（lib 头部实测）：纯过滤会产 2 个孤儿、
+// 泳道数 8→9、图断成两截；短路隐藏 0 孤儿、泳道数不变。
+// 关键约束：回溯用的 bySeq 必须由**完整 entries**（含被隐藏项）建立，否则回溯会在隐藏点断掉，
+// 子节点集体变孤儿。
+//
+// API（与 lib 一致）：HIDDEN_LS_PREFIX / indexBySeq / resolveVisibleParent / applyHidden / sanitizeHidden。
+
+// localStorage 键前缀：一个画布一份（后接画布标识），值为 seq 的 JSON 数组。
+const HIDDEN_LS_PREFIX = "hana.history.hidden.v1:";
+
+// 回溯上限：防御性上限，任何环或超深链都不得把主线程挂死。
+const MAX_WALK = 100000;
+
+// bySeq 兼容 Map / 普通对象 / null；seq 统一按数字取。
+function pick(bySeq, seq) {
+  if (!bySeq) return undefined;
+  if (typeof bySeq.get === "function") return bySeq.get(seq);
+  return bySeq[seq];
+}
+
+// hiddenSet 兼容 Set / Array / null。
+function hasHidden(hiddenSet, seq) {
+  if (!hiddenSet) return false;
+  if (typeof hiddenSet.has === "function") return hiddenSet.has(seq);
+  if (Array.isArray(hiddenSet)) return hiddenSet.includes(seq);
+  return false;
+}
+
+// 由 entries 建 seq → entry 的索引。同一 seq 重复出现时后者覆盖前者（索引理论上一行一 seq）。
+function indexBySeq(entries) {
+  const bySeq = new Map();
+  if (!Array.isArray(entries)) return bySeq;
+  for (const e of entries) {
+    if (!e || !Number.isInteger(e.seq)) continue;
+    bySeq.set(e.seq, e);
+  }
+  return bySeq;
+}
+
+// 从 seq 的 parent 开始向上回溯，返回第一个不在 hiddenSet 里的祖先 seq；
+// 一路全被隐藏、链断（parent 缺失 / 非整数）、成环、超过回溯上限 → 返回 null。
+function resolveVisibleParent(seq, hiddenSet, bySeq) {
+  const self = pick(bySeq, seq);
+  if (!self) return null;
+
+  const visited = new Set();
+  let cursor = self.parent;
+
+  for (let steps = 0; steps < MAX_WALK; steps++) {
+    if (!Number.isInteger(cursor)) return null;
+    // 环：回到自身，或在链上重复经过同一节点
+    if (cursor === seq || visited.has(cursor)) return null;
+    if (!hasHidden(hiddenSet, cursor)) return cursor;
+    const node = pick(bySeq, cursor);
+    if (!node) return null;
+    visited.add(cursor);
+    cursor = node.parent;
+  }
+  return null; // 超出回溯上限
+}
+
+// 短路隐藏：返回新数组，剔除 hiddenSet 内的项，其余项 parent 指向最近可见祖先。
+// 不修改入参（原 entries 的 parent 保持原值，输出元素为浅拷贝）。
+function applyHidden(entries, hiddenSet) {
+  if (!Array.isArray(entries) || entries.length === 0) return [];
+  const bySeq = indexBySeq(entries); // 注意：完整 entries，含被隐藏项
+  const out = [];
+  for (const e of entries) {
+    if (!e || !Number.isInteger(e.seq)) continue;
+    if (hasHidden(hiddenSet, e.seq)) continue;
+    out.push({ ...e, parent: resolveVisibleParent(e.seq, hiddenSet, bySeq) });
+  }
+  return out;
+}
+
+// 外部（localStorage）脏数据兜底。剔除：
+//   1) entries 里不存在的 seq
+//   2) 等于 headSeq 的 seq（HEAD 不允许隐藏）
+//   3) 根节点（parent == null 且存在其他节点以它为 parent）——藏了会让子节点集体变孤儿
+// 返回新的 Set。
+function sanitizeHidden(rawSet, entries, headSeq) {
+  const out = new Set();
+  if (!rawSet) return out;
+  const list = Array.isArray(entries) ? entries : [];
+
+  const bySeq = indexBySeq(list);
+  // 被别的节点当作 parent 的 seq 集合（判「根」用）
+  const hasChildren = new Set();
+  for (const e of list) {
+    if (e && Number.isInteger(e.parent)) hasChildren.add(e.parent);
+  }
+
+  const raw = typeof rawSet.has === "function" ? [...rawSet] : Array.isArray(rawSet) ? rawSet : [];
+  for (const item of raw) {
+    const seq = typeof item === "number" ? item : Number(item);
+    if (!Number.isInteger(seq)) continue;
+    const node = bySeq.get(seq);
+    if (!node) continue;                                  // 1) 不存在
+    if (Number.isInteger(headSeq) && seq === headSeq) continue; // 2) HEAD
+    const isRoot = !Number.isInteger(node.parent) && hasChildren.has(seq);
+    if (isRoot) continue;                                 // 3) 根节点
+    out.add(seq);
+  }
+  return out;
+}
+
+// ── D2：隐藏集合的 localStorage 读写（按画布隔离）：
+// 键 = HIDDEN_LS_PREFIX + (画布 id，无 id 回退工作流名) + ":" + 路径；值 = seq 数组 JSON。
+// 键结构照搬 historyTreeLsKey / historyTreeStateGet 口径（取不到键 → 读空 / 不写）。
+function historyHiddenLsKey() {
+  try {
+    const id = currentWorkflowId() || currentWorkflowInfo().name;
+    const p = currentWorkflowPath() || "";
+    return HIDDEN_LS_PREFIX + id + ":" + p;
+  } catch {
+    return null;
+  }
+}
+
+// 读：任何异常（无 localStorage / 坏 JSON / 非数组）→ 空 Set。
+function historyHiddenGet() {
+  const out = new Set();
+  try {
+    const k = historyHiddenLsKey();
+    if (!k) return out;
+    const raw = localStorage.getItem(k);
+    if (!raw) return out;
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return out;
+    for (const item of arr) {
+      const seq = typeof item === "number" ? item : Number(item);
+      if (Number.isInteger(seq)) out.add(seq);
+    }
+  } catch {
+    return new Set();
+  }
+  return out;
+}
+
+// 写：静默（无 localStorage / 异常均忽略，不影响渲染）。
+function historyHiddenSet(set) {
+  try {
+    const k = historyHiddenLsKey();
+    if (!k) return;
+    const arr = [...(set || [])].filter((seq) => Number.isInteger(seq));
+    localStorage.setItem(k, JSON.stringify(arr));
+  } catch {
+    /* 忽略 */
+  }
+}
+
 function commitGraphLanes(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
     return { lanes: [], nodes: [], rows: 0, sleepingCount: 0, cost: { cross: 0, hops: 0, score: 0 } };
@@ -6476,7 +6678,12 @@ function commitGraphLanes(entries) {
   //     重排反而会把这种天然的相邻关系打乱（历史 bug 源）。
   //     下面只算代价，纯供诊断用。
   const xOfSeq = new Map(entries.map((e, i) => [e.seq, i]));
-  const score = scoreOf(entries, laneOfSeq, xOfSeq);
+  // P0（2026-10-26）：scoreOf 是 O(n²) 纯诊断（见上方注释：不做重排，只算代价），
+  // 实测占算法耗时 87%~99%（182 节点 0.65ms→0.08ms；2000 节点 16.7ms→0.34ms）。
+  // 改为默认不算：调试时开 window.__hanaLaneDebug 才计算。cost 字段必须保留（下游会读），默认全 0。
+  const score = (typeof window !== "undefined" && window.__hanaLaneDebug)
+    ? scoreOf(entries, laneOfSeq, xOfSeq)
+    : { cross: 0, hops: 0, score: 0 };
 
   // (3) 全量显示
   const nodes = [];
@@ -6503,24 +6710,34 @@ function commitGraphLanes(entries) {
 
 
 // 计数：N 节点；M 分支（parent 被 ≥2 个节点指向的 parent 数）；K 泳道（总泳道数，全量显示、无折叠）。
+// 2026-10-26（D6·计数口径）：有隐藏项时首段改「可见 / 总数 节点」，无隐藏时保持原文案。
+// 实现选型：不改函数签名（调用方 historyTreeRefreshNow / historyTreeHiddenApplyChange 均不动），
+// 函数内部自读隐藏集合（与渲染同一来源：localStorage + sanitizeHidden）。
+// 分支 / 泳道两段按「可见集」算 —— 树画的是可见集，数字必须与画面一致。
 function historyTreeUpdateCounts(entries) {
   if (!historyTreeCountEl) return;
+  // mergeInto 行是「与前一提交结构相同、只多了次运行」的合并记录，
+  // 它们没有独立快照、也没有 blocks，**不应渲染成独立节点**。
+  // 实测：某工作流 156 条索引里 131 条是 mergeInto，全被当成节点画出来，
+  // 且因缺 blocks 被打上 data-legacy → 整棵树一片 55% 淡化（用户报「都不亮了」）。
+  const solidEntries = (Array.isArray(entries) ? entries : []).filter((e) => e && e.mergeInto == null);
+  const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
+  const hidden = sanitizeHidden(historyHiddenGet(), solidEntries, headSeq);
+  const visibleEntries = hidden.size ? applyHidden(solidEntries, hidden) : solidEntries;
   const cnt = new Map();
-  for (const ent of entries) {
+  for (const ent of visibleEntries) {
     const p = ent && ent.parent;
     if (p == null) continue;
     cnt.set(p, (cnt.get(p) || 0) + 1);
   }
   let branches = 0;
   for (const v of cnt.values()) if (v >= 2) branches += 1;
-  // mergeInto 行是「与前一提交结构相同、只多了次运行」的合并记录，
-  // 它们没有独立快照、也没有 blocks，**不应渲染成独立节点**。
-  // 实测：某工作流 156 条索引里 131 条是 mergeInto，全被当成节点画出来，
-  // 且因缺 blocks 被打上 data-legacy → 整棵树一片 55% 淡化（用户报「都不亮了」）。
-  const solidEntries = (Array.isArray(entries) ? entries : []).filter((e) => e && e.mergeInto == null);
-  const graph = commitGraphLanes(solidEntries);
+  const graph = commitGraphLanes(visibleEntries);
+  const nodeText = hidden.size
+    ? visibleEntries.length + " / " + solidEntries.length + " 节点"
+    : solidEntries.length + " 节点";
   historyTreeCountEl.textContent =
-    solidEntries.length + " 节点 · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
+    nodeText + " · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
 }
 
 // 纯函数（自测用）：entries: [{seq,parent}]（seq 升序）；mode: "time"|"compact"。
@@ -6552,6 +6769,7 @@ function historyTreeRenderTree(entries) {
   tree.textContent = "";
   if (historyTreeClickTimer) { clearTimeout(historyTreeClickTimer); historyTreeClickTimer = null; } // 重渲染 → 清消歧态
   historyTreeShotsHide(); // 重渲染 → 清预览浮层（防残留）
+  historyTreeMenuClose(); // D6：重渲染 → 右键菜单也随之失效（锚点节点/泳道已重建，留着会点错）
   const sleepEl = historyTreeEl ? historyTreeEl.querySelector(".htr-sleep") : null;
   if (!entries.length) {
     const empty = document.createElement("div");
@@ -6561,13 +6779,22 @@ function historyTreeRenderTree(entries) {
     tree.style.width = "";
     tree.style.height = "";
     if (sleepEl) sleepEl.classList.remove("htr-sleep-on");
+    historyTreeShownEntries = []; // D4：空树 = 无可见节点，连线回退到空集
     return { nodeEls: new Map(), graph: null };
   }
   // 与计数函数同口径：mergeInto 行不渲染（它们没有独立快照，只有「并进前一条」的语义）
   const solidEntries = (Array.isArray(entries) ? entries : []).filter((e) => e && e.mergeInto == null);
-  const graph = commitGraphLanes(solidEntries);
+  // D3（2026-10-26）：隐藏节点接入 —— 读集合 → sanitizeHidden（剔除不存在 / HEAD / 根） → applyHidden（短路隐藏）。
+  // 此后本函数下游一律消费 visibleEntries（bySeq / graph / shownNodes / xOf 等），不得再直接用 solidEntries，
+  // 否则隐藏节点会被重新画出来。
+  const hiddenRaw = historyHiddenGet();
+  const hidden = sanitizeHidden(hiddenRaw, solidEntries, historyTreeHead && historyTreeHead.seq);
+  const visibleEntries = applyHidden(solidEntries, hidden);
+  // D4：存一份给 historyTreeDrawEdges（连线必须与节点同一份数据，否则线会画到已隐藏节点上）。
+  historyTreeShownEntries = visibleEntries;
+  const graph = commitGraphLanes(visibleEntries);
   const bySeq = new Map(); // seq → ent
-  for (const ent of solidEntries) {
+  for (const ent of visibleEntries) {
     if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
   }
   // 时间轴等距（2026-10-12 修）：每个「可见提交」占等宽一格。
@@ -6647,7 +6874,7 @@ function historyTreeRenderTree(entries) {
     // 活图取不到（无画布 / 异常）→ 退回旧行为：entries 的 blocks[].name 并集（首次出现序），保证不炸。
     globalBlocks = [];
     const seen = new Set();
-    for (const ent of solidEntries) {
+    for (const ent of visibleEntries) {
       const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : [];
       for (const b of bl) {
         if (!b || typeof b !== "object") continue;
@@ -6663,11 +6890,25 @@ function historyTreeRenderTree(entries) {
   const liveColors = historyLiveBlockColors(); // 内条色 = 画布框色（整树算一次）
   // 泳道基准标记（2026-10-22 改）：左侧短标记 + 泳道序号，不再横贯面板。
   // 旧版 left:0;right:0 的长横线会被跨泳道竖线切出十字 —— 用户报的「连线跟泳道交叉」就是它。
+  // D6（2026-10-26）：行→可见 seq 列表（泳道右键批量隐藏用）。只统计本帧真正画出来的可见节点。
+  const rowSeqs = new Map();
+  for (const nd of graph.nodes) {
+    if (!nd || nd.row < 0) continue;
+    let arr = rowSeqs.get(nd.row);
+    if (!arr) { arr = []; rowSeqs.set(nd.row, arr); }
+    arr.push(nd.seq);
+  }
   for (let row = 0; row < graph.rows; row += 1) {
     const ax = document.createElement("div");
     ax.className = "htr-laneaxis";
     ax.style.top = row * laneH + laneH / 2 + "px";
+    ax.style.setProperty("--htr-lane-hot", laneH + "px"); // 命中区高度 = 一整行（可见仍是 1px 线）
     ax.dataset.lane = String(row + 1); // 序号标注（CSS ::after）
+    // D6（2026-10-26）：泳道右键 → 批量隐藏本行。preventDefault + stopPropagation 防冒泡触发画布右键菜单。
+    ax.addEventListener("contextmenu", (ev) => {
+      const seqs = rowSeqs.get(row) || [];
+      historyTreeLaneContextMenu(ev, row, seqs, solidEntries, hidden);
+    });
     tree.appendChild(ax);
   }
   const nodeEls = new Map(); // seq → 节点元素（连线测量用）
@@ -6728,6 +6969,9 @@ function historyTreeRenderTree(entries) {
     node.addEventListener("mouseenter", () => historyTreeBubbleShow(node, ent));
     node.addEventListener("mouseleave", () => historyTreeBubbleHide());
     node.addEventListener("click", (ev) => historyTreeNodeClick(ev, node, ent));
+    // D6（2026-10-26）：节点右键 → 隐藏此节点 / 恢复全部隐藏。
+    // preventDefault + stopPropagation 必须在监听器首行同步执行：否则事件冒泡到 ComfyUI 画布框架，弹画布自己的右键菜单。
+    node.addEventListener("contextmenu", (ev) => historyTreeNodeContextMenu(ev, nd.seq, ent, solidEntries, hidden));
     tree.appendChild(node);
     nodeEls.set(nd.seq, node);
   }
@@ -6766,6 +7010,255 @@ function historyTreeRenderTree(entries) {
   return { nodeEls, graph };
 }
 
+// D5（2026-10-26）：隐藏集合变更入口（供后续交互单在模块内调用）。
+// 流程：接受新集合（Set / seq 数组；省略则现读 localStorage）→ 对照完整 entries 做 sanitizeHidden
+//     （剔除不存在 / HEAD / 根）→ 写回 localStorage → 展开着用 historyTreeEntries 重渲染 + 重画线；
+//     收起着只更计数（不渲染）。
+// 注意：必须先把集合写进 localStorage，再调 historyTreeRenderTree（它自己从 localStorage 取集合）。
+// 返回 Boolean：true = 集合与调用前不同（已写盘并重绘）；false = 集合未变（已写盘，无需重绘也算已完成）。
+function historyTreeHiddenApplyChange(hiddenSet) {
+  const all = Array.isArray(historyTreeEntries) ? historyTreeEntries : [];
+  const solid = all.filter((e) => e && e.mergeInto == null);
+  const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
+  const before = historyHiddenGet();
+  const rawNext = (hiddenSet && typeof hiddenSet.has === "function") || Array.isArray(hiddenSet)
+    ? hiddenSet
+    : before;
+  const next = sanitizeHidden(rawNext, solid, headSeq);
+  historyHiddenSet(next);
+  if (historyTreeEl && historyTreeEl.classList.contains("htr-open") && historyTreeTreeEl) {
+    const res = historyTreeRenderTree(all);
+    historyTreeDrawEdges(res && res.nodeEls, res && res.graph);
+    // D6（2026-10-26）：重渲染路径原本不更计数（计数只在 fetch 后算）→ 隐藏/恢复后收纳条数字会停在旧值。补上。
+    historyTreeUpdateCounts(all);
+  } else {
+    historyTreeUpdateCounts(all);
+  }
+  if (next.size !== before.size) return true;
+  for (const seq of next) if (!before.has(seq)) return true;
+  return false;
+}
+
+// ── D6（2026-10-26）：提交树右键菜单（节点隐藏 / 整行隐藏）────────────────────
+// 为什么自绘：原生 confirm/alert 会打断画布且无法「置灰 + 写原因」；皮肤沿用树气泡（.htr-bubble）变量族。
+// 挂 document.body（position:fixed）：树面板内 .tcanvas 是 overflow:auto，挂在里面会被裁切。
+// 关闭四路：菜单外 pointerdown（捕获）/ Esc / 再右键（contextmenu 捕获）/ 树重渲染与收起。
+let historyTreeMenuEl = null;
+let historyTreeMenuOff = null; // 当前菜单的全局监听解绑器
+
+function historyTreeMenuClose() {
+  if (historyTreeMenuOff) {
+    try { historyTreeMenuOff(); } catch { /* 解绑失败不影响关闭 */ }
+    historyTreeMenuOff = null;
+  }
+  if (historyTreeMenuEl && historyTreeMenuEl.parentElement) {
+    historyTreeMenuEl.parentElement.removeChild(historyTreeMenuEl);
+  }
+  historyTreeMenuEl = null;
+}
+
+// spec: { title?: string, items: [{ label, hint?, disabled?, onPick? }] }
+// 定位：跟随鼠标（client 坐标，fixed）；贴右/贴底则翻转到鼠标另一侧，最后仍钳在视口内 8px。
+function historyTreeMenuOpen(clientX, clientY, spec) {
+  historyTreeMenuClose();
+  const items = (spec && Array.isArray(spec.items)) ? spec.items : [];
+  if (!items.length) return;
+  const box = document.createElement("div");
+  box.className = "htr-menu";
+  if (spec && spec.title) {
+    const t = document.createElement("div");
+    t.className = "htr-menu-title";
+    t.textContent = String(spec.title);
+    box.appendChild(t);
+  }
+  for (const it of items) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "htr-menu-item";
+    b.textContent = String(it && it.label != null ? it.label : "");
+    if (it && it.hint) {
+      const h = document.createElement("span");
+      h.className = "htr-menu-hint";
+      h.textContent = String(it.hint);
+      b.appendChild(h);
+    }
+    if (it && it.disabled) b.disabled = true;
+    if (it && typeof it.onPick === "function" && !it.disabled) {
+      b.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        try { it.onPick(ev); } finally { /* 关不关由 onPick 自己决定（两步确认会在同位重开） */ }
+      });
+    }
+    box.appendChild(b);
+  }
+  // 先隐藏挂入：需要 offsetWidth/offsetHeight 才能算翻转
+  box.style.left = "0px";
+  box.style.top = "0px";
+  box.style.visibility = "hidden";
+  // 菜单本体的右键也不再弹浏览器原生菜单（否则在菜单上再右键会闪出系统菜单）
+  box.addEventListener("contextmenu", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+  });
+  document.body.appendChild(box);
+  historyTreeMenuEl = box;
+  let left = clientX;
+  let top = clientY;
+  try {
+    const bw = box.offsetWidth;
+    const bh = box.offsetHeight;
+    const vw = window.innerWidth || 0;
+    const vh = window.innerHeight || 0;
+    if (vw > 0 && left + bw > vw - 8) left = clientX - bw;      // 贴右 → 翻到鼠标左侧
+    if (vh > 0 && top + bh > vh - 8) top = clientY - bh;        // 贴底 → 翻到鼠标上方
+    if (vw > 0) left = Math.max(8, Math.min(left, Math.max(8, vw - bw - 8)));
+    if (vh > 0) top = Math.max(8, Math.min(top, Math.max(8, vh - bh - 8)));
+  } catch { /* 定位失败就落在鼠标点 */ }
+  box.style.left = Math.round(left) + "px";
+  box.style.top = Math.round(top) + "px";
+  box.style.visibility = "visible";
+
+  // 关闭监听：一次性绑定，关闭时全部解绑（防监听堆积）
+  const onDown = (ev) => {
+    const t = ev && ev.target;
+    if (!t) return;
+    try { if (box.contains(t)) return; } catch { return; }
+    historyTreeMenuClose();
+  };
+  const onCtx = (ev) => {
+    const t = ev && ev.target;
+    if (t) { try { if (box.contains(t)) return; } catch { /* 按外部处理 */ } }
+    historyTreeMenuClose(); // 再次右键（含在节点/泳道上重开）：旧菜单先关，由新 contextmenu 处理器再开
+  };
+  const onKey = (ev) => { if (ev && ev.key === "Escape") historyTreeMenuClose(); };
+  const onBlur = () => historyTreeMenuClose();
+  const onScroll = () => historyTreeMenuClose(); // 滚动会让 fixed 菜单与锚点错位 → 直接关
+  document.addEventListener("pointerdown", onDown, true);
+  document.addEventListener("contextmenu", onCtx, true);
+  document.addEventListener("keydown", onKey, true);
+  window.addEventListener("blur", onBlur);
+  window.addEventListener("resize", onScroll);
+  document.addEventListener("scroll", onScroll, true);
+  historyTreeMenuOff = () => {
+    document.removeEventListener("pointerdown", onDown, true);
+    document.removeEventListener("contextmenu", onCtx, true);
+    document.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("blur", onBlur);
+    window.removeEventListener("resize", onScroll);
+    document.removeEventListener("scroll", onScroll, true);
+  };
+}
+
+// 不可隐藏原因（与 sanitizeHidden 口径一致：HEAD / 根节点）。可隐藏 → 返回空串。
+function historyTreeHiddenBlockReason(seq, solidEntries, headSeq) {
+  if (Number.isInteger(headSeq) && seq === headSeq) return "当前编辑点（HEAD）不可隐藏";
+  const list = Array.isArray(solidEntries) ? solidEntries : [];
+  const self = list.find((e) => e && e.seq === seq);
+  if (!self) return "该节点不在当前提交树数据里";
+  if (!Number.isInteger(self.parent)) {
+    for (const e of list) if (e && e.parent === seq) return "根节点（有子提交）不可隐藏";
+  }
+  return "";
+}
+
+// 节点右键菜单（任务 A）：隐藏此节点 / 恢复全部隐藏。
+// 必须 preventDefault + stopPropagation：否则冒泡到 ComfyUI 画布框架，弹出画布自己的右键菜单。
+function historyTreeNodeContextMenu(ev, seq, ent, solidEntries, hiddenSet) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  historyTreeBubbleHide(); // 右键时收起悬停气泡（避免与菜单重叠）
+  const items = [];
+  const reason = historyTreeHiddenBlockReason(seq, solidEntries, historyTreeHead && historyTreeHead.seq);
+  items.push({
+    label: "隐藏此节点",
+    hint: reason || "",
+    disabled: !!reason,
+    onPick: () => {
+      const next = new Set(hiddenSet || []);
+      next.add(seq);
+      historyTreeMenuClose();
+      historyTreeHiddenApplyChange(next);
+    },
+  });
+  const hiddenN = hiddenSet ? hiddenSet.size : 0;
+  if (hiddenN > 0) {
+    items.push({
+      label: "恢复全部隐藏（" + hiddenN + " 个）",
+      onPick: () => {
+        historyTreeMenuClose();
+        historyTreeHiddenApplyChange(new Set());
+      },
+    });
+  }
+  historyTreeMenuOpen(ev.clientX, ev.clientY, {
+    title: "#" + historySeqLabel(ent) + (ent && ent.at ? " · " + historyFmtTime(ent.at) : ""),
+    items,
+  });
+}
+
+// 泳道右键菜单（任务 B）：隐藏本行。
+// 两步确认：第一步「隐藏本行 N 个节点」→ 第二步（同右键坐标重开菜单）「确认隐藏 N 个节点」+「取消」。
+// N = 实际会被隐藏的个数（先跑一遍 sanitizeHidden 算差集），所以含 HEAD / 根时 N 会小于可见数，文案如实。
+// 选这种两步而不做「点一下即隐藏 + 提示可恢复」：整行是批量破坏性操作，误点代价高。
+function historyTreeLaneConfirm(x, y, laneIdx, laneSeqs, solidEntries, hiddenSet, willHide) {
+  historyTreeMenuOpen(x, y, {
+    title: "泳道 " + (laneIdx + 1) + " · 将要隐藏 " + willHide + " 个节点",
+    items: [
+      {
+        label: "确认隐藏 " + willHide + " 个节点",
+        onPick: () => {
+          const next = new Set(hiddenSet || []);
+          for (const s of laneSeqs) next.add(s);
+          historyTreeMenuClose();
+          historyTreeHiddenApplyChange(next);
+        },
+      },
+      { label: "取消", onPick: () => historyTreeMenuClose() },
+    ],
+  });
+}
+
+function historyTreeLaneContextMenu(ev, laneIdx, laneSeqs, solidEntries, hiddenSet) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  historyTreeBubbleHide();
+  const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
+  const base = hiddenSet instanceof Set ? hiddenSet : new Set();
+  const union = new Set(base);
+  for (const s of laneSeqs) union.add(s);
+  const willHide = sanitizeHidden(union, solidEntries, headSeq).size - base.size;
+  const blocked = laneSeqs.length - willHide;
+  const px = ev.clientX, py = ev.clientY; // 二次确认在同一坐标重开（不取点击项的坐标，否则菜单会跑）
+  const items = [];
+  if (willHide > 0) {
+    items.push({
+      label: "隐藏本行 " + willHide + " 个节点",
+      hint: blocked > 0 ? "本行 " + laneSeqs.length + " 个可见节点，其中 " + blocked + " 个是 HEAD / 根节点，不可隐藏" : "",
+      onPick: () => historyTreeLaneConfirm(px, py, laneIdx, laneSeqs, solidEntries, base, willHide),
+    });
+  } else {
+    items.push({
+      label: "本行无可隐藏节点",
+      hint: laneSeqs.length ? "本行 " + laneSeqs.length + " 个可见节点均为 HEAD / 根节点" : "本行没有可见节点",
+      disabled: true,
+    });
+  }
+  if (base.size > 0) {
+    items.push({
+      label: "恢复全部隐藏（" + base.size + " 个）",
+      onPick: () => {
+        historyTreeMenuClose();
+        historyTreeHiddenApplyChange(new Set());
+      },
+    });
+  }
+  historyTreeMenuOpen(ev.clientX, ev.clientY, {
+    title: "泳道 " + (laneIdx + 1) + " · " + laneSeqs.length + " 个可见节点",
+    items,
+  });
+}
+
 // ── P7 补完（2026-10-12）：容器挂载 / 取数 / 交互 / 连线 ────────────────────────
 
 // 容器挂载（幂等）：底部收纳条 + 展开面板（行容器 + SVG 连线层）挂 document.body。
@@ -6800,6 +7293,7 @@ function historyTreeEnsure() {
     historyTreeStateSet(open);
     historyTreeOpen = open;
     setToggleLabel();
+    historyTreeMenuClose(); // D6：收起/展开 → 右键菜单失效（面板已隐或即将重渲染）
     if (open) void historyTreeRefresh(); // 展开时取数渲染；收起不 fetch（下次提交/回跳的 refresh 只更计数）
   };
   collapsed.addEventListener("click", toggleTree);
@@ -6965,8 +7459,9 @@ function historyTreeUpdateFade() {
 }
 
 // 取数 + 渲染（commit 成功 / 回跳成功 / 展开时各调一次；函数本体补上即通，两处调用点不动）。
-// 竞态：每次 refresh 递增 historyTreeReqId，回包校验，旧的作废。
-async function historyTreeRefresh() {
+// 竞态：每次真正发起时递增 historyTreeReqId，回包校验，旧的作废。
+// P0（2026-10-26）：200ms 防抖 —— 同名连续调用在窗口内合并成一次发起（详见下方 historyTreeRefresh）。
+async function historyTreeRefreshNow() {
   if (!historyTreeEl) historyTreeEnsure();
   const reqId = ++historyTreeReqId;
   let wfName = "";
@@ -7010,6 +7505,33 @@ async function historyTreeRefresh() {
       historyTreeTreeEl.appendChild(errEl);
     }
   }
+}
+
+// P0（2026-10-26）：historyTreeRefresh 的 200ms 防抖外壳。
+// 背景：每次调用都完整 fetch + 全量重渲染；提交/回跳/换图/resize 常成串触发 → 重复请求与重复重绘。
+// 改法：连续调用都推进同一个 200ms 定时器，窗口到期只发起一次 historyTreeRefreshNow。
+// 保留：reqId 竞态、收起着只更计数、展开着渲染+画线、换工作流重置居中（historyTreeCenteredFor）
+//       全部在 historyTreeRefreshNow 内，一律不改。
+// 返回：Promise —— 本轮合并的所有调用共享一个 Promise，真正那次取数+渲染跑完后才 resolve。
+//       （调用方既有 void 也有 await，故不能返回 undefined、也不能提前 resolve。）
+const HISTORY_TREE_REFRESH_DEBOUNCE_MS = 200;
+let historyTreeRefreshTimer = null;
+let historyTreeRefreshWaiters = [];
+function historyTreeRefresh() {
+  return new Promise((resolve) => {
+    historyTreeRefreshWaiters.push(resolve); // 本轮合并的所有调用都在此排队
+    if (historyTreeRefreshTimer) clearTimeout(historyTreeRefreshTimer); // 新调用 → 窗口重新计时（尾部触发）
+    historyTreeRefreshTimer = setTimeout(() => {
+      historyTreeRefreshTimer = null;
+      const waiters = historyTreeRefreshWaiters;
+      historyTreeRefreshWaiters = [];
+      // 无论成败都 resolve（取数失败已在 Now 内部静默处理），避免 await 方永久挂住
+      Promise.resolve()
+        .then(() => historyTreeRefreshNow())
+        .catch((err) => { console.warn(LOG_TAG, "P7-树刷新异常（静默，不影响画布）", err); })
+        .then(() => { for (const w of waiters) { try { w(); } catch { /* 忽略 */ } } });
+    }, HISTORY_TREE_REFRESH_DEBOUNCE_MS);
+  });
 }
 
 // 悬停气泡（仿弹层 historyBarBubbleShow；内容：#NNN · 时间 / kind/source · 变更节点名）。
@@ -7262,11 +7784,14 @@ function roundedPolyline(pts, radius) {
 }
 
 // nodeEls/graph 均来自 historyTreeRenderTree；rAF 等一帧布局稳定后测量。
+// D4（2026-10-26）：遍历数据源 = historyTreeShownEntries（渲染时存下的可见集，已做短路隐藏）；
+// 为 null（还没渲染过）才回退 historyTreeEntries。否则隐藏后连线会画到已隐藏节点上。
 function historyTreeDrawEdges(nodeEls, graph) {
   const tree = historyTreeTreeEl;
   if (!tree || !nodeEls || !nodeEls.size) return;
+  const edgeEntries = historyTreeShownEntries || historyTreeEntries;
   const bySeq = new Map();
-  for (const ent of historyTreeEntries) {
+  for (const ent of edgeEntries) {
     if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
   }
   const rowOf = new Map();
@@ -7332,7 +7857,7 @@ function historyTreeDrawEdges(nodeEls, graph) {
       return false;
     };
 
-    for (const ent of historyTreeEntries) {
+    for (const ent of edgeEntries) {
       const seq = ent && ent.seq;
       if (seq == null) continue;
       const p = ent.parent;

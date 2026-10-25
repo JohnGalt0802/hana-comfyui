@@ -324,9 +324,13 @@ class TestCommit(TempRootTestCase):
         with open(os.path.join(out["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
             entry = json.loads(fh.readline())
         self.assertEqual(entry["blocks"], blocks)  # 索引行完整版（name + source + nodeIds + color）
-        # list_commits 读回一致
+        # list_commits 读回：响应里 blocks 已瘦身（去 nodeIds，只留实际存在的键）
         listed = hs.list_commits("wf", self.root)
-        self.assertEqual(listed["entries"][0]["blocks"], blocks)
+        self.assertEqual(
+            listed["entries"][0]["blocks"],
+            [{"name": "组1", "source": "group", "color": None},
+             {"name": "采样", "source": "role", "color": None}],
+        )
 
     def test_read_snapshot_legacy_with_blocks_ok(self):
         # N3 兼容口径：旧快照（尚带 blocks 字段）读取正常，不报错、字段原样读回
@@ -867,13 +871,12 @@ class TestP5bWiring(TempRootTestCase):
         self.assertEqual([x["promptId"] for x in obj["runs"]], ["p1", "p2"])
         self.assertEqual(obj["runs"][0]["images"], [{"filename": "a.png", "subfolder": "", "type": "output"}])
         self.assertEqual(obj["runs"][1]["images"], [{"filename": "b.png", "subfolder": "", "type": "output"}])
-        # list：节点一条，runs 两条各自带图，images 扁平
+        # list：节点一条，runs 两条（响应已瘦身：只有 promptId + imageCount），images 扁平保留明细
         listed = hs.list_commits("wf", self.root)
         self.assertEqual(len(listed["entries"]), 1)
         entry = listed["entries"][0]
-        self.assertEqual([r["promptId"] for r in entry["runs"]], ["p1", "p2"])
-        self.assertEqual(entry["runs"][0]["images"][0]["filename"], "a.png")
-        self.assertEqual(entry["runs"][1]["images"][0]["filename"], "b.png")
+        self.assertEqual(entry["runs"], [{"promptId": "p1", "imageCount": 1},
+                                         {"promptId": "p2", "imageCount": 1}])
         self.assertEqual([im["filename"] for im in entry["images"]], ["a.png", "b.png"])
 
     def test_attach_locates_node_via_merge_row(self):
@@ -901,7 +904,7 @@ class TestP5bWiring(TempRootTestCase):
             [{"filename": "old.png", "subfolder": "", "type": "output"}],
         )
         listed = hs.list_commits("wf", self.root)
-        self.assertEqual(listed["entries"][0]["runs"][0]["images"][0]["filename"], "old.png")
+        self.assertEqual([im["filename"] for im in listed["entries"][0]["images"]], ["old.png"])
         # 旧形态上 attach → 升级为新形态，且保留旧 run
         res = hs.attach_images("wf", self.root, "p1", [{"filename": "new.png"}])
         self.assertEqual(res["count"], 2)
@@ -934,6 +937,94 @@ class TestP5bWiring(TempRootTestCase):
         self.commit({"workflow": "wf", "graph": self.G_BASE, "promptId": "p1"})
         hs.save_commit({"workflow": "wf", "graph": self.G_STEPS}, self.root)
         self.assertFalse(os.path.exists(os.path.join(os.getcwd(), ".history")))
+
+
+class TestListResponseSlim(TempRootTestCase):
+    """2026-10-26：list_commits 响应瘦身（runs → {promptId,imageCount}；blocks 去 nodeIds）。
+
+    只改读取侧输出：索引磁盘结构不变、entry.images（扁平明细）原样保留。
+    """
+
+    WF = "wf"
+
+    def write_index(self, entries):
+        path = os.path.join(self.root, "workflows", ".history", self.WF, hs.INDEX_FILE_NAME)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n")
+        return path
+
+    def write_sidecar(self, entries, runs):
+        """为主行 entry 的 file 写 sidecar runs（{runs:[{promptId,at,images}]}）。"""
+        path = self.write_index(entries)
+        sidecar = os.path.join(os.path.dirname(path), entries[0]["file"] + hs.IMAGES_SUFFIX)
+        with open(sidecar, "w", encoding="utf-8") as fh:
+            json.dump({"runs": runs}, fh, ensure_ascii=False)
+        return sidecar
+
+    def base_entry(self, seq=1, **extra):
+        e = {
+            "seq": seq,
+            "file": "%04d-p%d.json" % (seq, seq),
+            "promptId": "p%d" % seq,
+            "at": "2026-10-11T00:00:00.000Z",
+            "source": "user",
+            "kind": "run",
+            "blocks": [],
+            "delta": None,
+        }
+        e.update(extra)
+        return e
+
+    # ① runs 精简后只有 promptId / imageCount 两个键
+    def test_runs_have_only_prompt_id_and_image_count(self):
+        entries = [self.base_entry()]
+        self.write_sidecar(entries, [
+            {"promptId": "p1", "at": "2026-10-11T00:00:00.000Z",
+             "images": [{"filename": "a.png", "subfolder": "", "type": "output"},
+                        {"filename": "b.png", "subfolder": "", "type": "output"}]},
+            {"promptId": "p2", "at": "2026-10-11T00:05:00.000Z",
+             "images": [{"filename": "c.png", "subfolder": "", "type": "output"}]},
+        ])
+        listed = hs.list_commits(self.WF, self.root)
+        self.assertTrue(listed["ok"])
+        entry = listed["entries"][0]
+        self.assertEqual(entry["runs"], [{"promptId": "p1", "imageCount": 2},
+                                         {"promptId": "p2", "imageCount": 1}])
+        for r in entry["runs"]:
+            self.assertEqual(sorted(r.keys()), ["imageCount", "promptId"])
+        # at / images 明细彻底不出现
+        self.assertEqual(json.dumps(entry["runs"], ensure_ascii=False).count("\"at\""), 0)
+        self.assertEqual(json.dumps(entry["runs"], ensure_ascii=False).count("\"images\""), 0)
+        # entry.images 不受影响：仍是对应 run 图的扁平合并明细
+        self.assertEqual([im["filename"] for im in entry["images"]], ["a.png", "b.png", "c.png"])
+
+    # ② blocks 里不含 nodeIds（且不存在的键不补 null）
+    def test_blocks_have_no_node_ids(self):
+        entries = [self.base_entry(
+            blocks=[
+                {"name": "A", "source": "group", "nodeIds": [1, 2], "color": "#3f789e"},
+                {"name": "B", "source": "group", "nodeIds": [3]},
+                {"name": "C", "title": "标题", "source": "role", "nodeIds": [4], "color": None},
+                {"nodeIds": [5]},
+            ],
+            delta={"changed": [{"id": 1, "title": "x", "fields": ["steps"]}], "added": [], "removed": []},
+        )]
+        self.write_index(entries)
+        listed = hs.list_commits(self.WF, self.root)
+        entry = listed["entries"][0]
+        self.assertEqual(entry["blocks"], [
+            {"name": "A", "source": "group", "color": "#3f789e"},     # 保留四键中实际存在的
+            {"name": "B", "source": "group"},                          # 缺 color → 不补 null
+            {"name": "C", "title": "标题", "source": "role", "color": None},  # color 原值 null 保留
+            {},                                                          # 只有 nodeIds → 瘦身后为空对象
+        ])
+        self.assertNotIn("nodeIds", json.dumps(entry["blocks"], ensure_ascii=False))
+        # 瘦身只影响响应：blockNames（内部计算）仍靠原 nodeIds 命中，磁盘索引未变
+        self.assertEqual(entry["blockNames"], ["A"])
+        with open(os.path.join(self.root, "workflows", ".history", self.WF, hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
+            raw = json.loads(fh.readline())
+        self.assertEqual(raw["blocks"][0]["nodeIds"], [1, 2])
 
 
 class TestHeadPersistence(TempRootTestCase):
@@ -1285,17 +1376,14 @@ class TestAttachImages(TempRootTestCase):
             lines = fh.read().splitlines()
         entry0_at = json.loads(lines[0])["at"]
         entry1_at = json.loads(lines[1])["at"]
-        # 有 sidecar 的 entry → 单元素 runs + 扁平 images
-        self.assertEqual(e0["runs"], [{
-            "promptId": "aaaaaaaa-1111",
-            "at": entry0_at,
-            "images": [{"filename": "a1.png", "subfolder": "", "type": "output"},
-                       {"filename": "a2.png", "subfolder": "", "type": "output"}],
-        }])
-        self.assertEqual(e0["images"], e0["runs"][0]["images"])
-        # 无 sidecar 的 entry → 单 run（promptId 在、images 空）
-        self.assertEqual(e1["runs"], [{"promptId": "bbbbbbbb-2222", "at": entry1_at, "images": []}])
+        # 有 sidecar 的 entry → 单元素 runs（瘦身：promptId + imageCount）+ 扁平 images（明细）
+        self.assertEqual(e0["runs"], [{"promptId": "aaaaaaaa-1111", "imageCount": 2}])
+        self.assertEqual(e0["images"], [{"filename": "a1.png", "subfolder": "", "type": "output"},
+                                       {"filename": "a2.png", "subfolder": "", "type": "output"}])
+        # 无 sidecar 的 entry → 单 run（promptId 在、imageCount 0）
+        self.assertEqual(e1["runs"], [{"promptId": "bbbbbbbb-2222", "imageCount": 0}])
         self.assertEqual(e1["images"], [])
+        self.assertTrue(entry0_at and entry1_at)  # 索引行 at 仍在（只是响应 runs 里不再带）
         # 索引磁盘内容未被改（主行 runs 仍为 P5 缺省 []、无 images 字段；仍两行）
         with open(os.path.join(a["dir"], hs.INDEX_FILE_NAME), encoding="utf-8") as fh:
             raw = json.loads(fh.readline())
@@ -1310,7 +1398,7 @@ class TestAttachImages(TempRootTestCase):
         e0 = listed["entries"][0]
         self.assertEqual(len(e0["runs"]), 1)
         self.assertEqual(e0["runs"][0]["promptId"], "aaaaaaaa-1111")
-        self.assertEqual(e0["runs"][0]["images"], [])
+        self.assertEqual(e0["runs"][0]["imageCount"], 0)
         self.assertEqual(e0["images"], [])
 
     def test_sidecar_bad_json_reads_empty(self):
