@@ -378,11 +378,26 @@ const SIG_GRAPH = {
   links: [[1, 1, 0, 2, 0, "MODEL"]],
 };
 
-test("graphSigIgnoringSeed：稳定 hex（v2 前缀 + 8 位），且与固定期望一致", () => {
+test("graphSigIgnoringSeed：稳定 hex（v3 前缀 + 8 位），且与固定期望一致", () => {
   const sig = graphSigIgnoringSeed(SIG_GRAPH);
-  assert.match(sig, /^v2:[0-9a-f]{8}$/);
-  assert.equal(sig, "v2:06abd57b"); // 跨语言一致基准（Python 侧同值）
+  assert.match(sig, /^v3:[0-9a-f]{8}$/);
+  assert.equal(sig, "v3:b832eb61"); // 跨语言一致基准（Python 侧同值，v3 起纳入 mode）
   assert.equal(graphSigIgnoringSeed(SIG_GRAPH), sig); // 幂等
+});
+
+test("graphSigIgnoringSeed：v3 节点 mode 参与签名（bypass/mute 另起新节点）", () => {
+  const base = { nodes: [
+    { id: 1, type: "A", mode: 0, widgets_values: [1] },
+    { id: 2, type: "B", widgets_values: [2] },
+  ], links: [] };
+  const s0 = graphSigIgnoringSeed(base);
+  const bypass = structuredClone(base); bypass.nodes[0].mode = 4;
+  const mute = structuredClone(base); mute.nodes[0].mode = 2;
+  const nomode = structuredClone(base); delete nomode.nodes[0].mode;
+  assert.notEqual(graphSigIgnoringSeed(bypass), s0, "bypass 应改签名");
+  assert.notEqual(graphSigIgnoringSeed(mute), s0, "mute 应改签名");
+  assert.notEqual(graphSigIgnoringSeed(bypass), graphSigIgnoringSeed(mute));
+  assert.equal(graphSigIgnoringSeed(nomode), s0, "mode 缺失应与 0 等价");
 });
 
 test("graphSigIgnoringSeed：忽略 seed 类 widget，对非 seed 变化敏感", () => {
@@ -552,7 +567,7 @@ test("graphSigIgnoringSeed：跨语言 fixture 与 Python 侧同串", () => {
       { id: 2, type: "KSampler", widgets_values_named: { seed: 123, sampler_name: "euler", steps: 20 } },
     ],
   };
-  assert.equal(graphSigIgnoringSeed(fixture), "v2:da8129a4");
+  assert.equal(graphSigIgnoringSeed(fixture), "v3:dd0db49c");
 });
 
 // ── 17. P5a：组合（新字段落索引行 → 解析 → normalizeEntry 读回）───────────

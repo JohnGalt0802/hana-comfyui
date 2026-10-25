@@ -348,9 +348,13 @@ export function graphSigIgnoringSeed(graph) {
   for (const n of nodes) {
     if (!isPlainObject(n)) continue;
     const type = n.type == null ? "" : String(n.type);
-    parts.push(fnv1aHex(`${type}|${widgetsPart(n)}`));
+    // 2026-10-26（v2 → v3）：纳入 mode。原先不含 mode 导致 bypass(=4) / mute(=2) 不参与签名，
+    // 关掉一个模块后签名不变 → 被判成「图没变」而合并。mode 缺失 / 非数字 → 按 0。
+    const modeRaw = Number(n.mode == null ? 0 : n.mode);
+    const mode = Number.isFinite(modeRaw) ? Math.trunc(modeRaw) : 0;
+    parts.push(fnv1aHex(`${type}|${mode}|${widgetsPart(n)}`));
   }
-  return `v2:${fnv1aHex(parts.join("|") + "#L#" + linksPart(g))}`;
+  return `v3:${fnv1aHex(parts.join("|") + "#L#" + linksPart(g))}`;
 }
 
 /** id → 节点（跳过无 id / 非对象）。 */

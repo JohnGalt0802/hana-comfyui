@@ -236,12 +236,18 @@ def _link_desc(ep, by_id):
 
 
 def graph_sig_ignoring_seed(graph):
-    """归一化画布签名（忽略 seed 类 widget；v2 起纳入连线端点对）。
-    口径（v2）：节点部分 = 按 graph.nodes 顺序，逐节点 type + "|" + widget 段，各节点段先
-    fnv1a，再以 "|" 串接；连线部分 = 全部端点串（`originId:originSlot>targetId:targetSlot`）
-    排序后以 "," 拼接；最终 `"v2:" + fnv1a(节点部分 + "#L#" + 连线部分)`，输出 8 位小写 hex。
-    与桥 js graphSignature() 同族但更简化（不含 mode/title/位置；不含节点 id）。
-    口径版本前缀：旧数据无 `v2:` 前缀 → 判为不可比 → 不合并（一次性代价）。"""
+    """归一化画布签名（忽略 seed 类 widget；v2 起纳入连线端点对；v3 起纳入节点 mode）。
+    口径（v3）：节点部分 = 按 graph.nodes 顺序，逐节点 type + "|" + mode + "|" + widget 段，
+    各节点段先 fnv1a，再以 "|" 串接；连线部分 = 全部端点串
+    （`originId:originSlot>targetId:targetSlot`）排序后以 "," 拼接；
+    最终 `"v3:" + fnv1a(节点部分 + "#L#" + 连线部分)`，输出 8 位小写 hex。
+    与桥 js graphSignature() 同族但更简化（不含 title/位置；不含节点 id）。
+    口径版本前缀：旧数据无前缀 / 旧版本前缀 → 判为不可比 → 不合并（一次性代价）。
+
+    2026-10-26（v2 → v3）：纳入 mode。原先不含 mode 导致 bypass(=4) / mute(=2) 不参与签名，
+    关掉一个模块后签名不变 → 被判成「图没变」而合并到上一个节点，用户报「bypass 也算合并」。
+    mode 缺失 / 非数字 → 按 0（正常）处理。
+    """
     g = graph if isinstance(graph, dict) else {}
     nodes = g.get("nodes") if isinstance(g.get("nodes"), list) else []
     parts = []
@@ -249,8 +255,12 @@ def graph_sig_ignoring_seed(graph):
         if not isinstance(n, dict):
             continue
         typ = "" if n.get("type") is None else str(n.get("type"))
-        parts.append(_fnv1a_hex("%s|%s" % (typ, _widgets_part(n))))
-    return "v2:" + _fnv1a_hex("|".join(parts) + "#L#" + _links_part(g))
+        try:
+            mode = int(n.get("mode") or 0)
+        except (TypeError, ValueError):
+            mode = 0
+        parts.append(_fnv1a_hex("%s|%s|%s" % (typ, mode, _widgets_part(n))))
+    return "v3:" + _fnv1a_hex("|".join(parts) + "#L#" + _links_part(g))
 
 
 def _index_nodes_by_id(graph):

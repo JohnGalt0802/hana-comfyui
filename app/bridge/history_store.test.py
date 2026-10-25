@@ -584,9 +584,33 @@ class TestP5Purity(TempRootTestCase):
 
     def test_graph_sig_ignoring_seed_stable(self):
         sig = hs.graph_sig_ignoring_seed(self.SIG_GRAPH)
-        self.assertRegex(sig, r"^v2:[0-9a-f]{8}$")
-        self.assertEqual(sig, "v2:06abd57b")  # 跨语言一致基准（JS 侧同值）
+        self.assertRegex(sig, r"^v3:[0-9a-f]{8}$")
+        self.assertEqual(sig, "v3:b832eb61")  # 跨语言一致基准（JS 侧同值，v3 起纳入 mode）
         self.assertEqual(hs.graph_sig_ignoring_seed(self.SIG_GRAPH), sig)
+
+    def test_graph_sig_v3_mode_sensitive(self):
+        """2026-10-26（v3）：节点 mode 参与签名 —— bypass(4) / mute(2) 必须另起新节点。
+
+        修前：签名不含 mode，关掉一个模块后签名不变 → 被判成「图没变」而合并。
+        """
+        import copy
+
+        base = {"nodes": [
+            {"id": 1, "type": "A", "mode": 0, "widgets_values": [1]},
+            {"id": 2, "type": "B", "widgets_values": [2]},
+        ], "links": []}
+        s0 = hs.graph_sig_ignoring_seed(base)
+        bypass = copy.deepcopy(base)
+        bypass["nodes"][0]["mode"] = 4
+        mute = copy.deepcopy(base)
+        mute["nodes"][0]["mode"] = 2
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(bypass), s0, "bypass 应改签名")
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(mute), s0, "mute 应改签名")
+        self.assertNotEqual(hs.graph_sig_ignoring_seed(bypass), hs.graph_sig_ignoring_seed(mute))
+        # mode 缺失与 mode=0 等价
+        nomode = copy.deepcopy(base)
+        nomode["nodes"][0].pop("mode")
+        self.assertEqual(hs.graph_sig_ignoring_seed(nomode), s0)
 
     def test_graph_sig_v2_links_sensitive_seed_insensitive(self):
         """v2 语义：纯连线改动 → 签名变化；仅换 seed → 签名不变（与 JS §12 用例对应）。"""
@@ -708,7 +732,7 @@ class TestP5Purity(TempRootTestCase):
             {"id": 1, "type": "PrimitiveInt", "widgets_values": [1024]},
             {"id": 2, "type": "KSampler", "widgets_values_named": {"seed": 123, "sampler_name": "euler", "steps": 20}},
         ]}
-        self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "v2:da8129a4")
+        self.assertEqual(hs.graph_sig_ignoring_seed(fixture), "v3:dd0db49c")
 
 
 class TestP5bWiring(TempRootTestCase):
