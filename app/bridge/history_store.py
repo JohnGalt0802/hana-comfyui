@@ -255,10 +255,7 @@ def graph_sig_ignoring_seed(graph):
         if not isinstance(n, dict):
             continue
         typ = "" if n.get("type") is None else str(n.get("type"))
-        try:
-            mode = int(n.get("mode") or 0)
-        except (TypeError, ValueError):
-            mode = 0
+        mode = _node_mode(n)
         parts.append(_fnv1a_hex("%s|%s|%s" % (typ, mode, _widgets_part(n))))
     return "v3:" + _fnv1a_hex("|".join(parts) + "#L#" + _links_part(g))
 
@@ -324,6 +321,19 @@ def _id_sort_key(v):
     return (1, str(v))
 
 
+def _node_mode(n):
+    """节点 mode 归一化：缺失 / 非数字 → 0（正常）；bypass=4 / mute=2 / never=1。
+
+    签名与 delta 共用，保证「改 mode」在两处口径一致。
+    """
+    if not isinstance(n, dict):
+        return 0
+    try:
+        return int(n.get("mode") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def compute_delta(prev_graph, next_graph):
     """对比两画布（UI 格式），相对 prev 算四类变化（节点三类 + 连线一类）。
     prev_graph 为 None/非法 → 返回 None。
@@ -364,6 +374,10 @@ def compute_delta(prev_graph, next_graph):
         tb = "" if b.get("type") is None else str(b.get("type"))
         if ta != tb:
             fields.append("type")
+        # 2026-10-26：mode 也参与改动判定（bypass=4 / mute=2）。
+        # 修前只比 type + widget → 关掉一个模块不算改动，节点色条不亮、也不进 changed。
+        if _node_mode(a) != _node_mode(b):
+            fields.append("mode")
         fields.extend(_changed_widget_names(a, b))
         if fields:
             changed.append({"id": b.get("id"), "title": _node_title(b), "fields": fields})

@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-26 hana-bridge-03234100";
+const BUILD_TAG = "2026-10-26 hana-bridge-05201100";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -4504,6 +4504,27 @@ function historyTickChangedNames(ent) {
   return out;
 }
 
+// 2026-10-26：字段名 → 中文标签（悬停气泡「改动」行的括号内容）。
+// 未知名字原样输出；widget_N 位置参数 → 「参数N」。
+const HISTORY_FIELD_LABELS = {
+  mode: "状态", type: "类型",
+  steps: "步数", cfg: "CFG", denoise: "降噪", seed: "种子", noise_seed: "种子",
+  sampler_name: "采样器", scheduler: "调度器", text: "文本",
+  width: "宽", height: "高", batch_size: "批次数", length: "长度",
+  strength: "强度", strength_model: "模型强度", strength_clip: "CLIP 强度",
+  lora_name: "LoRA", ckpt_name: "模型", vae_name: "VAE", clip_name: "CLIP",
+  clip_name1: "CLIP1", clip_name2: "CLIP2", clip_name3: "CLIP3", model_name: "模型",
+  prompt: "提示词", negative: "反向提示",
+};
+function historyFieldLabel(f) {
+  const k = String(f == null ? "" : f).trim();
+  if (!k) return "";
+  if (HISTORY_FIELD_LABELS[k]) return HISTORY_FIELD_LABELS[k];
+  const m = /^widget_(\d+)$/.exec(k);
+  if (m) return "参数" + Number(m[1]);
+  return k;
+}
+
 // ── 2026-10-15 缺口一：提交变动符号（刻度 / 树节点共用）────────────────────────
 // 语义：节点增删 → 「＋n」/「－n」；连线有变 → 「⇄n」；可组合（如「＋2 ⇄1」）。
 // 数据源 ent.delta（方案 §五 契约）：changed/added/removed（节点维度）+ links{added,removed}（连线维度）。
@@ -6376,6 +6397,23 @@ function historyTreeStyleEnsure() {
   box-shadow: 0 6px 20px var(--htr-bubble-sh); padding: 5px 8px; font-size: 11px; line-height: 1.45;
 }
 #${HISTORY_TREE_ID} .htr-bub-time { color: var(--htr-sub); }
+/* 2026-10-26：气泡正文改分组（改动 / 新增 / 删除 / 连线）。此前只有一行名字以「、」串接，
+   不区分动作、也不说改了什么，吊在半空里读不出信息。 */
+#${HISTORY_TREE_ID} .htr-bub-row {
+  display: flex; gap: 6px; align-items: flex-start; margin-top: 3px; max-width: 320px;
+}
+#${HISTORY_TREE_ID} .htr-bub-tag {
+  flex: none; font-size: 10px; line-height: 15px; padding: 0 4px; border-radius: 4px;
+  background: var(--htr-inset-line); color: var(--htr-sub); letter-spacing: .02em;
+}
+#${HISTORY_TREE_ID} .htr-bub-tag-mod { color: #d9a45c; }
+#${HISTORY_TREE_ID} .htr-bub-tag-add { color: #7fb069; }
+#${HISTORY_TREE_ID} .htr-bub-tag-del { color: #d5787a; }
+#${HISTORY_TREE_ID} .htr-bub-tag-link { color: #7ba6c9; }
+#${HISTORY_TREE_ID} .htr-bub-items { min-width: 0; }
+#${HISTORY_TREE_ID} .htr-bub-item { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#${HISTORY_TREE_ID} .htr-bub-fld { color: var(--htr-sub); font-size: 10px; margin-left: 3px; }
+#${HISTORY_TREE_ID} .htr-bub-more { color: var(--htr-sub); font-size: 10px; }
 /* 单击节点的缩略图浮层（默认隐藏；双击=回跳；点空白/移出关） */
 #${HISTORY_TREE_ID} .htr-shots {
   position: absolute; z-index: 6; display: none;
@@ -7922,13 +7960,91 @@ function historyTreeBubbleShow(tick, ent) {
   const t = document.createElement("div");
   t.className = "htr-bub-time";
   t.textContent = "#" + historySeqLabel(ent) + " · " + historyFmtTime(ent && ent.at);
-  const changed = historyTickChangedNames(ent).join("、");
-  if (changed) {
-    const names = document.createElement("div");
-    names.textContent = changed;
-    b.append(t, names);
-  } else {
-    b.append(t);
+  b.append(t);
+  // 2026-10-26：正文改分组渲染（改动 / 新增 / 删除 / 连线）。
+  // 旧版把 changed/added/removed 的名字混成一行「、」串接，不区分动作、也不说改了什么。
+  const MAX_ITEMS = 6; // 每组最多列几个名字，多的折成「…等 N 个」
+  const addRow = (tag, cls, nodes, withFields) => {
+    if (!Array.isArray(nodes) || !nodes.length) return;
+    const row = document.createElement("div");
+    row.className = "htr-bub-row";
+    const tg = document.createElement("span");
+    tg.className = "htr-bub-tag " + cls;
+    tg.textContent = tag;
+    const box = document.createElement("div");
+    box.className = "htr-bub-items";
+    for (const nd of nodes.slice(0, MAX_ITEMS)) {
+      if (!nd || typeof nd !== "object") continue;
+      const it = document.createElement("div");
+      it.className = "htr-bub-item";
+      const nm = String(nd.title == null ? "" : nd.title).trim() || "（未命名节点）";
+      it.textContent = nm;
+      if (withFields && Array.isArray(nd.fields) && nd.fields.length) {
+        const flds = nd.fields.map(historyFieldLabel).filter(Boolean);
+        if (flds.length) {
+          const f = document.createElement("span");
+          f.className = "htr-bub-fld";
+          f.textContent = "（" + flds.join("、") + "）";
+          it.appendChild(f);
+        }
+      }
+      it.title = it.textContent; // 名字过长被 ellipsis 时能看全
+      box.appendChild(it);
+    }
+    if (nodes.length > MAX_ITEMS) {
+      const more = document.createElement("div");
+      more.className = "htr-bub-more";
+      more.textContent = "…等 " + nodes.length + " 个";
+      box.appendChild(more);
+    }
+    row.append(tg, box);
+    b.appendChild(row);
+  };
+  const d = ent && ent.delta && typeof ent.delta === "object" ? ent.delta : null;
+  let rendered = false;
+  if (d) {
+    addRow("改动", "htr-bub-tag-mod", d.changed, true);
+    addRow("新增", "htr-bub-tag-add", d.added, false);
+    addRow("删除", "htr-bub-tag-del", d.removed, false);
+    const lk = d.links && typeof d.links === "object" ? d.links : null;
+    if (lk) {
+      const ln = (Array.isArray(lk.added) ? lk.added.length : 0) + (Array.isArray(lk.removed) ? lk.removed.length : 0);
+      if (ln) {
+        const row = document.createElement("div");
+        row.className = "htr-bub-row";
+        const tg = document.createElement("span");
+        tg.className = "htr-bub-tag htr-bub-tag-link";
+        tg.textContent = "连线";
+        const vl = document.createElement("div");
+        vl.className = "htr-bub-items";
+        vl.textContent = "⇄ " + ln + " 处";
+        row.append(tg, vl);
+        b.appendChild(row);
+      }
+    }
+    rendered = b.childElementCount > 1;
+    if (!rendered) {
+      const row = document.createElement("div");
+      row.className = "htr-bub-row";
+      const vl = document.createElement("div");
+      vl.className = "htr-bub-items";
+      vl.textContent = "无节点 / 连线变更";
+      row.appendChild(vl);
+      b.appendChild(row);
+    }
+  }
+  if (!d) {
+    // delta 缺失（旧条目）：退化到块名（与旧行为一致，只是包一层行）
+    const names = historyTickChangedNames(ent).join("、");
+    if (names) {
+      const row = document.createElement("div");
+      row.className = "htr-bub-row";
+      const vl = document.createElement("div");
+      vl.className = "htr-bub-items";
+      vl.textContent = names;
+      row.appendChild(vl);
+      b.appendChild(row);
+    }
   }
   // 先隐藏挂入：需要 offsetWidth/offsetHeight 才能算定位
   b.style.visibility = "hidden";

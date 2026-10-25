@@ -123,7 +123,8 @@ except ValueError:
 # 2026-10-26（隐藏节点 + P0 性能：scoreOf 改按需 / refresh 防抖 / list 胦身）：对齐新活动桥 hana-bridge-01472600。
 # 2026-10-26（泳道眼睛 + 隐藏 N 恢复入口）：对齐新活动桥 hana-bridge-02480500。
 # 2026-10-26（隐藏改留空位 + 泳道编号/眼睛常驻左侧 gutter）：对齐新活动桥 hana-bridge-03234100。
-BRIDGE_BUILD_TAG = "2026-10-26 hana-bridge-03234100"
+# 2026-10-26（悬停气泡分组显示 + delta 补 mode）：对齐新活动桥 hana-bridge-05201100。
+BRIDGE_BUILD_TAG = "2026-10-26 hana-bridge-05201100"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
