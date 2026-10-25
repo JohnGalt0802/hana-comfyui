@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-26 hana-bridge-01472600";
+const BUILD_TAG = "2026-10-26 hana-bridge-02480500";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -6010,6 +6010,7 @@ let historyTreePanelEl = null;
 let historyTreeCanvasEl = null; // 展开面板里的横滚容器（.tcanvas）
 let historyTreeTreeEl = null; // 展开面板里的泳道层（.lanes；绝对定位节点 + svg 连线层）
 let historyTreeCountEl = null; // 收纳条「N 节点 · M 分支 · K 泳道」
+let historyTreeHiddenBtnEl = null; // D7：收纳条「隐藏 N」恢复入口（无隐藏时不渲染）
 let historyTreeToggleEl = null; // 展开/收起按钮
 let historyTreeSleepEl = null; // 休眠折叠条（+N 休眠分支）
 let historyTreeFadeLEl = null; // 左端渐隐
@@ -6184,6 +6185,15 @@ function historyTreeStyleEnsure() {
 }
 #${HISTORY_TREE_ID} .htr-sum { font-weight: 600; }
 #${HISTORY_TREE_ID} .htr-count { color: var(--htr-sub); }
+/* 2026-10-26（D7·任务 B）：收纳条「隐藏 N」恢复入口 —— 与 .htr-count 同族（同字号/同色系），但可点。
+   有无隐藏项由 historyTreeUpdateCounts 控制（hidden 属性切换）；点开恢复面板（见 historyTreeHiddenPanelOpen）。 */
+#${HISTORY_TREE_ID} .htr-hidden-btn {
+  background: transparent; border: 0; padding: 0 3px; margin: -1px 0;
+  font: inherit; font-size: 12px; line-height: 1.4; color: var(--htr-sub);
+  border-radius: 5px; cursor: pointer;
+}
+#${HISTORY_TREE_ID} .htr-hidden-btn:hover { color: var(--htr-fg); background: var(--htr-btn-bg-h); }
+#${HISTORY_TREE_ID} .htr-hidden-btn[hidden] { display: none; }
 #${HISTORY_TREE_ID} .htr-toggle {
   margin-left: auto; background: transparent; border: 1px solid var(--htr-btn-line);
   color: var(--htr-btn-fg); border-radius: 6px; padding: 1px 8px; cursor: pointer; font-size: 11px;
@@ -6238,6 +6248,24 @@ function historyTreeStyleEnsure() {
   font-size: 9px; line-height: 1; color: var(--htr-sub); opacity: .5;
   pointer-events: none; /* 2026-10-26：序号只是标注，不参与命中（否则会抢最左侧节点的右键） */
 }
+/* 2026-10-26（D7·任务 A）：泳道眼睛 —— 每条泳道行一个，常显在序号左侧（PS 图层面板口径：点一下 = 隐藏该行）。
+   挂在 .htr-laneaxis 内部（复用行坐标系），12×12 居中对齐行中线，底色透明（不遮行）。
+   颜色走 --htr-sub（常态半透）/ hover 转 --htr-fg；纯 DOM + 内联 SVG，不引图标字体、不引外链。 */
+#${HISTORY_TREE_ID} .htr-laneeye {
+  position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
+  width: 12px; height: 12px; display: flex; align-items: center; justify-content: center;
+  background: transparent; border-radius: 3px;
+  color: var(--htr-sub); cursor: pointer; pointer-events: auto;
+  /* z-index 3：在 .lanes 堆叠上下文里 > 节点（z-index 1）> 其他泳道轴（无 z-index）。
+     眼睛只占左 2~14px（节点从 axisW=34 起），两者不重叠，抬高只为防万一。 */
+  z-index: 3;
+}
+#${HISTORY_TREE_ID} .htr-laneeye svg { display: block; width: 12px; height: 12px; opacity: .45; }
+#${HISTORY_TREE_ID} .htr-laneeye:hover { color: var(--htr-fg); }
+#${HISTORY_TREE_ID} .htr-laneeye:hover svg { opacity: 1; }
+#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-idle { cursor: default; opacity: .5; }
+#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-idle svg { opacity: .28; }
+#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-idle:hover { color: var(--htr-sub); }
 /* 节点（统一母题）：外框 = 线型(操作)+色(谁)；内条堆 = 本次碰过的画布框（框色，见 .hnode-bar） */
 #${HISTORY_TREE_ID} .node {
   position: absolute; transform: translate(-50%, -50%);
@@ -6376,6 +6404,20 @@ function historyTreeStyleEnsure() {
 .htr-menu-item[disabled] { color: var(--htr-sub); opacity: .6; cursor: default; }
 .htr-menu-item[disabled]:hover { background: transparent; }
 .htr-menu-hint { display: block; margin-top: 1px; color: var(--htr-sub); font-size: 10.5px; white-space: normal; }
+/* 2026-10-26（D7·任务 B）：隐藏项恢复面板 —— 复用 .htr-menu 皮肤（fixed / z-index 10002 / 气泡变量）。
+   挂 document.body，所以选择器不带 #${HISTORY_TREE_ID} 前缀（同 .htr-menu）。 */
+.htr-hidden-panel { min-width: 176px; max-width: 280px; max-height: 240px; overflow: auto; }
+.htr-hidden-panel .htr-hid-row { display: flex; align-items: center; gap: 8px; padding: 1px 8px 1px 8px; }
+.htr-hidden-panel .htr-hid-seq { flex: 1 1 auto; color: var(--htr-bubble-fg); font-variant-numeric: tabular-nums; }
+.htr-hidden-panel .htr-hid-btn {
+  flex: none; background: transparent; border: 1px solid var(--htr-btn-line); border-radius: 6px;
+  color: var(--htr-btn-fg); font: inherit; font-size: 11px; line-height: 1.3; padding: 1px 8px; cursor: pointer;
+}
+.htr-hidden-panel .htr-hid-btn:hover { background: var(--htr-btn-bg-h); }
+.htr-hidden-panel .htr-hid-all {
+  margin-top: 3px; border-top: 1px solid var(--htr-bubble-line); border-radius: 0 0 6px 6px;
+  padding-top: 6px; text-align: center;
+}
 `;
   document.head.appendChild(style);
   historyNodeStyleEnsure(); // 统一母题内条堆（两视图共用）
@@ -6738,6 +6780,20 @@ function historyTreeUpdateCounts(entries) {
     : solidEntries.length + " 节点";
   historyTreeCountEl.textContent =
     nodeText + " · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
+  // D7（2026-10-26·任务 B）：收纳条「隐藏 N」—— 有隐藏才出现，N = sanitize 后的实际隐藏个数。
+  // 面板开着时顺便刷新行（原项可能已恢复 / 新项可能出现）。
+  if (historyTreeHiddenBtnEl) {
+    if (hidden.size > 0) {
+      historyTreeHiddenBtnEl.hidden = false;
+      historyTreeHiddenBtnEl.textContent = "隐藏 " + hidden.size;
+      historyTreeHiddenBtnEl.title = "已隐藏 " + hidden.size + " 个提交（点击管理）";
+    } else {
+      historyTreeHiddenBtnEl.hidden = true;
+      historyTreeHiddenBtnEl.textContent = "";
+      historyTreeHiddenBtnEl.title = "";
+    }
+  }
+  historyTreeHiddenPanelRefresh();
 }
 
 // 纯函数（自测用）：entries: [{seq,parent}]（seq 升序）；mode: "time"|"compact"。
@@ -6770,6 +6826,7 @@ function historyTreeRenderTree(entries) {
   if (historyTreeClickTimer) { clearTimeout(historyTreeClickTimer); historyTreeClickTimer = null; } // 重渲染 → 清消歧态
   historyTreeShotsHide(); // 重渲染 → 清预览浮层（防残留）
   historyTreeMenuClose(); // D6：重渲染 → 右键菜单也随之失效（锚点节点/泳道已重建，留着会点错）
+  historyTreeHiddenPanelClose(); // D7：重渲染 → 恢复面板同因失效（行已重建，旧的 #seq 已不准）
   const sleepEl = historyTreeEl ? historyTreeEl.querySelector(".htr-sleep") : null;
   if (!entries.length) {
     const empty = document.createElement("div");
@@ -6904,6 +6961,9 @@ function historyTreeRenderTree(entries) {
     ax.style.top = row * laneH + laneH / 2 + "px";
     ax.style.setProperty("--htr-lane-hot", laneH + "px"); // 命中区高度 = 一整行（可见仍是 1px 线）
     ax.dataset.lane = String(row + 1); // 序号标注（CSS ::after）
+    // D7（2026-10-26）：泳道眼睛 —— 常显在序号左侧（2px），点击隐藏本行可见节点（PS 图层口径）。
+    // 数据源用渲染时已算好的 rowSeqs（不重算）；可隐藏数 = 过一遭 sanitizeHidden 后的差集（HEAD / 根自动排除）。
+    ax.appendChild(historyTreeLaneEye(row, rowSeqs.get(row) || [], solidEntries, hidden));
     // D6（2026-10-26）：泳道右键 → 批量隐藏本行。preventDefault + stopPropagation 防冒泡触发画布右键菜单。
     ax.addEventListener("contextmenu", (ev) => {
       const seqs = rowSeqs.get(row) || [];
@@ -7039,6 +7099,221 @@ function historyTreeHiddenApplyChange(hiddenSet) {
   return false;
 }
 
+// ── D7（2026-10-26·任务 B）：收纳条「隐藏 N」恢复面板 ──────────────────
+// 挂 document.body（position:fixed）：收纳条在树根内，且面板不能被任何 overflow 裁切。
+// 皮肤沿用 .htr-menu（z-index 10002 / 气泡变量），只额外加 .htr-hidden-panel 做行布局。
+// 关闭四路与右键菜单同口径：Esc / 点面板外空白 / 再次点入口 / 窗口失焦或缩放。
+let historyTreeHiddenPanelEl = null;
+let historyTreeHiddenPanelOff = null;
+
+function historyTreeHiddenPanelClose() {
+  if (historyTreeHiddenPanelOff) {
+    try { historyTreeHiddenPanelOff(); } catch { /* 解绑失败不影响关闭 */ }
+    historyTreeHiddenPanelOff = null;
+  }
+  if (historyTreeHiddenPanelEl && historyTreeHiddenPanelEl.parentElement) {
+    historyTreeHiddenPanelEl.parentElement.removeChild(historyTreeHiddenPanelEl);
+  }
+  historyTreeHiddenPanelEl = null;
+}
+
+// 当前的隐藏项（按当前画布隔离：historyHiddenGet 已按画布分键）+ 过一遍 sanitizeHidden（与渲染同口径）
+function historyTreeHiddenCurrentSet() {
+  const all = Array.isArray(historyTreeEntries) ? historyTreeEntries : [];
+  const solid = all.filter((e) => e && e.mergeInto == null);
+  const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
+  return sanitizeHidden(historyHiddenGet(), solid, headSeq);
+}
+
+// 面板内容重建（列表 + 底部全部恢复）。无隐藏项 → 直接关面板。
+function historyTreeHiddenPanelRefresh() {
+  const box = historyTreeHiddenPanelEl;
+  if (!box) return;
+  const set = historyTreeHiddenCurrentSet();
+  if (!set.size) { historyTreeHiddenPanelClose(); return; }
+  const seqs = [...set].sort((a, b) => a - b);
+  const title = "已隐藏 " + set.size + " 个提交";
+  // 保留已定位的外壳，只换内部
+  const keepRect = { left: box.style.left, top: box.style.top };
+  box.textContent = "";
+  const t = document.createElement("div");
+  t.className = "htr-menu-title";
+  t.textContent = title;
+  box.appendChild(t);
+  for (const seq of seqs) {
+    const row = document.createElement("div");
+    row.className = "htr-hid-row";
+    const lab = document.createElement("span");
+    lab.className = "htr-hid-seq";
+    lab.textContent = "#" + seq;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "htr-hid-btn";
+    btn.textContent = "恢复";
+    btn.title = "恢复 #" + seq;
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const next = historyTreeHiddenCurrentSet();
+      next.delete(seq);
+      historyTreeHiddenApplyChange(next); // 立即生效（内部重渲染 + 更计数）
+      // 面板刷新：展开着时 applyChange 会重渲染 → 面板已被关，这里按新集合重开；
+      // 收起着时面板仍存在，updateCounts 已就地重建行（不重复 open，否则会被当成「再点一次」关掉）。
+      if (!historyTreeHiddenPanelEl && historyTreeHiddenBtnEl && !historyTreeHiddenBtnEl.hidden) {
+        historyTreeHiddenPanelOpen();
+      }
+    });
+    row.append(lab, btn);
+    box.appendChild(row);
+  }
+  const all = document.createElement("button");
+  all.type = "button";
+  all.className = "htr-menu-item htr-hid-all";
+  all.textContent = "全部恢复（" + set.size + " 个）";
+  all.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyTreeHiddenApplyChange(new Set()); // 清空 → applyChange 内会重渲染并关面板
+  });
+  box.appendChild(all);
+  // 重建后尺寸可能变了：贴回入口上方（重算，不信任旧高度）
+  historyTreeHiddenPanelPlace(keepRect);
+}
+
+// 定位：挂在入口按钮上方，水平左对齐；贴边则钳在视口内 8px。
+function historyTreeHiddenPanelPlace(prev) {
+  const box = historyTreeHiddenPanelEl;
+  const anchor = historyTreeHiddenBtnEl;
+  if (!box || !anchor) return;
+  let left = 8;
+  let top = 8;
+  try {
+    const r = anchor.getBoundingClientRect();
+    left = r.left;
+    top = r.top - box.offsetHeight - 6;
+    const vw = window.innerWidth || 0;
+    const vh = window.innerHeight || 0;
+    const bw = box.offsetWidth;
+    const bh = box.offsetHeight;
+    if (vw > 0) left = Math.max(8, Math.min(left, Math.max(8, vw - bw - 8)));
+    if (vh > 0) {
+      if (top < 8) top = r.bottom + 6; // 上方放不下 → 翻到入口下方
+      top = Math.max(8, Math.min(top, Math.max(8, vh - bh - 8)));
+    }
+  } catch {
+    if (prev && prev.top) { left = prev.left; top = prev.top; }
+  }
+  box.style.left = Math.round(left) + "px";
+  box.style.top = Math.round(top) + "px";
+}
+
+// 打开（幂等）：已开 → 先关（再次点入口 = 关闭）
+function historyTreeHiddenPanelOpen() {
+  historyTreeMenuClose(); // 与右键菜单互斥（同一块屏幕区域）
+  if (historyTreeHiddenPanelEl) { historyTreeHiddenPanelClose(); return; }
+  const set = historyTreeHiddenCurrentSet();
+  if (!set.size) return; // 无隐藏项 → 不弹
+  const box = document.createElement("div");
+  box.className = "htr-menu htr-hidden-panel";
+  box.style.left = "0px";
+  box.style.top = "0px";
+  box.style.visibility = "hidden";
+  box.addEventListener("contextmenu", (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+  document.body.appendChild(box);
+  historyTreeHiddenPanelEl = box;
+  historyTreeHiddenPanelRefresh(); // 填内容 + 定位
+  box.style.visibility = "visible";
+  // 关闭监听（一次性绑定，关闭时全解）
+  const onDown = (ev) => {
+    const t = ev && ev.target;
+    if (!t) return;
+    try { if (box.contains(t)) return; } catch { return; }
+    // 入口按钮自身不算「空白」：否则 pointerdown 先关、click 再开 → 永远关不掉
+    try { if (historyTreeHiddenBtnEl && historyTreeHiddenBtnEl.contains(t)) return; } catch { /* 按外部处理 */ }
+    historyTreeHiddenPanelClose();
+  };
+  const onKey = (ev) => { if (ev && ev.key === "Escape") historyTreeHiddenPanelClose(); };
+  const onBlur = () => historyTreeHiddenPanelClose();
+  const onScroll = () => historyTreeHiddenPanelClose(); // fixed 面板与入口会错位 → 直接关
+  document.addEventListener("pointerdown", onDown, true);
+  document.addEventListener("keydown", onKey, true);
+  window.addEventListener("blur", onBlur);
+  window.addEventListener("resize", onScroll);
+  document.addEventListener("scroll", onScroll, true);
+  historyTreeHiddenPanelOff = () => {
+    document.removeEventListener("pointerdown", onDown, true);
+    document.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("blur", onBlur);
+    window.removeEventListener("resize", onScroll);
+    document.removeEventListener("scroll", onScroll, true);
+  };
+}
+
+// ── D7（2026-10-26·任务 A）：泳道眼睛 ────────────────────────────────
+// 构造一条泳道行的眼睛元素（常显）。点击 = 隐藏本行「当前可见且可隐」的节点。
+// 事件边界（关键）：
+//   · 眼睛是 .htr-laneaxis 的**子元素**，click 会往上冒泡到 ax —— 而 ax 本身没绑 click（只绑了 contextmenu），
+//     所以 click 无需 stopPropagation；但仍显式 stopPropagation，防日后给 ax / .tcanvas 加 click 时误触。
+//   · 眼睛自己的 contextmenu 必须 preventDefault + stopPropagation：否则会冒泡到 ax 触发「隐藏本行」菜单，
+//     而且 preventDefault 能让眼睛上的右键不弹浏览器系统菜单。泳道右键（点在眼睛以外的一整行）不受影响。
+//   · 眼睛 pointer-events:auto，且尺寸（12×12、光标）落在 .htr-laneaxis::before（18×整行的透明命中区）之内。
+//     实际命中顺序：眼睛是 ax 的子元素且自身有 pointer-events → 落在眼睛上的事件目标就是眼睛（子优先）；
+//     落在行内其余位置（含 ::before 区域）才是 ax → 泳道右键照旧。「谁挂在哪」：眼睛挂 ax 内，右键监听只挂在 ax 上。
+function historyTreeLaneEye(row, laneSeqs, solidEntries, hiddenSet) {
+  const el = document.createElement("div");
+  el.className = "htr-laneeye";
+  el.dataset.lane = String(row + 1);
+  const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
+  const base = hiddenSet instanceof Set ? hiddenSet : new Set();
+  const union = new Set(base);
+  for (const s of laneSeqs) union.add(s);
+  // 可隐数 = widen 后的集合尺寸增量（sanitizeHidden 会剔除 HEAD / 不存在 / 根，与右键菜单同口径）
+  const willHide = sanitizeHidden(union, solidEntries, headSeq).size - base.size;
+  // 纯 CSS + 内联 SVG 画眼睛（不引图标字体、不引外链）
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  const outline = document.createElementNS(NS, "path");
+  outline.setAttribute("d", "M1.6 8C3.7 4.3 5.7 2.9 8 2.9s4.3 1.4 6.4 5.1C12.3 11.7 10.3 13.1 8 13.1S3.7 11.7 1.6 8Z");
+  outline.setAttribute("fill", "none");
+  outline.setAttribute("stroke", "currentColor");
+  outline.setAttribute("stroke-width", "1.3");
+  const pupil = document.createElementNS(NS, "circle");
+  pupil.setAttribute("cx", "8"); pupil.setAttribute("cy", "8"); pupil.setAttribute("r", "2.15");
+  pupil.setAttribute("fill", "currentColor");
+  svg.append(outline, pupil);
+  el.appendChild(svg);
+  if (willHide > 0) {
+    el.title = "隐藏本行 " + willHide + " 个节点";
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation(); // 不往上冒（ax 无 click，但防日后加）
+      // 与节点 click 同口径：从眼睛上起始的拖拽（>3px）不算点击，防拖画布时误隐整行
+      if (Date.now() - historyTreeDragEndAt < 300) return;
+      historyTreeHiddenApplyChange(union);
+    });
+  } else {
+    // 本行无可隐（只剩 HEAD / 根）→ 视觉仍占位（行对齐不乱），但不可点、不弹任何东西
+    el.classList.add("htr-laneeye-idle");
+    el.title = laneSeqs.length
+      ? "本行 " + laneSeqs.length + " 个可见节点均为 HEAD / 根节点，不可隐藏"
+      : "本行没有可见节点";
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (Date.now() - historyTreeDragEndAt < 300) return;
+      console.debug(LOG_TAG, "lane eye: 本行无可隐藏节点", { row, laneSeqs: laneSeqs.length });
+    });
+  }
+  // 不抢泳道右键：眼睛上的右键就地吃掉（preventDefault 拦系统菜单 / stopPropagation 拦 ax 的「隐藏本行」）
+  el.addEventListener("contextmenu", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+  });
+  return el;
+}
+
 // ── D6（2026-10-26）：提交树右键菜单（节点隐藏 / 整行隐藏）────────────────────
 // 为什么自绘：原生 confirm/alert 会打断画布且无法「置灰 + 写原因」；皮肤沿用树气泡（.htr-bubble）变量族。
 // 挂 document.body（position:fixed）：树面板内 .tcanvas 是 overflow:auto，挂在里面会被裁切。
@@ -7061,6 +7336,7 @@ function historyTreeMenuClose() {
 // 定位：跟随鼠标（client 坐标，fixed）；贴右/贴底则翻转到鼠标另一侧，最后仍钳在视口内 8px。
 function historyTreeMenuOpen(clientX, clientY, spec) {
   historyTreeMenuClose();
+  historyTreeHiddenPanelClose(); // D7：与「隐藏 N」恢复面板互斥（同一屏幕区域，同时开会叠在一起）
   const items = (spec && Array.isArray(spec.items)) ? spec.items : [];
   if (!items.length) return;
   const box = document.createElement("div");
@@ -7281,6 +7557,22 @@ function historyTreeEnsure() {
   const count = document.createElement("span");
   count.className = "htr-count";
   count.textContent = "0 节点 · 0 分支";
+  // D7（2026-10-26·任务 B）：收纳条「隐藏 N」恢复入口。
+  // 默认 hidden（无隐藏就不占位）；N 与显隐由 historyTreeUpdateCounts 写。
+  // 必须 stopPropagation：它在 .htr-collapsed 内，否则点一下会连带触发收纳条 toggleTree。
+  const hiddenBtn = document.createElement("button");
+  hiddenBtn.type = "button";
+  hiddenBtn.className = "htr-hidden-btn";
+  hiddenBtn.hidden = true;
+  hiddenBtn.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    historyTreeHiddenPanelOpen();
+  });
+  hiddenBtn.addEventListener("contextmenu", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+  });
   const toggle = document.createElement("button");
   toggle.type = "button";
   toggle.className = "htr-toggle";
@@ -7294,6 +7586,7 @@ function historyTreeEnsure() {
     historyTreeOpen = open;
     setToggleLabel();
     historyTreeMenuClose(); // D6：收起/展开 → 右键菜单失效（面板已隐或即将重渲染）
+    historyTreeHiddenPanelClose(); // D7：收起/展开 → 恢复面板同样失效
     if (open) void historyTreeRefresh(); // 展开时取数渲染；收起不 fetch（下次提交/回跳的 refresh 只更计数）
   };
   collapsed.addEventListener("click", toggleTree);
@@ -7329,7 +7622,7 @@ function historyTreeEnsure() {
       if (historyTreeCanvasEl) historyTreeCanvasEl.scrollLeft = 0;
     } catch (e) { console.warn(LOG_TAG, "视角切换重渲染失败", e); }
   });
-  collapsed.append(sum, count, saveBtn, viewBtn, toggle);
+  collapsed.append(sum, count, hiddenBtn, saveBtn, viewBtn, toggle);
   // 展开面板：.tcanvas（横滚）> .lanes（节点层）+ 两端渐隐 + 休眠折叠条
   const panel = document.createElement("div");
   panel.className = "htr-panel";
@@ -7430,6 +7723,7 @@ function historyTreeEnsure() {
   historyTreeCanvasEl = tcanvas;
   historyTreeTreeEl = lanes;
   historyTreeCountEl = count;
+  historyTreeHiddenBtnEl = hiddenBtn; // D7：收纳条「隐藏 N」入口（计数函数与面板定位都需引用）
   historyTreeToggleEl = toggle;
   historyTreeSleepEl = sleep;
   historyTreeFadeLEl = fadeL;
