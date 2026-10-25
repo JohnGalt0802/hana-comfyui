@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-26 hana-bridge-05201100";
+const BUILD_TAG = "2026-10-26 hana-bridge-05292400";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -6410,6 +6410,8 @@ function historyTreeStyleEnsure() {
 #${HISTORY_TREE_ID} .htr-bub-tag-add { color: #7fb069; }
 #${HISTORY_TREE_ID} .htr-bub-tag-del { color: #d5787a; }
 #${HISTORY_TREE_ID} .htr-bub-tag-link { color: #7ba6c9; }
+/* 2026-10-26：种子标签（改种子仍合并，种子值单独一行展示），低饱和紫，与四个 delta 标签色区分 */
+#${HISTORY_TREE_ID} .htr-bub-tag-seed { color: #9d8ad0; }
 #${HISTORY_TREE_ID} .htr-bub-items { min-width: 0; }
 #${HISTORY_TREE_ID} .htr-bub-item { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #${HISTORY_TREE_ID} .htr-bub-fld { color: var(--htr-sub); font-size: 10px; margin-left: 3px; }
@@ -8002,6 +8004,46 @@ function historyTreeBubbleShow(tick, ent) {
   };
   const d = ent && ent.delta && typeof ent.delta === "object" ? ent.delta : null;
   let rendered = false;
+  // 2026-10-26：种子快照行（在四组 delta 之前 —— 种子是本次执行的输入参数，比 delta 更靠前）。
+  // 改种子不新建节点（签名忽略 seed），故种子值只随 mergeInto 行下发、后端读时覆盖到主行。
+  // 字段缺失（旧条目 → null）/ 空数组 → 整行不渲染，不留空行。
+  const MAX_SEEDS = 3; // 种子行最多列几条，多的折成「…等 N 个」
+  let seedRowAdded = false;
+  const seeds = ent && Array.isArray(ent.seeds) ? ent.seeds.filter((s) => s && typeof s === "object") : [];
+  if (seeds.length) {
+    const items = [];
+    for (const s of seeds.slice(0, MAX_SEEDS)) {
+      const nm = String(s.title == null ? "" : s.title).trim();
+      const vl = String(s.value == null ? "" : s.value);
+      if (!vl) continue; // 没值就没什么可看的
+      items.push(nm ? nm + " " + vl : vl);
+    }
+    if (items.length) {
+      const row = document.createElement("div");
+      row.className = "htr-bub-row";
+      const tg = document.createElement("span");
+      tg.className = "htr-bub-tag htr-bub-tag-seed";
+      tg.textContent = "种子";
+      const box = document.createElement("div");
+      box.className = "htr-bub-items";
+      for (const txt of items) {
+        const it = document.createElement("div");
+        it.className = "htr-bub-item";
+        it.textContent = txt;
+        it.title = txt;
+        box.appendChild(it);
+      }
+      if (seeds.length > MAX_SEEDS) {
+        const more = document.createElement("div");
+        more.className = "htr-bub-more";
+        more.textContent = "…等 " + seeds.length + " 个";
+        box.appendChild(more);
+      }
+      row.append(tg, box);
+      b.appendChild(row);
+      seedRowAdded = true;
+    }
+  }
   if (d) {
     addRow("改动", "htr-bub-tag-mod", d.changed, true);
     addRow("新增", "htr-bub-tag-add", d.added, false);
@@ -8022,7 +8064,7 @@ function historyTreeBubbleShow(tick, ent) {
         b.appendChild(row);
       }
     }
-    rendered = b.childElementCount > 1;
+    rendered = b.childElementCount > 1 + (seedRowAdded ? 1 : 0);
     if (!rendered) {
       const row = document.createElement("div");
       row.className = "htr-bub-row";

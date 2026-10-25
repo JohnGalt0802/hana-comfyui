@@ -2085,5 +2085,110 @@ class TestHistoryKey(TempRootTestCase):
         self.assertEqual(self.read_claims()[self.UUID], {pb: "primary"})
 
 
+class TestSeedSnapshot(TempRootTestCase):
+    """2026-10-26：种子快照（改种子仍合并，但悬停能看到该提交最新的种子）。
+
+    契约：索引行 seeds=[{title,name,value}]；value 字符串；无命中 → []；
+    旧条目无该字段 → normalize_entry 补 None；list 读时用最新 merge 行的 seeds 覆盖主行。
+    """
+
+    WF = "wf"
+
+    def graph(self, seed, steps=20, title=None):
+        node = {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": seed, "steps": steps}}
+        if title:
+            node["title"] = title
+        return {"nodes": [node], "links": []}
+
+    def index_lines(self):
+        path = os.path.join(self.root, "workflows", ".history", self.WF, hs.INDEX_FILE_NAME)
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(x) for x in fh.read().splitlines() if x.strip()]
+
+    # ① 提取：named 命中 seed / noise_seed；位置型与无命中 → []
+    def test_seed_values_extract(self):
+        g = {"nodes": [
+            {"id": 1, "type": "KSampler", "widgets_values_named": {"seed": 12345, "steps": 20}},
+            {"id": 2, "type": "KSamplerAdvanced", "title": "二次采样",
+             "widgets_values_named": {"noise_seed": 777, "add_noise": "enable"}},
+        ]}
+        self.assertEqual(hs._seed_values(g), [
+            {"title": "KSampler", "name": "seed", "value": "12345"},
+            {"title": "二次采样", "name": "noise_seed", "value": "777"},
+        ])
+        # 位置型 widgets_values 无名字 → 不猜，不输出
+        self.assertEqual(hs._seed_values({"nodes": [{"id": 1, "type": "KSampler", "widgets_values": [42, 20]}]}), [])
+        # 无种子类 widget → []
+        self.assertEqual(hs._seed_values({"nodes": [{"id": 1, "type": "LoadImage",
+                                                   "widgets_values_named": {"image": "a.png"}}]}), [])
+        # 非法入参不打挂
+        self.assertEqual(hs._seed_values(None), [])
+        self.assertEqual(hs._seed_values({"nodes": "x"}), [])
+
+    # ② 值规范化：整数型 float 不出现小数尾巴；大整数不丢精度
+    def test_seed_values_stringified(self):
+        g = {"nodes": [{"id": 1, "type": "KSampler",
+                        "widgets_values_named": {"seed": 12345.0}, "widgets_values": [12345.0]}]}
+        self.assertEqual(hs._seed_values(g)[0]["value"], "12345")
+        big = {"nodes": [{"id": 1, "type": "KSampler",
+                          "widgets_values_named": {"seed": 1234567890123456789}}]}
+        self.assertEqual(hs._seed_values(big)[0]["value"], "1234567890123456789")
+
+    # ③ 新建节点：索引主行写 seeds
+    def test_create_node_writes_seeds(self):
+        out = self.commit({"workflow": self.WF, "graph": self.graph(12345), "promptId": "p1"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.index_lines()[0]["seeds"],
+                         [{"title": "KSampler", "name": "seed", "value": "12345"}])
+
+    # ④ 三连：新建 → 只改种子合并 → 再只改种子合并；读回必须是第三次的种子
+    def test_merge_override_latest_seed(self):
+        r1 = self.commit({"workflow": self.WF, "graph": self.graph(111), "promptId": "p1"})
+        r2 = self.commit({"workflow": self.WF, "graph": self.graph(222), "promptId": "p2"})
+        r3 = self.commit({"workflow": self.WF, "graph": self.graph(333), "promptId": "p3"})
+        self.assertFalse(r1["merged"])
+        self.assertTrue(r2["merged"])
+        self.assertTrue(r3["merged"])
+        lines = self.index_lines()
+        self.assertEqual(len(lines), 3)              # 1 主行 + 2 merge 行（索引仍只追加）
+        self.assertNotIn("mergeInto", lines[0])      # 主行没被改写
+        self.assertEqual(lines[1]["seeds"][0]["value"], "222")
+        self.assertEqual(lines[2]["seeds"][0]["value"], "333")
+        listed = hs.list_commits(self.WF, self.root)
+        self.assertEqual(len(listed["entries"]), 1)  # merge 行不冒出来
+        self.assertEqual(listed["entries"][0]["seq"], 1)
+        self.assertEqual(listed["entries"][0]["seeds"],
+                         [{"title": "KSampler", "name": "seed", "value": "333"}])
+
+    # ⑤ 旧条目（无 seeds 字段）→ None；当时没种子（seeds:[]）→ []
+    def test_legacy_missing_field_none(self):
+        n = hs.normalize_entry({"seq": 1, "file": "0001-a.json", "promptId": "p1"})
+        self.assertIn("seeds", n)
+        self.assertIsNone(n["seeds"])
+        self.assertEqual(hs.normalize_entry({"seq": 2, "seeds": []})["seeds"], [])
+
+    # ⑥ build_index_line：meta 没 seeds → 不写该键（不补 null）
+    def test_build_index_line_omits_absent_seeds(self):
+        self.assertNotIn("seeds", json.loads(hs.build_index_line({"seq": 1})))
+        self.assertEqual(json.loads(hs.build_index_line({"seq": 1, "seeds": []}))["seeds"], [])
+
+    # ⑦ 合并行不带 seeds（旧数据）→ 不覆盖主行
+    def test_merge_rows_without_seeds_do_not_override(self):
+        path = os.path.join(self.root, "workflows", ".history", self.WF, hs.INDEX_FILE_NAME)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rows = [
+            {"seq": 1, "file": "0001-p1.json", "promptId": "p1", "at": "2026-10-26T00:00:00.000Z",
+             "source": "user", "kind": "run", "seeds": [{"title": "KSampler", "name": "seed", "value": "1"}]},
+            {"seq": 2, "mergeInto": 1, "promptId": "p2", "at": "2026-10-26T00:01:00.000Z",
+             "kind": "run", "source": "user"},
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+        listed = hs.list_commits(self.WF, self.root)
+        self.assertEqual(len(listed["entries"]), 1)
+        self.assertEqual(listed["entries"][0]["seeds"],
+                         [{"title": "KSampler", "name": "seed", "value": "1"}])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

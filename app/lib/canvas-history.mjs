@@ -529,6 +529,28 @@ function normBlock(blk) {
   };
 }
 
+/**
+ * 归一化 seeds：[{title,name,value}]（value 强制字符串）。非数组 → []；非对象项剔除。
+ *
+ * 2026-10-26：改种子仍合并（签名忽略 seed），种子值只存在 mergeInto 行上，
+ * 读侧覆盖到主行供悬停显示。值一律 String()：大整数跨语言不丢精度；缺字段补 ""（不补 null）。
+ * @param {any} seeds
+ * @returns {{title:string,name:string,value:string}[]}
+ */
+function normSeeds(seeds) {
+  if (!Array.isArray(seeds)) return [];
+  const out = [];
+  for (const s of seeds) {
+    if (!isPlainObject(s)) continue;
+    out.push({
+      title: s.title == null ? "" : String(s.title),
+      name: s.name == null ? "" : String(s.name),
+      value: s.value == null ? "" : String(s.value),
+    });
+  }
+  return out;
+}
+
 /** 归一化 blocks：非数组 → []；逐块补全 name/source/nodeIds（非对象块剔除）。 */
 function normBlocks(blocks) {
   if (!Array.isArray(blocks)) return [];
@@ -544,16 +566,18 @@ function normBlocks(blocks) {
 /**
  * 构造一行索引元数据（JSON 字符串，**不含 graph**）。
  * 字段（P5 v2）：seq / parent / file / promptId / at / source / kind /
- *   nodeCount / linkCount / sig / blocks(完整版) / delta / runs。
+ *   nodeCount / linkCount / sig / blocks(完整版) / delta / runs / seeds(可选)。
  * 入参兼容别名：file ← file | fileName | name。
  * 缺省：parent→null；kind→"run"；sig→""；blocks→[]；delta→null；runs→[]。
+ * seeds：meta 里**没有**该字段 → 不写这个键（与 Python 侧同口径：不补 null，
+ *   读侧才能区分「旧条目没有字段」与「当时没有种子」）。
  * @param {object} meta
  * @returns {string}
  */
 export function buildIndexLine(meta = {}) {
   const m = meta && typeof meta === "object" ? meta : {};
   const rawFile = m.file != null ? m.file : m.fileName != null ? m.fileName : m.name;
-  return JSON.stringify({
+  const obj = {
     seq: toInt(m.seq, 0),
     parent: normParent(m.parent),
     file: rawFile == null ? "" : String(rawFile),
@@ -567,7 +591,9 @@ export function buildIndexLine(meta = {}) {
     blocks: normBlocks(m.blocks),
     delta: isPlainObject(m.delta) ? m.delta : null,
     runs: normRuns(m.runs),
-  });
+  };
+  if ("seeds" in m) obj.seeds = normSeeds(m.seeds);
+  return JSON.stringify(obj);
 }
 
 // ── 7. 索引解析 ─────────────────────────────────────────────────────────────
@@ -602,7 +628,8 @@ export function parseIndex(text) {
 /**
  * 兼容补全：把旧条目（缺新字段）读成新形态，**不改写磁盘**、不改入参。
  * 缺省：parent→null；kind→"run"；sig→""；delta→null；blocks→[]；
- *   runs → 缺则用顶层 promptId/at 造单元素 runs（promptId 为 null 时 → []）。
+ *   runs → 缺则用顶层 promptId/at 造单元素 runs（promptId 为 null 时 → []）；
+ *   seeds → 字段缺失（旧条目）→ null（区别于「当时没有种子」的 []）。
  * @param {object} entry
  * @returns {object}
  */
@@ -614,6 +641,7 @@ export function normalizeEntry(entry) {
   out.sig = typeof e.sig === "string" ? e.sig : "";
   out.delta = isPlainObject(e.delta) ? e.delta : null;
   out.blocks = normBlocks(e.blocks);
+  out.seeds = "seeds" in e ? normSeeds(e.seeds) : null;
   out.runs = Array.isArray(e.runs)
     ? normRuns(e.runs)
     : e.promptId == null

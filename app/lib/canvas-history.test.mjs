@@ -593,3 +593,58 @@ test("组合：buildIndexLine 新字段 → parseIndex → normalizeEntry 读回
   assert.deepEqual(n.delta.changed, [{ id: 1, title: "A", fields: ["value"] }]);
   assert.equal(n.runs.length, 1);
 });
+
+// ── 18. 2026-10-26：种子快照（改种子仍合并，种子值随行下发）────────────
+test("buildIndexLine：meta 没 seeds → 不写该键（不补 null）", () => {
+  assert.equal("seeds" in JSON.parse(buildIndexLine({ seq: 1, file: "0001-x.json" })), false);
+  assert.deepEqual(JSON.parse(buildIndexLine({ seq: 1, seeds: [] })).seeds, []);
+});
+
+test("buildIndexLine：seeds 归一化（value 强制字符串）", () => {
+  const v = JSON.parse(
+    buildIndexLine({
+      seq: 2,
+      mergeInto: 1,
+      seeds: [
+        { title: "KSampler", name: "seed", value: 12345 },
+        { title: null, name: "noise_seed", value: null },
+        "bad",
+      ],
+    }),
+  );
+  assert.deepEqual(v.seeds, [
+    { title: "KSampler", name: "seed", value: "12345" },
+    { title: "", name: "noise_seed", value: "" },
+  ]);
+  // 非数组 → []
+  assert.deepEqual(JSON.parse(buildIndexLine({ seeds: "x" })).seeds, []);
+});
+
+test("normalizeEntry：seeds 字段缺失（旧条目）→ null；有字段 → [] 或归一化数组", () => {
+  assert.strictEqual(normalizeEntry({ seq: 1 }).seeds, null);
+  assert.deepEqual(normalizeEntry({ seq: 2, seeds: [] }).seeds, []);
+  assert.deepEqual(
+    normalizeEntry({ seq: 3, seeds: [{ title: "K", name: "seed", value: 9 }] }).seeds,
+    [{ title: "K", name: "seed", value: "9" }],
+  );
+  // 不改入参
+  const old = { seq: 1 };
+  normalizeEntry(old);
+  assert.equal("seeds" in old, false);
+});
+
+test("种子快照：跨语言一致（buildIndexLine → parseIndex → normalizeEntry）", () => {
+  const line = buildIndexLine({
+    seq: 3,
+    mergeInto: 1,
+    promptId: "p3",
+    at: "2026-10-26T00:00:00.000Z",
+    source: "user",
+    kind: "run",
+    seeds: [{ title: "KSampler", name: "seed", value: 333 }],
+  });
+  const { entries } = parseIndex(line);
+  assert.deepEqual(normalizeEntry(entries[0]).seeds, [
+    { title: "KSampler", name: "seed", value: "333" },
+  ]);
+});

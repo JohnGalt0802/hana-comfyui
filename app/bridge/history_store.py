@@ -298,6 +298,35 @@ def _widget_entries(node):
     return (None, [])
 
 
+# 2026-10-26：种子快照的命中名（精确匹配，不做子串猜测）。
+# seed / noise_seed 是签名的忽略项（见 graph_sig_ignoring_seed），因此改种子仍合并进同一节点；
+# 合并行单独存一份 seeds，读侧覆盖到主行 → 悬停能看到「这个节点最新一次执行用的种子」。
+_SEED_WIDGET_NAMES = ("seed", "noise_seed")
+
+
+def _seed_values(graph):
+    """提取图里所有种子类 widget 值（供悬停显示）。
+    只认 widgets_values_named（位置型 widgets_values 无名字，无法可靠判定哪个是 seed，不要猜）。
+    命中 seed / noise_seed → {"title","name","value"}，value 一律字符串（JS 大整数会丢精度）。
+    整数型 float（12345.0）走 _canon_value → "12345"（与签名口径的数值规范化一致）。
+    无 named / 无命中 → []。
+    """
+    out = []
+    g = graph if isinstance(graph, dict) else {}
+    nodes = g.get("nodes") if isinstance(g.get("nodes"), list) else []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        named = n.get("widgets_values_named")
+        if not isinstance(named, dict):
+            continue
+        for k, v in named.items():
+            if not isinstance(k, str) or k not in _SEED_WIDGET_NAMES:
+                continue
+            out.append({"title": _node_title(n), "name": k, "value": _canon_value(v)})
+    return out
+
+
 def _changed_widget_names(a, b):
     """同 id 两节点的 widget 变化名列表（逐项比较位置值；缺失项按 "" 参与比较）。"""
     na, va = _widget_entries(a)
@@ -873,11 +902,35 @@ def strip_heavy_fields(graph):
 
 
 # ── 6. 索引行 ───────────────────────────────────────────────────────────────
+def _norm_seeds(seeds):
+    """归一化 seeds：[{title,name,value}]（value 强制字符串）。非列表 → []；非对象项剔除。
+
+    值一律 str()：JS 侧大整数（>2^53）会丢精度，字符串化后跨语言一致；
+    缺字段补 ""（不补 null），前端只读不猜。
+    """
+    if not isinstance(seeds, list):
+        return []
+    out = []
+    for s in seeds:
+        if not isinstance(s, dict):
+            continue
+        out.append(
+            {
+                "title": "" if s.get("title") is None else str(s.get("title")),
+                "name": "" if s.get("name") is None else str(s.get("name")),
+                "value": "" if s.get("value") is None else str(s.get("value")),
+            }
+        )
+    return out
+
+
 def build_index_line(meta):
     """构造一行索引元数据（JSON 字符串，**不含 graph**）。
     字段（P5 v2）：seq / parent / file / promptId / at / source / kind /
-      nodeCount / linkCount / sig / blocks(完整版) / delta / runs。
+      nodeCount / linkCount / sig / blocks(完整版) / delta / runs / seeds(可选)。
     缺省：parent→None；kind→"run"；sig→""；blocks→[]；delta→None；runs→[]。
+    seeds：meta 里**没有**该字段 → 不写这个键（旧行不带，不补 null，读侧才能区分
+    「旧条目没有字段」与「当时没有种子」）。
     入参兼容别名：file ← file | fileName | name。
     """
     m = meta if isinstance(meta, dict) else {}
@@ -903,6 +956,8 @@ def build_index_line(meta):
         "delta": m.get("delta") if isinstance(m.get("delta"), dict) else None,
         "runs": _norm_runs(m.get("runs")),
     }
+    if "seeds" in m:
+        obj["seeds"] = _norm_seeds(m.get("seeds"))
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -919,6 +974,8 @@ def normalize_entry(entry):
     out["sig"] = sig if isinstance(sig, str) else ""
     out["delta"] = e.get("delta") if isinstance(e.get("delta"), dict) else None
     out["blocks"] = _norm_blocks(e.get("blocks"))
+    # 2026-10-26：seeds —— 字段缺失（旧条目）→ None（区别于「当时没有种子」的 []）
+    out["seeds"] = _norm_seeds(e.get("seeds")) if "seeds" in e else None
     if isinstance(e.get("runs"), list):
         out["runs"] = _norm_runs(e.get("runs"))
     elif e.get("promptId") is None:
@@ -1233,6 +1290,8 @@ def commit(body, user_dir, workflow_id=None, path=None, temporary=None):
                     "at": _to_iso(b.get("at")),
                     "kind": "run",
                     "source": normalize_source(src),
+                    # 2026-10-26：合并行带本轮种子快照（读侧用它覆盖主行的 seeds）
+                    "seeds": _seed_values(b.get("graph")),
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -1313,6 +1372,7 @@ def _create_node(dir_path, index_path, entries, graph, prompt_id=None, at=None, 
             "nodeCount": snapshot["nodeCount"],
             "linkCount": snapshot["linkCount"],
             "blocks": blocks,  # N3：索引行仍写完整版 blocks（取自上报入参；与快照无关）
+            "seeds": _seed_values(graph),  # 2026-10-26：种子快照（悬停显示）
         }
     )
 
@@ -1751,6 +1811,14 @@ def list_commits(workflow, user_dir, workflow_id=None, path=None, temporary=None
         sidecar_runs = _read_sidecar_runs(dir_path, snapshot_file) if snapshot_file else []
         seq_key = _to_int(e.get("seq"), None)
         rows = merge_rows.get(seq_key, []) if seq_key is not None else []
+        # 2026-10-26：种子快照读时覆盖（**不改写索引文件**）。
+        # 改种子不新建节点（签名忽略 seed），种子值只存在各 merge 行上；
+        # 这里按索引顺序把最新一条带 seeds 的 merge 行覆盖到主行，节点 seeds 永远是最新一次执行的值。
+        # 合并行本身仍不单独成 entry（保持 mergeInto 不渲染的原有语义）。
+        # merge 行没带 seeds 字段（旧数据）→ 不覆盖，保留主行自己的值（可能是 None）。
+        for m in rows:
+            if "seeds" in m:
+                norm["seeds"] = _norm_seeds(m.get("seeds"))
         full_runs = _node_runs(e, sidecar_runs, rows)
         # entry.images 由**完整 runs** 扁平合并（气泡缩略图仍用它，故必须先于瘦身取）
         norm["images"] = _merge_images([], [im for r in full_runs for im in r["images"]])
