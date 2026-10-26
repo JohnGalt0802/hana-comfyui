@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-26 hana-bridge-06310100";
+const BUILD_TAG = "2026-10-26 hana-bridge-12290700";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -4604,18 +4604,13 @@ function historyNodeStyleEnsure() {
 /* 2026-10-15：中性灰底跟随明暗（内条的语义色 --hnode-bc 不动）。 */
 :root { --hnode-dim: rgba(0,0,0,.22); }
 :root.dark-theme { --hnode-dim: rgba(255,255,255,.16); }
-/* 2026-10-23：gap / 条最小高随档位走变量；overflow:hidden 兜底——条多时宁可裁掉一点，
-   也不许溢出外框（缩到最小档「蓝框被顶出去」就是这么来的）。 */
+/* 2026-10-23：gap / 条最小高随档位走变量；2026-10-26（方案变更）：条保持正常粗细，
+   --hnode-gap / --hnode-barmin 继续用档位原值（由 historyTreeShellTier 给出）；
+   塞不下改由「节点高按 maxBlocks 自适应长高」解决（historyTreeAdaptSize）。
+   overflow:hidden 仅作最后兜底。 */
 .hnode-bars { display:flex; flex-direction:column; gap:var(--hnode-gap, 1.5px); align-items:stretch; justify-content:center; flex:1 1 auto; min-height:0; overflow:hidden; }
 .hnode-bar { display:block; flex:1 1 0; min-height:var(--hnode-barmin, 2px); border-radius:2px; background:var(--hnode-dim, ${HNODE_BAR_DIM}); } /* 3b（2026-10-13）：内条圆角 1px→2px */
 .hnode-bar.hnode-bar-on { background:var(--hnode-bc, #5aa0d8); filter:brightness(1.08); } /* 3a修（2026-10-13）：去掉内条 5px 光晕 + 降亮度 1.15→1.08，外框始终是视觉主线（原亮条盖过外框） */
-/* 2026-10-26（任务 A）：提交树节点的内条堆改横向分段（只加在提交树上，历史刻度 .hhb-tick 仍竖排）。
-   为什么：竖排要 6×(barmin 1) + 5×(gap .5) = 8.5px，而 nodeH 11/12 扣掉边框(2×1~1.5)与内边距(2×1)
-   后内高只剩 7px → overflow:hidden 把末尾 2~3 根裁掉，表现为「改了第 6 个框却一根都不亮」。
-   横排：段数 = 框数，顺序仍按 globalBlocks（构建时就是那个顺序）。
-   gap 反算：内容宽 20 - 2×2(边框) = 16px，若 gap=1.5 则 (16-7.5)/6 = 1.42px < 1.5px，故横向 gap 压到 0。 */
-.hnode-bars-row { flex-direction: row; gap: 0; align-items: stretch; justify-content: flex-start; width: 100%; height: 100%; overflow: hidden; }
-.hnode-bars-row .hnode-bar { flex: 1 1 0; min-width: 1px; min-height: 0; height: 100%; border-radius: 1px; }
 `;
   document.head.appendChild(style);
 }
@@ -6915,6 +6910,83 @@ function historyTreeComputeX(entries, mode) {
   return { xOf, maxX, cols };
 }
 
+// 2026-10-26（方案变更：不压细条，改自适应节点高）：
+// 节点外壳档位（边框 / 内边距 / 圆角 / 条间距 / 条最小高）只由 nodeH 决定，抽成纯函数以便自检。
+function historyTreeShellTier(nodeH) {
+  const tightLvl = nodeH >= 18 ? 0 : nodeH >= 12 ? 1 : 2;
+  const bwPx = tightLvl === 0 ? 2 : tightLvl === 1 ? 1.5 : 1;
+  const padPx = tightLvl === 0 ? 2 : 1;
+  const brPx = tightLvl === 0 ? 4.5 : tightLvl === 1 ? 3 : 2.5;
+  const gapPx = tightLvl === 0 ? 1.5 : tightLvl === 1 ? 1 : 0.5;
+  const barMinPx = tightLvl === 0 ? 2 : tightLvl === 1 ? 1.5 : 1;
+  return { tightLvl, bwPx, padPx, brPx, gapPx, barMinPx };
+}
+
+// 2026-10-26（方案变更）：**条保持正常粗细**（barmin / gap 用档位原值，绝不为塞下而往下压），
+// 改为「按该树最大框数把节点长高、泳道行高再跟着长」。
+//   maxBlocks = 全量 solidEntries 里 blocks.length 的最大值（不能用可见集，否则隐藏节点会让行高跳动）
+//   need      = maxBlocks * barMin + (maxBlocks - 1) * gap        // N 根条所需内容高
+//   nodeHNeed = need + 2 * ((bwPx + 0.5) + padPx)                  // 节点所需高（含上下边框与内边距；
+//                                                                  // 边框按合并节点口径 bw+0.5 取，保证普通/合并都能装下）
+//   nodeH     = max(基准 nodeH, nodeHNeed)                          // 基准 = max(8, min(22, round(22*zoom), laneHBase-6))
+//   laneH     = max(14, round(36*zoom), nodeH + 6)                  // 行高永远容得下节点
+// 档位由 nodeH 决定、nodeH 又依赖档位 → 迭代至稳定（最多几轮；实际 1~2 轮收敛）。
+function historyTreeAdaptSize(zoomZ, maxBlocks) {
+  const zoom = Number.isFinite(zoomZ) && zoomZ > 0 ? zoomZ : 1;
+  const N = Math.max(0, Math.floor(Number(maxBlocks) || 0));
+  const laneHBase = Math.max(14, Math.round(36 * zoom));
+  const nodeHBase = Math.max(8, Math.min(22, Math.round(22 * zoom), laneHBase - 6));
+  const needFor = (t) => (N > 0 ? N * t.barMinPx + (N - 1) * t.gapPx : 0);
+  const needHFor = (t, need) => need + 2 * (t.bwPx + 0.5 + t.padPx); // 按合并节点边框（bw+0.5）留余地
+  let nodeH = nodeHBase;
+  let tier = historyTreeShellTier(nodeH);
+  let need = needFor(tier);
+  let nodeHNeed = needHFor(tier, need);
+  for (let i = 0; i < 8; i += 1) {
+    tier = historyTreeShellTier(nodeH);
+    need = needFor(tier);
+    nodeHNeed = needHFor(tier, need);
+    const next = Math.max(nodeHBase, Math.ceil(nodeHNeed * 100) / 100);
+    if (Math.abs(next - nodeH) < 1e-9) break;
+    nodeH = next;
+  }
+  tier = historyTreeShellTier(nodeH);
+  need = needFor(tier);
+  nodeHNeed = needHFor(tier, need);
+  const laneH = Math.max(14, Math.round(36 * zoom), nodeH + 6);
+  const inner = nodeH - 2 * tier.bwPx - 2 * tier.padPx; // 普通节点内高
+  const innerBulge = nodeH - 2 * (tier.bwPx + 0.5) - 2 * tier.padPx; // 合并节点（边框 bw+0.5）内高
+  return {
+    zoom, maxBlocks: N, nodeHBase, nodeH, laneH, need, nodeHNeed,
+    inner: Math.round(inner * 100) / 100,
+    innerBulge: Math.round(innerBulge * 100) / 100,
+    fits: need <= inner + 1e-6,
+    fitsBulge: need <= innerBulge + 1e-6,
+    raised: nodeH > nodeHBase,
+    laneOk: nodeH <= laneH - 6 + 1e-6,
+    tightLvl: tier.tightLvl, bwPx: tier.bwPx, padPx: tier.padPx,
+    gapPx: tier.gapPx, barMinPx: tier.barMinPx, brPx: tier.brPx,
+  };
+}
+
+// 该树最大框数（全量，绝不按可见集）：取 solidEntries 的 blocks.length 最大值；
+// 补充：blocks 缺失 / 为空的旧条目在渲染时会回退「活图块清单」（historyBarsSpecFor 的 fromHistory=false 分支），
+// 那些节点的条数 = 活图块数 → 存在这种条目时把活图块数一并纳入，否则节点会按偏小的 maxBlocks 长高、反而裁条。
+// liveBlockCount：可选，活图块清单长度（即 globalBlocks.length）；不传 / 0 时不影响。
+function historyTreeMaxBlocks(solidEntries, liveBlockCount) {
+  let mx = 0;
+  let anyFallback = false;
+  for (const ent of Array.isArray(solidEntries) ? solidEntries : []) {
+    const bl = ent && Array.isArray(ent.blocks) ? ent.blocks : null;
+    const n = bl ? bl.length : 0;
+    if (n > mx) mx = n;
+    if (n === 0) anyFallback = true;
+  }
+  const live = Math.max(0, Math.floor(Number(liveBlockCount) || 0));
+  if (anyFallback && live > mx) mx = live;
+  return mx;
+}
+
 // 树渲染（泳道式）：entries → commitGraphLanes → 泳道定位（X=seq 轴，Y=泳道行）→ 全量渲染（去折叠后无 row<0）。
 // 返回 {nodeEls, graph}：nodeEls 供连线测量，graph 供连线使用。
 function historyTreeRenderTree(entries) {
@@ -6979,46 +7051,10 @@ function historyTreeRenderTree(entries) {
   const colWMin = Math.max(7, 18 * zoomZ);
   const colWMax = Math.max(colWMin + 1, 48 * zoomZ);
   const colW = Math.max(colWMin, Math.min(colWMax, ((availW - 24) / cols) * zoomZ));
-  const laneH = Math.max(14, Math.round(36 * zoomZ)); // 泳道行高随缩放，下限 14（再低就上下重叠）
   const nw = Math.max(5, Math.min(colW - 3, colW * 0.42)); // 2026-10-14：0.45→0.42（略瘦，多留间隙）
   const nwBulge = Math.min(nw + 10, colW - 3); // 第8条：多块更宽（+8→+10，封顶 colW-3）→ 单/多差拉大
-  // 节点高度随缩放（2026-10-22）：旧版写死 22；缩小后 22 会撑满整行导致上下撞。
-  // 不高于 laneH-6（至少留 6px 行间缝），不低于 8（再小点不中）。
-  const nodeH = Math.max(8, Math.min(22, Math.round(22 * zoomZ), laneH - 6));
-  // 内容宽只由内容决定（cols * colW），绝不被容器宽绑架（去 maxSeq*colW / availW-4，防右侧假留白）
-  // 2026-10-22：右侧留白 = 半个视口宽。
-  // 目的：最右侧的提交节点能被拖到面板中间（否则它永远贴在右边缘，改不了、看不全上下文）。
-  // 留白 = clientWidth/2 刚好够把最右节点滚到中线。
-  const rightPad = Math.max(24, ((historyTreeCanvasEl && historyTreeCanvasEl.clientWidth) || 320) / 2);
-  // 2026-10-24：左侧留白 —— 泳道基准线（0~18px）与序号（22px 起）占的宽度。
-  // 原实现第一列节点中心在 0.5*colW，节点半宽直接压住序号（用户报「泳道数字和提交节点撞车」）。
-  // 现在所有列坐标整体右移 axisW，节点落在序号右侧。
-  const axisW = 34;
-  const W = axisW + cols * colW + rightPad;
-  // 2026-10-12：内容高 = 全量泳道（rows=laneCount）；视口（.tcanvas）高封顶 ≤200，多的靠拖/滚查看。
-  // .lanes 取内容全高 → 连线层（height:100%）不被截，SVG 也不再被 300×150 缺省视口裁。
-  const contentH = Math.max(46, graph.rows * laneH + 6);
-  const H = Math.min(200, contentH); // 视口高上限 200（面板不占满屏）
-  // D8：geom 额外存 xOf / nw / nwBulge —— 隐藏节点没有 DOM，连线要用这套几何替它补位（穿过空位）。
-  historyTreeGeom = { colW, laneH, nodeH, W, H: contentH, rightPad, axisW, nw, nwBulge, xOf };
-  // 2026-10-23：外壳尺寸随档位一起缩（宽松 / 紧凑 / 极小）。
-  // 不这么干的话，最小档节点只有 ~6×13px，2px 边框×2 就吃掉一半宽度，内条会把框顶出去。
-  const tightLvl = nodeH >= 18 ? 0 : nodeH >= 12 ? 1 : 2;
-  const bwPx = tightLvl === 0 ? 2 : tightLvl === 1 ? 1.5 : 1;
-  const padPx = tightLvl === 0 ? 2 : 1;
-  const brPx = tightLvl === 0 ? 4.5 : tightLvl === 1 ? 3 : 2.5;
-  const gapPx = tightLvl === 0 ? 1.5 : tightLvl === 1 ? 1 : 0.5;
-  const barMinPx = tightLvl === 0 ? 2 : tightLvl === 1 ? 1.5 : 1;
-  tree.style.setProperty("--htr-bw", bwPx + "px");
-  tree.style.setProperty("--htr-bw-bulge", (bwPx + 0.5) + "px");
-  tree.style.setProperty("--htr-pad", padPx + "px");
-  tree.style.setProperty("--htr-br", brPx + "px");
-  tree.style.setProperty("--hnode-gap", gapPx + "px");
-  tree.style.setProperty("--hnode-barmin", barMinPx + "px");
-  tree.style.width = W + "px";
-  tree.style.height = contentH + "px";
-  if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 视口高封顶（内容可拖/滚）
-  // 全局框列表（2026-10-19 修）：与「提交历史框」（hhb）同口径 —— 直接用活图块名（按活图顺序去重）。
+  // 2026-10-19 修：全局框列表 —— 与「提交历史框」（hhb）同口径，直接用活图块名（按活图顺序去重）。
+  // 2026-10-26（方案变更）：提前到这里算 —— historyTreeMaxBlocks 需要它作「回退条目」的条数下限。
   // 旧实现扫 entries 取 blocks[].name 并集 → 历史上改过名的组 / 旧角色块名全被累进来，节点内小条堆到 12 根以上。
   // 历史提交里对不上的块名：那根不对应任何小条（不做 hitSet 映射），不亮、也不新增。
   const liveBlocks = historyLiveBlocks(); // 活图块清单（取不到 → null）
@@ -7049,6 +7085,51 @@ function historyTreeRenderTree(entries) {
   }
   const singleBar = globalBlocks.length === 0;
   const liveColors = historyLiveBlockColors(); // 内条色 = 画布框色（整树算一次）
+  // 2026-10-26（方案变更）：节点高 / 行高改为按本树最大框数自适应（不再压细条）。
+  //   maxBlocks 用全量 solidEntries（隐藏节点不得让行高跳动）；
+  //   回退到活图块清单的旧条目按 globalBlocks.length 计条数（见 historyTreeMaxBlocks）。
+  //   顺序：先按 zoom 得基准 nodeH → 再按 maxBlocks 抬到够用 → 最后反推 laneH（行高永远容得下节点）。
+  const maxBlocks = Math.max(singleBar ? 1 : 0, historyTreeMaxBlocks(solidEntries, globalBlocks.length));
+  const _sz = historyTreeAdaptSize(zoomZ, maxBlocks);
+  const nodeH = _sz.nodeH;
+  const laneH = _sz.laneH;
+  // 防线断言（理论上恒成立）：行高必须容得下节点（至少留 6px 行间缝）。
+  if (!_sz.laneOk) console.warn("[hana] historyTree: nodeH > laneH-6", _sz);
+  // 内容宽只由内容决定（cols * colW），绝不被容器宽绑架（去 maxSeq*colW / availW-4，防右侧假留白）
+  // 2026-10-22：右侧留白 = 半个视口宽。
+  // 目的：最右侧的提交节点能被拖到面板中间（否则它永远贴在右边缘，改不了、看不全上下文）。
+  // 留白 = clientWidth/2 刚好够把最右节点滚到中线。
+  const rightPad = Math.max(24, ((historyTreeCanvasEl && historyTreeCanvasEl.clientWidth) || 320) / 2);
+  // 2026-10-24：左侧留白 —— 泳道基准线（0~18px）与序号（22px 起）占的宽度。
+  // 原实现第一列节点中心在 0.5*colW，节点半宽直接压住序号（用户报「泳道数字和提交节点撞车」）。
+  // 现在所有列坐标整体右移 axisW，节点落在序号右侧。
+  const axisW = 34;
+  const W = axisW + cols * colW + rightPad;
+  // 2026-10-12：内容高 = 全量泳道（rows=laneCount）；视口（.tcanvas）高封顶 ≤200，多的靠拖/滚查看。
+  // .lanes 取内容全高 → 连线层（height:100%）不被截，SVG 也不再被 300×150 缺省视口裁。
+  const contentH = Math.max(46, graph.rows * laneH + 6);
+  const H = Math.min(200, contentH); // 视口高上限 200（面板不占满屏）
+  // D8：geom 额外存 xOf / nw / nwBulge —— 隐藏节点没有 DOM，连线要用这套几何替它补位（穿过空位）。
+  historyTreeGeom = { colW, laneH, nodeH, W, H: contentH, rightPad, axisW, nw, nwBulge, xOf };
+  // 2026-10-23：外壳尺寸随档位一起缩（宽松 / 紧凑 / 极小）。
+  // 不这么干的话，最小档节点只有 ~6×13px，2px 边框×2 就吃掉一半宽度，内条会把框顶出去。
+  // 2026-10-26（方案变更）：档位判定抽为 historyTreeShellTier（与 historyTreeAdaptSize 同一口径）。
+  const tier = historyTreeShellTier(nodeH);
+  const bwPx = tier.bwPx;
+  const padPx = tier.padPx;
+  const brPx = tier.brPx;
+  const gapPx = tier.gapPx;
+  const barMinPx = tier.barMinPx;
+  tree.style.setProperty("--htr-bw", bwPx + "px");
+  tree.style.setProperty("--htr-bw-bulge", (bwPx + 0.5) + "px");
+  tree.style.setProperty("--htr-pad", padPx + "px");
+  tree.style.setProperty("--htr-br", brPx + "px");
+  tree.style.setProperty("--hnode-gap", gapPx + "px");
+  tree.style.setProperty("--hnode-barmin", barMinPx + "px");
+  tree.style.width = W + "px";
+  tree.style.height = contentH + "px";
+  if (historyTreeCanvasEl) historyTreeCanvasEl.style.height = H + "px"; // 视口高封顶（内容可拖/滚）
+  // 全局框列表 / singleBar / liveColors 已在上面（算 maxBlocks 之前）算好。
   // 泳道基准标记（2026-10-22 改）：左侧短标记 + 泳道序号，不再横贯面板。
   // 旧版 left:0;right:0 的长横线会被跨泳道竖线切出十字 —— 用户报的「连线跟泳道交叉」就是它。
   // D6（2026-10-26）：行→seq 列表（泳道右键 / 眼睛用）。
@@ -7129,23 +7210,10 @@ function historyTreeRenderTree(entries) {
     // 统一母题内条堆：全局框各一根；碰过的框 → 画布框色（亮），未碰 → 灰
     // 同 A：内条槽位与颜色取该提交自己的快照
     const _specB = historyBarsSpecFor(ent, globalBlocks, liveColors, singleBar);
-    // 2026-10-26（任务 A）：提交树内条堆改横向分段（.hnode-bars-row）；历史刻度（historyBarTickMake）不加这个类，仍竖排。
-    // 槽位顺序不动：historyBarsBuild 按 _specB.names 顺序 for，_specB.names 就是 globalBlocks 顺序，横排只换排布方向。
+    // 2026-10-26（方案变更）：条保持竖排、正常粗细 —— 条高 / 间距全用 tree 上交下来的档位值，
+    // 塞不下的问题改由「节点高度按 maxBlocks 自适应」解决（见 historyTreeAdaptSize）。
     const _barsEl = historyBarsBuild(_specB.names, _specB.fromHistory ? _specB.hitSet : hitSet,
                                      _specB.colorMap, _specB.singleBar);
-    _barsEl.classList.add("hnode-bars-row");
-    // 2026-10-26（任务 B）兜底可辨性：横向也挤到无法分辨（可用宽度 / 框数 < 1px）时，只画「碰过的」段，
-    // 未碰的框不占位（DOM 顺序天然保留 globalBlocks 顺序）。可用宽度 = 本节点真实内容宽 = baseW - 左右边框（横向 padding 为 0）。
-    // 合并节点（.htr-tick-bulge）边框是 bwPx + 0.5，兜底判定要用实际值，不能拿基础值凑。
-    const _barBw = runsN > 1 ? bwPx + 0.5 : bwPx;
-    const _barAvail = Math.max(0, baseW - _barBw * 2);
-    const _barN = _barsEl.childElementCount;
-    if (_barN > 0 && _barAvail / _barN < 1) {
-      node.dataset.barsCompact = "1";
-      for (const _barEl of Array.from(_barsEl.children)) {
-        if (!_barEl.classList.contains("hnode-bar-on")) _barEl.remove();
-      }
-    }
     node.appendChild(_barsEl);
     // ×N 徽标（合并提交）。2026-10-26（任务 A）三级降级：
     //   colW >= 10 → 照旧显示「×N」；6 <= colW < 10 → 画 2px 方点（title 挂「合并 N 次」）；
