@@ -129,7 +129,8 @@ except ValueError:
 # 2026-10-26（条堆回竖排 + 节点高度按最大框数自适应）：对齐新活动桥 hana-bridge-12290700。
 # 2026-10-26（回滚泳道隐藏 + 隐藏改级联侧枝/紧凑/记号）：对齐新活动桥 hana-bridge-21592500。
 # 2026-10-27（跨泳道连线直下优先）：对齐新活动桥 hana-bridge-01263400。
-BRIDGE_BUILD_TAG = "2026-10-27 hana-bridge-01263400"
+# 2026-10-27（侧向接入阈值 8→2，消除缩小后的台阶）：对齐新活动桥 hana-bridge-02010800。
+BRIDGE_BUILD_TAG = "2026-10-27 hana-bridge-02010800"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}

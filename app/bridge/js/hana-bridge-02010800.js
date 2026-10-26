@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-27 hana-bridge-01263400";
+const BUILD_TAG = "2026-10-27 hana-bridge-02010800";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -8507,7 +8507,11 @@ function historyTreeDrawEdges(nodeEls, graph) {
         //           ② 水平段得真有一段可走（太短就退化成一个小绊，不如原折线）。
         const sideX = ccx > pcx ? (ccx - cr.width / 2) : (ccx + cr.width / 2);
         const horizRun = Math.abs(sideX - pcx);
-        if (horizRun >= 8 && !laneBlocked(cRow, seq, pcx, sideX)) {
+        // 2026-10-27（John 反馈「缩小后还会这样」）：原阈值写死 8px，而缩小到 colW=10.8 时
+        // horizRun 正好是 7.8（= colW - nw/2），差 0.2 就掉回四点绕行，那个小台阶就是这么来的。
+        // 实测紧凑视角 + zoom 0.6 下有 153 条边落在这一类。侧向接入就算横移短，也只是一个拐角；
+        // 四点绕行是两个拐角，后者更刺眼。阈值降到 2px：横移看得见就走侧向接入。
+        if (horizRun >= 2 && !laneBlocked(cRow, seq, pcx, sideX)) {
           edges.push({
             kind: "cross", ep: [seq, p],
             pts: [{ x: pcx, y: yP }, { x: pcx, y: ccy }, { x: sideX, y: ccy }],
@@ -8534,7 +8538,7 @@ function historyTreeDrawEdges(nodeEls, graph) {
       for (let r = Math.min(pRow, cRow) + 1; r < Math.max(pRow, cRow); r += 1) {
         if (laneBlocked(r, seq, pcx, pcx)) { vBlocked = true; break; }
       }
-      if (!vBlocked && horizRun >= 8 && !laneBlocked(cRow, seq, pcx, sideX)) {
+      if (!vBlocked && horizRun >= 2 && !laneBlocked(cRow, seq, pcx, sideX)) {
         edges.push({
           kind: "cross", ep: [seq, p],
           pts: [{ x: pcx, y: yP }, { x: pcx, y: ccy }, { x: sideX, y: ccy }],
