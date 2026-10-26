@@ -380,16 +380,26 @@ def _seed_values(graph):
 
 
 def _changed_widget_names(a, b):
-    """同 id 两节点的 widget 变化名列表（逐项比较位置值；缺失项按 "" 参与比较）。"""
+    """同 id 两节点的 widget 变化名列表（逐项比较位置值；缺失项按 "" 参与比较）。
+
+    2026-10-26：**种子类 widget 不计入变化**。
+    签名本来就忽略 seed（改种子不新建节点），但 delta 原先逐项比到底 ——
+    随机模式下只改一个参数、seed 也自动变了，就会被记成两处改动，色条亮两根。
+    现在 delta 与签名同口径：seed / noise_seed 一律跳过（种子值由 seeds 快照单独记录）。
+    只改种子 → fields 为空 → 该节点不进 changed（本来也不新建节点）。
+    """
     na, va = _widget_entries(a)
     nb, vb = _widget_entries(b)
     n = max(len(va), len(vb))
     fields = []
     for i in range(n):
+        name = (na[i] if na and i < len(na) else None) or (nb[i] if nb and i < len(nb) else None)
+        if name is not None and str(name) in _SEED_WIDGET_SET:
+            continue  # 种子类不计入变化（与签名口径一致）
         x = va[i] if i < len(va) else None
         y = vb[i] if i < len(vb) else None
         if _canon_value(x) != _canon_value(y):
-            fields.append((na[i] if na and i < len(na) else None) or (nb[i] if nb and i < len(nb) else None) or ("widget_%d" % i))
+            fields.append(name or ("widget_%d" % i))
     return fields
 
 

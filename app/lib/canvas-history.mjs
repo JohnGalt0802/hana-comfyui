@@ -417,15 +417,22 @@ function widgetEntries(node) {
 
 /** 同 id 两节点的 widget 变化名列表（逐项比较位置值；缺失项按 "" 参与比较）。 */
 function changedWidgetNames(a, b) {
+  // 2026-10-26：种子类 widget 不计入变化（与签名口径一致）。
+  // 签名本来就忽略 seed，但 delta 原先逐项比到底 ——
+  // 随机模式下只改一个参数、seed 也自动变了，就被记成两处改动，色条亮两根。
   const ea = widgetEntries(a);
   const eb = widgetEntries(b);
   const n = Math.max(ea.values.length, eb.values.length);
   const fields = [];
   for (let i = 0; i < n; i++) {
+    const name = (ea.names && ea.names[i]) || (eb.names && eb.names[i]) || null;
+    if (name != null && SEED_WIDGET_NAMES.has(String(name))) {
+      continue; // 种子类不计入变化
+    }
     const va = i < ea.values.length ? ea.values[i] : undefined;
     const vb = i < eb.values.length ? eb.values[i] : undefined;
     if (canonValue(va) !== canonValue(vb)) {
-      fields.push((ea.names && ea.names[i]) || (eb.names && eb.names[i]) || `widget_${i}`);
+      fields.push(name || `widget_${i}`);
     }
   }
   return fields;
