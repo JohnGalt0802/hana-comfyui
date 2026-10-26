@@ -127,7 +127,8 @@ except ValueError:
 # 2026-10-26（种子快照：合并行带 seeds + 读时覆盖 + 悬停展示）：对齐新活动桥 hana-bridge-05292400。
 # 2026-10-26（签名 v4 含框维度/节点名 + 条堆改横向 + 徽标降级 + 字段映射）：对齐新活动桥 hana-bridge-06310100。
 # 2026-10-26（条堆回竖排 + 节点高度按最大框数自适应）：对齐新活动桥 hana-bridge-12290700。
-BRIDGE_BUILD_TAG = "2026-10-26 hana-bridge-12290700"
+# 2026-10-26（回滚泳道隐藏 + 隐藏改级联侧枝/紧凑/记号）：对齐新活动桥 hana-bridge-21592500。
+BRIDGE_BUILD_TAG = "2026-10-26 hana-bridge-21592500"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}

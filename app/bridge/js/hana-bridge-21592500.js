@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-26 hana-bridge-12290700";
+const BUILD_TAG = "2026-10-26 hana-bridge-21592500";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -6157,10 +6157,6 @@ function historyTreeStyleEnsure() {
   --htr-btn-bg-h: rgba(0,0,0,.1);
   --htr-panel1: rgba(252,250,246,.96);
   --htr-panel2: rgba(243,240,234,.97);
-  /* D8（2026-10-26）：泳道 gutter 专用不透明底色（不能用 --htr-panel1/2：它们是半透明，
-     节点横滚到 gutter 下面时会透出来）。两段取 panel1/2 在典型底色上的实色值。 */
-  --htr-gutter1: #fbf9f5;
-  --htr-gutter2: #f0ece6;
   --htr-hi: rgba(255,255,255,.75);
   --htr-inset-line: rgba(0,0,0,.05);
   --htr-collapsed-sh: rgba(60,50,40,.12);
@@ -6191,8 +6187,6 @@ function historyTreeStyleEnsure() {
   --htr-btn-bg-h: rgba(255,255,255,.14);
   --htr-panel1: rgba(38,44,54,.94);
   --htr-panel2: rgba(27,32,40,.95);
-  --htr-gutter1: #262c36;
-  --htr-gutter2: #1b2028;
   --htr-hi: rgba(255,255,255,.075);
   --htr-inset-line: rgba(255,255,255,.05);
   --htr-collapsed-sh: rgba(0,0,0,.3);
@@ -6218,9 +6212,6 @@ function historyTreeStyleEnsure() {
   position: absolute; left: 0; right: 0; bottom: 0; z-index: 9990;
   pointer-events: none; user-select: none;
   font-size: 12px; line-height: 1.4; color: var(--htr-fg);
-  /* D8（2026-10-26）：行内视觉下移量 —— 与节点样式里的 row*laneH + laneH/2 + 3 同源。
-     gutter 里的眼睛 / 编号用同一个值，才能和节点中心严格同一水平线。 */
-  --htr-row-nudge: 3px;
 }
 #${HISTORY_TREE_ID} .htr-collapsed {
   pointer-events: auto; height: 26px; display: flex; align-items: center; gap: 8px;
@@ -6271,62 +6262,20 @@ function historyTreeStyleEnsure() {
 #${HISTORY_TREE_ID} .tcanvas::-webkit-scrollbar { display: none; }
 #${HISTORY_TREE_ID} .tcanvas.htr-dragging { cursor: grabbing; }
 #${HISTORY_TREE_ID} .lanes { position: relative; height: 100%; }
-/* D8（2026-10-26·任务 C）：左侧 gutter —— 泳道编号 + 眼睛常驻，不跟内容横滚。
-   · sticky + left:0：只固定水平，垂直方向留在文档流里跟内容一起上下滚（不设 top）。
-   · 容器 = .lanes（position:relative，宽 W、高 contentH）→ gutter 高度写 contentH，行行对得上。
-   · 底色不透明（--htr-gutter1/2）：节点横向滑过时不透出。
-   · pointer-events:none 让空白区继续吃 .tcanvas 的拖拽；行元素 .htr-laneaxis 自己收回指针事件。 */
-#${HISTORY_TREE_ID} .htr-lanegutter {
-  position: sticky; left: 0; z-index: 3; /* 盖过节点（.node z-index:1）与左端渐隐（.htr-fade z-index:2）—— gutter 常驻后左侧渐隐已无意义，让位 */
-  background: linear-gradient(180deg, var(--htr-gutter1) 0%, var(--htr-gutter2) 100%);
-  pointer-events: none;
-  box-shadow: 1px 0 0 var(--htr-inset-line);
-}
 /* 泳道基准线（2026-10-22 改）：从「横贯面板」改成「左侧短标记」。
    旧：left:0; right:0 → 一整条横线贯穿。跨泳道连线每穿一条泳道就在它上面切一个
    十字，用户看到的就是「连线跟泳道交叉」——那些长横线就是基准线本身。
-   现：只留左侧 18px 一段作泳道标识，右边整条不再画 → 竖线与它碰不上。
-   D8：行元素改为「整行高」（gutter 内的行容器），可见的 1px 短标记改由 ::before 画。 */
+   现：只留左侧 18px 一段作泳道标识，右边整条不再画 → 竖线与它碰不上。 */
 #${HISTORY_TREE_ID} .htr-laneaxis {
-  position: absolute; left: 0; width: 100%;
-  pointer-events: auto; cursor: context-menu;
-  background: none;
+  position: absolute; left: 0; width: 18px; height: 1px;
+  background: var(--htr-lane); pointer-events: none;
 }
-#${HISTORY_TREE_ID} .htr-laneaxis::before {
-  content: "";
-  position: absolute; left: 0; top: 50%; transform: translateY(-50%);
-  width: 18px; height: 1px; background: var(--htr-lane);
-}
-/* 泳道序号：行右侧，与节点中心同一水平线（D8：以前贴在 1px 标记旁、随内容横滚，现在常驻 gutter） */
+/* 泳道序号：贴在左侧标记右边，跟着内容一起横滚（说明该行是第几条泳道） */
 #${HISTORY_TREE_ID} .htr-laneaxis::after {
   content: attr(data-lane);
-  position: absolute; left: 22px; top: calc(50% + var(--htr-row-nudge, 3px)); transform: translateY(-50%);
+  position: absolute; left: 22px; top: -5px;
   font-size: 9px; line-height: 1; color: var(--htr-sub); opacity: .5;
-  pointer-events: none; /* 2026-10-26：序号只是标注，不参与命中 */
-}
-/* 2026-10-26（D7）：泳道眼睛 —— 每条泳道行一个，常驻行首（PS 图层面板口径：点一下 = 隐藏/恢复该行）。
-   挂在 .htr-laneaxis 内部（复用行坐标系），12×12 居中对齐行中线，底色透明（不遮行）。
-   颜色走 --htr-sub（常态半透）/ hover 转 --htr-fg；纯 DOM + 内联 SVG，不引图标字体、不引外链。 */
-#${HISTORY_TREE_ID} .htr-laneeye {
-  position: absolute; left: 2px; top: calc(50% + var(--htr-row-nudge, 3px)); transform: translateY(-50%);
-  width: 12px; height: 12px; display: flex; align-items: center; justify-content: center;
-  background: transparent; border-radius: 3px;
-  color: var(--htr-sub); cursor: pointer; pointer-events: auto;
-  /* z-index 3：在 gutter 堆叠上下文里盖在行元素/基准线上 */
-  z-index: 3;
-}
-#${HISTORY_TREE_ID} .htr-laneeye svg { display: block; width: 12px; height: 12px; opacity: .45; }
-#${HISTORY_TREE_ID} .htr-laneeye:hover { color: var(--htr-fg); }
-#${HISTORY_TREE_ID} .htr-laneeye:hover svg { opacity: 1; }
-#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-idle { cursor: default; opacity: .5; }
-#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-idle svg { opacity: .28; }
-#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-idle:hover { color: var(--htr-sub); }
-/* D8：全隐状态 = 闭眼 —— 瞳孔隐藏，外轮廓压平（只留一条横线观感），可点恢复。 */
-#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-off { color: var(--htr-fg); }
-#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-off svg circle { display: none; }
-#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-off svg path { stroke-width: 1.5; }
-#${HISTORY_TREE_ID} .htr-laneeye.htr-laneeye-off svg {
-  opacity: .9; transform: scaleY(.34);/* 压成一条横线 */
+  pointer-events: none; /* 2026-10-26：序号只是标注，不参与命中（否则会抢最左侧节点的右键） */
 }
 /* 节点（统一母题）：外框 = 线型(操作)+色(谁)；内条堆 = 本次碰过的画布框（框色，见 .hnode-bar） */
 #${HISTORY_TREE_ID} .node {
@@ -6388,6 +6337,14 @@ function historyTreeStyleEnsure() {
   content: ""; position: absolute; bottom: -7px; left: 50%; transform: translateX(-50%);
   width: 6px; height: 6px; border-radius: 50%; background: #e8c268;
 }
+/* D9（2026-10-26·记号）：可见节点的父链上跳过了被隐藏的提交 → 左边缘一个 2px 圆点。
+   不占布局（绝对定位、pointer-events:none）；无隐藏项时该 class 一个都不会出现（正常树必须干净）。
+   不用 .node::before：那是透明扩大热区；不用 ::after：那是 HEAD 金点。 */
+#${HISTORY_TREE_ID} .node.htr-hid-after .htr-hid-dot {
+  position: absolute; left: 0; top: 50%; transform: translate(-50%, -50%);
+  width: 2px; height: 2px; border-radius: 50%;
+  background: var(--htr-sub); opacity: .6; pointer-events: none;
+}
 /* 旧数据（blockNames === null）：淡化（同弹层 [data-legacy] 口径） */
 #${HISTORY_TREE_ID} .node[data-legacy] .hnode-bars { opacity: .55; }
 /* 父子连线层：渲染后按真实位置补画（SVG），只描边不填充 */
@@ -6401,7 +6358,7 @@ function historyTreeStyleEnsure() {
 }
 /* 两端渐隐（同框口径） */
 #${HISTORY_TREE_ID} .htr-fade { position: absolute; top: 0; bottom: 0; width: 18px; pointer-events: none; z-index: 2; opacity: 0; transition: opacity .2s; }
-#${HISTORY_TREE_ID} .htr-fade.l { left: 36px; background: linear-gradient(90deg, var(--htr-fade), transparent); } /* D8：让开 34px 常驻 gutter */
+#${HISTORY_TREE_ID} .htr-fade.l { left: 10px; background: linear-gradient(90deg, var(--htr-fade), transparent); }
 #${HISTORY_TREE_ID} .htr-fade.r { right: 10px; background: linear-gradient(270deg, var(--htr-fade), transparent); }
 #${HISTORY_TREE_ID} .htr-fade.htr-fade-on { opacity: 1; }
 /* 休眠折叠条：虚线框 + +N（本期只显示+计数；展开折叠分支列为后续） */
@@ -6470,7 +6427,7 @@ function historyTreeStyleEnsure() {
 }
 #${HISTORY_TREE_ID} .htr-shots-img.single { width: 100%; max-width: 720px; height: auto; max-height: 340px; object-fit: contain; } /* 限宽树浮层内单图自适应；同 .hhb-thumb-img 观感 */
 #${HISTORY_TREE_ID} .htr-shots-img.multi { width: 240px; height: auto; max-height: 340px; object-fit: contain; } /* 同 .hhb-thumb-strip .hhb-thumb-img */
-/* 2026-10-26（D6）：自绘右键菜单（隐藏节点 / 隐藏本行）。
+/* 2026-10-26（D6）：自绘右键菜单（隐藏节点）。
    挂 document.body（position:fixed），不挂在树容器内 —— 避免被 .tcanvas 的 overflow 裁切。
    皮肤沿用 .htr-bubble 家族变量；z-index 10002（> 树 9990，< 回跳确认框 10003）。 */
 .htr-menu {
@@ -6649,7 +6606,7 @@ function scoreOf(entries, laneOfSeq, xOfSeq) {
 // 关键约束：回溯用的 bySeq 必须由**完整 entries**（含被隐藏项）建立，否则回溯会在隐藏点断掉，
 // 子节点集体变孤儿。
 //
-// API（与 lib 一致）：HIDDEN_LS_PREFIX / indexBySeq / resolveVisibleParent / applyHidden / sanitizeHidden。
+// API（与 lib 一致）：HIDDEN_LS_PREFIX / indexBySeq / resolveVisibleParent / applyHidden / sanitizeHidden / mainlineSeqs / expandHiddenCascade。
 
 // localStorage 键前缀：一个画布一份（后接画布标识），值为 seq 的 JSON 数组。
 const HIDDEN_LS_PREFIX = "hana.history.hidden.v1:";
@@ -6715,6 +6672,74 @@ function applyHidden(entries, hiddenSet) {
     if (!e || !Number.isInteger(e.seq)) continue;
     if (hasHidden(hiddenSet, e.seq)) continue;
     out.push({ ...e, parent: resolveVisibleParent(e.seq, hiddenSet, bySeq) });
+  }
+  return out;
+}
+
+// D9（2026-10-26·级联）→ D10 修正：**保护主干，只藏侧枝**。
+//   entries 用全量（含 mergeInto 行）；hiddenSet 是已 sanitize 的原始集合；headSeq 用于算 mainline。
+//   BFS 遇 mainline 节点 → 不加入、也不从它继续往下扩（否则主干分叉点一藏，HEAD 连整棵树都没了）。
+//   镜像：app/lib/history-hide.mjs 的 mainlineSeqs / expandHiddenCascade，改一处必须同改两处。
+function mainlineSeqs(entries, headSeq) {
+  const out = new Set();
+  const list = Array.isArray(entries) ? entries : [];
+  if (!Number.isInteger(headSeq)) return out;
+  const parentOf = new Map();
+  for (const e of list) {
+    if (e && Number.isInteger(e.seq)) parentOf.set(e.seq, e.parent);
+  }
+  if (!parentOf.has(headSeq)) return out;
+  const visited = new Set();
+  let cursor = headSeq;
+  for (let steps = 0; steps < MAX_WALK; steps++) {
+    if (!Number.isInteger(cursor)) break;
+    if (visited.has(cursor)) break;
+    visited.add(cursor);
+    out.add(cursor);
+    cursor = parentOf.has(cursor) ? parentOf.get(cursor) : null;
+  }
+  return out;
+}
+
+function expandHiddenCascade(entries, hiddenSet, headSeq) {
+  const out = new Set();
+  if (!hiddenSet) return out;
+  const list = Array.isArray(entries) ? entries : [];
+  if (list.length === 0) return out;
+
+  const mainline = mainlineSeqs(list, headSeq); // 空集 = 不做保护（headSeq 缺失）
+
+  const childrenOf = new Map();
+  for (const e of list) {
+    if (!e || !Number.isInteger(e.seq)) continue;
+    if (!Number.isInteger(e.parent)) continue;
+    let kids = childrenOf.get(e.parent);
+    if (!kids) { kids = []; childrenOf.set(e.parent, kids); }
+    kids.push(e.seq);
+  }
+
+  const visited = new Set();
+  const queue = [];
+  const raw = typeof hiddenSet.has === "function" ? [...hiddenSet] : Array.isArray(hiddenSet) ? hiddenSet : [];
+  for (const item of raw) {
+    const seq = typeof item === "number" ? item : Number(item);
+    if (!Number.isInteger(seq)) continue;
+    if (visited.has(seq)) continue;
+    visited.add(seq);
+    out.add(seq); // 种子：即使在主干上也照藏（用户自己点的）
+    queue.push(seq);
+  }
+
+  for (let i = 0; i < queue.length; i++) {
+    const kids = childrenOf.get(queue[i]);
+    if (!kids) continue;
+    for (const k of kids) {
+      if (visited.has(k)) continue;
+      if (mainline.has(k)) continue; // D10：主干节点不藏，也不从它往下扩
+      visited.add(k);
+      out.add(k);
+      queue.push(k);
+    }
   }
   return out;
 }
@@ -6856,30 +6881,37 @@ function historyTreeUpdateCounts(entries) {
   const solidEntries = (Array.isArray(entries) ? entries : []).filter((e) => e && e.mergeInto == null);
   const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
   const hidden = sanitizeHidden(historyHiddenGet(), solidEntries, headSeq);
-  // D8（2026-10-26）：留空位后结构不再随隐藏变化 —— 分支 / 泳道都按全量算（与渲染同口径），
-  // 只有节点数区分「可见 / 总数」。旧实现拿可见集算 graph → 隐藏后泳道数会变小，与画面（泳道不变）矛盾。
-  const visibleCount = solidEntries.length - hidden.size;
+  // D9（2026-10-26·级联紧凑）：计数与渲染同口径 —— 级联扩集 → 可见集。
+  //   分支 / 泳道都按可见集算（隐藏一个分支起点 → 泳道数会真的变小，与画面一致）。
+  const hiddenExpanded = expandHiddenCascade(solidEntries, hidden, headSeq);
+  const visibleEntries = hiddenExpanded.size ? applyHidden(solidEntries, hiddenExpanded) : solidEntries;
+  const visibleCount = visibleEntries.length;
   const cnt = new Map();
-  for (const ent of solidEntries) {
+  for (const ent of visibleEntries) {
     const p = ent && ent.parent;
     if (p == null) continue;
     cnt.set(p, (cnt.get(p) || 0) + 1);
   }
   let branches = 0;
   for (const v of cnt.values()) if (v >= 2) branches += 1;
-  const graph = commitGraphLanes(solidEntries);
-  const nodeText = hidden.size
+  const graph = commitGraphLanes(visibleEntries);
+  const nodeText = visibleCount !== solidEntries.length
     ? visibleCount + " / " + solidEntries.length + " 节点"
-    : solidEntries.length + " 节点";
+    : visibleCount + " 节点";
   historyTreeCountEl.textContent =
     nodeText + " · " + branches + " 分支 · " + graph.lanes.length + " 泳道";
-  // D7（2026-10-26·任务 B）：收纳条「隐藏 N」—— 有隐藏才出现，N = sanitize 后的实际隐藏个数。
+  // D7（2026-10-26·任务 B）：收纳条「隐藏 N」—— 有隐藏才出现。
+  // D9：N 仍取**用户明确隐藏**的个数（不含级联项）—— 恢复面板按同一集合列行，两者必须一致；
+  //    级联带走的后代个数只放进 title，不改标签（否则「隐藏 1」会变成「隐藏 109」，与面板行数矛盾）。
   // 面板开着时顺便刷新行（原项可能已恢复 / 新项可能出现）。
+  const cascadeExtra = Math.max(0, hiddenExpanded.size - hidden.size);
   if (historyTreeHiddenBtnEl) {
     if (hidden.size > 0) {
       historyTreeHiddenBtnEl.hidden = false;
       historyTreeHiddenBtnEl.textContent = "隐藏 " + hidden.size;
-      historyTreeHiddenBtnEl.title = "已隐藏 " + hidden.size + " 个提交（点击管理）";
+      historyTreeHiddenBtnEl.title = cascadeExtra > 0
+        ? "已隐藏 " + hidden.size + " 个提交，连带 " + cascadeExtra + " 个分支后代（点击管理）"
+        : "已隐藏 " + hidden.size + " 个提交（点击管理）";
     } else {
       historyTreeHiddenBtnEl.hidden = true;
       historyTreeHiddenBtnEl.textContent = "";
@@ -7011,28 +7043,62 @@ function historyTreeRenderTree(entries) {
   }
   // 与计数函数同口径：mergeInto 行不渲染（它们没有独立快照，只有「并进前一条」的语义）
   const solidEntries = (Array.isArray(entries) ? entries : []).filter((e) => e && e.mergeInto == null);
-  // D3/D8（2026-10-26）：隐藏节点接入 —— 读集合 → sanitizeHidden（剔除不存在 / HEAD / 根）→ 渲染时跳过隐藏项。
-  // 注意：文件里仍保留 applyHidden（历史框 / 计数用），但树渲染**不再**用它。
-  // D8（2026-10-26）：留空位 —— 不再 applyHidden（不短路重排）。
-  // 隐藏只决定「这个节点画不画」，不改变 entries 结构：泳道分配（commitGraphLanes）与行列坐标一律走全量
-  // solidEntries → 泳道数不变、行号不漂、被隐藏的位置留白、连线直接穿过空位。
-  // sanitizeHidden 照旧保留（HEAD / 根 / 不存在的 seq 仍要剔除）。
+  // D9（2026-10-26·级联紧凑）：隐藏 = 级联（分支一并藏）+ 紧凑（不留空位），取代 D8 的「留空位」。
+  //   ① hidden = 用户明确隐藏的集合（sanitize 后；localStorage 只存这一份，不掺级联项）
+  //   ② hiddenExpanded = 级联扩集（隐藏分支起点 → 该节点引出的所有后代一并藏）
+  //   ③ visibleEntries = applyHidden(...) 短路：剔除隐藏项，其余 parent 改挂到最近可见祖先
+  //      ——这就是「后面的节点提到被隐藏节点的位置」：不留空位，也不再另写重排。
+  //   ④ 泳道 / x / 连线全部基于 visibleEntries 重算 → 泳道自动压实（空出来的行由下方泳道补上）。
   const hiddenRaw = historyHiddenGet();
-  const hidden = sanitizeHidden(hiddenRaw, solidEntries, historyTreeHead && historyTreeHead.seq);
-  // D4/D8：连线数据源 = 全量（父或子被隐藏时线照样连过去 → 视觉上穿过空位）。
-  historyTreeShownEntries = solidEntries;
-  const graph = commitGraphLanes(solidEntries);
-  const bySeq = new Map(); // seq → ent（全量，含被隐藏项：x 的驱动数据要能从这儿取 parent）
-  for (const ent of solidEntries) {
+  const headSeqForTree = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
+  const hidden = sanitizeHidden(hiddenRaw, solidEntries, headSeqForTree);
+  // D10：级联必须传 headSeq —— 否则拿不到 mainline，主干会被一并藏掉（上一版的 bug）。
+  const hiddenExpanded = expandHiddenCascade(solidEntries, hidden, headSeqForTree);
+  const visibleEntries = hiddenExpanded.size ? applyHidden(solidEntries, hiddenExpanded) : solidEntries;
+  // 连线数据源 = 可见集（parent 已被短路改挂到可见祖先 → 不存在隐藏端点，也不需要幽灵矩形补位）。
+  historyTreeShownEntries = visibleEntries;
+  const graph = commitGraphLanes(visibleEntries); // 泳道基于可见集重算 → 压实
+  const bySeq = new Map(); // seq → ent（可见集：x 的驱动数据从这里取 parent）
+  for (const ent of visibleEntries) {
     if (ent && ent.seq != null) bySeq.set(ent.seq, ent);
   }
+  // D9·记号 → D10 重写：不占布局，但要能看出「这里藏过东西」，且**不能满屏都是点**。
+  //
+  // 判定演进（全部基于真实数据实测）：
+  //   · D9 判据一「父链经过隐藏 seq」：级联下恒为 0（任何可见节点的父链都不可能经过隐藏项）
+  //   · D9 判据二/三「按 seq 序取隐藏段紧前/紧后的可见节点」：主干保护后**满屏都是点**
+  //     （实测 14f602c2 藏 #43 → 89/106 命中，96dd27ac 藏 #174 → 135/175）
+  //     原因：侧枝散布在序号各处，每个侧枝与主干相邻对都成了一个「段边界」，全被当成了断口。
+  //
+  // 现判据（D10，基于父子边而非 seq 序）：一个可见节点被看成「这里藏过东西」的接入点，当且仅当
+  //   它在**原始 entries** 里的某个子节点（直接子）被隐藏了。
+  //   为什么这样正确：级联只藏「非主干后代」→ 被藏节点的父必然可见 → 断口就落在那个父节点上。
+  //     a) 藏主干上的分叉点 A → A 的侧枝子被藏，而 A 自己也藏，不产生标记；
+  //        但 A 的父 P 有个子 A 被藏 → 标记落在 P（= 紧接隐藏位置的保留节点）✔
+  //     b) 藏侧枝 B → B 的父（接主干那个节点）有个子 B 被藏 → 标记落在它上面 ✔
+  //   实测命中数：藏主干点 1 个、藏侧枝 1~2 个；无隐藏时为 0。
+  const origParentOf = new Map();
+  for (const ent of solidEntries) {
+    if (ent && Number.isInteger(ent.seq)) origParentOf.set(ent.seq, ent.parent);
+  }
+  const cutMark = new Set(); // 断口接入点（有直接子节点被隐藏的可见节点）
+  if (hiddenExpanded.size) {
+    for (const ent of solidEntries) {
+      if (!ent || !Number.isInteger(ent.seq)) continue;
+      if (!hiddenExpanded.has(ent.seq)) continue; // 只看被隐藏项
+      const p = ent.parent;
+      if (!Number.isInteger(p)) continue;          // 根 / 脏 parent：没接入点
+      if (hiddenExpanded.has(p)) continue;         // 父也被藏 → 断口往上推
+      cutMark.add(p);
+    }
+  }
+  const skippedAfterHidden = (seq) => cutMark.has(seq); // 无隐藏 → cutMark 空 → 一个点都不会打
   // 时间轴等距（2026-10-12 修）：每个「可见提交」占等宽一格。
   // 旧实现 X=(seq-0.5)*colW 用 seq 值定距，而 seq 因合并（mergeInto 行不生成节点）跳号
   // （实测 43 节点 seq 跨 1..144，相邻差 1~12 不等）→ 间距随序号差疏密悬殊、观感像按时间差伸缩。
   // 改：rank = 可见节点（row>=0）序号，等距铺开；折叠节点不占位（收进 +N，不撑开间距）。
   const mode = historyTreeViewGet();
-  // D8：shownNodes = 全量节点（含被隐藏的）。xIn 必须用全量 —— 隐藏节点的列位仍占一格，
-  // 若按可见集算 x，后面的节点会整体往前挤（「留空位」就不成立了）。
+  // D9：节点集 = 可见集（graph 已基于 visibleEntries），隐藏节点不在 entries 里，也不占列位。
   const shownNodes = graph.nodes.filter((nd) => nd && nd.row >= 0);
   // x 计算抽为纯函数 historyTreeComputeX：时序=rank；紧凑=父 x + 1（拓扑紧排）。
   const xIn = [];
@@ -7132,51 +7198,19 @@ function historyTreeRenderTree(entries) {
   // 全局框列表 / singleBar / liveColors 已在上面（算 maxBlocks 之前）算好。
   // 泳道基准标记（2026-10-22 改）：左侧短标记 + 泳道序号，不再横贯面板。
   // 旧版 left:0;right:0 的长横线会被跨泳道竖线切出十字 —— 用户报的「连线跟泳道交叉」就是它。
-  // D6（2026-10-26）：行→seq 列表（泳道右键 / 眼睛用）。
-  // D8：全量（含被隐藏项）—— 留空位后行内「可见数 / 全隐」都要能拿到完整成员。
-  const rowSeqs = new Map();
-  for (const nd of graph.nodes) {
-    if (!nd || nd.row < 0) continue;
-    let arr = rowSeqs.get(nd.row);
-    if (!arr) { arr = []; rowSeqs.set(nd.row, arr); }
-    arr.push(nd.seq);
-  }
-  // D8（2026-10-26·任务 C）：泳道 gutter —— 编号 + 眼睛常驻左侧，不再跟着内容横滚。
-  // 对齐口径（与 .lanes 同一内容坐标系，不靠估位）：
-  //   · 同行高 laneH（同一个变量算出来的）、同顶部偏移 row*laneH（同一乘式）
-  //   · 行内眼睛 / 序号垂直居中（top:50% + translateY(-50%)）→ 中心 = row*laneH + laneH/2，
-  //     与节点（row*laneH + laneH/2 + 3）、连线（cyOf 同源）用同一套行基准
-  //   · gutter 宽 = axisW（34px），与 .lanes 左侧留白等宽 → 节点不压 gutter，gutter 也不吃节点命中
-  // sticky 只固定水平（left:0），不设 top → 垂直方向跟内容一起上下滚。
-  const gutter = document.createElement("div");
-  gutter.className = "htr-lanegutter";
-  gutter.style.width = axisW + "px";
-  gutter.style.height = contentH + "px";
   for (let row = 0; row < graph.rows; row += 1) {
     const ax = document.createElement("div");
     ax.className = "htr-laneaxis";
-    ax.style.top = row * laneH + "px";
-    ax.style.height = laneH + "px";
+    ax.style.top = row * laneH + laneH / 2 + "px";
     ax.dataset.lane = String(row + 1); // 序号标注（CSS ::after）
-    // D7/D8：泳道眼睛 —— 常驻 gutter 行首，点击 = 隐藏/恢复本行（切换）。
-    // 数据源用渲染时已算好的 rowSeqs（全量，含隐藏项）；可隐数 / 全隐判定都由 sanitizeHidden 同口径给出。
-    ax.appendChild(historyTreeLaneEye(row, rowSeqs.get(row) || [], solidEntries, hidden));
-    // D6（2026-10-26）：泳道右键 → 批量隐藏本行。preventDefault + stopPropagation 防冒泡触发画布右键菜单。
-    // D8：行元素仍是 .htr-laneaxis（只是挪进 gutter），处理器一字未改。
-    ax.addEventListener("contextmenu", (ev) => {
-      const seqs = rowSeqs.get(row) || [];
-      historyTreeLaneContextMenu(ev, row, seqs, solidEntries, hidden);
-    });
-    gutter.appendChild(ax);
+    tree.appendChild(ax);
   }
-  tree.appendChild(gutter);
   const nodeEls = new Map(); // seq → 节点元素（连线测量用）
   const head = historyTreeHead; // 2026-10-23：小黄点跟后端 HEAD（historyTreeRefresh 缓存），不读 localStorage
+  // D9：不留空位 —— 隐藏项已从 entries 剔除，这里不再跳过；标记只加 class，不占布局。
+  // （若仍保留跳过分支，一旦 hiddenExpanded 与 entries 不同步就会默默少画节点。）
   for (const nd of graph.nodes) {
     if (!nd || nd.row < 0) continue; // 去折叠后不会出现（保留兜底）
-    // D8：留空位 —— 隐藏节点只是不建 DOM（位置仍被 graph / xOf 占着，不会往前挤）。
-    // 必须在创建 DOM 之前跳过，否则会先 append 再移除（白白触发布局 + 连线测量拿到脏节点）。
-    if (hidden.has(nd.seq)) continue;
     const ent = bySeq.get(nd.seq);
     if (!ent) continue;
     const legacy = !(ent && Array.isArray(ent.blockNames));
@@ -7191,6 +7225,16 @@ function historyTreeRenderTree(entries) {
     if (runsN > 1) node.classList.add("htr-tick-bulge"); // 合并加粗
     node.title = ""; // 自绘气泡，不用原生 tooltip
     if (head && head.seq === nd.seq) node.classList.add("htr-tick-head"); // HEAD 金点
+    // D9·记号：父链上跳过了被隐藏的提交 → 左边缘一个 2px 圆点。
+    // 为什么用子元素而不是 ::before：.node::before 已经是透明扩大热区（见 CSS），.htr-tick-head::after
+    // 也已被 HEAD 金点占用（HEAD 节点本身不可隐藏，但可以有被隐藏的祖先）。故用一个绝对定位的 span，
+    // 同样不占布局、pointer-events:none。
+    if (skippedAfterHidden(nd.seq)) {
+      node.classList.add("htr-hid-after");
+      const hidDot = document.createElement("span");
+      hidDot.className = "htr-hid-dot";
+      node.appendChild(hidDot);
+    }
     node.style.setProperty("--htr-c", srcColor); // 外框色 = 谁
     node.style.borderStyle = historyTickBorderStyle(ent && ent.kind); // 外框线型 = 操作
     const xx = xOf.get(nd.seq);
@@ -7463,93 +7507,7 @@ function historyTreeHiddenPanelOpen() {
   };
 }
 
-// ── D7/D8（2026-10-26·任务 B）：泳道眼睛（切换）────────────────────────
-// 构造一条泳道行的眼睛元素（常驻 gutter 行首）。点击 = 切换本行的隐藏状态：
-//   · 本行全部可隐节点都已隐藏 → 全部恢复（从集合删本行 seq）
-//   · 否则 → 全部隐藏（本行所有可隐 seq 加入集合，HEAD / 根由 sanitizeHidden 剔除）
-// 事件边界（关键）：
-//   · 眼睛是 .htr-laneaxis 的子元素，click 会往上冒泡到 ax —— 而 ax 本身没绑 click（只绑了 contextmenu），
-//     所以 click 无需 stopPropagation；但仍显式 stopPropagation，防日后给 ax / .tcanvas 加 click 时误触。
-//   · 眼睛自己的 contextmenu 必须 preventDefault + stopPropagation：否则会冒泡到 ax 触发「隐藏本行」菜单，
-//     而且 preventDefault 能让眼睛上的右键不弹浏览器系统菜单。泳道右键（点在眼睛以外的一整行）不受影响。
-//   · 眼睛 pointer-events:auto，落在 gutter 行内，子元素优先命中 → 落在眼睛上的是眼睛，其余位置是 ax。
-function historyTreeLaneEye(row, laneSeqs, solidEntries, hiddenSet) {
-  const el = document.createElement("div");
-  el.className = "htr-laneeye";
-  el.dataset.lane = String(row + 1);
-  const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
-  const base = hiddenSet instanceof Set ? hiddenSet : new Set();
-  // 本行全部 seq（全量，含已隐藏）→ 过一遍 sanitizeHidden 得到「可隐集」：HEAD / 根 / 不存在自动排除。
-  const union = new Set(base);
-  for (const s of laneSeqs) union.add(s);
-  const sanitized = sanitizeHidden(union, solidEntries, headSeq);
-  // 本行可隐成员 = 可隐集 ∩ 本行 seq
-  const laneSet = new Set(laneSeqs);
-  const hiable = [...sanitized].filter((s) => laneSet.has(s));
-  const hiddenInRow = hiable.filter((s) => base.has(s));
-  const allHidden = hiable.length > 0 && hiddenInRow.length === hiable.length;
-  const willHide = sanitized.size - base.size; // 本行还能隐几个（用于 title 与空闲判定）
-  // 纯 CSS + 内联 SVG 画眼睛（不引图标字体、不引外链）
-  const NS = "http://www.w3.org/2000/svg";
-  const svg = document.createElementNS(NS, "svg");
-  svg.setAttribute("viewBox", "0 0 16 16");
-  svg.setAttribute("aria-hidden", "true");
-  const outline = document.createElementNS(NS, "path");
-  outline.setAttribute("d", "M1.6 8C3.7 4.3 5.7 2.9 8 2.9s4.3 1.4 6.4 5.1C12.3 11.7 10.3 13.1 8 13.1S3.7 11.7 1.6 8Z");
-  outline.setAttribute("fill", "none");
-  outline.setAttribute("stroke", "currentColor");
-  outline.setAttribute("stroke-width", "1.3");
-  const pupil = document.createElementNS(NS, "circle");
-  pupil.setAttribute("cx", "8"); pupil.setAttribute("cy", "8"); pupil.setAttribute("r", "2.15");
-  pupil.setAttribute("fill", "currentColor");
-  svg.append(outline, pupil);
-  el.appendChild(svg);
-  if (allHidden) {
-    // 全隐 → 闭眼（CSS 把瞳孔藏起来、描边拉直）+ 可点恢复
-    el.classList.add("htr-laneeye-off");
-    el.title = "恢复本行 " + hiable.length + " 个节点";
-    el.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (Date.now() - historyTreeDragEndAt < 300) return;
-      const next = new Set(base);
-      for (const s of hiable) next.delete(s);
-      historyTreeHiddenApplyChange(next);
-    });
-  } else if (willHide > 0) {
-    // 部分隐 / 全显 → 睁眼，点一下全部隐藏；部分隐时 title 说清还剩几个可见
-    const visibleInRow = laneSeqs.length - hiddenInRow.length;
-    el.title = hiddenInRow.length
-      ? "隐藏本行剩余 " + willHide + " 个节点（本行可见 " + visibleInRow + " / 共 " + laneSeqs.length + "，已隐藏 " + hiddenInRow.length + "）"
-      : "隐藏本行 " + willHide + " 个节点";
-    el.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (Date.now() - historyTreeDragEndAt < 300) return;
-      historyTreeHiddenApplyChange(union);
-    });
-  } else {
-    // 本行无可隐（只剩 HEAD / 根 / 空行）→ 视觉仍占位（行对齐不乱），但不可点、不弹任何东西
-    el.classList.add("htr-laneeye-idle");
-    el.title = laneSeqs.length
-      ? "本行 " + laneSeqs.length + " 个节点均为 HEAD / 根节点，不可隐藏"
-      : "本行没有节点";
-    el.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (Date.now() - historyTreeDragEndAt < 300) return;
-      console.debug(LOG_TAG, "lane eye: 本行无可隐藏节点", { row, laneSeqs: laneSeqs.length });
-    });
-  }
-  // 不抢泳道右键：眼睛上的右键就地吃掉（preventDefault 拦系统菜单 / stopPropagation 拦 ax 的「隐藏本行」）
-  el.addEventListener("contextmenu", (ev) => {
-    ev.preventDefault();
-    ev.stopPropagation();
-  });
-  return el;
-}
-
-// ── D6（2026-10-26）：提交树右键菜单（节点隐藏 / 整行隐藏）────────────────────
+// ── D6（2026-10-26）：提交树右键菜单（节点隐藏）────────────────────
 // 为什么自绘：原生 confirm/alert 会打断画布且无法「置灰 + 写原因」；皮肤沿用树气泡（.htr-bubble）变量族。
 // 挂 document.body（position:fixed）：树面板内 .tcanvas 是 overflow:auto，挂在里面会被裁切。
 // 关闭四路：菜单外 pointerdown（捕获）/ Esc / 再右键（contextmenu 捕获）/ 树重渲染与收起。
@@ -7704,81 +7662,6 @@ function historyTreeNodeContextMenu(ev, seq, ent, solidEntries, hiddenSet) {
   }
   historyTreeMenuOpen(ev.clientX, ev.clientY, {
     title: "#" + historySeqLabel(ent) + (ent && ent.at ? " · " + historyFmtTime(ent.at) : ""),
-    items,
-  });
-}
-
-// 泳道右键菜单（任务 B）：隐藏本行。
-// 两步确认：第一步「隐藏本行 N 个节点」→ 第二步（同右键坐标重开菜单）「确认隐藏 N 个节点」+「取消」。
-// N = 实际会被隐藏的个数（先跑一遍 sanitizeHidden 算差集），所以含 HEAD / 根时 N 会小于可见数，文案如实。
-// 选这种两步而不做「点一下即隐藏 + 提示可恢复」：整行是批量破坏性操作，误点代价高。
-function historyTreeLaneConfirm(x, y, laneIdx, laneSeqs, solidEntries, hiddenSet, willHide) {
-  historyTreeMenuOpen(x, y, {
-    title: "泳道 " + (laneIdx + 1) + " · 将要隐藏 " + willHide + " 个节点",
-    items: [
-      {
-        label: "确认隐藏 " + willHide + " 个节点",
-        onPick: () => {
-          const next = new Set(hiddenSet || []);
-          for (const s of laneSeqs) next.add(s);
-          historyTreeMenuClose();
-          historyTreeHiddenApplyChange(next);
-        },
-      },
-      { label: "取消", onPick: () => historyTreeMenuClose() },
-    ],
-  });
-}
-
-function historyTreeLaneContextMenu(ev, laneIdx, laneSeqs, solidEntries, hiddenSet) {
-  ev.preventDefault();
-  ev.stopPropagation();
-  historyTreeBubbleHide();
-  const headSeq = historyTreeHead && Number.isInteger(historyTreeHead.seq) ? historyTreeHead.seq : null;
-  const base = hiddenSet instanceof Set ? hiddenSet : new Set();
-  const union = new Set(base);
-  for (const s of laneSeqs) union.add(s);
-  const willHide = sanitizeHidden(union, solidEntries, headSeq).size - base.size;
-  // D8（2026-10-26）：laneSeqs 现在是本行全量成员（含已隐藏）→ 文案不能再叫「可见节点」。
-  const already = laneSeqs.filter((s) => base.has(s)).length;
-  const blocked = laneSeqs.length - already - willHide;
-  const px = ev.clientX, py = ev.clientY; // 二次确认在同一坐标重开（不取点击项的坐标，否则菜单会跑）
-  const items = [];
-  if (willHide > 0) {
-    items.push({
-      label: "隐藏本行 " + willHide + " 个节点",
-      hint: blocked > 0 ? "本行 " + laneSeqs.length + " 个节点，其中 " + blocked + " 个是 HEAD / 根节点，不可隐藏" : "",
-      onPick: () => historyTreeLaneConfirm(px, py, laneIdx, laneSeqs, solidEntries, base, willHide),
-    });
-  } else {
-    items.push({
-      label: "本行无可隐藏节点",
-      hint: laneSeqs.length ? "本行 " + laneSeqs.length + " 个节点均已隐藏或为 HEAD / 根节点" : "本行没有节点",
-      disabled: true,
-    });
-  }
-  if (already > 0) {
-    items.push({
-      label: "恢复本行 " + already + " 个节点",
-      onPick: () => {
-        const next = new Set(base);
-        for (const s of laneSeqs) next.delete(s);
-        historyTreeMenuClose();
-        historyTreeHiddenApplyChange(next);
-      },
-    });
-  }
-  if (base.size > 0) {
-    items.push({
-      label: "恢复全部隐藏（" + base.size + " 个）",
-      onPick: () => {
-        historyTreeMenuClose();
-        historyTreeHiddenApplyChange(new Set());
-      },
-    });
-  }
-  historyTreeMenuOpen(ev.clientX, ev.clientY, {
-    title: "泳道 " + (laneIdx + 1) + " · " + laneSeqs.length + " 个节点" + (already ? "（已隐藏 " + already + "）" : ""),
     items,
   });
 }
@@ -8464,8 +8347,9 @@ function roundedPolyline(pts, radius) {
 }
 
 // nodeEls/graph 均来自 historyTreeRenderTree；rAF 等一帧布局稳定后测量。
-// D4/D8（2026-10-26）：遍历数据源 = historyTreeShownEntries（= 全量 solidEntries）。
-// 留空位后隐藏节点只是不画，边仍要连 —— 隐藏端的位置用 historyTreeGeom.xOf 补出幽灵矩形。
+// D9（2026-10-26·级联紧凑）：遍历数据源 = historyTreeShownEntries（= 可见集 visibleEntries）。
+// 可见集的 parent 已被 applyHidden 短路改挂到可见祖先 → 不存在隐藏端点，边一律两端都有 DOM。
+// ghostRect 分支保留作兜底（正常路径不会再走到：几何、行号、端点均来自可见集）。
 function historyTreeDrawEdges(nodeEls, graph) {
   const tree = historyTreeTreeEl;
   if (!tree || !nodeEls || !nodeEls.size) return;
@@ -8537,9 +8421,9 @@ function historyTreeDrawEdges(nodeEls, graph) {
       return false;
     };
 
-    // D8（2026-10-26·留空位）：被隐藏的节点没有 DOM，但它的格位还在（row / x 都是全量算的）。
-    // 用渲染时存进 geom 的 xOf / nw / laneH 给它补一个「幽灵矩形」，连线就能直穿空位。
-    // 坐标系与 getBoundingClientRect 一致（client 坐标）→ 下游几何公式一行不改。
+    // D8（留空位时代的兼容分支）：被隐藏节点没有 DOM 时用 geom.xOf 补一个「幽灵矩形」。
+    // D9（2026-10-26·级联紧凑）后 historyTreeShownEntries 已是可见集、parent 已短路改挂，
+    // 正常情况下走不到这里；保留作几何/行号缺失时的兜底，不改变任何现有路径。
     const ghostRect = (sq) => {
       const row = rowOf.get(sq);
       if (row == null || row < 0) return null;
