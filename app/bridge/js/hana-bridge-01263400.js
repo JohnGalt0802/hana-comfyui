@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-26 hana-bridge-21592500";
+const BUILD_TAG = "2026-10-27 hana-bridge-01263400";
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -8518,6 +8518,26 @@ function historyTreeDrawEdges(nodeEls, graph) {
         edges.push({
           kind: "cross", ep: [seq, p],
           pts: [{ x: pcx, y: yP }, { x: pcx, y: c1 }, { x: ccx, y: c1 }, { x: ccx, y: yC }],
+        });
+        continue;
+      }
+      // 2026-10-27（用户定·跨泳道直下优先）：原来的 cross-long 无条件走「桥到间隙列再竖穿」，
+      // 父节点正下方明明是空的也拐三下 —— 用户原话「这曲里拐弯的是啥」。
+      // 新判定：父 x 的竖线穿过中间各行时若没有其它节点挡路 → 直接垂直下到子节点所在行，
+      // 再横着接进子节点靠近父一侧的腰边（与 hop===1 的「侧向接入」同一写法、同一种 kind）。
+      // 真的被中间泳道的节点挡住，才退回下面原有的「走间隙列」绕行（gapIdx / 轨道分配一概不动）。
+      // 两条前置（同 hop===1）：① 目标泳道在 [pcx, sideX] 这段水平区间里没有别的节点；
+      //                        ② 水平段得真有一段可走（太短就退化成一个小绊，不如原折线）。
+      const sideX = ccx > pcx ? (ccx - cr.width / 2) : (ccx + cr.width / 2);
+      const horizRun = Math.abs(sideX - pcx);
+      let vBlocked = false;
+      for (let r = Math.min(pRow, cRow) + 1; r < Math.max(pRow, cRow); r += 1) {
+        if (laneBlocked(r, seq, pcx, pcx)) { vBlocked = true; break; }
+      }
+      if (!vBlocked && horizRun >= 8 && !laneBlocked(cRow, seq, pcx, sideX)) {
+        edges.push({
+          kind: "cross", ep: [seq, p],
+          pts: [{ x: pcx, y: yP }, { x: pcx, y: ccy }, { x: sideX, y: ccy }],
         });
         continue;
       }
