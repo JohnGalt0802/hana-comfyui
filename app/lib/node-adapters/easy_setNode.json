@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "easy setNode",
+  "title": "Easy-Use Set/Get 的「存」端：纯前端名字容器，不进 prompt；上游值由同名 easy getNode 经 pull 取走",
+  "source": "builtin",
+  "verifiedAt": "2026-10-30",
+  "rules": { "virtual": true },
+  "evidence": "本机已装 ComfyUI-Easy-Use 且该前端在役：/extensions/ComfyUI-Easy-Use/assets/extensions-Bwtr72lq.js（web_version/v2，即当前实际加载的前端）里有 registerNodeType(\"easy setNode\") 与 registerNodeType(\"easy getNode\")，两处均 isVirtualNode=!0；可读同源代码 web_version/v1/js/getset.js:22 名字是 widgets[0] 的 text widget、:37 只有一个 * 输入槽、:152 isVirtualNode=true、:166 registerNodeType。真实样本 D:/BaiduNetdiskDownload/工作流/2026.02.02/flux-2-klein-9b-fp8     新EDIT.json：#149 type=easy setNode widgets_values=[\"模型\"] inputs[0]=MODEL(link 220) outputs=[]。注意 type 字符串带空格且为 camelCase（\"easy setNode\"），与本机 KJNodes 的 \"SetNode\" 是两个不同类型。它不在 /object_info 里（2535 个类型逐个比过），只能靠前端注册。"
+}

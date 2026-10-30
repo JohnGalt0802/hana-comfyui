@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "nodeType": "GetNode",
+  "title": "KJNodes Set/Get 的「取」端：纯前端，无输入槽，按 widgets_values[0] 的名字配同名 SetNode，取它 inputs[0] 的上游作为真实源",
+  "source": "builtin",
+  "verifiedAt": "2026-10-30",
+  "rules": {
+    "virtual": true,
+    "pull": {
+      "keyPath": "widgets_values[0]",
+      "fromType": ["SetNode"],
+      "fromKeyPath": "widgets_values[0]",
+      "sourcePath": "inputs[0]"
+    }
+  },
+  "evidence": "前端源码 custom_nodes/ComfyUI-KJNodes/web/js/setgetnodes.js：:909 GetNode 类、:924 isVirtualNode=true、:951 名字是 widgets[0] 的 combo widget（配对方按 node.widgets[0].value === name 找 Set）、:1003 只有一个 * 输出槽、:1213 registerNodeType(\"GetNode\")；Set 的值入口是 inputs[0]（:601）。真实样本 D:/ComfyUI/ComfyUI/qwen-image-2.1-workflow.json：#96 type=GetNode widgets_values=[\"模型\"] inputs=[] outputs[0]=MODEL(links 880)，与 #95 SetNode key=模型 inputs[0]=MODEL(link 916) 同名配对，输出类型与 Set 输入类型一致。验收（2026-10-30）：同一张图的真实工作流（user/default/workflows/共编存档-20261008-生态工作流.json，14 个 Set/Get）去掉与 Set/Get 无关的阻碍后，无档案→整份拒绝、有档案→通过（产物 29 节点）；展开抽查：「vae」→VAELoader #3:0 进 #21.optional_vae、「模型」→TESpeedQwenImage21 #127:0 进 #21.model、「尺寸」→CR Latent Input Switch #143:0 进 #21.latent_image、「clip」→TextEncodeQwenImage21 #128:0 进 #6.conditioning，坏引用 0。"
+}

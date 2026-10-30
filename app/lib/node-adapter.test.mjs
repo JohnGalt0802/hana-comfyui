@@ -490,3 +490,380 @@ test("adapters 非对象：warn 且按默认行为处理", () => {
   );
   assert.ok(warnings.some((w) => /adapters 需要对象/.test(w)));
 });
+
+// ── 八、pull：按名字配对展开（SetNode/GetNode 这类「一个存、一个取」的虚拟件）──────
+// 规则只描述「位置」：名字在各自节点的哪个字段、配对节点的源在哪个输入槽——引擎不认识 Set/Get 的节点身份。
+const SETGET = {
+  SetNode: { virtual: true },
+  GetNode: {
+    virtual: true,
+    pull: {
+      keyPath: "widgets_values[0]",
+      fromType: ["SetNode"],
+      fromKeyPath: "widgets_values[0]",
+      sourcePath: "inputs[0]",
+    },
+  },
+};
+const setNodeOf = (id, key, link, inputType = "MODEL") => ({
+  id,
+  type: "SetNode",
+  inputs: [{ name: "value", link, type: inputType }],
+  outputs: [],
+  widgets_values: [key],
+});
+const getNodeOf = (id, key, outType = "MODEL") => ({
+  id,
+  type: "GetNode",
+  inputs: [],
+  outputs: [out("", outType)],
+  widgets_values: [key],
+});
+// SRC(1) → Set(11,"MODEL") … Get(12,"MODEL") → Sink(3)
+const setGetWf = ({ getKey = "MODEL", setLink = 20, setInputType = "MODEL", getOutType = "MODEL", extraSets = [] } = {}) => ({
+  nodes: [
+    { id: 1, type: "SRC", inputs: [], outputs: [out("", "MODEL")] },
+    setNodeOf(11, "MODEL", setLink, setInputType),
+    ...extraSets.map(([id, key]) => setNodeOf(id, key, 30 + id)),
+    getNodeOf(12, getKey, getOutType),
+    { id: 3, type: "Sink", inputs: [{ name: "model", link: 21, type: getOutType }] },
+  ],
+  links: [
+    ...(setLink === null ? [] : [[20, 1, 0, 11, 0, setInputType]]),
+    ...extraSets.map(([id]) => [30 + id, 1, 0, id, 0, "MODEL"]),
+    [21, 12, 0, 3, 0, getOutType],
+  ],
+});
+
+test("pull：同名 Set 唯一 → 下游直指 Set 的上游真实源，Set/Get 都不进 prompt", () => {
+  const o = convertUiToApi(setGetWf(), OBJ, { adapters: SETGET });
+  assert.deepEqual(Object.keys(o).sort(), ["1", "3"]);
+  assert.deepEqual(o["3"].inputs.model, ["1", 0]);
+});
+
+test("pull：0 个候选 → warning 点名节点与名字，下游走既有「连线缺失」", () => {
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(setGetWf({ getKey: "CLIP" }), OBJ, { onWarning: (w) => warnings.push(w), adapters: SETGET }),
+    /节点 #3 输入 model 的连线缺失（link 21）/,
+  );
+  assert.ok(warnings.some((w) => /#12/.test(w) && /CLIP/.test(w)), `缺少 0 候选告警：${JSON.stringify(warnings)}`);
+});
+
+test("pull：取不到名字（keyPath 解析不到值）→ warning + 下游连线缺失", () => {
+  const wf = setGetWf();
+  wf.nodes.find((n) => n.id === 12).widgets_values = [];
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { onWarning: (w) => warnings.push(w), adapters: SETGET }),
+    /连线缺失（link 21）/,
+  );
+  assert.ok(warnings.some((w) => /取不到名字/.test(w)), `缺少取不到名字的告警：${JSON.stringify(warnings)}`);
+});
+
+test("pull：同名 Set 不唯一 → 整份拒绝并点名每个候选 id（不猜）", () => {
+  const wf = setGetWf({ extraSets: [[23, "MODEL"]] });
+  assert.throws(() => convertUiToApi(wf, OBJ, { adapters: SETGET }), (err) => {
+    // 候选枚举顺序不属于契约：只要求文案点名「同名多候选」并包含两个 id，允许任意排列
+    assert.match(err.message, /同一个名字「MODEL」对应多个 SetNode 节点（#[^）]*）/);
+    assert.match(err.message, /#11/);
+    assert.match(err.message, /#23/);
+    return true;
+  });
+});
+
+test("pull：输出槽与取源槽类型不兼容 → 整份拒绝并写明两边类型与节点", () => {
+  const wf = setGetWf({ getOutType: "IMAGE", setInputType: "MODEL" });
+  assert.throws(() => convertUiToApi(wf, OBJ, { adapters: SETGET }), (err) => {
+    assert.match(err.message, /类型不兼容/);
+    assert.match(err.message, /#12/);
+    assert.match(err.message, /IMAGE/);
+    assert.match(err.message, /MODEL/);
+    return true;
+  });
+});
+
+test('pull：类型校验中 `*` 任一侧视为通配，不拒绝', () => {
+  const o = convertUiToApi(setGetWf({ getOutType: "*" }), OBJ, { adapters: SETGET });
+  assert.deepEqual(o["3"].inputs.model, ["1", 0]);
+});
+
+test("pull：配对的 Set 源槽悬空 → warning + 下游连线缺失", () => {
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(setGetWf({ setLink: null }), OBJ, { onWarning: (w) => warnings.push(w), adapters: SETGET }),
+    /连线缺失（link 21）/,
+  );
+  assert.ok(warnings.some((w) => /悬空/.test(w) && /#11/.test(w)), `缺少悬空告警：${JSON.stringify(warnings)}`);
+});
+
+test("pull 链式：Set ← 另一个 Get ← 另一个 Set，一路解到最上游 SRC", () => {
+  const wf = {
+    nodes: [
+      { id: 1, type: "SRC", inputs: [], outputs: [out("", "MODEL")] },
+      setNodeOf(15, "B", 21),
+      getNodeOf(14, "B"),
+      setNodeOf(11, "A", 20),
+      getNodeOf(12, "A"),
+      { id: 3, type: "Sink", inputs: [{ name: "model", link: 22, type: "MODEL" }] },
+    ],
+    links: [
+      [21, 1, 0, 15, 0, "MODEL"],
+      [20, 14, 0, 11, 0, "MODEL"],
+      [22, 12, 0, 3, 0, "MODEL"],
+    ],
+  };
+  const o = convertUiToApi(wf, OBJ, { adapters: SETGET });
+  assert.deepEqual(Object.keys(o).sort(), ["1", "3"]);
+  assert.deepEqual(o["3"].inputs.model, ["1", 0], "A → Set#11 → Get#14 → Set#15 → SRC#1");
+});
+
+test("pull 成环：Set 的源又来自同一个 Get → 不猜源，按连线缺失处理", () => {
+  const wf = {
+    nodes: [
+      setNodeOf(11, "A", 20),
+      getNodeOf(12, "A"),
+      { id: 3, type: "Sink", inputs: [{ name: "model", link: 21, type: "MODEL" }] },
+    ],
+    links: [
+      [20, 12, 0, 11, 0, "MODEL"],
+      [21, 12, 0, 3, 0, "MODEL"],
+    ],
+  };
+  assert.throws(() => convertUiToApi(wf, OBJ, { adapters: SETGET }), /连线缺失（link 21）/);
+});
+
+test("pull 节点被 mute：恒按 skip（断链），不按名取源", () => {
+  const wf = setGetWf();
+  wf.nodes.find((n) => n.id === 12).mode = 2;
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { onWarning: (w) => warnings.push(w), adapters: SETGET }),
+    /连线缺失（link 21）/,
+  );
+  assert.ok(warnings.some((w) => /mode 2/.test(w) && /pull/.test(w)), `缺少 mute 告警：${JSON.stringify(warnings)}`);
+  // 对照：同一个 Get 在 mode 0 下确实展开
+  assert.deepEqual(convertUiToApi(setGetWf(), OBJ, { adapters: SETGET })["3"].inputs.model, ["1", 0]);
+});
+
+test("pull 缺 virtual：warn 并丢弃 pull，退回普通节点路径（GetNode 不在 /object_info）", () => {
+  const warnings = [];
+  assert.throws(
+    () =>
+      convertUiToApi(setGetWf(), OBJ, {
+        onWarning: (w) => warnings.push(w),
+        adapters: { SetNode: { virtual: true }, GetNode: { pull: SETGET.GetNode.pull } },
+      }),
+    /类型 GetNode 不在 \/object_info/,
+  );
+  assert.ok(warnings.some((w) => /pull 需要配合 virtual/.test(w)), `缺少缺 virtual 的告警：${JSON.stringify(warnings)}`);
+});
+
+test("pull 与 passthrough 同声明：warn 并丢弃 passthrough（pull 优先）", () => {
+  const warnings = [];
+  const o = convertUiToApi(setGetWf(), OBJ, {
+    onWarning: (w) => warnings.push(w),
+    adapters: { ...SETGET, GetNode: { ...SETGET.GetNode, passthrough: true } },
+  });
+  assert.deepEqual(o["3"].inputs.model, ["1", 0]);
+  assert.ok(warnings.some((w) => /同时声明了 pull 与 passthrough/.test(w)), `缺少冲突告警：${JSON.stringify(warnings)}`);
+});
+
+test("pull 规则形态/路径非法：warn 并丢弃该规则（不回退成穿透）", () => {
+  const warnings = [];
+  const base = SETGET.GetNode.pull;
+  for (const [pull, re] of [
+    [{ ...base, sourcePath: "inputs[a]" }, /sourcePath 需要/],
+    [{ ...base, keyPath: 3 }, /keyPath 需要/],
+    [{ ...base, fromType: [] }, /fromType 需要非空字符串数组/],
+    [{ ...base, keyPath: [] }, /keyPath 需要/],
+    [{ ...base, fromKeyPath: [1, 2] }, /fromKeyPath 需要/],
+    ["SetNode", /需要对象/],
+  ]) {
+    const w = [];
+    assert.throws(
+      () => convertUiToApi(setGetWf(), OBJ, { onWarning: (m) => w.push(m), adapters: { SetNode: { virtual: true }, GetNode: { virtual: true, pull } } }),
+      /连线缺失（link 21）/,
+      `pull=${JSON.stringify(pull)} 丢弃后 GetNode 仍虚拟，下游应连线缺失`,
+    );
+    assert.ok(w.some((m) => re.test(m)), `pull=${JSON.stringify(pull)} 缺少告警 ${re}：${JSON.stringify(w)}`);
+    warnings.push(...w);
+  }
+  assert.ok(warnings.length > 0);
+});
+
+test("反向自检：同一份样本去掉 pull 规则就回到「GetNode 不在 /object_info」", () => {
+  const wf = setGetWf();
+  assert.deepEqual(convertUiToApi(wf, OBJ, { adapters: SETGET })["3"].inputs.model, ["1", 0], "有 pull 时必须展开");
+  // 只留 SetNode 的 virtual：GetNode 回到普通节点路径，被 /object_info 拒
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { adapters: { SetNode: { virtual: true } } }),
+    /节点 #12 类型 GetNode 不在 \/object_info/,
+  );
+  // 完全无档案：同样拒绝（证明展开来自 pull 规则，不是样本本身能过）
+  assert.throws(() => convertUiToApi(wf, OBJ), /类型 GetNode 不在 \/object_info/);
+});
+
+test("有 pull 档案但图里没有 Set/Get：输出与无档案完全一致", () => {
+  const wf = dynSlotWf();
+  const base = convertUiToApi(wf, OBJ);
+  assert.deepEqual(convertUiToApi(wf, OBJ, { adapters: SETGET }), base);
+});
+
+// ── 九、pull 口径修补（2026-10-31 复核）：mode 4 语义 / 配对节点静音旁路 / 预扫收窄 / 路径数组回退 ──
+
+test("P1：pull 节点被 bypass（mode 4）→ 名字视为无值（断链）+ warning", () => {
+  const wf = setGetWf();
+  wf.nodes.find((n) => n.id === 12).mode = 4;
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { onWarning: (w) => warnings.push(w), adapters: SETGET }),
+    /节点 #3 输入 model 的连线缺失（link 21）/,
+    "mode 4 的 Get 必须按断链处理，不能让产物接着 Set 的上游",
+  );
+  assert.ok(
+    warnings.some((w) => /#12/.test(w) && /mode 4/.test(w) && /断链/.test(w)),
+    `缺少「Get 被旁路，按断链处理」的告警：${JSON.stringify(warnings)}`,
+  );
+  // 对照：同一个 Get 在 mode 0 下确实展开（证明断链来自 mode 4 分支，不是样本本身取不到源）
+  assert.deepEqual(convertUiToApi(setGetWf(), OBJ, { adapters: SETGET })["3"].inputs.model, ["1", 0]);
+});
+
+test('P1：pull 节点 mode 4 且档案写 bypass="passthrough" → 仍断链，且多一条「无输入槽」warning', () => {
+  const wf = setGetWf();
+  wf.nodes.find((n) => n.id === 12).mode = 4;
+  const adapters = { ...SETGET, GetNode: { ...SETGET.GetNode, bypass: "passthrough" } };
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { onWarning: (w) => warnings.push(w), adapters }),
+    /节点 #3 输入 model 的连线缺失（link 21）/,
+    "穿透对无输入槽的 Get 无意义：仍须断链，不许把 Set 的上游接过来",
+  );
+  // 两条都针对 #12：第一条「被旁路按断链」，第二条「穿透无意义」（后者不重复 mode 4 字样，一并筛进来）
+  const about12 = warnings.filter((w) => /#12/.test(w) && /(mode 4|bypass=)/.test(w));
+  assert.equal(about12.length, 2, `应恰好两条 mode 4 告警：${JSON.stringify(warnings)}`);
+  assert.ok(
+    about12.some((w) => /无输入槽/.test(w) && /按断链处理/.test(w)),
+    `缺少「无输入槽，穿透对它无意义」的告警：${JSON.stringify(about12)}`,
+  );
+});
+
+test("P2：配对的 Set 被静音（mode 2）→ 值不可用 + warning", () => {
+  const wf = setGetWf();
+  wf.nodes.find((n) => n.id === 11).mode = 2;
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { onWarning: (w) => warnings.push(w), adapters: SETGET }),
+    /节点 #3 输入 model 的连线缺失（link 21）/,
+  );
+  assert.ok(
+    warnings.some((w) => /同名 Set 节点 #11/.test(w) && /静音\/旁路/.test(w) && /值不可用/.test(w)),
+    `缺少配对节点静音的告警：${JSON.stringify(warnings)}`,
+  );
+});
+
+test("P2：配对的 Set 被旁路（mode 4）→ 值不可用 + warning", () => {
+  const wf = setGetWf();
+  wf.nodes.find((n) => n.id === 11).mode = 4;
+  // Set 自己给 bypass:"skip"，把「mode 4 节点一律拒绝」的旧路径让开，单独验 pull 侧的判定
+  const adapters = { SetNode: { virtual: true, bypass: "skip" }, GetNode: SETGET.GetNode };
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { onWarning: (w) => warnings.push(w), adapters }),
+    /节点 #3 输入 model 的连线缺失（link 21）/,
+  );
+  assert.ok(
+    warnings.some((w) => /同名 Set 节点 #11/.test(w) && /静音\/旁路（mode 4）/.test(w) && /值不可用/.test(w)),
+    `缺少配对节点旁路的告警：${JSON.stringify(warnings)}`,
+  );
+});
+
+test("P3：同名多候选而 Get 没有下游 → 仍整份拒绝；孤立 Get 不产出「连线缺失」误导文案", () => {
+  // ① 预扫守门：Get #12 没有任何下游消费，同名 Set 仍有两个 → 必须整份拒绝
+  const wf = {
+    nodes: [
+      { id: 1, type: "SRC", inputs: [], outputs: [out("", "MODEL")] },
+      setNodeOf(11, "MODEL", 20),
+      setNodeOf(23, "MODEL", 31),
+      getNodeOf(12, "MODEL"),
+    ],
+    links: [
+      [20, 1, 0, 11, 0, "MODEL"],
+      [31, 1, 0, 23, 0, "MODEL"],
+    ],
+  };
+  assert.throws(() => convertUiToApi(wf, OBJ, { adapters: SETGET }), (err) => {
+    assert.match(err.message, /同一个名字「MODEL」对应多个 SetNode 节点（#[^）]*）/);
+    assert.match(err.message, /#11/);
+    assert.match(err.message, /#23/);
+    return true;
+  });
+  // ② 孤立 Get 配对到悬空 Set：唯一候选 → 不解析、不产出「下游连线缺失」类告警
+  const w2 = [];
+  const wf2 = { nodes: [setNodeOf(11, "MODEL", null), getNodeOf(12, "MODEL")], links: [] };
+  assert.deepEqual(convertUiToApi(wf2, OBJ, { onWarning: (w) => w2.push(w), adapters: SETGET }), {});
+  assert.deepEqual(w2, [], `孤立 Get 不应产生任何告警：${JSON.stringify(w2)}`);
+});
+
+const KEYFALLBACK = {
+  SetNode: { virtual: true },
+  GetNode: {
+    virtual: true,
+    pull: {
+      keyPath: ["widgets_values_named.key", "widgets_values[0]"],
+      fromType: ["SetNode"],
+      fromKeyPath: "widgets_values[0]",
+      sourcePath: "inputs[0]",
+    },
+  },
+};
+
+test("P4：keyPath 数组回退——named 缺失回退位置取值，named 存在时 named 优先", () => {
+  // ① named 缺失 → 回退 widgets_values[0]
+  assert.deepEqual(
+    convertUiToApi(setGetWf(), OBJ, { adapters: KEYFALLBACK })["3"].inputs.model,
+    ["1", 0],
+    "named 缺失时必须回退位置取值",
+  );
+  // ② named 存在 → named 优先（位置值写另一个名字，按位置会 0 候选）
+  const wf2 = setGetWf();
+  const g = wf2.nodes.find((n) => n.id === 12);
+  g.widgets_values = ["OTHER"];
+  g.widgets_values_named = { key: "MODEL" };
+  assert.deepEqual(
+    convertUiToApi(wf2, OBJ, { adapters: KEYFALLBACK })["3"].inputs.model,
+    ["1", 0],
+    "named 必须排在位置之前",
+  );
+  // ③ fromKeyPath 同样支持数组（named 在 Set 侧，位置值是过期名字）
+  const wf3 = setGetWf();
+  const s = wf3.nodes.find((n) => n.id === 11);
+  s.widgets_values = ["STALE"];
+  s.widgets_values_named = { key: "MODEL" };
+  const adapters3 = {
+    SetNode: { virtual: true },
+    GetNode: {
+      ...KEYFALLBACK.GetNode,
+      pull: { ...KEYFALLBACK.GetNode.pull, fromKeyPath: ["widgets_values_named.key", "widgets_values[0]"] },
+    },
+  };
+  assert.deepEqual(
+    convertUiToApi(wf3, OBJ, { adapters: adapters3 })["3"].inputs.model,
+    ["1", 0],
+    "fromKeyPath 也须支持数组回退",
+  );
+});
+
+test("P4：keyPath 数组两项都取不到 → warning + 无源（下游连线缺失）", () => {
+  const wf = setGetWf();
+  wf.nodes.find((n) => n.id === 12).widgets_values = [];
+  const warnings = [];
+  assert.throws(
+    () => convertUiToApi(wf, OBJ, { onWarning: (w) => warnings.push(w), adapters: KEYFALLBACK }),
+    /节点 #3 输入 model 的连线缺失（link 21）/,
+  );
+  assert.ok(
+    warnings.some((w) => /取不到名字/.test(w) && /widgets_values_named\.key \| widgets_values\[0\]/.test(w)),
+    `缺少取不到名字的告警（且应列出两条回退路径）：${JSON.stringify(warnings)}`,
+  );
+});

@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "SetNode",
+  "title": "KJNodes Set/Get 的「存」端：纯前端名字容器，不进 prompt；上游值由同名 GetNode 经 pull 取走",
+  "source": "builtin",
+  "verifiedAt": "2026-10-30",
+  "rules": { "virtual": true },
+  "evidence": "前端源码 custom_nodes/ComfyUI-KJNodes/web/js/setgetnodes.js：:583 isVirtualNode=true（作者注释「purely frontend … should not be serialized」）、:585 名字是 widgets[0] 的 text widget、:601-602 只有一个 * 输入槽和一个从未被连线的 * 输出槽、:901 registerNodeType(\"SetNode\")。真实样本 D:/ComfyUI/ComfyUI/qwen-image-2.1-workflow.json：#95 type=SetNode widgets_values=[\"模型\"] inputs[0]=MODEL(link 916) outputs[0].links=null。本档案只声明 virtual：Set 自身没有下游，取源语义写在 GetNode.json 的 pull 里。验收（2026-10-30，/object_info 在线）：真实工作流 user/default/workflows/共编存档-20261008-生态工作流.json（14 个 Set/Get）去掉与 Set/Get 无关的阻碍后，无档案→整份拒绝、有档案→通过（产物 29 节点，虚拟件残留 0，31 条连线输入坏引用 0）。"
+}

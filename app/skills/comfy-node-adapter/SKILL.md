@@ -114,20 +114,13 @@ node -e "const w=require(process.argv[1]);for(const n of w.nodes.filter(x=>x.typ
 | 虚拟件 | 实测形态 | 档案规则 |
 |---|---|---|
 | `Reroute` | `inputs[0].type="*"`，`outputs[0].links` 有下游 | **已有内置档案**（`app/lib/node-adapters/reroute.json`，`virtual+passthrough`），不用再写；它不在语料出现时也不用管 |
-| `SetNode` + `GetNode` | `widgets_values_named.Constant` = 变量名；Set 有 `inputs[0].link`，Get 只有 `outputs[].links`、`inputs` 为空 | **当前不支持自动处理**：引擎里没有任何按 key 配对的机制。GetNode 没有 `inputs`，写 `{"virtual":true,"passthrough":true}` 也解析不到上游，结果是下游报「输入 X 的连线缺失（link N）」（实测） |
+| `SetNode` + `GetNode` | `widgets_values_named.Constant` = 变量名；Set 有 `inputs[0].link`，Get 只有 `outputs[].links`、`inputs` 为空 | **已内置档案（KJNodes 与 Easy-Use 各一对），无需手工**：存端 `{virtual:true}`、取端 `{virtual:true, pull:{…}}`，`submit` / `_relay/submit-file` 自动加载，见 §9.2 |
 | `Label (rgthree)`、`Fast Groups Bypasser (rgthree)`、`Fast Groups Muter (rgthree)` | 不在 `/object_info`，`links` 为空（语料实测 Label 4 个实例、Fast Groups Bypasser 2 个） | `{"virtual":true}`：直接丢弃，无连线可穿透 |
 | `PrimitiveNode` | 上游是它、下游是某个 widget 槽的 `link` | **v1 收编不了**：它是「把常量写进下游 widget」，不是连线穿透。停下来报告，让用户在画布右键「转换为输入」或改填原始值 |
 
 语义硬要求：`virtual:true` = 节点不进 prompt；`passthrough:true` = 把下游引用改接到它的上游（必须配合 `virtual:true`，单写会被规则引擎告警丢弃）。直通拿不到上游（悬空、成环）时按「连线缺失」报错，不许写成悬空引用。
 
-**SetNode / GetNode 的人工处理**（当前唯一可靠做法）：
-
-1. 在 `nodes[]` 里按 `widgets_values_named.Constant`（没有 named 就看 `widgets_values[0]`）找到同 key 的 SetNode；
-2. 取该 SetNode 的 `inputs[0].link`，在 `wf.links` 里查出 `origin_id` / `origin_slot`；
-3. 把引用该 GetNode 输出的每条下游连线的 `origin_id` / `origin_slot` 改成上一步的真实源（`link_id`、`target_id`、`target_slot` 不动）；
-4. SetNode 与 GetNode 都从 `nodes[]` 删掉，SetNode 的入边也一并删。
-
-改出来的是**展开后的副本**（另存新文件），不要覆盖用户原件。不想手改就直说：这两类需要转换器版本支持按 key 配对，当前的错误呈现是下游「连线缺失」，不是档案能修好的。
+**SetNode / GetNode 不用手工展开**：内置档案已覆盖（KJNodes `SetNode`/`GetNode` 与 Easy-Use `easy setNode`/`easy getNode` 各一对，见 §9.2）。遇到同类但**不同名**的插件，按第九节写一份档案，同样不要手改用户工作流原件。
 
 ### 类 4 —— 写档案（bypass）
 
@@ -289,7 +282,7 @@ node "$env:TEMP\conv-submit.mjs" "<最小工作流路径>" "<档案路径>"
 按序排查，逐条给出结论，不要重修一次档案碰运气：
 
 1. **子图**：仍有 UUID 类型节点 → 类 5，交回用户。
-2. **SetNode / GetNode**：当前引擎没有按 key 配对机制，写了 `virtual+passthrough` 也会因解析不到上游而报「连线缺失」→ 按类 3 的人工步骤展开副本，或写明「需转换器版本支持」。
+2. **SetNode / GetNode**：内置档案已覆盖（§9.2，KJNodes 与 Easy-Use 各一对），走 `pull` 按名取源，不需要手工展开副本；仍报 Set/Get 相关错误时才回 §9.4 的边界表逐条定位。同类但不同名的插件按 §九 自己写一份档案。
 3. **旁路/穿透歧义映射**：报「输出槽 N 对应多个同类型入口（「a」/「b」），无法确定上游来源」→ 引擎拒猜，档案层无解（v1 没有给入口命名的规则）；只能让用户在工作流里把同类型入口改名/改用专节点，或反馈。
 4. **PrimitiveNode 常量注入**：下游 widget 槽的 `link` 指向 PrimitiveNode → v1 表达不了。
 5. **R1 值分叉**：`widgets_values_named` 与 `widgets_values[0]` 不一致（如 `CLIPLoader.clip_name`）→ 是文件脏，不是适配问题；让用户在画布里重存并导出。
@@ -300,3 +293,89 @@ node "$env:TEMP\conv-submit.mjs" "<最小工作流路径>" "<档案路径>"
 ## 八、边界
 
 只写档案文件；不改 `workflow-tools.mjs`、`node-adapter-store.mjs`、不改用户工作流原件、不动 git。一次只处理一类节点；同一份工作流里出现两类以上问题时，先报清单再动手。实测与推断分开写：跑过什么命令、看到什么输出，就只写这些；没跑过的结论标「未验证」。
+
+## 九、pull 规则：按名字关联的虚拟节点
+
+### 9.1 什么时候用 pull
+
+有些虚拟件是「存-取分离」的一对：一个节点只负责**给值起名**（接上游、自己没有下游），另一个节点只负责**按名字取回**（没有输入槽，只有输出槽），两者在画布上根本不连线。KJNodes 的 `SetNode`/`GetNode`、Easy-Use 的 `easy setNode`/`easy getNode` 都是这个形态（前者 type 带空格、camelCase，与后者是两个不同类型）。
+
+以后任何插件自创同类机制（变量、复用线、别名），只要满足三条，就只写一份档案，**引擎不动**：
+
+- 存端纯前端（`isVirtualNode`），有一个名字 widget + 一个真实输入槽
+- 取端纯前端，**没有**输入槽，只有输出槽
+- 配对全靠名字字符串，且两个节点都在同一张图的 `wf.nodes` 里
+
+`virtual:true` 只能让取端消失，它没有上游可穿透（写 `passthrough` 解析不到源，实测下游报「连线缺失」）——缺的正是 pull。
+
+### 9.2 内置档案（随仓库分发，已落地）
+
+| 文件（`app/lib/node-adapters/`） | `nodeType` | `rules` |
+|---|---|---|
+| `SetNode.json` | `SetNode` | `{ "virtual": true }` |
+| `GetNode.json` | `GetNode` | `virtual:true` + `pull`（`fromType:["SetNode"]`） |
+| `easy_setNode.json` | `easy setNode` | `{ "virtual": true }` |
+| `easy_getNode.json` | `easy getNode` | `virtual:true` + `pull`（`fromType:["easy setNode"]`） |
+| `reroute.json` | `Reroute` | `virtual:true` + `passthrough:true`（§四类 3） |
+
+存端只写 `virtual`：它没有下游，取源语义全写在取端。取端的四个字段统一是：
+
+```json
+{ "virtual": true,
+  "pull": { "keyPath": "widgets_values[0]", "fromType": ["SetNode"],
+            "fromKeyPath": "widgets_values[0]", "sourcePath": "inputs[0]" } }
+```
+
+### 9.3 四个字段各是什么
+
+| 字段 | 是什么 | 本机实测值 |
+|---|---|---|
+| `keyPath` | **取端**自己的名字在哪（路径） | 取端名字是 `widgets[0]` 的 combo/text widget → `widgets_values[0]` |
+| `fromType` | 去哪些类型里找**存端**（数组，兼容多实现/多变体） | KJNodes `["SetNode"]`；Easy-Use `["easy setNode"]` |
+| `fromKeyPath` | **存端**的名字在哪（可与 `keyPath` 不同位置） | 存端名字同样是 `widgets[0]` → `widgets_values[0]` |
+| `sourcePath` | 从存端的哪一格**输入**取上游 | 存端只有一个 `*` 输入槽，接真值 → `inputs[0]` |
+
+`keyPath` 与 `fromKeyPath` 还可以写成**数组**，按序回退到第一个取到值的路径——同一个字段在不同插件/版本里，有的写 named 对象、有的只写位置数组，一份档案就能兼容两套写法。例：
+
+```json
+{ "virtual": true,
+  "pull": { "keyPath":     ["widgets_values_named.key", "widgets_values[0]"],
+            "fromType":    ["SetNode"],
+            "fromKeyPath": ["widgets_values_named.Constant", "widgets_values[0]"],
+            "sourcePath":  "inputs[0]" } }
+```
+
+`sourcePath` 仍是**单值**：取源槽只有一个，不需要回退。数组里的每一项都要各自合下面的路径语法。
+
+路径语法只认两种形态、可连用：`字段`、`字段[数字]`（例 `widgets_values[0]`、`inputs[0]`、`a[0].b`）。写成别的样子（`widgets_values.Constant`、`inputs[0].link` 想直接取 link id 也不行——`sourcePath` 要的是**槽**，不是槽里的 link）→ 引擎 warn「需要「字段」或「字段[数字]」形式的路径」并整条 pull 作废。
+
+两条硬约束（都不写死进档案，是引擎判定）：`pull` 必须与 `virtual:true` 同存（节点还在 prompt 里就没有「按名取源」这回事，缺 virtual 时 warn 并丢弃 pull）；同一档案同时写 `pull` 与 `passthrough` → **pull 优先**，passthrough 被丢弃并告警。
+
+### 9.4 七种边界的行为（引擎已实现，逐条实测）
+
+| 情况 | 行为 |
+|---|---|
+| **0 候选**：全图没有同名存端 | warn「名字「X」在本图中找不到对应的 SetNode 节点，按无源处理」→ 该连线作废 → 下游走既有「连线缺失」→ **整份拒绝**（不静默产出坏引用） |
+| **1 候选** | 展开：下游输入改接到存端 `sourcePath` 那格的真实上游 id/slot，取端与存端都不进 prompt |
+| **≥2 候选**：同名存端不唯一 | **整份拒绝**，点名候选 id（「同一个名字「X」对应多个 SetNode 节点（#a / #b），无法确定来源」），不猜 |
+| **类型不兼容** | 取端被消费的输出槽声明类型 vs 存端 `sourcePath` 那格的输入类型，`*` 任一侧视为通配 → 不兼容则**整份拒绝**，报两侧类型 |
+| **存端悬空**：Set 的 `inputs[0]` 没连线 | warn「…但它的 inputs[0] 没有连线（悬空），按无源处理」→ 下游报「连线缺失」→ 整份拒绝 |
+| **链式**：源是另一个 passthrough / pull 节点 | 继续解析到真正的发射节点；**成环**（自己的源又来自自己）按无源处理，不会无限递归 |
+| **无档案** | 与 0.17.0 逐字一致：取端类型不在 `/object_info` → 整份拒绝（「类型 GetNode 不在 /object_info」） |
+
+补充三条实测定律：
+
+1. **取端（pull 节点）被 mute（mode 2）或 bypass（mode 4）**：两种都按**断链**处理——不取源 + warn，且**永不**进 `passthroughIds`。取端没有输入槽，「穿透」在它身上只能是断链；bypass 也是用户显式掐断，不能因为 mode 不同就一支有一支没有。
+2. **配对到的存端处于 mute/bypass**：等同「没有值」，按无源处理（下游随报「连线缺失」）。Set 被掐断，这个名字就没有值，不许取到一条用户已断开的线。
+3. 判定**不依赖下游连线**——孤立的取端也会被解析一遍，所以「同名不唯一」不会因为没人用而漏检。也正因为如此，**预扫只负责「同名多候选 → 整份拒绝」，类型校验只发生在被消费的输出槽上**：孤立的取端没有消费槽，不该拿它拖垮整份提交。
+
+配对范围只有 `wf.nodes` 这一张图，子图定义里的 Set/Get 不参与（子图另见 §四类 5）。
+
+语料实测（2026-10-30，`http://127.0.0.1:8188/object_info` 在线）：`user/default/workflows` 2921 份里含 Set/Get 的 2 份，旧版拒绝原因点名 Set/Get 共 12 条，新版 **0 条**；百度网盘工作流集 137 份 UI 格式里含 Set/Get 的 49 份，旧版点名 137 条，新版 **0 条**。两份含 Set/Get 的真实工作流仍有**与 Set/Get 无关**的阻碍（mute 的 `LoraLoaderModelOnly`/`ConditioningZeroOut`、`Label (rgthree)`、`Fast Groups Bypasser (rgthree)`）→ 整份照样被拒，这是 §四类 3 / 类 4 的活，不要指望 Set/Get 档案解决。
+
+### 9.5 新插件怎么自己写一份档案（四步）
+
+1. **核类型名**：`Invoke-RestMethod "http://127.0.0.1:8188/object_info/$([uri]::EscapeDataString($t))"` 返回 `{}`（不是节点、不是后端节点）才可能是虚拟件；`type` 逐字符照抄工作流 JSON，含空格与大小写（`easy setNode` ≠ `SetNode`）。
+2. **找名字位置**：在真实样本里看 `widgets_values` / `widgets_values_named`——取端、存端各落在第几位就要写成 `widgets_values[N]`；两者不同位时分别写进 `keyPath` / `fromKeyPath`。
+3. **定取源槽**：看存端 `inputs[]` 里哪一格接了真值（`inputs[N].link` 有值、类型是真类型），写成 `sourcePath: "inputs[N]"`；存端若有两个以上输入槽，槽的选择直接决定取到哪一路，别照抄别人的档案。
+4. **验一遍再落盘**：写 `verifiedAt` 与 `evidence`（前端 JS 的文件:行 + 真实样本路径与字段），按 §六 跑最小工作流；判定与 §六第 3 条同：产物里没有这俩类型、连线项指向真实发射节点、`/object_info` 声明齐全。取端与存端各一份档案，取端写 `pull`、存端只写 `virtual`。

@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "nodeType": "easy getNode",
+  "title": "Easy-Use Set/Get 的「取」端：纯前端，无输入槽，按 widgets_values[0] 的名字配同名 easy setNode，取它 inputs[0] 的上游作为真实源",
+  "source": "builtin",
+  "verifiedAt": "2026-10-30",
+  "rules": {
+    "virtual": true,
+    "pull": {
+      "keyPath": "widgets_values[0]",
+      "fromType": ["easy setNode"],
+      "fromKeyPath": "widgets_values[0]",
+      "sourcePath": "inputs[0]"
+    }
+  },
+  "evidence": "在役前端 /extensions/ComfyUI-Easy-Use/assets/extensions-Bwtr72lq.js（web_version/v2，未压缩源自 v1/js/getset.js）：findSetter 按 \"easy setNode\"==e.type && e.widgets[0].value===name 配对，getInputLink 从 setter.inputs[slot] 的 link 取源，两处 isVirtualNode=!0；可读源 v1/js/getset.js:194 名字是 widgets[0] 的 combo widget、:210 只有一个 * 输出槽、:278 isVirtualNode、:302 registerNodeType。真实样本 D:/BaiduNetdiskDownload/工作流/2026.02.02/flux-2-klein-9b-fp8     新EDIT.json：#155 type=easy getNode widgets_values=[\"模型\"] inputs=[] outputs[0]=MODEL(links 229)，与 #149 easy setNode key=模型 inputs[0]=MODEL(link 220) 同名配对，输出/输入类型一致。验收（2026-10-30）：真实工作流 D:/BaiduNetdiskDownload/工作流/2026.08.03/Seed+VR2官流-高清放大（速度超快）.json 仅去掉 2 个无连线的 Label (rgthree) 后，无档案→拒绝（「类型 easy getNode 不在 /object_info」）、有档案→通过（产物 12 节点，虚拟件残留 0）；展开抽查：「图像」→#17:0（LayerUtility: ImageScaleByAspectRatio V2）分别进 #21.image_b / #8.original_resized_images，「出图」→#8:0（SeedVR2PostProcessing）进 #21.image_a / #20.images。"
+}

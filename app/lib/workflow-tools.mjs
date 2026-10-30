@@ -45,6 +45,14 @@ const cutValue = (v) => { const s = typeof v === "string" ? v : JSON.stringify(v
 // 形态：{ [nodeType]: { virtual?, passthrough?, bypass?, slots? } }
 //   virtual: true          → 该类型的节点不进 prompt（Note / Reroute / SetNode 这类纯前端件）
 //   passthrough: true      → 配合 virtual：经过该节点的连线穿透到它的上游真实源（支持多层嵌套）
+//   pull: { keyPath, fromType[], fromKeyPath, sourcePath }
+//                          → 配合 virtual：按「名字」在整图里配对同类节点（如 GetNode 找同名 SetNode），
+//                            取配对节点 sourcePath 那格输入的上游作为真实源（可与 passthrough 链式串联）
+//                            0 候选 / 配对节点悬空 → 该连线作废，下游走既有「连线缺失」路径
+//                            ≥2 候选（同名不唯一）/ 输出槽与取源槽类型不兼容 → problems，整份拒绝
+//                            与 passthrough 同时声明时 pull 优先（passthrough 丢弃）；mute/bypass 恒按 skip（断链），不取源
+//                            （Get 没有输入槽，旁路在无输入节点上只能当断链；档案写了 bypass="passthrough" 也不穿透）
+//                            配对范围只有 wf.nodes 这一张图（子图定义不在 nodes 里，天然不参与）
 //   bypass: "skip"|"passthrough"（仅字符串）
 //                          → 节点 mode 4(bypass) 时的处理；缺省沿用旧行为（problems 拒绝）
 //                            mode 2(mute) 不做配置项：mute 在 ComfyUI 里是断链，有档案时恒按 skip 处理
@@ -57,6 +65,61 @@ const cutValue = (v) => { const s = typeof v === "string" ? v : JSON.stringify(v
 const ADAPTER_ACTIONS = new Set(["passthrough", "ignore", "alias"]);
 const BYPASS_ACTIONS = new Set(["skip", "passthrough"]);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// pull 规则的路径语法（只认两种形态，可连续）：
+//   `字段` / `字段[数字]`，例：widgets_values[0]、inputs[0]、a[0].b
+// 解析成 token 序列 [{ key } | { index }]；语法不合法返回 null（调用方按「忽略该规则」处理）。
+function parseFieldPath(path) {
+  if (typeof path !== "string" || !path.trim()) return null;
+  const tokens = [];
+  for (const seg of path.trim().split(".")) {
+    const m = /^([^[\].]+)((?:\[\d+\])*)$/.exec(seg);
+    if (!m) return null;
+    tokens.push({ key: m[1] });
+    for (const n of m[2].match(/\d+/g) || []) tokens.push({ index: Number(n) });
+  }
+  return tokens.length ? tokens : null;
+}
+// 路径字段的多值形态（2026-10-31，P4）：keyPath / fromKeyPath 允许「字符串」或「字符串数组」。
+// 数组 = 按序回退：项目其它地方是「named 优先、位置回退」双写，一份档案可能同时要写两条路，
+// 例：["widgets_values_named.key", "widgets_values[0]"]——按序尝试，用第一个取到非空字符串的。
+// sourcePath 保持单值（它指向「配对节点的那一格输入槽」，回退语义无意义）。
+// 非法形态（非字符串 / 非字符串数组 / 空数组 / 数组里任一项语法不合法）→ null（调用方按「忽略该规则」处理）。
+function parseFieldPathAlternatives(value) {
+  const list = Array.isArray(value) ? value : [value];
+  if (list.length === 0) return null;
+  const alts = [];
+  for (const one of list) {
+    const tokens = parseFieldPath(one);
+    if (!tokens) return null;
+    alts.push({ raw: one, tokens });
+  }
+  return alts;
+}
+// 按 token 序列取值；任何一步缺失（键不存在 / 越界 / 类型不对）都返回 undefined，不猜
+function readFieldPath(value, tokens) {
+  let cur = value;
+  for (const t of tokens) {
+    if (t.index !== undefined) {
+      if (!Array.isArray(cur) || t.index >= cur.length) return undefined;
+      cur = cur[t.index];
+    } else {
+      if (cur === null || typeof cur !== "object") return undefined;
+      if (!Object.prototype.hasOwnProperty.call(cur, t.key)) return undefined;
+      cur = cur[t.key];
+    }
+  }
+  return cur;
+}
+// 按序回退取值：第一个「取到非空字符串」的路径胜出（空串视为没有值，继续回退）；全部取不到 → null
+function readFieldPathAlternatives(value, alts) {
+  for (const alt of alts) {
+    const v = readFieldPath(value, alt.tokens);
+    if (typeof v === "string" && v) return { value: v, raw: alt.raw };
+  }
+  return null;
+}
+// 诊断文案里展示路径：数组形态用 " | " 连接（不引 JSON 转义噪音）
+const fieldPathDesc = (v) => (Array.isArray(v) ? v.join(" | ") : String(v));
 function matchSlotPattern(pattern, name) {
   if (pattern === "*") return true;
   if (!pattern.includes("*")) return pattern === name;
@@ -104,6 +167,48 @@ function normalizeAdapters(adapters, warn) {
         }
         if (slots.length) rules.slots = slots;
       }
+    }
+    if ("pull" in raw) {
+      const p = raw.pull;
+      const drop = (why) => warn(`适配规则 ${type}.pull ${why}，已忽略该规则`);
+      if (!isPlainObject(p)) {
+        drop(`需要对象（{ keyPath, fromType, fromKeyPath, sourcePath }），收到 ${cutValue(p)}`);
+      } else {
+        const keyPaths = parseFieldPathAlternatives(p.keyPath);
+        const fromKeyPaths = parseFieldPathAlternatives(p.fromKeyPath);
+        const sourcePathTokens = parseFieldPath(p.sourcePath);
+        const bad = [
+          ["keyPath", p.keyPath, keyPaths, "路径或它们的非空字符串数组"],
+          ["fromKeyPath", p.fromKeyPath, fromKeyPaths, "路径或它们的非空字符串数组"],
+          ["sourcePath", p.sourcePath, sourcePathTokens, "路径"],
+        ].find(([, , parsed]) => !parsed);
+        if (bad) {
+          drop(`的 ${bad[0]} 需要「字段」或「字段[数字]」形式的${bad[3]}（收到 ${cutValue(bad[1])}）`);
+        } else if (!Array.isArray(p.fromType) || p.fromType.length === 0 || p.fromType.some((t) => typeof t !== "string" || !t)) {
+          drop(`的 fromType 需要非空字符串数组（收到 ${cutValue(p.fromType)}）`);
+        } else {
+          rules.pull = {
+            keyPath: p.keyPath,
+            keyPaths,
+            fromType: [...p.fromType],
+            fromTypes: new Set(p.fromType),
+            fromKeyPath: p.fromKeyPath,
+            fromKeyPaths,
+            sourcePath: p.sourcePath,
+            sourcePathTokens,
+          };
+        }
+      }
+    }
+    // pull 只在「节点自己不进 prompt」时才有意义（节点还在 prompt 里就没有「按名取源」这回事）
+    if (rules.pull && rules.virtual !== true) {
+      warn(`适配规则 ${type}.pull 需要配合 virtual: true（节点自身仍在 prompt 里，pull 语义无意义），已忽略 pull`);
+      delete rules.pull;
+    }
+    // 同一档案里 pull 与 passthrough 冲突（两条路径抢同一条出边的解释权）→ pull 优先
+    if (rules.pull && rules.passthrough === true) {
+      warn(`适配规则 ${type} 同时声明了 pull 与 passthrough（语义冲突，pull 优先），已忽略 passthrough`);
+      delete rules.passthrough;
     }
     if (Object.keys(rules).length === 0) continue;
     map.set(String(type), rules);
@@ -163,6 +268,7 @@ export function convertUiToApi(wf, objectInfo, options) {
   const adapters = normalizeAdapters(opts.adapters, (m) => warnings.push(m));
   const droppedIds = new Set(); // 不进 prompt 的节点（virtual / 按规则跳过的静音旁路）
   const passthroughIds = new Set(); // 连线需要穿透到上游真实源的节点
+  const pullRules = new Map(); // 需要按名字配对展开的节点：id → pull 规则（走独立路径，不进 passthroughIds）
   if (adapters.size > 0) {
     for (const n of nodes) {
       if (!n || typeof n !== "object") continue;
@@ -173,6 +279,7 @@ export function convertUiToApi(wf, objectInfo, options) {
       if (rules.virtual === true) {
         droppedIds.add(id);
         if (rules.passthrough === true) passthroughIds.add(id);
+        if (rules.pull) pullRules.set(id, rules.pull);
       }
       // 静音/旁路：无档案时这段不介入，mode 2/4 仍按旧行为拒绝（见主循环）。
       // mute(2) 在 ComfyUI 里是断链（上游不接到下游），所以只允许 skip，绝不允许穿透。
@@ -180,19 +287,35 @@ export function convertUiToApi(wf, objectInfo, options) {
       // 档案下的 mute 节点会照旧穿透，产物与 mode 0 完全一致且零告警。
       if (n.mode === 2) {
         const wasPassthrough = passthroughIds.delete(id); // mute 一律撤销穿透
+        const wasPull = pullRules.delete(id); // mute 是断链：pull 同理，绝不按名取源
         droppedIds.add(id);
-        if (wasPassthrough || rules.bypass === "passthrough") {
-          warnings.push(
-            `节点 #${id} ${ntype} 处于 mute（mode 2）：mute 是断链，${wasPassthrough ? "virtual + passthrough" : 'bypass="passthrough"'} 不适用，已按 skip 处理`,
-          );
+        if (wasPassthrough || wasPull || rules.bypass === "passthrough") {
+          const why = wasPassthrough ? "virtual + passthrough" : wasPull ? "pull" : 'bypass="passthrough"';
+          warnings.push(`节点 #${id} ${ntype} 处于 mute（mode 2）：mute 是断链，${why} 不适用，已按 skip 处理`);
         }
-      } else if (n.mode === 4 && rules.bypass === "skip") {
-        droppedIds.add(id);
-      } else if (n.mode === 4 && rules.bypass === "passthrough") {
-        droppedIds.add(id);
-        passthroughIds.add(id);
+      } else if (n.mode === 4) {
+        // bypass(mode 4) 与 pull 的语义（2026-10-31，P1）：
+        // Get 没有输入槽，bypass 在「无输入节点」上的语义只能是断链，不能当成「输入直通」。
+        // 所以 pull 节点被旁路 == 这个名字没有值：撤销 pull 规则，下游走既有「连线缺失」。
+        // 绝不给它注册 passthrough：那会把产物静默接到无关的上游。
+        const wasPull = pullRules.delete(id);
+        if (wasPull) {
+          droppedIds.add(id);
+          warnings.push(`节点 #${id} ${ntype} 处于 bypass（mode 4）：Get 被旁路，按断链处理（按名字取源不生效，下游连线缺失）`);
+          if (rules.bypass === "passthrough") {
+            warnings.push(`节点 #${id} ${ntype} 的档案声明了 bypass="passthrough"，但该节点无输入槽，旁路穿透对它无意义，按断链处理`);
+          }
+        } else if (rules.bypass === "skip") {
+          droppedIds.add(id);
+        } else if (rules.bypass === "passthrough") {
+          droppedIds.add(id);
+          passthroughIds.add(id);
+        }
       }
     }
+    // 不变量：pull 节点只进 droppedIds，永不进 passthroughIds（任何分支都不许）。
+    // pull 是按名取源，passthrough 是按输入槽穿透；Get 没有输入槽，走穿透只会把产物接到无关上游。
+    for (const pid of pullRules.keys()) passthroughIds.delete(pid);
   }
   if (droppedIds.size > 0 || passthroughIds.size > 0) {
     const rawById = new Map();
@@ -247,20 +370,125 @@ export function convertUiToApi(wf, objectInfo, options) {
         why: `节点 #${node.id} ${node.type} 的旁路/穿透存在歧义映射：输出槽 ${os}${outName ? `「${outName}」` : ""}${typed ? `:${outType}` : ""} 对应多个同类型入口（${cands.map((c) => `「${c.name}」`).join("/")}），无法确定上游来源，已拒绝`,
       };
     };
-    // 穿透：把经过 passthrough 节点的链路压缩到真实源；无上游 / 成环 / 歧义 → null（下游走既有「连线缺失」路径）
+    // pull：按「名字」配对展开（独立于 passthrough 的解析路径；pull 节点只进 droppedIds，不进 passthroughIds）
+    // 配对只在 wf.nodes 这一张图内进行：子图定义的节点不在 nodes 里，天然不参与
+    const pullSolved = new Map(); // `${节点id}:${输出槽}` → { origin, originSlot } | null（同一槽只解一次）
+    const pullSaid = new Set(); // pull 的 warning / problems 去重：同一节点被多条下游连线碰到只报一次
+    const pullOnce = (list, msg) => { if (pullSaid.has(msg)) return; pullSaid.add(msg); list.push(msg); };
+    const pullKeyOf = (node, pull) => readFieldPathAlternatives(node, pull.keyPaths);
+    const pullCandidatesOf = (pull, key) => {
+      const cands = [];
+      for (const other of nodes) {
+        if (!other || typeof other !== "object") continue;
+        if (!pull.fromTypes.has(String(other.type || ""))) continue;
+        const otherKey = readFieldPathAlternatives(other, pull.fromKeyPaths);
+        if (otherKey && otherKey.value === key) cands.push(other);
+      }
+      return cands;
+    };
+    const pullMultiMsg = (node, pull, key, cands) =>
+      `同一个名字「${key}」对应多个 ${pull.fromType.join("/")} 节点（${cands.map((c) => `#${c.id}`).join(" / ")}），无法确定来源，已拒绝`;
+    const pullSource = (node, originSlot, pull) => {
+      const id = String(node.id);
+      const hit = pullKeyOf(node, pull);
+      const key = hit ? hit.value : undefined;
+      if (typeof key !== "string" || !key) {
+        pullOnce(warnings, `节点 #${id} ${node.type} 的 pull 规则取不到名字（${fieldPathDesc(pull.keyPath)}=${cutValue(key)}），按无源处理（下游连线缺失）`);
+        return null;
+      }
+      const cands = pullCandidatesOf(pull, key);
+      if (cands.length === 0) {
+        pullOnce(warnings, `节点 #${id} ${node.type} 的名字「${key}」在本图中找不到对应的 ${pull.fromType.join("/")} 节点，按无源处理（下游连线缺失）`);
+        return null;
+      }
+      if (cands.length > 1) {
+        pullOnce(problems, pullMultiMsg(node, pull, key, cands));
+        return null;
+      }
+      const setNode = cands[0];
+      // P2（2026-10-31）：配对到的 Set 被静音/旁路 → 同名 Set 没有值（mode 2 断链、mode 4 旁路都不取源）。
+      // 必须判在取源之前：静音/旁路的 Set 的 inputs[i].link 仍然留在文件里，只看 link 会把死值当活值。
+      const setMode = Number(setNode.mode);
+      if (setMode === 2 || setMode === 4) {
+        pullOnce(
+          warnings,
+          `节点 #${id} ${node.type} 按名字「${key}」配到 ${setNode.type} #${setNode.id}，但同名 Set 节点 #${setNode.id} 处于静音/旁路（mode ${setMode}），值不可用，按无源处理（下游连线缺失）`,
+        );
+        return null;
+      }
+      const slot = readFieldPath(setNode, pull.sourcePathTokens);
+      const sIdx = isPlainObject(slot) && Array.isArray(setNode.inputs) ? setNode.inputs.indexOf(slot) : -1;
+      const link = !isPlainObject(slot)
+        ? null
+        : sIdx >= 0
+          ? slotLinkOf(setNode, sIdx)
+          : slot.link === null || slot.link === undefined
+            ? null
+            : rawById.get(String(slot.link)) || null;
+      if (!link) {
+        pullOnce(
+          warnings,
+          `节点 #${id} ${node.type} 按名字「${key}」配到 ${setNode.type} #${setNode.id}，但它的 ${pull.sourcePath} 没有连线（悬空），按无源处理（下游连线缺失）`,
+        );
+        return null;
+      }
+      // 类型：被下游消费的输出槽（originSlot）声明类型 vs 配对节点取源那格的输入槽类型；`*` 任一侧通配，缺信息则跳过校验
+      const outSlot = Array.isArray(node.outputs) ? node.outputs[originSlot] : null;
+      const outType = outSlot && typeof outSlot.type === "string" ? outSlot.type : "";
+      const inType = typeof slot.type === "string" ? slot.type : "";
+      if (outType && inType && outType !== "*" && inType !== "*" && outType !== inType) {
+        pullOnce(
+          problems,
+          `节点 #${id} ${node.type} 输出槽 ${originSlot}:${outType} 与按名字「${key}」取用的 ${setNode.type} #${setNode.id} 的 ${pull.sourcePath}:${inType} 类型不兼容，已拒绝`,
+        );
+        return null;
+      }
+      return { origin: link[1], originSlot: link[2] };
+    };
+    const pullReal = (id, slot) => {
+      const k = `${id}:${slot}`;
+      if (pullSolved.has(k)) return pullSolved.get(k);
+      pullSolved.set(k, null); // 先占位：重入（链式成环）时按无源处理
+      const node = nodeById.get(String(id));
+      const pull = pullRules.get(String(id));
+      const real = node && pull ? pullSource(node, slot, pull) : null;
+      pullSolved.set(k, real);
+      return real;
+    };
+    // 穿透：把经过 passthrough / pull 节点的链路压缩到真实源；无上游 / 成环 / 歧义 → null（下游走既有「连线缺失」路径）
     const reported = new Set(); // 同一条歧义映射可能被多条下游连线重复碰到，只报一次
     const resolveReal = (origin, originSlot, seen) => {
       const id = String(origin);
-      if (!passthroughIds.has(id)) return { origin, originSlot };
+      const isPull = pullRules.has(id);
+      if (!passthroughIds.has(id) && !isPull) return { origin, originSlot };
       if (seen.has(id)) return null;
       seen.add(id);
       const node = nodeById.get(id);
       if (!node) return null;
+      if (isPull) {
+        const src = pullReal(id, originSlot); // 按名字配对得到的真实源（可以是另一个 passthrough / pull 节点）
+        if (!src) return null;
+        return resolveReal(src.origin, src.originSlot, seen);
+      }
       const entry = pickEntry(node, originSlot);
       if (entry.why) { if (!reported.has(entry.why)) { reported.add(entry.why); problems.push(entry.why); } return null; }
       if (!entry.link) return null;
       return resolveReal(entry.link[1], entry.link[2], seen);
     };
+    // 预扫（2026-10-31，P3）：只做一条硬判定——「同名多候选 → 整份拒绝」不依赖该 pull 节点是否被下游消费
+    // （孤立的 Get 也必须拒，否则同一名字到底取谁就变成「可能不报」）。
+    // 其余判定（取不到名字 / 0 候选 / 配对槽悬空 / 配对节点静音旁路 / 类型不兼容）全部留在「被消费槽」的路径上：
+    // 孤立 Get 没有下游，给它产出「下游连线缺失」只会误导，也不该拖垮整份提交。
+    if (pullRules.size > 0) {
+      for (const [pid, pull] of pullRules) {
+        const node = nodeById.get(pid);
+        if (!node) continue;
+        const hit = pullKeyOf(node, pull);
+        if (!hit) continue; // 取不到名字：留给「被消费」路径去报，孤立节点静默
+        const cands = pullCandidatesOf(pull, hit.value);
+        if (cands.length > 1) pullOnce(problems, pullMultiMsg(node, pull, hit.value, cands));
+      }
+    }
     const rewritten = new Map();
     for (const l of rawLinks) {
       const real = resolveReal(l[1], l[2], new Set());
