@@ -1559,3 +1559,16 @@ test("子图：定义 links 是旧版数字数组 → 拒绝文案点明旧版�
     (e) => /旧版子图格式/.test(e.message) && /links 为数组/.test(e.message) && /sg1/.test(e.message) && /#18/.test(e.message),
   );
 });
+
+// 分类顺序回归（2026-10-31 汇总段三瑕疵修复）：同一样本带 adapters 出汇总时，
+// 「旧版子图格式」必须仍归子图类，不被先判的 value_mismatch 抢走。
+// 挂点：value_mismatch 判据改成先于/覆盖结构词（比如「实例」判据被删或顺序颠倒）→ 本用例挂。
+test("汇总：旧版子图格式仍归子图类（不被 value_mismatch 抢走）", () => {
+  const wf = sgWf();
+  wf.definitions.subgraphs[0].links = [25, 26, 6];
+  assert.throws(
+    () => convertUiToApi(wf, sgObj, { adapters: {} }),
+    (e) => /分类：子图 2。/.test(e.message) && !e.message.includes("参数分歧"),
+    `旧版子图格式应归子图类（展开失败文案与主循环兜底各一条）：${""}`,
+  );
+});

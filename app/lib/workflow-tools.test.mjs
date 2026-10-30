@@ -330,3 +330,65 @@ test("汇总⑤：strict 下汇总照常出现（warnings 归入其他类）", (
     `strict 下动态槽 warning 应计入汇总（其他 1）：${""}`,
   );
 });
+
+// ⑥ 建议句按类别给（2026-10-31 三处瑕疵修复）：只有静音/旁路一类 → 不出插件建议，出静音建议。
+//    构造：静音上游导致下游连线缺失，文案带「处于静音」归因后缀 → 整条归 mute_bypass。
+//    挂点：建议句改回无条件拼接，或 mute_bypass 建议句丢失 → 本用例挂。
+test("汇总⑥：只有静音/旁路 → 不出现插件建议，出现静音建议句", () => {
+  assert.throws(
+    () =>
+      convertUiToApi(
+        {
+          nodes: [
+            { id: 2, type: "Opt", mode: 2, inputs: [] },
+            { id: 3, type: "TriggerWordToggle", inputs: [{ name: "toggle", link: 11, type: "BOOLEAN" }] },
+          ],
+          links: [[11, 2, 0, 3, 0, "MODEL"]],
+        },
+        OBJ,
+        { adapters: {} },
+      ),
+    (e) =>
+      /共 1 项阻断，分类：静音\/旁路 1。静音\/旁路节点按 ComfyUI 语义处理，缺值下游会如实报错：在画布上确认这些节点是否应处于该状态。/.test(e.message) &&
+      !e.message.includes("插件"),
+    `只有静音/旁路时不应出现插件建议：${""}`,
+  );
+});
+
+// ⑦ 只有参数分歧 → 归 value_mismatch 计数，出重存工作流建议，不出插件建议。
+//    挂点：分类顺序里 value_mismatch 未先行（被子图/其他抢走）或建议句丢失 → 本用例挂。
+test("汇总⑦：只有参数分歧 → value_mismatch 计数 + 重存建议，无插件建议", () => {
+  assert.throws(
+    () =>
+      convertUiToApi(
+        { nodes: [{ id: 1, type: "LoadImage", inputs: [], widgets_values_named: { image: "b.png" }, widgets_values: ["a.png"] }], links: [] },
+        OBJ,
+        { adapters: {} },
+      ),
+    (e) =>
+      /共 1 项阻断，分类：参数分歧 1。参数分歧通常是工作流被外部脚本只改了其中一个字段：在 ComfyUI 里重新保存一次工作流即可自愈。/.test(e.message) &&
+      !e.message.includes("插件"),
+    `参数分歧应出重存建议且不出插件建议：${""}`,
+  );
+});
+
+// ⑧ 未知类型 + 参数分歧混合 → 两类计数正确，两句建议都出现且顺序稳定（未知类型在前）。
+test("汇总⑧：未知类型+参数分歧 → 两类计数与两句建议，顺序稳定", () => {
+  assert.throws(
+    () =>
+      convertUiToApi(
+        {
+          nodes: [
+            { id: 1, type: "NopeNode", inputs: [] },
+            { id: 2, type: "LoadImage", inputs: [], widgets_values_named: { image: "b.png" }, widgets_values: ["a.png"] },
+          ],
+          links: [],
+        },
+        OBJ,
+        { adapters: {} },
+      ),
+    (e) =>
+      /共 2 项阻断，分类：未知类型 1 · 参数分歧 1。未知类型通常是本机没有安装对应插件[\s\S]*参数分歧通常是工作流被外部脚本只改了其中一个字段：在 ComfyUI 里重新保存一次工作流即可自愈。/.test(e.message),
+    `两类计数与建议顺序应为 未知类型 → 参数分歧：${""}`,
+  );
+});

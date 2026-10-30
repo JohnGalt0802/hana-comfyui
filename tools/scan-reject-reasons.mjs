@@ -92,8 +92,10 @@ for (const f of allFiles) {
 }
 
 // ── 4. 分类统计（口径与 2026-10-30 扫描脚本一致）──────────────────────────────
-const CATS = ["subgraph", "mute_bypass", "unknown_type", "missing_link", "pull", "other"];
+const CATS = ["subgraph", "value_mismatch", "mute_bypass", "unknown_type", "missing_link", "pull", "other"];
 function classify(msg) {
+  // value_mismatch 先于 subgraph，与引擎 summarizeProblems 口径一致：值分歧文案也含「子图实例」，须先接走。
+  if (msg.includes("位置值分歧") || msg.includes("widgets_values_named 与 widgets_values") || msg.includes("疑似过期 named")) return "value_mismatch";
   if (msg.includes("子图/环绕节点")) return "subgraph";
   if (msg.includes("静音/旁路")) return "mute_bypass";
   if (msg.includes("不在 /object_info")) return "unknown_type";
@@ -181,8 +183,8 @@ ${CATS.map((c) => `| ${c} | ${onlyBlocked(c)} | ${remainAfterFix(c)} |`).join("\
 
 - 分类条目合计 ${catSum} ＝ problems 总数 ${totalProblems} → ${verdict(checks.catTotal)}
 - 通过 ${okCount} + 被拒 ${failed.length} ＝ UI 格式总数 ${uiCount} → ${verdict(checks.passReject)}
-- 分类口径：UUID 型（子图实例）→ subgraph；「静音/旁路」→ mute_bypass；「不在 /object_info」→ unknown_type；「连线缺失/不在工作流节点内」→ missing_link；pull 专属文案（「无法确定来源」「类型不兼容」）→ pull；其余 → other。
-- 注意：2026-10-30 临时扫描脚本没有 pull 类（pull 条目当时落在 other）；本次对比历史数字时 other 会偏大、pull 为 0。
+- 分类口径：UUID 型（子图实例）→ subgraph；「位置值分歧 / widgets_values_named 与 widgets_values / 疑似过期 named」→ value_mismatch（先于 subgraph，与引擎 summarizeProblems 一致）；「静音/旁路」→ mute_bypass；「不在 /object_info」→ unknown_type；「连线缺失/不在工作流节点内」→ missing_link；pull 专属文案（「无法确定来源」「类型不兼容」）→ pull；其余 → other。
+- 注意：2026-10-30 临时扫描脚本没有 pull 类（pull 条目当时落在 other）；本次对比历史数字时 other 会偏大、pull 为 0。另外 value_mismatch 是本次新增类，历史数字里也落在 other，对比时同样注意。
 `;
 md += checks.catTotal && checks.passReject ? "" : "\n⚠️ 校验未通过，统计有洞，先排查再用数字。\n";
 

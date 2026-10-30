@@ -241,16 +241,19 @@ function matchSlotRule(rules, name, warn) {
 // summarizeProblems 按类别统计全量 problems；未知类型的类型名从「类型 X 不在 /object_info」解析，
 // 解析不到的条目只进数量不进 Top（宁可少列不编造）。
 const summarizeProblems = (list) => {
-  const counts = { unknown_type: 0, mute_bypass: 0, missing_link: 0, subgraph: 0, pull: 0, other: 0 };
+  const counts = { unknown_type: 0, value_mismatch: 0, mute_bypass: 0, missing_link: 0, subgraph: 0, pull: 0, other: 0 };
   const unknownNames = new Map(); // 未知类型的类型名 → 次数
   for (const msg of list) {
     if (/不在 \/object_info/.test(msg)) {
       counts.unknown_type++;
       const m = /类型 ([^\s（(]+) 不在 \/object_info/.exec(msg);
       if (m) unknownNames.set(m[1], (unknownNames.get(m[1]) || 0) + 1);
-    } else if (/处于静音|处于旁路|处于未知 mode/.test(msg)) counts.mute_bypass++;
+    } else if (/位置值分歧|widgets_values_named 与 widgets_values|疑似过期 named/.test(msg)) counts.value_mismatch++;
+    else if (/处于静音|处于旁路|处于未知 mode/.test(msg)) counts.mute_bypass++;
     else if (/连线缺失|不在工作流节点内/.test(msg)) counts.missing_link++;
-    else if (/子图/.test(msg) || /^[0-9a-fA-F-]{20,}$/.test(msg)) counts.subgraph++;
+    // 子图类只收结构/接口问题（旧版 links 格式、实例槽对不上定义、-10/-20 接口链接等）；
+    // 值分歧类文案虽也含「子图实例」，但已被上面的 value_mismatch 先行接走。
+    else if (/子图格式|实例|接口链接|-10|-20|无法展开|子图/.test(msg) || /^[0-9a-fA-F-]{20,}$/.test(msg)) counts.subgraph++;
     else if (/按名字|pull/.test(msg)) counts.pull++;
     else counts.other++;
   }
@@ -261,12 +264,18 @@ const summarizeProblems = (list) => {
     const seg = `未知类型 ${counts.unknown_type}`;
     parts.push(topTypes.length > 1 ? `${seg}（涉及类型：${topTypes.map(([t, c]) => `${t} ×${c}`).join("、")}）` : seg);
   }
+  if (counts.value_mismatch > 0) parts.push(`参数分歧 ${counts.value_mismatch}`);
   if (counts.mute_bypass > 0) parts.push(`静音/旁路 ${counts.mute_bypass}`);
   if (counts.missing_link > 0) parts.push(`连线缺失 ${counts.missing_link}`);
   if (counts.subgraph > 0) parts.push(`子图 ${counts.subgraph}`);
   if (counts.pull > 0) parts.push(`pull ${counts.pull}`);
   if (counts.other > 0) parts.push(`其他 ${counts.other}`);
-  return `共 ${list.length} 项阻断，分类：${parts.join(" · ")}。未知类型通常是本机没有安装对应插件：在 ComfyUI 里装好后重试；若确认是纯前端辅助件（不进 prompt），可写一份适配档案，写法见 app/skills/comfy-node-adapter/SKILL.md。`;
+  // 建议句按实际出现的类别给：该类计数为 0 就不出对应建议，全 0 时只报计数。
+  const advices = [];
+  if (counts.unknown_type > 0) advices.push("未知类型通常是本机没有安装对应插件：在 ComfyUI 里装好后重试；若确认是纯前端辅助件（不进 prompt），可写一份适配档案，写法见 app/skills/comfy-node-adapter/SKILL.md。");
+  if (counts.value_mismatch > 0) advices.push("参数分歧通常是工作流被外部脚本只改了其中一个字段：在 ComfyUI 里重新保存一次工作流即可自愈。");
+  if (counts.mute_bypass > 0) advices.push("静音/旁路节点按 ComfyUI 语义处理，缺值下游会如实报错：在画布上确认这些节点是否应处于该状态。");
+  return `共 ${list.length} 项阻断，分类：${parts.join(" · ")}。${advices.join("")}`;
 };
 
 // ── 子图（subgraph）展开 v1（2026-10-31）────────────────────────────────────
