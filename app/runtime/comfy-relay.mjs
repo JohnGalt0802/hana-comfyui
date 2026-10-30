@@ -2785,7 +2785,21 @@ function queueDetailPayload() {
 // ── 进度事件缓存（订阅后端 /ws）─────────────────────────────────────────────
 // 只做"最近事件 → prompt 状态"的只读聚合，供 App 侧轮询；不改变任何后端行为。
 const promptStore = new Map(); // promptId -> record
-const wsEvents = { connected: false, lastEventAt: 0, lastError: null, everConnected: false, queueRemaining: null, byType: Object.create(null), count: 0 };
+const wsEvents = {
+  connected: false, lastEventAt: 0, lastError: null, everConnected: false, queueRemaining: null,
+  byType: Object.create(null), count: 0,
+  // 预览帧计数（2026-10-30，issue #1 诊断，additive）：二进制帧不走 byType/count（那两个只统计文本事件）
+  // 恒等式（正常路径）：previewReceived === previewAttributed + previewDropped + previewOversizeDropped + previewEmptyDropped
+  //   —— 四条出口各自只计一次，且都只对「已计入 received」的帧计数（见 handleBackendBinary）
+  previewReceived: 0,        // 收到的预览帧数（解析到 PREVIEW_IMAGE / PREVIEW_IMAGE_WITH_METADATA 即计）
+  previewAttributed: 0,      // 成功归属并进环形缓冲的帧数
+  previewAttributedBySole: 0, // attributed 的子集：「没带 prompt_id、靠唯一 running 记录兜底归属」的帧数（既有行为，可能归错，仅计数）
+  previewDropped: 0,         // 因「判不出归属」被丢弃的帧数
+  previewDroppedByReason: Object.create(null), // 按原因分桶：no-prompt-id / unknown-prompt-id / ambiguous-running
+  previewOversizeDropped: 0, // 超过 PREVIEW_MAX_FRAME_BYTES 被丢弃的帧数
+  previewEmptyDropped: 0,    // 图像字节为空被丢弃的帧数（仅帧头、无像素）
+  previewLastAt: 0,          // 最后一帧到达时间（ms）
+};
 let wsRetryTimer = null;
 let wsStopped = false;
 
@@ -2976,6 +2990,57 @@ function pickPreviewOwner(promptId) {
   return found;
 }
 
+// ── 预览帧无归属诊断（2026-10-30，issue #1）────────────────────────────────
+// 背景：ComfyUI 只把预览帧发给「发起该 prompt 的 client_id」。画布执行（card 侧 canvas.queue）由前端
+//   直接 POST /prompt，中继不是发起者 → 结构上收不到帧；后台直提（mode=backend）中继是发起者，所以有帧。
+// 本段只做「让现象可见」：分类计数 + 每个原因一条 warnOnce + 暂存最后一帧。**不改链路、不改判定**：
+//   pickPreviewOwner 该返回 null 仍返回 null，这里只在拿到 null 之后解释「为什么是 null」。
+const PREVIEW_MISS = {
+  NO_PROMPT_ID: "no-prompt-id",           // a) 帧本身没带 prompt_id（旧格式 type=1 就没有）
+  UNKNOWN_PROMPT_ID: "unknown-prompt-id", // b) 带了 prompt_id 但 promptStore 里查不到
+  AMBIGUOUS_RUNNING: "ambiguous-running", // c) 没带 prompt_id，且有多个 running 记录，无法判定归属
+};
+
+// 仅在 pickPreviewOwner 返回 null 后调用：只读 promptStore（不建记录、不改状态），复刻它的 running 计数口径。
+// ⚠ 调用约定（请不要破坏）：本函数与 pickPreviewOwner 之间**不得插入 await / 任何异步边界**。
+//   分类依赖「与归属判定读到的是同一份 promptStore 快照」；中间一旦有 await，running 集合可能在两次读取
+//   之间变化，分桶就会静默失真（明明判的是多 running 歧义，却计成没带 prompt_id，反之亦然）。
+// ⚠ 已知：b) 在当前实现里走不到 —— pickPreviewOwner 对「带 prompt_id 但查不到」会走 promptRec() 自动
+//   补建记录并完成归属，因此不会返回 null。分支保留，以便将来归属策略改动后原因仍可区分（现为不可达）。
+function previewMissReason(promptId) {
+  if (typeof promptId === "string" && promptId) return PREVIEW_MISS.UNKNOWN_PROMPT_ID;
+  let running = 0;
+  for (const rec of promptStore.values()) if (rec.state === "running") running += 1;
+  return running > 1 ? PREVIEW_MISS.AMBIGUOUS_RUNNING : PREVIEW_MISS.NO_PROMPT_ID;
+}
+
+// 最后一个无归属帧的**元信息**（模块级暂存，只留 1 条）。
+// 刻意不存帧字节：进程内没有任何读出口，存下的 base64（≤512KB 单帧 → 约 683KB 常驻）是纯死状态；
+//   诊断只需要「有没有、多大、为什么没归属」，不需要像素。也因此天然不会破 PREVIEW_MAX_FRAME_BYTES 内存防线。
+let previewOrphanFrame = null;
+
+function previewMissText(reason, promptId, bytes) {
+  const head = `预览帧无归属被丢弃（reason=${reason}, ${bytes}B${promptId ? `, prompt_id=${promptId}` : ""}）`;
+  if (reason === PREVIEW_MISS.UNKNOWN_PROMPT_ID) return `${head}：promptStore 里查不到该 prompt_id`;
+  if (reason === PREVIEW_MISS.AMBIGUOUS_RUNNING) {
+    return `${head}：存在多个 running 记录，无法判定归属（未带 prompt_id；中继不是任务发起者时属预期：ComfyUI 只把预览帧发给发起该 prompt 的 client_id）`;
+  }
+  return `${head}：帧没带 prompt_id（旧格式 PREVIEW_IMAGE 无元数据），且没有唯一 running 记录可兜底（中继不是任务发起者时属预期）`;
+}
+
+function noteOrphanPreview(promptId, image, reason) {
+  const bytes = image ? image.length : 0;
+  wsEvents.previewDropped += 1;
+  wsEvents.previewDroppedByReason[reason] = (wsEvents.previewDroppedByReason[reason] || 0) + 1;
+  previewOrphanFrame = {
+    at: Date.now(),
+    reason,
+    promptId: typeof promptId === "string" && promptId ? promptId : null,
+    bytes,
+  };
+  warnOnce(`preview-orphan:${reason}`, previewMissText(reason, previewOrphanFrame.promptId, bytes));
+}
+
 function pushPreviewFrame(rec, image) {
   if (!image || image.length === 0) return;
   if (image.length > PREVIEW_MAX_FRAME_BYTES) return; // 单帧超限→丢弃（内存防线）
@@ -3014,8 +3079,30 @@ async function handleBackendBinary(data) {
     return; // 其它类型（含 TEXT=3）：忽略
   }
 
+  // 已收到的预览帧计数（二进制帧此前不计入 wsEvents.count/byType）。
+  // 以下四条出口互斥且穷尽，保证 received 恒等式成立：
+  //   droppedNoOwner / oversizeDropped / emptyDropped / attributed
+  wsEvents.previewReceived += 1;
+  wsEvents.previewLastAt = Date.now();
   const rec = pickPreviewOwner(promptId);
-  if (!rec) return; // 拿不到归属→丢弃
+  if (!rec) {
+    // 拿不到归属：仍丢弃（归属策略不变），但不再静默 —— 分类计数 + 一条 warnOnce + 暂存最后一帧元信息
+    noteOrphanPreview(promptId, image, previewMissReason(promptId));
+    return;
+  }
+  // 空帧 / 超限帧：与 pushPreviewFrame 内部的守卫同口径，在调用前计清（pushPreviewFrame 自身的守卫保留不动）
+  if (!image || image.length === 0) {
+    wsEvents.previewEmptyDropped += 1;
+    return;
+  }
+  if (image.length > PREVIEW_MAX_FRAME_BYTES) {
+    wsEvents.previewOversizeDropped += 1;
+    return;
+  }
+  wsEvents.previewAttributed += 1;
+  // attributed 的子集：没带 prompt_id 却归属成功 —— 只可能是「唯一 running 记录兜底」这条路
+  //   （既有行为，可能把帧归到错的任务上；不改判定，只让人能从计数看出「有多少帧是靠兜底归的」）
+  if (!(typeof promptId === "string" && promptId)) wsEvents.previewAttributedBySole += 1;
   pushPreviewFrame(rec, image);
 }
 
@@ -3155,6 +3242,29 @@ function statusPayload() {
       promptsTracked: promptStore.size,
       count: wsEvents.count,
       byType: { ...wsEvents.byType },
+      // 预览帧可观测（2026-10-30，issue #1，additive）：区分「中继压根没收到帧」与「收到但判不出归属」。
+      // 两者都表现为「任务卡没有预览」，但处置完全不同：前者是链路/发起者问题，后者是归属问题。
+      // 恒等式：received === attributed + droppedNoOwner + oversizeDropped + emptyDropped
+      preview: {
+        received: wsEvents.previewReceived,
+        attributed: wsEvents.previewAttributed,
+        // 其中靠「唯一 running 记录」兜底归属的（没带 prompt_id；既有行为，可能归错，仅计数）
+        attributedBySoleRunning: wsEvents.previewAttributedBySole,
+        droppedNoOwner: wsEvents.previewDropped,
+        oversizeDropped: wsEvents.previewOversizeDropped,
+        emptyDropped: wsEvents.previewEmptyDropped,
+        droppedByReason: { ...wsEvents.previewDroppedByReason },
+        lastReceivedAt: wsEvents.previewLastAt || null,
+        // 最后一个无归属帧的元信息（不存帧字节：无读出口，见 previewOrphanFrame 注释）
+        lastOrphan: previewOrphanFrame
+          ? {
+              at: new Date(previewOrphanFrame.at).toISOString(),
+              reason: previewOrphanFrame.reason,
+              promptId: previewOrphanFrame.promptId,
+              bytes: previewOrphanFrame.bytes,
+            }
+          : null,
+      },
     },
     requests: {
       total: stats.total,
