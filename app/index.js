@@ -26,6 +26,9 @@ import { analyzeGraph, traceGraph } from "./lib/canvas-analysis.mjs";
 import { outlineGraph } from "./lib/canvas-outline.mjs";
 import { resolveWorkflowPath, loadUiWorkflow, fileGet, fileCheck, fileTrace, fileOutline, fileSummary, fileDiff, runFilePatch, writeFileAtomic } from "./workflow-file.mjs";
 import { isPlainObject, convertUiToApi, applyInputs, summarizeWorkflow } from "./lib/workflow-tools.mjs";
+// 节点适配档案加载（2026-10-30）：内置 <app>/lib/node-adapters + <dataDir>/node-adapters（用户覆盖内置）。
+// 只负责 IO；规则引擎在 lib/workflow-tools.mjs（冻结，不改）。
+import { loadNodeAdapters } from "./lib/node-adapter-store.mjs";
 // T3-1 / T3-3（2026-10-10）：openWorkflow 链路的落定判定与路由失败文案（纯函数，见其 test.mjs）。
 import { nameMatchesTarget, openWorkflowLoadVerdict, openWorkflowRouteError, toIntOrNull } from "./lib/canvas-open-workflow.mjs";
 
@@ -375,6 +378,8 @@ export default defineApp(async (sdk) => {
       logRequests: true,
       upstreamTimeoutMs: 0,
       logFile: join(dataDir, "logs", "relay.log"),
+      // 节点适配档案（2026-10-30）：中继据此定位 <dataDir>/node-adapters（与 app 侧同一口径的分发）
+      appDataDir: dataDir,
       controlKey,
       clientId,
       note: `comfyui-hana relay v${APP_VERSION} (attempt ${attempt}) @ ${new Date().toISOString()}`,
@@ -1880,7 +1885,20 @@ export default defineApp(async (sdk) => {
     return { parsed, source: `userdata:${target.path}` };
   }
 
+  // 节点适配档案（2026-10-30）：app-data 根目录沿用本 App 既有口径 sdk.dataDir；
+  // 用户档案目录 <dataDir>/node-adapters，同名 nodeType 覆盖内置档案。
+  // 加载失败或返回空对象 → 返回 {}，convertUiToApi 的第三参等效于不传，行为与接线前一致。
+  async function loadAdaptersForConvert() {
+    try {
+      return await loadNodeAdapters({ userDir: join(dataDir, "node-adapters"), warn });
+    } catch (e) {
+      warn(`节点适配档案加载失败（按无档案处理）：${msgOf(e)}`);
+      return {};
+    }
+  }
+
   async function resolveWorkflowToPrompt(workflow) {
+    const adapters = await loadAdaptersForConvert();
     if (typeof workflow === "string") {
       const path = workflow.trim();
       if (!path) throw new Error("workflow 路径为空");
@@ -1888,7 +1906,7 @@ export default defineApp(async (sdk) => {
       let parsed;
       try { parsed = JSON.parse(text); } catch (e) { throw new Error(`工作流文件不是合法 JSON：${path}（${msgOf(e)}）`); }
       if (Array.isArray(parsed.nodes)) {
-        const api = convertUiToApi(parsed, await getObjectInfo());
+        const api = convertUiToApi(parsed, await getObjectInfo(), { adapters });
         return { prompt: api, source: `file:${path}（UI 格式已转换）` };
       }
       if (isPlainObject(parsed)) return { prompt: parsed, source: `file:${path}（API 格式）` };
@@ -1898,14 +1916,14 @@ export default defineApp(async (sdk) => {
       if (typeof workflow.template === "string" && Object.keys(workflow).length === 1) {
         const { parsed, source } = await loadTemplate(workflow.template.trim());
         if (Array.isArray(parsed.nodes)) {
-          const api = convertUiToApi(parsed, await getObjectInfo());
+          const api = convertUiToApi(parsed, await getObjectInfo(), { adapters });
           return { prompt: api, source: `${source}（UI 格式已转换）` };
         }
         if (isPlainObject(parsed)) return { prompt: parsed, source: `${source}（API 格式）` };
         throw new Error(`模板结构无法识别：${workflow.template}`);
       }
       if (Array.isArray(workflow.nodes)) {
-        const api = convertUiToApi(workflow, await getObjectInfo());
+        const api = convertUiToApi(workflow, await getObjectInfo(), { adapters });
         return { prompt: api, source: "inline（UI 格式已转换）" };
       }
       return { prompt: workflow, source: "inline（API 格式）" };

@@ -56,6 +56,9 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { isPlainObject, convertUiToApi, applyInputs } from "../lib/workflow-tools.mjs";
+// 节点适配档案加载（2026-10-30）：内置 <app>/lib/node-adapters + <appDataDir>/node-adapters（用户覆盖内置）。
+// 中继没有 sdk.dataDir：app-data 根目录由运行时配置的 appDataDir 传入（兼容旧配置：缺字段则只加载内置）。
+import { loadNodeAdapters } from "../lib/node-adapter-store.mjs";
 import { writeFileAtomic } from "../workflow-file.mjs"; // 原子写共享实现（T-fs 修复：中继代 app 落盘）
 import { handleHistoryCommit } from "./history-commit.mjs"; // 画布提交快照落盘（P1-B1，纯逻辑模块；中继只做路由接线）
 
@@ -121,6 +124,18 @@ function logLine(stream, level, text) {
 const log = (...a) => logLine(process.stdout, "info", a.map(String).join(" "));
 const warn = (...a) => logLine(process.stderr, "warn", a.map(String).join(" "));
 const logErr = (...a) => logLine(process.stderr, "error", a.map(String).join(" "));
+
+// 节点适配档案（2026-10-30）：用户目录 = <appDataDir>/node-adapters（同名 nodeType 覆盖内置）。
+// 加载失败或返回空对象 → {}，convertUiToApi 的第三参等效于不传，行为与接线前一致。
+async function nodeAdaptersForConvert() {
+  try {
+    const root = config && typeof config.appDataDir === "string" ? config.appDataDir : "";
+    return await loadNodeAdapters({ userDir: root ? join(root, "node-adapters") : null, warn });
+  } catch (e) {
+    warn(`节点适配档案加载失败（按无档案处理）：${(e && e.message) || e}`);
+    return {};
+  }
+}
 
 function initLogFile(path) {
   try {
@@ -214,6 +229,7 @@ function validateConfig(raw, sourceLabel) {
     controlKey: null,
     comfyBase: null,
     clientId: "comfyui-relay-" + randomBytes(4).toString("hex"),
+    appDataDir: null,
   };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`${sourceLabel}: 配置必须是 JSON 对象`);
@@ -245,6 +261,8 @@ function validateConfig(raw, sourceLabel) {
   if (typeof raw.controlKey === "string" && raw.controlKey.length >= 16) out.controlKey = raw.controlKey;
   if (typeof raw.comfyBase === "string" && raw.comfyBase.trim()) out.comfyBase = raw.comfyBase.trim();
   if (typeof raw.clientId === "string" && raw.clientId.trim()) out.clientId = raw.clientId.trim();
+  // app-data 根目录（2026-10-30）：仅用于定位节点适配档案目录 <appDataDir>/node-adapters
+  if (typeof raw.appDataDir === "string" && raw.appDataDir.trim()) out.appDataDir = raw.appDataDir.trim();
   return out;
 }
 
@@ -3731,7 +3749,7 @@ async function handleSubmitFile(req, res) {
     if (Array.isArray(parsed.nodes)) {
       const oi = await fetchBackendJson("/object_info", 12_000);
       if (!oi.ok || !oi.data || typeof oi.data !== "object") throw new Error("读取 /object_info 失败（后端不可用）");
-      prompt = convertUiToApi(parsed, oi.data);
+      prompt = convertUiToApi(parsed, oi.data, { adapters: await nodeAdaptersForConvert() });
       source = `${sourceLabel}（UI 格式已转换）`;
     } else if (isPlainObject(parsed)) {
       prompt = parsed;

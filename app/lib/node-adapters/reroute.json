@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Reroute",
+  "title": "Reroute 是纯前端转发节点，不进 prompt，连线穿透到真实源",
+  "source": "builtin",
+  "verifiedAt": "2026-10-30",
+  "rules": { "virtual": true, "passthrough": true },
+  "evidence": "已实测：A→Reroute→B 注入档案后 B 的输入 origin 直指 A，Reroute 不出现在产物里；无档案时仍按旧路径拒绝。"
+}
