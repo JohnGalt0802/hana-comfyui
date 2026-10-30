@@ -20,13 +20,24 @@ test("拒绝：缺 nodes 数组", () => {
   assert.throws(() => convertUiToApi({ links: [] }, OBJ), /不是 UI 格式工作流/);
 });
 
-test("拒绝：静音 / 旁路节点", () => {
+test("静音 / 旁路节点不再整份拒绝：按 ComfyUI 语义处理（2026-10-31）", () => {
+  // mode 2：静音节点不进 prompt，孤立（无下游）时转换成功；mode 4：旁路同样不拒绝。
+  // 下游消费被断的连线时仍会因「连线缺失」报错（见 node-adapter.test.mjs 的静音/旁路用例组）。
   for (const mode of [2, 4]) {
-    assert.throws(
-      () => convertUiToApi({ nodes: [{ id: 1, type: "LoraManager", mode, inputs: [] }], links: [] }, OBJ),
-      /静音\/旁路/,
+    const warnings = [];
+    const o = convertUiToApi(
+      { nodes: [{ id: 1, type: "LoraManager", mode, inputs: [] }], links: [] },
+      OBJ,
+      { onWarning: (w) => warnings.push(w) },
     );
+    assert.equal(Object.keys(o).length, 0, `mode ${mode} 节点不进 prompt`);
+    assert.ok(warnings.length >= 1, `mode ${mode} 应有 warning`);
   }
+  // 未知 mode：仍拒绝并点名（不放行）
+  assert.throws(
+    () => convertUiToApi({ nodes: [{ id: 1, type: "LoraManager", mode: 7, inputs: [] }], links: [] }, OBJ),
+    /未知 mode（7）/,
+  );
 });
 
 test("拒绝：子图 / 环绕节点类型", () => {
@@ -248,4 +259,74 @@ test("回归：R1 一致时不误报", () => {
     OBJ,
   );
   assert.equal(out["4"].inputs.image, "a.png");
+});
+
+// ── 六、拒绝报错末尾的归类汇总段（2026-10-31）────────────────────────────
+// 只追加在整条消息末尾，不改变既有前缀 / 前 6 条 / 提示句；以下用例都传 adapters（App 工具路径的触发条件）。
+
+const mixedWf = () => ({
+  nodes: [
+    { id: 1, type: "NopeNode", inputs: [] }, // 未知类型
+    { id: 2, type: "Opt", mode: 2, inputs: [{ name: "model", link: 10, type: "MODEL" }] },
+    { id: 3, type: "TriggerWordToggle", inputs: [{ name: "toggle", link: 11, type: "BOOLEAN" }] }, // 连线缺失 + 上游被静音归因
+    { id: 4, type: "TriggerWordToggle", inputs: [{ name: "toggle", link: 77, type: "BOOLEAN" }] }, // 纯死链（无归因后缀）
+  ],
+  links: [
+    [10, 1, 0, 2, 0, "MODEL"],
+    [11, 2, 0, 3, 0, "MODEL"],
+  ],
+});
+
+// ① 单类未知类型且 2 个类型名：数量与 Top 类型名都正确
+test("汇总①：单类未知类型 2 个名字 → 数量与涉及类型正确", () => {
+  assert.throws(
+    () =>
+      convertUiToApi(
+        { nodes: [{ id: 1, type: "NopeNode", inputs: [] }, { id: 2, type: "AlsoNope", inputs: [] }], links: [] },
+        OBJ,
+        { adapters: {} },
+      ),
+    (e) =>
+      /共 2 项阻断，分类：未知类型 2（涉及类型：NopeNode ×1、AlsoNope ×1）/.test(e.message) &&
+      /静音\/旁路|连线缺失|子图|pull/.test(e.message) === false,
+    `汇总段应只含未知类型一类且 Top 名字正确：${""}`,
+  );
+});
+
+// ② 多类混合：三类都出现且顺序为 未知类型 · 静音/旁路 · 连线缺失，无 0 值类别
+test("汇总②：未知类型+静音+连线缺失 → 三类都出现且顺序正确", () => {
+  assert.throws(
+    () => convertUiToApi(mixedWf(), OBJ, { adapters: {} }),
+    (e) => /共 3 项阻断，分类：未知类型 1 · 静音\/旁路 1 · 连线缺失 1。/.test(e.message),
+    `汇总段三类顺序应为 未知类型 · 静音/旁路 · 连线缺失：${""}`,
+  );
+});
+
+// ③ 只有 1 类：有数量，不出现「涉及类型 / ×n」的重复噪音
+test("汇总③：单类单名 → 有数量无 Top 噪音", () => {
+  assert.throws(
+    () => convertUiToApi({ nodes: [{ id: 1, type: "NopeNode", inputs: [] }], links: [] }, OBJ, { adapters: {} }),
+    (e) => /未知类型 1。/.test(e.message) && !/涉及类型/.test(e.message) && !/×/.test(e.message),
+    `单类单名不应列出「涉及类型 / ×n」：${""}`,
+  );
+});
+
+// ④ 既有前缀、前 6 条原文、末尾提示句完整存在（汇总只是追加）
+test("汇总④：既有报错原文三段完整，汇总仅追加在末尾", () => {
+  assert.throws(
+    () => convertUiToApi(mixedWf(), OBJ, { adapters: {} }),
+    (e) =>
+      /^UI→API 转换遇到不支持的构造：节点 #1 类型 NopeNode 不在 \/object_info/.test(e.message) &&
+      /。请在 ComfyUI 里用「工作流 → 导出（API 格式）」拿到 API JSON 后再提交。\n/.test(e.message),
+    `前缀 / 首条问题原文 / 末尾提示句必须保持不变：${""}`,
+  );
+});
+
+// ⑤ strict 模式：warnings 并入 errors 后汇总照常出现
+test("汇总⑤：strict 下汇总照常出现（warnings 归入其他类）", () => {
+  assert.throws(
+    () => convertUiToApi(dynamicSlotWf, OBJ, { strict: true, adapters: {} }),
+    (e) => /共 1 项阻断，分类：其他 1。/.test(e.message),
+    `strict 下动态槽 warning 应计入汇总（其他 1）：${""}`,
+  );
 });
