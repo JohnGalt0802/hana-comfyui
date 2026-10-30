@@ -994,24 +994,40 @@ function runExe(exe, args, timeoutMs = 20_000) {
 // 顺序：(a) netstat → (b) Get-NetTCPConnection → (c) 命令行匹配；前一路拿到结果即停。
 //   都拿不到时返回空数组（调用方语义不变：仍是 pid 数组）。
 
-// (a) netstat 解析（原逻辑保持）；全局无 LISTENING 行 → 失明
+// (a) netstat 解析；两种「失明」都要判 ok=false（issue #3 第二形态，2026-10-23 报告者实测）：
+//   (a1) 全局一条 LISTENING 行都没有 → netstat 没给出全貌；
+//   (a2) 目标端口**有** LISTENING 行，但最后一列 PID 被抹成 0 / 解析不出正整数
+//        → 旧的 ok:true + pids=[] 会被上层读成「查询成功、没人监听」，从而短路掉命令行兜底，
+//        最终 pids=[] 什么都不杀，接口却还能回 ok。这里必须判失明，让上层继续兜底。
+//   hidden=true 标记「PID 不可见」，供 listeningPids 的短路前置条件使用。
 function netstatListeningPids(port) {
   const r = runExe("netstat.exe", ["-ano", "-p", "TCP"], 15_000);
   const pids = new Set();
-  let listenRows = 0;
+  let listenRows = 0;      // 全局 LISTENING 行数
+  let portListenRows = 0;  // 命中目标端口的 LISTENING 行数
+  let hiddenRows = 0;      // 其中 PID 列不可见（0 / 非正整数）的行数
   for (const line of String(r.stdout || "").split(/\r?\n/)) {
     const parts = line.trim().split(/\s+/);
     if (parts.length < 5 || parts[0].toUpperCase() !== "TCP") continue;
     if (String(parts[3]).toUpperCase() === "LISTENING") listenRows += 1;
     if (!parts[1].endsWith(`:${port}`)) continue;
     if (String(parts[3]).toUpperCase() !== "LISTENING") continue;
+    portListenRows += 1;
     const pid = Number(parts[4]);
     if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+    else hiddenRows += 1;
   }
   if (!listenRows) {
-    return { ok: false, pids: [], reason: `netstat 输出无任何 LISTENING 行（exit ${r.code}${r.error ? ` ${r.error}` : ""}）` };
+    return { ok: false, hidden: false, hiddenRows, pids: [], reason: `netstat 输出无任何 LISTENING 行（exit ${r.code}${r.error ? ` ${r.error}` : ""}）` };
   }
-  return { ok: true, pids: [...pids], reason: null };
+  if (!pids.size && portListenRows) {
+    return {
+      ok: false, hidden: true, hiddenRows, pids: [],
+      reason: `netstat 报 ${port} 处于 LISTENING（${portListenRows} 行），但 PID 列不可见（PID=0/非正整数，${hiddenRows} 行）`,
+    };
+  }
+  // hiddenRows 即使不足以判失明也要回传（同行里一行 PID=0、一行有 PID 的情形）：只用来看，不影响采用结果
+  return { ok: true, hidden: false, hiddenRows, pids: [...pids], reason: null };
 }
 
 // (b) Get-NetTCPConnection -State Listen（PS 不可用/被拒 → 静默降级为 ok=false）
@@ -1029,11 +1045,17 @@ function psListeningPids(port) {
   if (err) return { ok: false, pids: [], reason: `Get-NetTCPConnection 不可用：${String(err[1]).replace(/[^\x20-\x7E]/g, "?").slice(0, 160)}` };
   if (!/HANA_PS_OK/.test(text)) return { ok: false, pids: [], reason: `PowerShell 无标记输出（exit ${r.code}${r.error ? ` ${String(r.error).replace(/[^\x20-\x7E]/g, "?")}` : ""}）` };
   const pids = [];
+  let pidRows = 0;  // 打出的 PID 行数（含 OwningProcess=0 的不可见行）
   for (const m of out.matchAll(/HANA_PS_PID:(\d+)/g)) {
+    pidRows += 1;
     const pid = Number(m[1]);
     if (Number.isInteger(pid) && pid > 0 && !pids.includes(pid)) pids.push(pid);
   }
-  return { ok: true, pids, reason: null };  // 查询成功且为空（HANA_PS_EMPTY）= 确无监听者，不是失明
+  // 有 Listen 行却一个有效 PID 都没有 = OwningProcess 全是 0 → 同属「PID 不可见」，判失明
+  if (!pids.length && pidRows) {
+    return { ok: false, hidden: true, pids: [], reason: `Get-NetTCPConnection 报 ${pidRows} 条 Listen 连接，但 OwningProcess 全为 0（PID 不可见）` };
+  }
+  return { ok: true, hidden: false, pids, reason: null };  // 查询成功且为空（HANA_PS_EMPTY）= 确无监听者，不是失明
 }
 
 // (c) 命令行匹配：python*.exe 且命令行含 main.py 且 --port 值精确等于目标端口
@@ -1101,7 +1123,8 @@ function pidSourcesText(diag) {
     const n = String((s.pids || []).length);
     return s.state === "blind" ? `!${n}` : n;
   };
-  const parts = [`netstat=${cell(diag.netstat)}`, `ps=${cell(diag.ps)}`];
+  const hiddenNote = diag.netstat && diag.netstat.hiddenRows > 0 ? `(隐${diag.netstat.hiddenRows})` : "";
+  const parts = [`netstat=${cell(diag.netstat)}${hiddenNote}`, `ps=${cell(diag.ps)}`];
   let cmd = `cmdline=${cell(diag.cmdline)}`;
   if (diag.cmdline && diag.cmdline.state !== "skip" && (diag.cmdline.candidates || 0) > 0) {
     cmd += ` 候选=${diag.cmdline.candidates}(淘汰${(diag.cmdline.eliminated || []).length})`;
@@ -1113,13 +1136,27 @@ function pidSourcesText(diag) {
 }
 
 // 8188 上正在监听的进程（撤下按钮的靶子；按端口找，不依赖进程名，兼容外部启动方式）
-// 返回类型仍是 number[]（4 个调用点全部按数组消费）；逐源诊断挂在 pidCache.diag。
-function listeningPids() {
-  if (Date.now() - pidCache.at < PID_CACHE_MS) return pidCache.pids;
+// 返回类型仍是 number[]（5 个调用点全部按数组消费）；逐源诊断挂在 pidCache.diag。
+// 5s 缓存只做防抖（同一次界面渲染里不必反复跑 netstat / Get-NetTCPConnection），
+//   **不带任何「未知」语义**：过期即重算，缓存里永远是上一次真查到的结果。
+// 命令行兜底（CIM 全表枚举）不额外加频率门：实测它本身百毫秒级（大头是 PowerShell 子进程启动），
+//   且只在「netstat 与 Get-NetTCPConnection 双盲」的机器上才会走到，正常机器碰不到。
+let pidCachePort = null; // pidCache 归属的端口（端口可配，换端口必须作废缓存）
+
+function listeningPids(opts = {}) {
+  // 强制刷新口径沿用既有约定：pidCache.at === 0 表示调用方刚把缓存归零（不吃缓存）。
+  // 显式 force 也直接跳过 5s 缓存，让「停止服务」不必依赖调用方先归零才拿得到最新结论。
+  const force = opts.force === true || pidCache.at === 0;
+  // 端口变了：pidCache 作废，不跨端口继承
+  if (pidCachePort !== backend.port) {
+    pidCachePort = backend.port;
+    pidCache = { at: 0, pids: [], diag: null };
+  }
+  if (!force && Date.now() - pidCache.at < PID_CACHE_MS) return pidCache.pids;
   const port = backend.port;
   const diag = {
     port,
-    netstat: { state: "skip", pids: [], note: null },
+    netstat: { state: "skip", pids: [], note: null, hiddenRows: 0 },
     ps: { state: "skip", pids: [], note: null },
     cmdline: { state: "skip", pids: [], candidates: 0, eliminated: [], note: null },
     adopted: null,
@@ -1128,7 +1165,7 @@ function listeningPids() {
 
   // (a) netstat
   const a = netstatListeningPids(port);
-  diag.netstat = { state: a.ok ? "ok" : "blind", pids: a.pids, note: a.reason || null };
+  diag.netstat = { state: a.ok ? "ok" : "blind", pids: a.pids, note: a.reason || null, hiddenRows: a.hiddenRows || 0 };
   if (a.ok && a.pids.length) {
     pids = a.pids;
     diag.adopted = "netstat";
@@ -1147,8 +1184,11 @@ function listeningPids() {
       warnOnce(`ps-blind:${b.reason}`, `监听进程枚举降级：${b.reason}（PowerShell 受限属预期，继续命令行兜底）`);
     }
 
-    // 短路：两个独立枚举器都成功且都为 0 → 一致认为无监听者，不必跑 (c)（CIM 全表枚举开销大，5s 轮询路径）
-    const bothOkEmpty = a.ok && b.ok && a.pids.length === 0 && b.pids.length === 0;
+    // 短路：(a)(b) 两个独立枚举器都成功且都为 0 → 一致认为无监听者，不必跑 (c)（CIM 全表枚举开销大）。
+    // 前置条件（issue #3 第二形态）：任何一路报了「PID 不可见」（hidden）时禁止短路 ——
+    //   那种 0 不是「没人监听」，只是 PID 列被抹成 0/空，必须让命令行兜底给出名字。
+    const pidHidden = a.hidden === true || b.hidden === true;
+    const bothOkEmpty = a.ok && b.ok && !pidHidden && a.pids.length === 0 && b.pids.length === 0;
     if (!diag.adopted && !bothOkEmpty) {
       const c = cmdlineComfyCandidates(port);
       diag.cmdline = {
@@ -1159,7 +1199,10 @@ function listeningPids() {
         note: c.reason || null,
       };
       if (c.ok && c.cands.length) {
-        const rec = reconcileCmdlineCandidates(c.cands, b.pids, b.ok);
+        // 能走到兜底，就说明没有可信监听集合（(b) 要么失明、要么成功但为 0）；
+        // 把 b.ok 直接当 listenersOk 会把「成功但 0 个」当成可信交集，单候选也会被无谓淘汰。
+        const listenersOk = b.ok && b.pids.length > 0;
+        const rec = reconcileCmdlineCandidates(c.cands, b.pids, listenersOk);
         diag.cmdline.eliminated.push(...rec.eliminated);
         diag.cmdline.pids = rec.keep.map((x) => x.pid);
         if (rec.keep.length) {
@@ -1484,7 +1527,7 @@ function killPidTree(pid) {
 
 async function stopBackendService() {
   pidCache = { at: 0, pids: [], diag: null }; // 强制重查：不强依赖「可达」判断（端口有监听但 HTTP 不响时也要能撤）
-  const pids = listeningPids();
+  const pids = listeningPids({ force: true }); // force：不吃 5s 缓存，停止必须拿最新结论
   const diag = pidCache.diag;
   const sources = pidSourcesText(diag);
   const stopped = [];
@@ -2608,7 +2651,7 @@ function backendProcPayload() {
     mainPy: backendProc.mainPy,
     launcher: backendProc.launcher,
     logFile: backendProc.logFile,
-    pids: listeningPids(), // 始终查（5s 缓存）：启动中/未就绪时也能看到进程是否已起来
+    pids: listeningPids(), // 与其它调用点同一套语义：5s 缓存只防抖，过期即重算
     starting: backendProc.starting,
     lastStartResult: backendProc.lastStartResult,
     lastError: backendProc.lastError,
