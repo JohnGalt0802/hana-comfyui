@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Fast Muter (rgthree)",
+  "title": "按连线目标逐个静音/取消静音的开关面板，纯开关不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true },
+  "evidence": "源码 web/comfyui/muter.js:33-34（type=NodeTypesString.FAST_MUTER='Fast Muter (rgthree)'，constants.js:17；:37-38 注册），继承 base_node_mode_changer.js：widget 值不落盘（无 serialize_widgets=true，仅 Bookmark/FastActionsButton 等显式开），doModeChange 调 changeModeOfNodes(linkedNode, modeOn/modeOff)（base_node_mode_changer.js:62），重建时开关值由目标节点 mode 回读（:43 linkedNode.mode===this.modeOn）。状态全在目标节点 JSON 的 mode，丢弃面板无损失。"
+}

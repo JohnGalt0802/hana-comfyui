@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Fast Bypasser (rgthree)",
+  "title": "按连线目标逐个旁路/恢复的开关面板，纯开关不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true },
+  "evidence": "源码 web/comfyui/bypasser.js:33-34（type=NodeTypesString.FAST_BYPASSER='Fast Bypasser (rgthree)'，constants.js:18；:37-38 注册），继承 base_node_mode_changer.js：点击改目标节点 mode（:62 changeModeOfNodes(linkedNode, modeOn/modeOff)，modeOff=4 BYPASS），开关值由目标 mode 回读重建（:43）。被旁路节点各自 JSON 的 mode=4 不受影响，丢弃面板无损失。"
+}

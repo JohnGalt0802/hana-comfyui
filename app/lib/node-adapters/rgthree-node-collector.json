@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Node Collector (rgthree)",
+  "title": "多进一出的连线汇集件，纯前端转发，不进 prompt",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true, "passthrough": true },
+  "evidence": "源码 web/comfyui/node_collector.js:18-19（type=NodeTypesString.NODE_COLLECTOR='Node Collector (rgthree)'，constants.js:30；:99 注册），继承 base_node_collector.js:6 BaseCollectorNode（仅管理连线去重）；isVirtualNode 经 base_node.js:195 RgthreeBaseVirtualNode。无 widgets。多输入汇集一输出，穿透语义明确。"
+}

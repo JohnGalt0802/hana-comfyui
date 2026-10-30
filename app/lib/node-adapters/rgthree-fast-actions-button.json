@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Fast Actions Button (rgthree)",
+  "title": "一键对连线目标执行 Mute/Bypass/Enable/Queue Prompt 的动作按钮，纯开关不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true },
+  "evidence": "源码 web/comfyui/fast_actions_button.js:257-258（type=NodeTypesString.FAST_ACTIONS_BUTTON='Fast Actions Button (rgthree)'，constants.js:21；:268-269 注册）；:15 serialize_widgets=true（存 buttonText/shortcut 的 widget 值与各 combo 所选动作），但动作只在 :183 executeConnectedNodes() 手动点按时执行：:195-201 changeModeOfNodes(node, MODE_MUTE/BYPASS/ALWAYS)——转 API 时队列里不会有人点它，目标节点 mode 原样保留在各自 JSON，丢弃按钮不改变行为。输出槽仅声明性 OPT_CONNECTION。"
+}

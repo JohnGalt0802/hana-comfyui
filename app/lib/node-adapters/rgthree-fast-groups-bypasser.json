@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Fast Groups Bypasser (rgthree)",
+  "title": "按组整体旁路/恢复的按钮面板，纯开关不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true },
+  "evidence": "源码 web/comfyui/fast_groups_bypasser.js:14-15（type=NodeTypesString.FAST_GROUPS_BYPASSER='Fast Groups Bypasser (rgthree)'，constants.js:20；:19-20 注册），继承 fast_groups_muter.js:15 BaseFastGroupsModeChanger：serialize_widgets=false（:22），点击走 changeModeOfNodes（muter.js:335）。真实样本 D:/BaiduNetdiskDownload/工作流/2026.06.12/klein 编辑.json 节点 #253：无 widgets_values，outputs 仅声明性 OPT_CONNECTION(*)。被旁路组的状态在各节点 JSON 的 mode=4 里，丢弃面板不改变它们。"
+}

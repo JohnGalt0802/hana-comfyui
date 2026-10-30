@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Mute / Bypass Repeater (rgthree)",
+  "title": "把上游 Relay/Collector 的模式变化转发给多个连线目标的广播件，纯前端不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true, "passthrough": true },
+  "evidence": "源码 web/comfyui/node_mode_repeater.js:136-137（type=NodeTypesString.NODE_MODE_REPEATER='Mute / Bypass Repeater (rgthree)'，constants.js:16；:145 注册），继承 base_node_collector.js:6 BaseCollectorNode；:15/:83 addOutput('OPT_CONNECTION','*') 仅声明性。实际改 mode 的是被连线目标自己（onModeChange 响应），Repeater 的状态即各目标 mode，转 API 只需穿透连线。"
+}

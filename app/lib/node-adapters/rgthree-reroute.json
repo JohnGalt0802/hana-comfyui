@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Reroute (rgthree)",
+  "title": "rgthree 的连线转发件，纯前端穿透，与裸 Reroute（内置 reroute.json）是不同类型字符串",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true, "passthrough": true },
+  "evidence": "源码 web/comfyui/reroute.js:826-827（type=title=NodeTypesString.REROUTE='Reroute (rgthree)'，constants.js:31 addRgthree 拼后缀；:978-979 注册，前端注册故不在 /object_info，实测 8188 查无）；:246-250 isVirtualNode=true，:287 configure() 收 UI 数据时把 inputs 裁到 1 槽，单进单出纯转发；无 widget。与内置 'Reroute'（ComfyUI 原生）逐字符不同，需独立档案。"
+}

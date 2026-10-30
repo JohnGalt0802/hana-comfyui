@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Node Combiner (rgthree)",
+  "title": "Node Collector 的废弃旧名（legacyType），同语义纯前端转发",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true, "passthrough": true },
+  "evidence": "源码 web/comfyui/node_collector.js:48 legacyType='Node Combiner (rgthree)'（:110 以此名注册兼容旧图），同文件 :20 CombinerNode extends CollectorNode——与 Node Collector 同一类，多进一出纯转发。旧工作流里残留此类型时按 passthrough 穿透。"
+}

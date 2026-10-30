@@ -379,3 +379,39 @@ node "$env:TEMP\conv-submit.mjs" "<最小工作流路径>" "<档案路径>"
 2. **找名字位置**：在真实样本里看 `widgets_values` / `widgets_values_named`——取端、存端各落在第几位就要写成 `widgets_values[N]`；两者不同位时分别写进 `keyPath` / `fromKeyPath`。
 3. **定取源槽**：看存端 `inputs[]` 里哪一格接了真值（`inputs[N].link` 有值、类型是真类型），写成 `sourcePath: "inputs[N]"`；存端若有两个以上输入槽，槽的选择直接决定取到哪一路，别照抄别人的档案。
 4. **验一遍再落盘**：写 `verifiedAt` 与 `evidence`（前端 JS 的文件:行 + 真实样本路径与字段），按 §六 跑最小工作流；判定与 §六第 3 条同：产物里没有这俩类型、连线项指向真实发射节点、`/object_info` 声明齐全。取端与存端各一份档案，取端写 `pull`、存端只写 `virtual`。
+
+## 十、纯前端辅助件：什么时候可以 virtual 丢弃
+
+有一类节点连「存-取」都谈不上——它们只是画布上的操作面板或转发件，本身不往 prompt 里贡献任何值。这类满足**全部三条判据**就可以只写 `{ "virtual": true }`（需要连线穿透的加 `passthrough: true`）丢弃：
+
+1. **不在 `/object_info`**：纯前端注册（插件 JS 里 `LiteGraph.registerNodeType` / `registerCustomNodes`），后端不认识它，转 API 必然被拒；
+2. **不供值**：没有会被消费的输出（无输出槽，或输出只是 `OPT_CONNECTION` 这类声明性占位），也没有 `serializeValue` 往下游 widget 塞值；
+3. **状态落在别处或纯显示**：它的开关/按钮效果直接写**别的节点**的字段（典型是 `mode`），或它干脆只画字。
+
+判据 3 是关键：丢它不会丢状态。用户在画布上用它关掉的节点，状态早已在各节点自己的 JSON（`mode: 2` 静音 / `mode: 4` 旁路）里；重建画布时这类面板的开关是按目标节点 mode 反推出来的，不是从自己身上读的。
+
+### rgthree 这批（2026-10-31 落地，`app/lib/node-adapters/rgthree-*.json`）
+
+| 文件 | `nodeType` | 规则 | 为什么可丢 |
+|---|---|---|---|
+| `rgthree-label` | `Label (rgthree)` | virtual | 浮动文字标签，无槽无 widget，信息全在 title/properties（纯显示） |
+| `rgthree-bookmark` | `Bookmark (rgthree)` | virtual | 快捷键跳转画布视角，widget 只有 shortcut/zoom，不进 prompt |
+| `rgthree-fast-groups-muter` | `Fast Groups Muter (rgthree)` | virtual | `serialize_widgets=false`（fast_groups_muter.js:22），点击 `changeModeOfNodes` 改组内节点 mode（:335） |
+| `rgthree-fast-groups-bypasser` | `Fast Groups Bypasser (rgthree)` | virtual | 同上（继承同一个基类，fast_groups_bypasser.js:14） |
+| `rgthree-fast-muter` | `Fast Muter (rgthree)` | virtual | 开关值由目标节点 mode 回读重建（base_node_mode_changer.js:43），点击改目标 mode（:62） |
+| `rgthree-fast-bypasser` | `Fast Bypasser (rgthree)` | virtual | 同上（bypasser.js:33，modeOff=4） |
+| `rgthree-fast-actions-button` | `Fast Actions Button (rgthree)` | virtual | 动作只在手点时执行（fast_actions_button.js:195-201），转 API 无人点；目标 mode 原样在各节点 JSON |
+| `rgthree-node-collector` | `Node Collector (rgthree)` | virtual+passthrough | 多进一出连线汇集件，纯转发 |
+| `rgthree-node-combiner` | `Node Combiner (rgthree)` | virtual+passthrough | Collector 的废弃旧名（node_collector.js:48 legacyType），同语义 |
+| `rgthree-node-mode-repeater` | `Mute / Bypass Repeater (rgthree)` | virtual+passthrough | 模式广播件，输出仅声明性 OPT_CONNECTION，状态在各目标 mode |
+| `rgthree-node-mode-relay` | `Mute / Bypass Relay (rgthree)` | virtual+passthrough | 模式中继，只读输入 mode 改下游 Repeater mode，自身无 widget |
+| `rgthree-random-unmuter` | `Random Unmuter (rgthree)` | virtual+passthrough | 排队瞬间随机启用一个静音输入（浏览器 queue 事件），转 API 时不会发生；连线穿透 |
+| `rgthree-reroute` | `Reroute (rgthree)` | virtual+passthrough | rgthree 转发件；**与裸 `Reroute`（reroute.json）是两个类型字符串**，逐字符不同，必须各一份 |
+
+注意：这批是 rgthree 40 个注册类型里**不在 `/object_info` 的前端件**；它的 26 个真后端节点（Context 家族、Power Prompt、Power Lora Loader、Seed、Display Any、Any Switch 等）**一个都不许写档案**——档案按 nodeType 键覆盖转换行为，给真后端节点写 virtual 等于静默断供。
+
+### 反例：哪些「看起来像面板」的不能丢
+
+- **Context 家族（`Context (rgthree)` 等七个）**：真后端节点（在 `/object_info`，实测在线确认），model/clip/vae 靠真实连线供值，丢了就是断供。
+- **Random Unmuter 的行为损失要说清**：`virtual:true` 转换层丢掉它之后，画布上「每次出图随机启用一个静音输入」的抽签行为只剩画布侧（有 rgthree 前端时仍活）；直接提交 API 跑批时这个行为不再发生，各输入保持 JSON 里的 mode。这是**语义损失**（用户显式搭的随机机制不工作了），不是数据损失——可接受的原因是转 API 本来就是「按存档跑一次」，抽签类运行时行为没有等价的静态表达。
+- **任何在 `/object_info` 里的类型**：哪怕它长得再像辅助件，也不能写。判据 1 是硬门槛。

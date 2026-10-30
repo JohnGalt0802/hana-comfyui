@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Label (rgthree)",
+  "title": "画布浮动文字标签，纯显示，无槽无 widget，不参与 prompt",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true },
+  "evidence": "源码 web/comfyui/label.js:120-122（type=title=NodeTypesString.LABEL='Label (rgthree)'，constants.js:27 拼后缀；label.js:160-161 注册，前端注册故不在 /object_info，实测 8188 查无）；label.js:29-133 draw() 只按 properties 画字，无 addInput/addOutput/addWidget。真实样本 D:/BaiduNetdiskDownload/工作流/2026.07.06/RED MIX krea2.json 节点 #121/#122：inputs=[]、outputs=[]、无 widgets_values，信息全在 title 与 properties（fontSize 等）。丢弃零损失。"
+}

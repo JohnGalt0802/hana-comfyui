@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Mute / Bypass Relay (rgthree)",
+  "title": "读输入节点 mode 并转发给下游 Repeater 的模式中继，纯前端不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true, "passthrough": true },
+  "evidence": "源码 web/comfyui/node_mode_relay.js:181-182（type=NodeTypesString.NODE_MODE_RELAY='Mute / Bypass Relay (rgthree)'，constants.js:15；:202 注册），继承 base_node_collector.js:6 BaseCollectorNode；:42 addOutput('REPEATER','_NODE_REPEATER_') 仅接 Repeater 用；:92 stabilize() 只读输入节点 mode，:157 dispatchModeToRepeater() 改的是下游 Repeater 的 mode（用户操作产生的效果已存进各节点 JSON），Relay 本身无 widget 不进 prompt，穿透即可。"
+}

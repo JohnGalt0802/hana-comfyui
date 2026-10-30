@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Bookmark (rgthree)",
+  "title": "画布书签：按快捷键跳转画布视角，无输入输出槽，不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true },
+  "evidence": "源码 web/comfyui/bookmark.js:97-98（type=NodeTypesString.BOOKMARK='Bookmark (rgthree)'，constants.js:35；:102-103 注册）；:19 isVirtualNode=true，:21 serialize_widgets=true 但 :28-37 只两个 UI widget（shortcut_key 文本、zoom 数字），:96 canvasToBookmark() 仅移动画布 offset/scale，无 serializeValue 供值。真实样本无连线无下游。丢弃只损失画布导航体验，不损失 prompt。"
+}

@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "nodeType": "Fast Groups Muter (rgthree)",
+  "title": "按组整体静音/取消静音的按钮面板，纯开关不供值",
+  "source": "rgthree-comfy",
+  "verifiedAt": "2026-10-31",
+  "rules": { "virtual": true },
+  "evidence": "源码 web/comfyui/fast_groups_muter.js:279-306（type=NodeTypesString.FAST_GROUPS_MUTER='Fast Groups Muter (rgthree)'，constants.js:19）；:22 serialize_widgets=false——开关值不落工作流 JSON；:335 点击走 changeModeOfNodes(groupNodes, modeOn/modeOff)，被关的组各节点的 mode 直接写进各自 JSON，重建面板时开关按目标 mode 回读重造。丢弃面板不会把用户静音的组重新打开。"
+}
