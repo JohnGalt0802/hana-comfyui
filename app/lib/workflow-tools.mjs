@@ -11,7 +11,14 @@ export const NOTE_TYPES = new Set(["Note", "MarkdownNote"]);
 export const UNSUPPORTED_UI_TYPES = new Set(["Reroute", "PrimitiveNode", "Subgraph", "GroupNode", "SubgraphInputNode", "SubgraphOutputNode"]);
 
 // UI 格式（nodes/links）→ API 格式：经典图子集（子图/环绕/静音/旁路节点会明确报错）
-const WIDGET_SPEC_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3"]);
+const WIDGET_SPEC_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3", "AUTOCOMPLETE_TEXT_LORAS"]);
+// 常见 socket 类型的近似名单（实测未覆盖全部：本机 /object_info 有 220 个输入类型、这里有 20 个）；
+// 未列出的类型靠「widgets_values_named 本就没有该键」兜底，不会误注入；名单不完备可接受。
+const NON_WIDGET_INPUT_TYPES = new Set([
+  "MODEL", "CLIP", "VAE", "CLIP_VISION", "CLIP_VISION_OUTPUT", "STYLE_MODEL", "UPSCALE_MODEL",
+  "IMAGE", "MASK", "LATENT", "CONDITIONING", "CONTROL_NET", "SIGMAS", "SAMPLER", "GUIDER", "NOISE",
+  "AUDIO", "VIDEO", "WEBCAM", "LATENT_UPSCALE", "GLIGEN", "TAESD",
+]);
 const SEED_CONTROL_VALUES = new Set(["fixed", "increment", "decrement", "randomize"]);
 
 // R1 防线（2026-10-08）：named↔位置值交叉校验——防静默采用过期 named。
@@ -32,7 +39,13 @@ const NAMED_WV_CHECK = new Map([
 ]);
 const cutValue = (v) => { const s = typeof v === "string" ? v : JSON.stringify(v); return s == null ? String(s) : s.length > 36 ? s.slice(0, 36) + "…" : s; };
 
-export function convertUiToApi(wf, objectInfo) {
+// options（可选）：{ strict = false, onWarning = null }
+//   strict=true  → warnings 并入 errors，抛出行为与旧版完全一致；
+//   onWarning(fn) → 每条 warning 调用一次（在判定 throw 之前，strict 下也会收到）。
+export function convertUiToApi(wf, objectInfo, options) {
+  const opts = isPlainObject(options) ? options : {};
+  const strict = opts.strict === true;
+  const onWarning = typeof opts.onWarning === "function" ? opts.onWarning : null;
   const nodes = Array.isArray(wf.nodes) ? wf.nodes : null;
   if (!nodes) throw new Error("不是 UI 格式工作流（缺 nodes 数组）");
   const linkById = new Map();
@@ -42,7 +55,12 @@ export function convertUiToApi(wf, objectInfo) {
     }
   }
   const out = {};
-  const problems = [];
+  // 降级分支用：prompt 只会包含非 Note 节点，origin 必须落在这些 id 里才是可引用的上游
+  const emittableIds = new Set(
+    nodes.filter((n) => n && typeof n === "object" && !NOTE_TYPES.has(String(n.type || ""))).map((n) => String(n.id)),
+  );
+  const problems = []; // 即 errors：仍会导致整份拒绝（R1 校验也推入此列表，语义不变）
+  const warnings = []; // 仅记录、不拒绝：动态槽等可安全收编的构造
   for (const n of nodes) {
     if (!n || typeof n !== "object") continue;
     const type = String(n.type || "");
@@ -71,7 +89,20 @@ export function convertUiToApi(wf, objectInfo) {
       if (lid === null || lid === undefined) continue;
       const sname = typeof slot.name === "string" ? slot.name : "";
       if (!sname || !(declaredSet.has(sname) || declared.some((d) => sname.startsWith(d + ".")))) {
-        problems.push(`节点 #${n.id} 输入槽 ${sname ? `「${sname}」` : "（无名）"}不对应任何声明输入（连线无法收编）`);
+        // 动态输入槽（如 FlexibleOptionalInputType / TriggerWord Toggle）不出现在 /object_info，
+        // 槽名不在 declared 里属正常：能找到连线就按连线原样收编，仅记 warning；
+        // 无名槽无法作 API 键、连线缺失或 origin 不在工作流节点内则无从取源，三者归 errors。
+        const dyn = sname ? linkById.get(lid) : null;
+        if (!dyn) {
+          problems.push(`节点 #${n.id} 输入槽 ${sname ? `「${sname}」` : "（无名）"}不对应任何声明输入（连线无法收编）`);
+          continue;
+        }
+        if (!emittableIds.has(String(dyn.origin))) {
+          problems.push(`节点 #${n.id} 输入槽「${sname}」的连线 origin ${dyn.origin} 不在工作流节点内（无法引用上游）`);
+          continue;
+        }
+        warnings.push(`节点 #${n.id} 输入槽「${sname}」不对应任何声明输入（按动态输入槽处理）`);
+        inputs[sname] = [String(dyn.origin), dyn.originSlot];
         continue;
       }
       const link = linkById.get(lid);
@@ -88,7 +119,7 @@ export function convertUiToApi(wf, objectInfo) {
         const spec = required[name] || optional[name];
         if (!spec) continue;
         const t = Array.isArray(spec[0]) ? "COMBO" : String(spec[0]);
-        if (!WIDGET_SPEC_TYPES.has(t)) continue;
+        if (NON_WIDGET_INPUT_TYPES.has(t)) continue;
         if (spec[1] && spec[1].forceInput === true) continue;
         if (!Object.prototype.hasOwnProperty.call(named, name)) continue;
         let val = named[name];
@@ -142,8 +173,11 @@ export function convertUiToApi(wf, objectInfo) {
     out[String(n.id)] = { class_type: type, inputs };
     if (typeof n.title === "string" && n.title) out[String(n.id)]._meta = { title: n.title };
   }
-  if (problems.length) {
-    throw new Error(`UI→API 转换遇到不支持的构造：${problems.slice(0, 6).join("；")}${problems.length > 6 ? " 等" : ""}。请在 ComfyUI 里用「工作流 → 导出（API 格式）」拿到 API JSON 后再提交。`);
+  // 回调失败只影响它自己，不掩盖真实转换结果
+  if (onWarning) for (const w of warnings) { try { onWarning(w); } catch { /* 忽略回调自身异常 */ } }
+  const blocking = strict ? [...problems, ...warnings] : problems;
+  if (blocking.length) {
+    throw new Error(`UI→API 转换遇到不支持的构造：${blocking.slice(0, 6).join("；")}${blocking.length > 6 ? " 等" : ""}。请在 ComfyUI 里用「工作流 → 导出（API 格式）」拿到 API JSON 后再提交。`);
   }
   return out;
 }
