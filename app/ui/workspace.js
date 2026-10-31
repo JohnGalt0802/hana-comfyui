@@ -1811,6 +1811,29 @@ function setupKeepalivePokeListener() {
 // 变稀或停摆——外部读回探针记录 / 落盘文件即可判定。窗口态/卡页通用（不做
 // window.hanaAppWindow 限制）；全链路 try/catch 静默（含 Promise 拒绝兜底，不留未处理拒绝）。
 // 摘除：删除本块 + main() 内调用行 + 网络直采路由（app/index.js keepalive-probe-ping）。
+
+// ── 载体自报（2026-11-01）─────────────────────────────────────────────────────
+// 目的：区分本页是宿主按 manifest detached 开的独立窗口，还是页内卡页。纯观测字段，
+// 全部 try/catch 静默，任何一项取不到给 null，绝不抛错。
+// 判据：window.hanaAppWindow 只有宿主 App 窗口会挂（页内卡没有）；独立窗口的
+// outerWidth/outerHeight 通常大于 inner（含标题栏/边框）；window.opener 能拿到说明是
+// 被 open() 弹出的，属于额外线索。常见属性直接读，带 ?. 的属性链断掉时给 null。
+function carrierInfo() {
+  try {
+    const pick = (fn) => { try { const v = fn(); return v === undefined ? null : v; } catch { return null; } };
+    return {
+      appWindow: pick(() => !!window.hanaAppWindow),
+      innerW: pick(() => window.innerWidth),
+      innerH: pick(() => window.innerHeight),
+      outerW: pick(() => window.outerWidth),
+      outerH: pick(() => window.outerHeight),
+      screenW: pick(() => window.screen?.width ?? null),
+      screenH: pick(() => window.screen?.height ?? null),
+      popup: pick(() => (window.opener ? true : null)),
+    };
+  } catch { return null; }
+}
+
 function setupThrottleProbe() {
   const PROBE_KEY = "throttle-probe";
   const PING_ROUTE = "/comfyui-hana/keepalive-probe-ping"; // TODO 实验：网络直采通道
@@ -1833,7 +1856,7 @@ function setupThrottleProbe() {
   };
   setInterval(() => {
     n += 1;
-    const rec = { t: Date.now(), n, vis: document.visibilityState };
+    const rec = { t: Date.now(), n, vis: document.visibilityState, carrier: carrierInfo() };
     try {
       const p = hana.state.set(PROBE_KEY, rec); // 主通道：卡实例态（窗口态不可用时静默兜底）
       if (p && typeof p.catch === "function") p.catch(() => writeFallback(rec));
@@ -1862,6 +1885,7 @@ function reportShellLifecycle(event, extra) {
       referrer: (() => { try { const u = new URL(document.referrer); return u.origin + u.pathname; } catch { return ""; } })(),
       winName: String(window.name || "").slice(0, 80),
       vis: document.visibilityState,
+      carrier: carrierInfo(),
       // 卸载时刻补报：只在 boot 时扫（frame-reload 不扫，避免重复消费）
       gone: event === "boot" ? drainShellGone() : undefined,
       ...(extra && typeof extra === "object" ? extra : {}),
@@ -1889,6 +1913,7 @@ function recordShellGone(kind, extra) {
       timeOrigin: Math.round(performance.timeOrigin || 0),
       sinceOriginMs: Math.round(Date.now() - (performance.timeOrigin || Date.now())),
       vis: document.visibilityState,
+      carrier: carrierInfo(), // 死亡时刻的载体，最关键的观测点
       ...(extra && typeof extra === "object" ? extra : {}),
     };
     localStorage.setItem(key, JSON.stringify(rec));
