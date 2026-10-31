@@ -2610,9 +2610,14 @@ export default defineApp(async (sdk) => {
     const sameCanvas = !!(copilotNow && copilotNow.enabled === true);
     const pageKeyFromCopilot = copilotNow && copilotNow.pageKey ? String(copilotNow.pageKey) : null;
     // 同页路径（v3 新增）：预存当前画布（装载会覆盖当前图，覆盖前必须先落盘），再装载 + 执行。
+    // 2026-11-01：预存若走了另存形态（页面原本无文件身份，画布切到新 AgentSaved 文件），
+    // 页面身份已变，副驾驶需在预存内重开；重开失败（总闸关等）→ 降级副本路径（preSave.reopenCopilotFailed）。
     let preSave = null;
     if (sameCanvas) {
       preSave = await preSaveActiveCanvas();
+      if (preSave.reopenCopilotFailed) {
+        sameCanvas = false;
+      }
     }
     // ③ 复制副本（v3：仅未开副驾驶时；总闸 readAllowCopilot 只在副本路径需要——副本要开副驾驶才用得着它）。
     let dup = null, dupPage = null, dupKey = null, pageKey = pageKeyFromCopilot, copyName = null, copyFile = null;
@@ -2733,15 +2738,20 @@ export default defineApp(async (sdk) => {
     // v3 执行路径标注：canvasPath（same-canvas / agent-copy）+ preSave（同页：覆盖前落盘信息）+ fallback（回落原因）。
     const pathFields = sameCanvas
       ? { canvasPath: "same-canvas", preSave, fallback: null, copilotSource, landingCheck, pageIdentityCheck, landingMismatch: landing.mismatch }
-      : { canvasPath: "agent-copy", preSave: null, fallback: null, copilotSource, landingCheck: "strict", pageIdentityCheck: "strict", landingMismatch: null };
+      : preSave && preSave.reopenCopilotFailed
+        ? { canvasPath: "same-canvas→agent-copy", preSave, fallback: `预存另存后重开副驾驶失败（${preSave.reopenCopilotFailed}）`, copilotSource, landingCheck: "strict", pageIdentityCheck: "strict", landingMismatch: null }
+        : { canvasPath: "agent-copy", preSave: null, fallback: null, copilotSource, landingCheck: "strict", pageIdentityCheck: "strict", landingMismatch: null };
     if (!promptId) {
       const text = [
         `已发起画布执行（快返）：${label}`,
         sameCanvas
           ? `- 执行位置：画布当前页（副驾驶开，共编同页）`
           : `- 执行位置：画布（Agent 副本页${copyName ? `：${copyName}` : ""}）`,
+        !sameCanvas && preSave && preSave.reopenCopilotFailed
+          ? `- 说明：当前画布原先未保存，已另存为「${preSave.name}」，但重开副驾驶未成功（${preSave.reopenCopilotFailed}），本次转入副本页执行`
+          : null,
         sameCanvas
-          ? `- 装载前已落盘：${preSave.savedAs ? `另存「${preSave.name}」` : `原文件「${preSave.name}」`}${preSave.savedAs ? "（画布已切到该文件）" : ""}`
+          ? `- 装载前已落盘：${preSave.savedAs ? `另存「${preSave.name}」` : `原文件「${preSave.name}」`}${preSave.savedAs ? "（画布已切到该文件）" : ""}${preSave.copilotReopened ? "\n- 说明：当前画布原先未保存，已另存为上述文件，并在该文件上重新进入驾驶位" : ""}`
           : `- 副本文件：${copyFile}（副驾驶已开）`,
         `- 来源：${ref.source}`,
         "- 注意：桥未回传 prompt_id，本次无法自动跟踪（进度以画布原生 UI 为准）。",
@@ -2764,8 +2774,11 @@ export default defineApp(async (sdk) => {
       sameCanvas
         ? `- 执行位置：画布当前页（副驾驶开，共编同页）`
         : `- 执行位置：画布（Agent 副本页${copyName ? `：${copyName}` : ""}）`,
+      !sameCanvas && preSave && preSave.reopenCopilotFailed
+        ? `- 说明：当前画布原先未保存，已另存为「${preSave.name}」，但重开副驾驶未成功（${preSave.reopenCopilotFailed}），本次转入副本页执行`
+        : null,
       sameCanvas
-        ? `- 装载前已落盘：${preSave.savedAs ? `另存「${preSave.name}」` : `原文件「${preSave.name}」`}${preSave.savedAs ? "（画布已切到该文件）" : ""}`
+        ? `- 装载前已落盘：${preSave.savedAs ? `另存「${preSave.name}」` : `原文件「${preSave.name}」`}${preSave.savedAs ? "（画布已切到该文件）" : ""}${preSave.copilotReopened ? "\n- 说明：当前画布原先未保存，已另存为上述文件，并在该文件上重新进入驾驶位" : ""}`
         : `- 副本文件：${copyFile}（副驾驶已开；原布未被触碰）`,
       `- 来源：${ref.source}`,
       job.taskId
@@ -3771,7 +3784,8 @@ export default defineApp(async (sdk) => {
 
   // v2 副本落盘命名：<原名去尾> (AgentCopy) YYYYMMDD-HHmm；重名递增「 (2)」「 (3)」…。
   // 「原名去尾」= 从 duplicate 产物页名派生（去 .json、去尾部「 (N)」副本递增、「 (Copy)」副本后缀，
-  // 以及 T3-2 补上的「 (AgentCopy) YYYYMMDD-HHmm」历史副本段——与桥侧 duplicate 的清洗口径同源）。
+  // 以及历史标记段「 (AgentCopy) YYYYMMDD-HHmm」「 (AgentSaved) YYYYMMDD-HHmm」——T3-2 补前者，
+  // 2026-11-01 补后者：另存过一次的页再派生副本时两层标记会叠叠加，只留最原始名 + 一个新标记）。
   // 重名探测：读 workflows/<name>.json 是否存在（与桥侧「另存并切换」的目标已存在预检同口径）；
   // 探测失败按「不存在」处理（save 侧仍有预检兜底）。
   function agentCopyBaseName(srcPage) {
@@ -3784,7 +3798,7 @@ export default defineApp(async (sdk) => {
     for (let guard = 0; guard < 50; guard++) {
       const next = base
         .replace(/\s*\(\d+\)$/, "")
-        .replace(/(?:\s*\(AgentCopy\)\s*\d{8}-\d{4})+$/i, "")
+        .replace(/(?:\s*\((?:AgentCopy|AgentSaved)\)\s*\d{8}-\d{4})+$/i, "")
         .replace(/\s*\(Copy\)$/i, "");
       if (next === base) break;
       base = next;
@@ -3852,7 +3866,14 @@ export default defineApp(async (sdk) => {
         await settleSaveAsPending(svAs.payload, saveRevBefore);
       }
       const name = svAs.payload && svAs.payload.saved ? String(svAs.payload.saved) : `workflows/${asName}.json`;
-      return { name, savedAs: true };
+      // 2026-11-01（真机复现必修）：另存换了页面文件身份，副驾驶按页/文件记——必须重新进入驾驶位，
+      // 否则后续同页装载被桥以 copilot_off 拒绝，白白回落副本路径。开不起来（总闸关等）时
+      // 带 reopenCopilotFailed 返回，调用方改走副本路径（内容已落盘，不丢）。
+      const reopen = await openCopilotOnActivePage();
+      if (reopen !== true) {
+        return { name, savedAs: true, reopenCopilotFailed: reopen || "回执未确认开启" };
+      }
+      return { name, savedAs: true, copilotReopened: true };
     }
     const name = sv.payload && sv.payload.saved ? String(sv.payload.saved) : null;
     return { name: name || "(当前文件)", savedAs: false };
