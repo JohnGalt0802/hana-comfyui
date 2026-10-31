@@ -2305,8 +2305,11 @@ export default defineApp(async (sdk) => {
     const mode = modeRaw || "auto";
     let degradeNote = "";
     let structuralExempt = false; // T1-2：auto 下「inline/inputs 形态直走后台」的结构豁免标记
-    if (mode === "canvas") {
-      return await submitCanvasFlow(args, context);
+    try {
+      if (mode === "canvas") return await submitCanvasFlow(args, context);
+    } catch (e) {
+      if (e && e.__submitCanvasResult) return e.__submitCanvasResult; // v3 同页→副本回落的结果通道
+      throw e;
     }
     if (mode === "auto") {
       // 结构性豁免判定（先于 probe）：inline 对象（非 {template} 单键形态）或带非空 inputs。
@@ -2335,6 +2338,7 @@ export default defineApp(async (sdk) => {
         try {
           return await submitCanvasFlow(args, context, probe);
         } catch (e) {
+          if (e && e.__submitCanvasResult) return e.__submitCanvasResult; // v3 同页→副本回落的结果通道
           if (e && e.code === "canvas-busy") throw e; // 画布忙：报错退出（不抢占、不静默改走后端）
           const stopped = autoStopReplyForCanvasError(e);
           warn(`submit auto 停下（${stopped.details.comfyui.code}）：${stopped.details.comfyui.reason}`);
@@ -2547,12 +2551,21 @@ export default defineApp(async (sdk) => {
     return { job, bridge, subagentOrigin, sessionPath };
   }
 
-  // canvas 流程（D1 契约 §3.1；v2 副驾驶规则 2026-10-08 升级为「复制工作台」五步）：
-  //   duplicate（复制副本）→ save（副本落盘：<原名去尾> (AgentCopy) YYYYMMDD-HHmm，重名递增）
-  //   → 开副本 copilot → loadWorkflowFile（装载）→ settle + 落点断言 → canvas.queue（快返）。
-  //   前置：画布在线 + 写授权 + 副驾驶总闸（readAllowCopilot）；不满足时按失败码抛错。
+  // canvas 流程（D1 契约 §3.1；执行路径 v3.1，2026-10-31 真机复现必修）：
+  //   判定分支：先读 activePageCopilot()（canvas.pages 活动页逐页账本；pages 不可用才回落
+  //   fetchCanvasCopilot() 的 state 缓存）——
+  //   · enabled === true → 同页路径：预存当前画布（覆盖前先落盘）→（目标≠活动页时）loadWorkflowFile 装载
+  //     → settle + 落点断言 → canvas.queue。依据：副驾驶开 = 用户已授权共编同页，此时复制副本反而多此一举。
+  //   · 否则（含 null/undefined）→ 副本路径（v2「复制工作台」五步，逻辑不变）：
+  //     duplicate → save（<原名去尾> (AgentCopy) YYYYMMDD-HHmm，重名递增）→ 开副本 copilot
+  //     → loadWorkflowFile（装载）→ settle + 落点断言 → canvas.queue。原布零改动。
+  //   回落：同页路径里第一次真正的写操作（loadWorkflowFile / queue）若被桥拒绝（copilot_off），
+  //     说明缓存状态过期——桥是权威，不凭缓存硬顶，立即回落副本路径，结果标注 fallback:"copilot_off"。
+  //   前置：画布在线 + 写授权（两路都要，都是写操作）；副驾驶总闸（readAllowCopilot）只在副本路径需要
+  //     （副本要开副驾驶才有它的事），挪进副本路径。
   //   失败抛错（code：canvas-offline / canvas-busy / canvas-unauthorized / canvas-unloadable / canvas-failed），
   //   auto 调用方按 code 分流：授权缺 / 失败 / 未知 → 停下回执（blocked）；canvas-busy → 报错退出。
+  //   copilot_off 在同页路径只作回落信号，不直接抛给调用方（除非回落也失败）。
   async function submitCanvasFlow(args, context, probeIn, preRefIn) {
     const probe = probeIn || (await canvasProbe());
     if (!probe.ok) {
@@ -2567,12 +2580,6 @@ export default defineApp(async (sdk) => {
       const e = new Error("未开启「允许 agent 修改画布」授权（画布流程会复制/装载/执行，需先在 Hana-ComfyUI 设置页开启；或显式 mode=backend）");
       e.code = "canvas-unauthorized"; e.gate = "write"; throw e;
     }
-    // v2（2026-10-08）：副驾驶总闸——canvas 流程要在副本上开启副驾驶（第 3 步）；
-    // 总闸关则不可走画布路径（auto 停下 + 选项；显式 mode=canvas 时直接报错）。
-    if (!readAllowCopilot()) {
-      const e = new Error("未开启「允许 Agent 开启画布副驾驶」授权——canvas 流程需在副本上开启副驾驶（请先在 Hana-ComfyUI 设置页打开「允许 Agent 开启画布副驾驶」；或显式 mode=backend）");
-      e.code = "canvas-unauthorized"; e.gate = "copilot"; throw e;
-    }
     if (args.inputs !== undefined && args.inputs !== null && !(typeof args.inputs === "object" && Object.keys(args.inputs || {}).length === 0)) {
       const e = new Error("inputs 注入暂不支持画布路径（画布按文件装载原样参数；可显式 mode=backend 做注入）");
       e.code = "canvas-unloadable"; throw e;
@@ -2582,63 +2589,132 @@ export default defineApp(async (sdk) => {
     const wfPath = typeof wfArg === "string" ? wfArg.trim() : "";
     const wfTemplate = isPlainObject(wfArg) && typeof wfArg.template === "string" && Object.keys(wfArg).length === 1 ? wfArg.template.trim() : "";
     const ref = preRefIn || (await resolveCanvasLoadRef({ wfPath, wfTemplate }));
-    // ② 复制副本（v2 固定路径，2026-10-08）：无论用户画布副驾驶开关如何，一律先复制——
-    //    「copilot 开 = 共编同页」自动分支已去除（降为「用户明确要求」的人工例外，不走本流程）。
-    //    红线：原布零改动。
-    const dup = await canvasBridgeInvoke("canvas.duplicate", {});
-    if (!dup.ok) {
-      if (dup.error === "copilot_off") throw copilotOffError("duplicate", dup); // 防御：duplicate 本在豁免名单
-      const e = new Error(`复制画布失败：${dup.error || "未知"}`); e.code = "canvas-failed"; throw e;
+    // ② 执行路径判定（v3.1，2026-10-31 真机复现必修）：活动页副驾驶 enabled===true → 同页；否则副本。
+    //    取数顺序：activePageCopilot()（canvas.pages 活动页，state 缓存对「刚切过去的页」滞后——
+    //    真机实测页 A 开着仍误复制 (2)）→ pages 不可用（null）时回落 fetchCanvasCopilot()（state 缓存）。
+    //    null/undefined / known:false（活动页判不出 / 未上报）按「未开」处理——宁可多复制，不可在未授权同页的布上动写。
+    //    copilotSource 标注判定依据："pages"（pages 活动页且上报过 copilot）/ "pages-unknown"（pages 里
+    //    活动页或其 copilot 状态判不出）/ "state"（回落 state 缓存）。
+    //    回落重入（__agentCopyFallback 已设）强制走副本路径：此时缓存已证实过期，禁止再信一次同页判定
+    //    （否则同页再被拒 → 再回落 → 无限递归）。
+    let copilotNow = null;
+    let copilotSource = "state";
+    if (!args.__agentCopyFallback) {
+      copilotNow = await activePageCopilot();
+      if (copilotNow) {
+        copilotSource = copilotNow.known ? "pages" : "pages-unknown";
+      } else {
+        copilotNow = await fetchCanvasCopilot();
+      }
     }
-    const dupPage = dup.payload && dup.payload.page ? String(dup.payload.page) : null;
-    const dupKey = dup.payload && dup.payload.key ? String(dup.payload.key) : null;
-    const pageKey = dupPage || dupKey || null;
-    // ③ 副本落盘：命名 <原名去尾> (AgentCopy) YYYYMMDD-HHmm（重名递增；语义见 pickAgentCopyName）。
-    //    落盘走桥的「另存并切换」链——先拿到有文件身份的副本，再开副驾驶（v2 第 2、3 步顺序固定）。
-    const copyName = await pickAgentCopyName(dupPage || dupKey);
-    const saveRevBefore = await canvasRevisionRead();
-    const sv = await canvasBridgeInvoke("canvas.save", { name: copyName });
-    if (!sv.ok) {
-      if (sv.error === "copilot_off") throw copilotOffError("save", sv); // 防御：save 本在豁免名单
-      const e = new Error(`副本落盘失败：${sv.error || "未知"}`); e.code = "canvas-failed"; throw e;
+    const sameCanvas = !!(copilotNow && copilotNow.enabled === true);
+    const pageKeyFromCopilot = copilotNow && copilotNow.pageKey ? String(copilotNow.pageKey) : null;
+    // 同页路径（v3 新增）：预存当前画布（装载会覆盖当前图，覆盖前必须先落盘），再装载 + 执行。
+    let preSave = null;
+    if (sameCanvas) {
+      preSave = await preSaveActiveCanvas();
     }
-    if (sv.payload && sv.payload.savedAs === true && sv.payload.pending === true) {
-      await settleSaveAsPending(sv.payload, saveRevBefore);
+    // ③ 复制副本（v3：仅未开副驾驶时；总闸 readAllowCopilot 只在副本路径需要——副本要开副驾驶才用得着它）。
+    let dup = null, dupPage = null, dupKey = null, pageKey = pageKeyFromCopilot, copyName = null, copyFile = null;
+    if (!sameCanvas) {
+      if (!readAllowCopilot()) {
+        const e = new Error("未开启「允许 Agent 开启画布副驾驶」授权——canvas 流程需在副本上开启副驾驶（请先在 Hana-ComfyUI 设置页打开「允许 Agent 开启画布副驾驶」；或显式 mode=backend）");
+        e.code = "canvas-unauthorized"; e.gate = "copilot"; throw e;
+      }
+      const d = await canvasBridgeInvoke("canvas.duplicate", {});
+      if (!d.ok) {
+        if (d.error === "copilot_off") throw copilotOffError("duplicate", d); // 防御：duplicate 本在豁免名单
+        const e = new Error(`复制画布失败：${d.error || "未知"}`); e.code = "canvas-failed"; throw e;
+      }
+      dup = d;
+      dupPage = dup.payload && dup.payload.page ? String(dup.payload.page) : null;
+      dupKey = dup.payload && dup.payload.key ? String(dup.payload.key) : null;
+      pageKey = dupPage || dupKey || null;
+      // 副本落盘：命名 <原名去尾> (AgentCopy) YYYYMMDD-HHmm（重名递增；语义见 pickAgentCopyName）。
+      // 落盘走桥的「另存并切换」链——先拿到有文件身份的副本，再开副驾驶（v2 第 2、3 步顺序固定）。
+      copyName = await pickAgentCopyName(dupPage || dupKey);
+      const saveRevBefore = await canvasRevisionRead();
+      const sv = await canvasBridgeInvoke("canvas.save", { name: copyName });
+      if (!sv.ok) {
+        if (sv.error === "copilot_off") throw copilotOffError("save", sv); // 防御：save 本在豁免名单
+        const e = new Error(`副本落盘失败：${sv.error || "未知"}`); e.code = "canvas-failed"; throw e;
+      }
+      if (sv.payload && sv.payload.savedAs === true && sv.payload.pending === true) {
+        await settleSaveAsPending(sv.payload, saveRevBefore);
+      }
+      copyFile = sv.payload && sv.payload.saved ? String(sv.payload.saved) : `workflows/${copyName}.json`;
+      // 开副本副驾驶（v2 第 3 步；Agent 默认在副本上工作——不碰原布）
+      const cp = await openCopilotOnActivePage();
+      if (cp !== true) {
+        const e = new Error(`开启副本副驾驶失败：${cp || "回执未确认开启"}`); e.code = "canvas-failed"; throw e;
+      }
     }
-    const copyFile = sv.payload && sv.payload.saved ? String(sv.payload.saved) : `workflows/${copyName}.json`;
-    // ④ 开副本副驾驶（v2 第 3 步；Agent 默认在副本上工作——不碰原布）
-    const cp = await canvasBridgeInvoke("canvas.copilot", { enabled: true });
-    if (!cp.ok || !(cp.payload && cp.payload.enabled === true)) {
-      if (cp.error === "copilot_off") throw copilotOffError("copilot", cp); // 防御：copilot 本在豁免名单
-      const e = new Error(`开启副本副驾驶失败：${cp.error || "回执未确认开启"}`); e.code = "canvas-failed"; throw e;
-    }
-    // ⑤ 装载提交的工作流到副本（force：装载发生在副本上——零风险）。
+
+    // ⑤ 装载提交的工作流（同页路径装到当前页——由预存保底；副本路径装到副本——force 零风险）。
     //    ⚠ 时序（修复 3）：桥侧 loadWorkflowFile 是快返（fire-and-forget）；v1.53.6 的
     //    app.loadGraphData 在 configure 前至少 3 处 await（扩展钩子 ×2、nodeReplacementStore.load），
     //    且 clean() 先行清图——快返后画布可能仍处「空图 / 旧图」窗口，不能拿快返当「装好了」。
     //    身份保持（补丁批 2026-10-08 已就位）：loadWorkflowFile 传「装载前活动页对象」为第 4 参，
     //    活动页保持在副本页（v1.55.14 activateLoadedWorkflow 对对象走 store.openWorkflow）。
+    // 3b（v3）：同页且目标工作流就是当前活动页 → 跳过装载（预存后当前图即目标，直接执行）。
+    const skipLoad = sameCanvas && canvasPageMatches(
+      running && running.activeWorkflow != null ? String(running.activeWorkflow) : null,
+      [ref.file]
+    );
     const revBefore = await canvasRevisionRead(); // 装载前序号（settle 参照；取不到退化为纯计数判定）
-    const ld = await canvasBridgeInvoke("canvas.loadWorkflowFile", { file: ref.file, force: true });
-    if (!ld.ok) {
-      if (ld.error === "copilot_off") throw copilotOffError("loadWorkflowFile", ld);
-      const e = new Error(`装载工作流到画布失败：${ld.error || "未知"}`); e.code = "canvas-failed"; throw e;
+    let ld = null;
+    if (!skipLoad) {
+      ld = await canvasBridgeInvoke("canvas.loadWorkflowFile", { file: ref.file, force: true });
+      if (!ld.ok) {
+        // v3 回落：仅限同页路径（__agentCopyFallback 重入不再回落，防无限递归）。copilot_off 说明
+        // 缓存状态过期——桥是权威，转入副本路径重走全链；本变量不再使用。
+        if (ld.error === "copilot_off" && sameCanvas && !args.__agentCopyFallback) {
+          await runAgentCopyPath(args, ref, context, "copilot_off");
+        }
+        const e = new Error(`装载工作流到画布失败：${ld.error || "未知"}`); e.code = "canvas-failed"; throw e;
+      }
+      if (ld.payload && ld.payload.loaded === false) {
+        const e = new Error(`装载被拒（${ld.payload.blocked || "未保存保护等"}）`); e.code = "canvas-failed"; throw e;
+      }
     }
-    if (ld.payload && ld.payload.loaded === false) {
-      const e = new Error(`装载被拒（${ld.payload.blocked || "未保存保护等"}）`); e.code = "canvas-failed"; throw e;
-    }
-    // ⑥ settle + 落点断言（v2：总是断言——执行页必须是 Agent 副本页）。
-    //    等目标页节点数与预期一致（或 revision 位移）再放行 queue；超时 / 落点不符 → 报错退出（不 queue）。
-    const targetCandidates = [...new Set([copyName, copyFile, dupPage, dupKey].filter(Boolean))];
+    // ⑥ settle + 落点断言（分路径口径，2026-10-31 真机误拦必修）。
+    //    副本路径（strict）：活动页必须是新建副本页——拿「副本页名」比对「活动页名」，names 命中即 strict 通过。
+    //    同页路径：页面身份（sid / pageKey / 文件）在装载前后保持原样，只是内容换成目标文件——
+    //    拿「目标文件名」比对「页面名」必然不等（真机实拦：活动页「Unsaved Workflow (AgentCopy) …」≠「_smoke-…」）。
+    //    改按分支断言：①页面身份未变（settle 后活动页 ∈ 提交前快照的候选名单）②内容已装载（活动页名与目标文件
+    //    名字比对，容忍桥侧显示名差异：去 .json / 反斜杠归一 / 大小写；skipLoad 时本就同文件视为已装载）。
+    //    ①失败（活动页变成了别的页）→ 中止不 queue；①过而②比对不上 → 显示名差异降级 warning 继续
+    //    （landingCheck:"soft"），写进回执。身份快照拿不到 → 退化弱判据「活动页不是任何一个 (AgentCopy) 新页」
+    //    （pageIdentityCheck:"weak"）。
+    const targetCandidates = sameCanvas
+      ? [...new Set([String(ref.file).split("/").pop().replace(/\.json$/i, ""), ref.file].filter(Boolean))]
+      : [...new Set([copyName, copyFile, dupPage, dupKey].filter(Boolean))];
+    const activeBefore = await captureActivePageIdentity();
     await waitCanvasLoadSettled({
-      expectedNodes: ld.payload && Number.isFinite(Number(ld.payload.nodeCount)) ? Number(ld.payload.nodeCount) : null,
+      expectedNodes: ld && ld.payload && Number.isFinite(Number(ld.payload.nodeCount)) ? Number(ld.payload.nodeCount) : null,
       revBefore: revBefore ? revBefore.revision : null,
       targetCandidates,
+      landing: {
+        expectedNodes: ld && ld.payload && Number.isFinite(Number(ld.payload.nodeCount)) ? Number(ld.payload.nodeCount) : null,
+        sameCanvas,
+        identityCandidates: activeBefore ? activeBefore.candidates : null,
+        targetCandidates,
+        skipLoad,
+      },
     });
+    const landing = await judgeSamePageLanding({ activeBefore, ref, skipLoad });
+    const landingCheck = sameCanvas ? (landing.loaded ? "strict" : "soft") : "strict";
+    const pageIdentityCheck = sameCanvas ? (activeBefore ? "strict" : "weak") : "strict";
     // ⑦ 画布发起执行（快返）；promptId 缺失时用 /queue 前后差集反查
     const before = await queuePromptIdsSnapshot();
     const q = await canvasBridgeInvoke("canvas.queue", args.front === true ? { front: true } : {});
-    if (!q.ok) { const e = new Error(`画布执行提交失败：${q.error || "未知"}`); e.code = "canvas-failed"; throw e; }
+    if (!q.ok) {
+      // v3 回落：同页路径 queue 被桥拒（copilot_off）→ 同上，转入副本路径（此后代码不再使用）。
+      if (q.error === "copilot_off" && sameCanvas && !args.__agentCopyFallback) {
+        await runAgentCopyPath(args, ref, context, "copilot_off");
+      }
+      const e = new Error(`画布执行提交失败：${q.error || "未知"}`); e.code = "canvas-failed"; throw e;
+    }
     let promptId = q.payload && typeof q.payload.promptId === "string" && q.payload.promptId ? q.payload.promptId : null;
     const number = q.payload && q.payload.number !== undefined ? q.payload.number : undefined;
     let promptIdVia = promptId ? "queue-op" : null;
@@ -2652,19 +2728,27 @@ export default defineApp(async (sdk) => {
     // ⑧ 返回与跟踪：有 promptId → 与 backend 流程同构（宿主任务 + 轮询结算）；
     //    缺失（桥未实现反查）→ 如实说明不可自动跟踪。进度均以画布原生 UI 为准。
     const refName = String(ref.file).split("/").pop() || ref.file;
-    const nodeCount = ld.payload && Number.isFinite(Number(ld.payload.nodeCount)) ? Number(ld.payload.nodeCount) : null;
+    const nodeCount = ld && ld.payload && Number.isFinite(Number(ld.payload.nodeCount)) ? Number(ld.payload.nodeCount) : null;
     const label = String(args.clientLabel || "").trim().slice(0, 120) || `ComfyUI 生成（${refName}${nodeCount ? ` · ${nodeCount} 节点` : ""}）`;
+    // v3 执行路径标注：canvasPath（same-canvas / agent-copy）+ preSave（同页：覆盖前落盘信息）+ fallback（回落原因）。
+    const pathFields = sameCanvas
+      ? { canvasPath: "same-canvas", preSave, fallback: null, copilotSource, landingCheck, pageIdentityCheck, landingMismatch: landing.mismatch }
+      : { canvasPath: "agent-copy", preSave: null, fallback: null, copilotSource, landingCheck: "strict", pageIdentityCheck: "strict", landingMismatch: null };
     if (!promptId) {
       const text = [
         `已发起画布执行（快返）：${label}`,
-        `- 执行位置：画布（Agent 副本页${copyName ? `：${copyName}` : ""}）`,
-        `- 副本文件：${copyFile}（副驾驶已开）`,
+        sameCanvas
+          ? `- 执行位置：画布当前页（副驾驶开，共编同页）`
+          : `- 执行位置：画布（Agent 副本页${copyName ? `：${copyName}` : ""}）`,
+        sameCanvas
+          ? `- 装载前已落盘：${preSave.savedAs ? `另存「${preSave.name}」` : `原文件「${preSave.name}」`}${preSave.savedAs ? "（画布已切到该文件）" : ""}`
+          : `- 副本文件：${copyFile}（副驾驶已开）`,
         `- 来源：${ref.source}`,
         "- 注意：桥未回传 prompt_id，本次无法自动跟踪（进度以画布原生 UI 为准）。",
       ].join("\n");
       return {
         content: [{ type: "text", text }],
-        details: { comfyui: { action: "submit", mode: "canvas", ok: true, promptId: null, pageKey, agentCopy: { name: copyName, file: copyFile, copilotOn: true }, source: ref.source, queued: true, promptIdVia: null } },
+        details: { comfyui: { action: "submit", mode: "canvas", ok: true, promptId: null, pageKey, ...pathFields, agentCopy: sameCanvas ? null : { name: copyName, file: copyFile, copilotOn: true }, source: ref.source, queued: true, promptIdVia: null } },
       };
     }
     // P8（2026-10-08）：任务桥抽取为 attachHostTask（submit / queue 两路复用），行为与原先一致。
@@ -2677,8 +2761,12 @@ export default defineApp(async (sdk) => {
     const text = [
       `已提交 ComfyUI 工作流（画布执行，快返）：${label}`,
       `- prompt_id: ${promptId}${promptIdVia === "queue-diff" ? "（经 /queue 差集反查）" : ""}`,
-      `- 执行位置：画布（Agent 副本页${copyName ? `：${copyName}` : ""}）`,
-      `- 副本文件：${copyFile}（副驾驶已开；原布未被触碰）`,
+      sameCanvas
+        ? `- 执行位置：画布当前页（副驾驶开，共编同页）`
+        : `- 执行位置：画布（Agent 副本页${copyName ? `：${copyName}` : ""}）`,
+      sameCanvas
+        ? `- 装载前已落盘：${preSave.savedAs ? `另存「${preSave.name}」` : `原文件「${preSave.name}」`}${preSave.savedAs ? "（画布已切到该文件）" : ""}`
+        : `- 副本文件：${copyFile}（副驾驶已开；原布未被触碰）`,
       `- 来源：${ref.source}`,
       job.taskId
         ? (subagentOrigin
@@ -2700,7 +2788,8 @@ export default defineApp(async (sdk) => {
           label,
           source: ref.source,
           pageKey,
-          agentCopy: { name: copyName, file: copyFile, copilotOn: true },
+          ...pathFields,
+          agentCopy: sameCanvas ? null : { name: copyName, file: copyFile, copilotOn: true },
           promptIdVia,
           number,
           submittedAt: job.submittedAt,
@@ -3411,7 +3500,56 @@ export default defineApp(async (sdk) => {
   const CANVAS_SETTLE_POLL_MS = 800;
   const CANVAS_SETTLE_TIMEOUT_MS = 30_000;
   const CANVAS_SETTLE_WEAK_POLLS = 4; // 弱证据路径的保守轮数（≈3.2s）
-  async function waitCanvasLoadSettled({ expectedNodes, revBefore, targetCandidates }) {
+  // 同页落点取证（2026-10-31）：只读，提交前抓「当前活动页是谁」。失败返回 null（调用方退化弱判据）。
+  // 逐层候选（同一页在不同读数通道下名字不同，全部收进名单，settle 后命中任意一个即算身份未变）：
+  //   exec.running.activeWorkflow（前台工作流名）→ canvas.pages 活动页 workflow/path →
+  //   copilot.pageKey（pages 活动页 copilot 上报的页面键）。
+  async function captureActivePageIdentity() {
+    const names = new Set();
+    let pageKey = null;
+    try {
+      const run = await canvasBridgeInvoke("exec.running", {});
+      if (run.ok && run.payload && typeof run.payload === "object" && run.payload.activeWorkflow) {
+        names.add(String(run.payload.activeWorkflow));
+      }
+    } catch { /* 取不到，走下一路 */ }
+    try {
+      const pgs = await canvasBridgeInvoke("canvas.pages", {});
+      const pages = pgs.ok && pgs.payload && Array.isArray(pgs.payload.pages) ? pgs.payload.pages.filter((p) => p && p.stale !== true) : null;
+      if (pages && pages.length) {
+        const actives = pages.filter((p) =>
+          Array.isArray(p.openWorkflows) && p.openWorkflows.length
+            ? p.openWorkflows.some((w) => w && w.active === true)
+            : true
+        );
+        const active = actives.reduce((a, b) => (Number(b.ageSec) < Number(a.ageSec) ? b : a));
+        for (const n of [active.workflow, active.path]) if (n) names.add(String(n));
+        if (active.copilot && typeof active.copilot.pageKey === "string" && active.copilot.pageKey) {
+          pageKey = active.copilot.pageKey;
+          names.add(pageKey);
+        }
+      }
+    } catch { /* 同上 */ }
+    if (!names.size) return null;
+    return { pageKey, candidates: [...names] };
+  }
+
+  // 同页内容装载核对（2026-10-31）：settle 后取当前活动页，与目标文件名字比对（canvasPageMatches
+  // 口径：去 .json / 反斜杠归一 / 大小写不敏感）。命中 → strict 已装载；比对不上 → true + mismatch
+  // （显示名差异，降级 soft，不阻断）；skipLoad 时本就是目标文件，视为已装载。只返回 loaded: boolean +
+  // mismatch 诊断，不抛错——页面身份断言失败已单独中止。
+  async function judgeSamePageLanding({ activeBefore, ref, skipLoad }) {
+    if (skipLoad) return { loaded: true, mismatch: null };
+    let active = null;
+    try {
+      const run = await canvasBridgeInvoke("exec.running", {});
+      if (run.ok && run.payload && typeof run.payload === "object") active = run.payload.activeWorkflow || null;
+    } catch { /* 取不到 → 比对不上，按显示名差异处理 */ }
+    if (canvasPageMatches(active, [ref.file])) return { loaded: true, mismatch: null };
+    return { loaded: false, mismatch: { before: activeBefore ? activeBefore.candidates : null, after: active, target: ref.file } };
+  }
+
+  async function waitCanvasLoadSettled({ expectedNodes, revBefore, targetCandidates, landing }) {
     const deadline = Date.now() + CANVAS_SETTLE_TIMEOUT_MS;
     const target = Array.isArray(targetCandidates) && targetCandidates.length ? targetCandidates : null;
     let polls = 0;
@@ -3422,12 +3560,27 @@ export default defineApp(async (sdk) => {
     for (;;) {
       await sleep(CANVAS_SETTLE_POLL_MS);
       polls += 1;
-      // 落点断言（v2 总是启用）：活动页必须是目标副本页；不符立即报错（不 queue）
+      // 落点断言（v2 → 2026-10-31 分路径）：副本路径 = 活动页必须是新建副本页（原口径保留）；
+      // 同页路径 = 先断言页面身份未变（活动页 ∈ 提交前快照候选；拿不到快照退化弱判据「不是任何
+      // (AgentCopy) 新页」），再核对内容装载——名字比对不上只降级 soft（true + mismatch），不中断轮询。
       if (target) {
         const run = await canvasBridgeInvoke("exec.running", {});
         if (run.ok && run.payload && typeof run.payload === "object" && "activeWorkflow" in run.payload) {
           const active = run.payload.activeWorkflow;
-          if (!canvasPageMatches(active, target)) {
+          if (landing && landing.sameCanvas) {
+            const strictCands = (landing.identityCandidates || []).map((n) => String(n));
+            const idOk = strictCands.length
+              ? canvasPageMatches(active, strictCands)
+              : !/\(AgentCopy\)\s*\d{8}-\d{4}/i.test(String(active || ""));
+            if (!idOk) {
+              const weak = !(landing.identityCandidates || []).length;
+              const e = new Error(weak
+                ? `同页执行已中止：活动页在装载过程中发生变化（当前「${active || "(未知)"}」，疑似新建副本页；页面身份快照不可用，弱判据命中）（不 queue）`
+                : `同页执行已中止：活动页在装载过程中发生变化（提交前「${strictCands.join(" / ")}」，当前「${active || "(未知)"}」）（不 queue）`);
+              e.code = "canvas-failed";
+              throw e;
+            }
+          } else if (!canvasPageMatches(active, target)) {
             const e = new Error(`装载落点不符：当前活动页「${active || "(未知)"}」，应为目标页「${target[0]}」（不 queue）`);
             e.code = "canvas-failed";
             throw e;
@@ -3574,6 +3727,48 @@ export default defineApp(async (sdk) => {
     return undefined;
   }
 
+  // v3.1（2026-10-31 真机复现必修）：活动页副驾驶判定——改读 canvas.pages 的逐页账本。
+  // 为何不信 canvas.state：state 是服务端快照缓存（py /hana_bridge/state 上报时更新，bridge/__init__.py
+  // L648-662），对「刚切过去的页」滞后——真机实测页 A 副驾驶开、state 仍报旧页 → enabled!==true 误走副本路径。
+  // canvas.pages 数据源＝py 侧 op=="canvas.pages" 直答 _pages_payload()（bridge/__init__.py L334-337、L322-361），
+  // 不依赖前端实时回包。页条目字段（py _pages_payload L322-361）：
+  //   sid/sidFull、workflow（前台工作流名，桥 js currentWorkflowInfo L235-243 读 activeWorkflow）、
+  //   path、modified、ageSec（seenAt 距今秒）、copilot {enabled, pageKey?, updatedAt}（该页最近上报，L341-344；
+  //   从未上报=null）、stale、openWorkflows [{name,path,key,active,dirty}]（L388-404；桥 js
+  //   openWorkflowsInfo L328-342 上报，active = 该项 === activeWorkflow）。
+  // 「当前活动页」判据（与 py 定向路由 L533-546 同口径——前台名命中或 openWorkflows.active 命中都算前台）：
+  //   ① openWorkflows 非空数组 → 取其中有 active:true 的页（多标签精确判据）；
+  //   ② openWorkflows 缺失或空数组（旧桥/读不到 store）→ 该页 workflow 本身即 activeWorkflow（L235-243），
+  //      非 stale 即活动页候选；
+  //   ③ 多个候选 → 取 ageSec 最小者（最近上报，等价 py _live_pick 的 seenAt 最新，L187-189）。
+  // 返回 { enabled, pageKey, known }；known=false（活动页判不出 / 该页 copilot 未上报）→ 调用方按
+  // 「未开」走副本路径并标 copilotSource:"pages-unknown"；pages 不可用（桥旧版/报错）→ 返回 null，
+  // 调用方回落 fetchCanvasCopilot()（state 缓存）。
+  async function activePageCopilot() {
+    let pages = null;
+    try {
+      const pgs = await canvasBridgeInvoke("canvas.pages", {});
+      if (pgs.ok && pgs.payload && Array.isArray(pgs.payload.pages)) pages = pgs.payload.pages;
+    } catch { /* pages 拿不到 → 回落 state */ }
+    if (!pages) return null;
+    const fresh = pages.filter((p) => p && p.stale !== true);
+    const candidates = fresh.filter((p) =>
+      Array.isArray(p.openWorkflows) && p.openWorkflows.length
+        ? p.openWorkflows.some((w) => w && w.active === true)
+        : true
+    );
+    if (!candidates.length) return { enabled: false, pageKey: null, known: false };
+    const active = candidates.reduce((a, b) => (Number(b.ageSec) < Number(a.ageSec) ? b : a));
+    if (!active.copilot || typeof active.copilot !== "object" || typeof active.copilot.enabled !== "boolean") {
+      return { enabled: false, pageKey: null, known: false };
+    }
+    return {
+      enabled: active.copilot.enabled === true,
+      pageKey: typeof active.copilot.pageKey === "string" && active.copilot.pageKey ? active.copilot.pageKey : null,
+      known: true,
+    };
+  }
+
   // v2 副本落盘命名：<原名去尾> (AgentCopy) YYYYMMDD-HHmm；重名递增「 (2)」「 (3)」…。
   // 「原名去尾」= 从 duplicate 产物页名派生（去 .json、去尾部「 (N)」副本递增、「 (Copy)」副本后缀，
   // 以及 T3-2 补上的「 (AgentCopy) YYYYMMDD-HHmm」历史副本段——与桥侧 duplicate 的清洗口径同源）。
@@ -3598,13 +3793,26 @@ export default defineApp(async (sdk) => {
     return base;
   }
 
+  // v3 同页另存派生名：临时页（无文件身份）取桥报错里的临时名（或退化「workflow」），
+  // 命名 <原名去尾> (AgentSaved) YYYYMMDD-HHmm（重名递增，探测同 pickStampedCopyName）。
+  async function pickAgentSavedName(bridgeMsg) {
+    const m = String(bridgeMsg || "").match(/「(.+?)」/);
+    return pickStampedCopyName(m ? m[1] : "", "AgentSaved");
+  }
+
   async function pickAgentCopyName(srcPage) {
+    return pickStampedCopyName(srcPage, "AgentCopy");
+  }
+
+  // 带标记的落盘命名：<原名去尾> (<marker>) YYYYMMDD-HHmm（重名递增「 (2)」「 (3)」…）。
+  // marker=AgentCopy（副本路径）｜AgentSaved（v3 同页预存的另存形态）；探测逻辑原 pickAgentCopyName 原样。
+  async function pickStampedCopyName(srcPage, marker) {
     const base = agentCopyBaseName(srcPage);
     const d = new Date();
     const pad = (n) => String(n).padStart(2, "0");
     const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
     for (let i = 1; i <= 50; i++) {
-      const name = i === 1 ? `${base} (AgentCopy) ${stamp}` : `${base} (AgentCopy) ${stamp} (${i})`;
+      const name = i === 1 ? `${base} (${marker}) ${stamp}` : `${base} (${marker}) ${stamp} (${i})`;
       let exists = false;
       try {
         const r = await relayJson(`/_relay/userdata?file=${encodeURIComponent(`workflows/${name}.json`)}`, { timeoutMs: 8_000 });
@@ -3612,7 +3820,68 @@ export default defineApp(async (sdk) => {
       } catch { exists = false; }
       if (!exists) return name;
     }
-    throw new Error(`副本落盘命名失败：同名 50 连撞（${base} (AgentCopy) ${stamp}…）`);
+    throw new Error(`落盘命名失败：同名 50 连撞（${base} (${marker}) ${stamp}…）`);
+  }
+
+  // ── v3 执行路径二选一（2026-10-31 用户当面定稿）辅助三件 ──────────────
+  // 纪律：副驾驶开 = 用户已授权共编同页 → 在当前画布直接执行（装载前先落盘，防覆盖丢失）；
+  // 未开 → 复制副本、开副本副驾驶、在副本上执行（原布零改动，v2 五步不变）。
+  // 判定只信桥：写操作被 copilot_off 拒绝时立即回落副本路径，不凭缓存硬顶。
+
+  // 同页路径第 1 步：预存当前画布（装载会覆盖当前图，覆盖前必须先落盘）。
+  // 先试同名保存（保存到它自己的文件，画布不切页）；若页面无文件身份（桥报「临时工作流」），
+  // 改走另存形态：派生名 `<原名去尾> (AgentSaved) YYYYMMDD-HHmm`（重名递增，复用 pickAgentCopyName），
+  // 落盘走「另存并切换」链——画布会切到新文件，需 settle 落定。savedAs 信息回传给调用方标注。
+  async function preSaveActiveCanvas() {
+    const sv = await canvasBridgeInvoke("canvas.save", {});
+    if (!sv.ok) {
+      const msg = String(sv.error || "");
+      const noFile = msg.includes("临时工作流"); // 桥侧对无文件身份页面（Unsaved Workflow）的显式报错
+      if (sv.error === "copilot_off" || !noFile) {
+        const e = new Error(`同页执行前预存当前画布失败：${msg || "未知"}`); e.code = "canvas-failed"; throw e;
+      }
+      // 另存形态：从桥报错取临时页名，派生 AgentSaved 名（<原名去尾> (AgentSaved) YYYYMMDD-HHmm），
+      // 落盘并切换（savedAs，画布会切到新文件，settle 落定后把实际名字记进 preSave）。
+      const asName = await pickAgentSavedName(msg);
+      const saveRevBefore = await canvasRevisionRead();
+      const svAs = await canvasBridgeInvoke("canvas.save", { name: asName });
+      if (!svAs.ok) {
+        const e = new Error(`同页执行前预存当前画布失败（另存「${asName}」）：${svAs.error || "未知"}`); e.code = "canvas-failed"; throw e;
+      }
+      if (svAs.payload && svAs.payload.savedAs === true && svAs.payload.pending === true) {
+        await settleSaveAsPending(svAs.payload, saveRevBefore);
+      }
+      const name = svAs.payload && svAs.payload.saved ? String(svAs.payload.saved) : `workflows/${asName}.json`;
+      return { name, savedAs: true };
+    }
+    const name = sv.payload && sv.payload.saved ? String(sv.payload.saved) : null;
+    return { name: name || "(当前文件)", savedAs: false };
+  }
+
+  // 开当前活动页副驾驶（副本路径第 3 步专用；copilot 在写拦截豁免名单，但受副驾驶总闸管辖——
+  // 总闸检查在调用方 readAllowCopilot()）。返回 true，或失败原因字符串。
+  async function openCopilotOnActivePage() {
+    const cp = await canvasBridgeInvoke("canvas.copilot", { enabled: true });
+    if (!cp.ok || !(cp.payload && cp.payload.enabled === true)) {
+      if (cp.error === "copilot_off") return `copilot_off（防御：copilot 本在豁免名单）`;
+      return cp.error || "回执未确认开启";
+    }
+    return true;
+  }
+
+  // v3 回落通道：同页路径里写操作被桥拒（copilot_off，缓存状态过期）→ 整体重走副本路径。
+  // 本函数不返回：成功 → 直接把副本路径结果返回给调用方（带 fallback:"copilot_off" 标注）；
+  // 失败 → 按原失败码抛错。fallback 原因透传，让调用方能区分「正常副本路径」与「回落」。
+  async function runAgentCopyPath(args, ref, context, fallbackReason) {
+    const flow = await submitCanvasFlow({ ...args, __agentCopyFallback: fallbackReason }, context, null, { file: ref.file, source: ref.source });
+    const txt = typeof flow.content?.[0]?.text === "string" ? flow.content[0].text : "";
+    const tag = `\n- ⚠ 回落说明：同页缓存判定已过期（桥报 copilot_off），本次自动转入副本路径执行；若同页有未落盘改动，已由预存另存（见上方装载前落盘行）。`;
+    flow.content = [{ type: "text", text: txt ? txt + tag : tag.trim() }];
+    if (flow.details && flow.details.comfyui) {
+      flow.details.comfyui.fallback = fallbackReason;
+      if (flow.details.comfyui.canvasPath !== "agent-copy") flow.details.comfyui.canvasPath = "agent-copy";
+    }
+    throw { __submitCanvasResult: flow, message: "copilot_off 回落：结果见 error 对象", code: "copilot_off" };
   }
 
   // P2 抽取（2026-10-08）：另存并切换（savedAs）pending 落定 + 目标文件落盘核对
@@ -5894,15 +6163,26 @@ export default defineApp(async (sdk) => {
       await settlePrepare(true, lines.join("\n"));
     } catch (e) {
       let text;
-      if (e && e.code === "canvas-busy") {
+      if (e && e.__submitCanvasResult) {
+        // v3 同页→副本回落的结果通道：环境准备链闭包里无法 return，结果经 settlePrepare(true,…) 送达
+        const fr = e.__submitCanvasResult;
+        const fc = fr && fr.details && fr.details.comfyui ? fr.details.comfyui : {};
+        const flines = [
+          (fr.content && fr.content[0] && typeof fr.content[0].text === "string" ? fr.content[0].text : "环境准备后已自动继续画布提交（副本路径）。"),
+        ];
+        log(`submit 环境准备链完成（副本路径回落，fallback=${fc.fallback || "copilot_off"}）`);
+        await settlePrepare(true, flines.join("\n"));
+      } else if (e && e.code === "canvas-busy") {
         text = `环境已就绪，但画布忙（不抢占、未提交）：${msgOf(e)}`;
       } else {
         const stopped = autoStopReplyForCanvasError(e);
         const s = stopped && stopped.content && stopped.content[0] ? stopped.content[0].text : msgOf(e);
         text = `环境已就绪，继续提交被停下：\n${s}`;
       }
-      warn(`submit 环境准备链：继续提交失败（${(e && e.code) || "?"}）`);
-      await settlePrepare(false, text);
+      if (text !== undefined) {
+        warn(`submit 环境准备链：继续提交失败（${(e && e.code) || "?"}）`);
+        await settlePrepare(false, text);
+      }
     }
   }
 

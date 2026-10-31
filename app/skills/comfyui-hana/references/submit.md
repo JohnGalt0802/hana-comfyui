@@ -74,8 +74,9 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
   - （停下均为正常返回 + `details.comfyui.blocked: true` 含失败码 / 原因 / 选项摘要；**不静默改走后台**。）
 - **结构性豁免**：`workflow` 为 inline 对象（非 `{template}` 单键形态）或带非空 `inputs` → 形态判定前置（先于探测）、**直接走 backend**；回执注明「未上画布：inline/inputs 形态直走后台提交」。
 - **例外 · 画布忙**：画布有执行中任务 → **报错退出**（不抢占、不静默改走后端；确需后端请显式 `mode=backend`）。
-- **v2「复制工作台」五步**（2026-10-08）：`duplicate`（复制副本；原布零改动）→ `save`（副本落盘：`<原名去尾> (AgentCopy) YYYYMMDD-HHmm`，重名递增 ` (2)`）→ `canvas.copilot {enabled:true}`（开副本副驾驶）→ `loadWorkflowFile`（装载到副本）→ settle（落点断言：活动页＝副本页）→ `canvas.queue`（快返）。
-  「copilot 开＝共编同页」自动分支已去除（共编同页降为「用户明确要求」的人工例外，不走本流程）；副驾驶总闸关时无法在副本上开副驾驶 → 画布路径不可走。
+- **v3 执行路径二选一**（2026-10-31 用户定稿）：先读当前画布副驾驶状态（`enabled === true` → 同页，否则副本）——
+  **同页路径**：`save`（预存当前画布，无文件身份时另存 `<原名去尾> (AgentSaved) YYYYMMDD-HHmm`）→（目标≠活动页时）`loadWorkflowFile` 装载到当前页 → settle → `canvas.queue`；回执带 `canvasPath:"same-canvas"` 与 `preSave:{name, savedAs}`；装载/queue 被 `copilot_off` 拒 → 回落副本路径（标 `fallback:"copilot_off"`）。
+  **副本路径**：`duplicate`（复制副本；原布零改动）→ `save`（副本落盘：`<原名去尾> (AgentCopy) YYYYMMDD-HHmm`，重名递增 ` (2)`）→ `canvas.copilot {enabled:true}`（开副本副驾驶）→ `loadWorkflowFile`（装载到副本）→ settle（落点断言：活动页＝副本页）→ `canvas.queue`（快返）；回执带 `canvasPath:"agent-copy"`。副驾驶总闸只在副本路径需要。
 - `mode=canvas`：强制画布流程（前置不满足直接报错）；`mode=backend`：显式后台直提（**唯一**会记待同步的路径；回执带风险说明——后端丢值先例）。
 
 ### 环境自举链（B 主链 · 2026-10-08）
@@ -87,7 +88,7 @@ comfyui(action="upload", path="D:\\pics\\ref.png")
   1. 中继段：进程内 `ensureManagedRuntime()`（已有单飞行语义）。
   2. 服务段：`envcheck` → `start` → 多轮 `wait`（单次 ≤25s 是宿主硬限；**总时限 150s**）→ 重探；**envcheck 阻断 → 停下报告、不自动清障**。
   3. 工作区段：重探两腿（#49）；**工作区没开 → 自动拉起宿主原生窗**（`/workspace.html`；需能力 `app/windows.manage`；回执注明「已拉起工作区窗口（aw_*）」）→ 等就绪（探测自愈，**90s**）；壳页在线但桥不可达 → 不双开（同刻仅一壳页）、等自愈，超时停下 + 指引。
-- **就绪自动继续**：重探通过 → 走完画布五步（复制副本 → 落盘 → 副驾驶 → 装载 → 执行）→ 准备任务 `complete`（注明实际动作与 prompt 指向；产物回执由跟踪任务送达）。
+- **就绪自动继续**：重探通过 → 走完画布执行路径（v3 二选一：副驾驶开走同页四步；未开走副本五步——复制副本 → 落盘 → 副驾驶 → 装载 → 执行）→ 准备任务 `complete`（注明实际动作与 prompt 指向；产物回执由跟踪任务送达）。
 - **失败停下**：准备任务 `fail`（或日志，无 callToken 时）；阻断类回执附阻断明细 + `snapshotId` + 处理指引（`service clear` 后重新提交即可自动续跑）。
 - **静态预检前移**：装载引用解析在快返前先跑——「引用不可装载」立即停下（`canvas-unloadable`），不必等环境就绪。
 - **边界**：跨 App 重载 / 宿主重启无持久化（与现状一致）；工作区拉起不做周期巡检（按需检测）。
