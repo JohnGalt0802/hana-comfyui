@@ -1,6 +1,6 @@
 ---
 name: comfyui-hana
-description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端（iframe 直连 8188，自定义节点扩展可用）；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；画布读写——读/改人正在看的同一张画布（投影 get / 体检 / 追踪 / 大纲 / patch 事务 / 自动排布）；画布执行与副驾驶（queue 画布执行 / duplicate 复制 / visual 锁与高亮 / 共编开关）；工作区顶栏与左侧面板均可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；可自定义 ComfyUI 安装目录；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、自定义 ComfyUI 目录/ComfyUI 装在别处、自定义节点不显示/扩展脚本 403、帮我安装 ComfyUI、未检测到 ComfyUI 环境、画布执行、在画布上跑工作流、复制画布、副驾驶、共编画布、小花副驾驶。
+description: Hana-ComfyUI（v2 App）——把本机 ComfyUI（127.0.0.1:8188）接进 Hana：整页工作区嵌官方前端（iframe 直连 8188，自定义节点扩展可用）；comfyui 工具支持提交工作流/跟踪进度/取回产物/取消/上传/服务起停（service）；画布读写——读/改人正在看的同一张画布（投影 get / 体检 / 追踪 / 大纲 / patch 事务 / 自动排布）；画布执行与副驾驶（queue 画布执行 / duplicate 复制 / visual 锁与高亮 / 共编开关）；工作区顶栏与左侧面板均可一键启动/停止 ComfyUI 服务（计划任务拉起，独立于 Hana 存活）；可自定义 ComfyUI 安装目录；环境自举——未安装时引导 agent 完成安装。触发场景：用 ComfyUI 生成图片、提交工作流、查看生成进度、取回产物、取消生成任务、查询队列、上传参考图、启动/停止 ComfyUI 服务、帮我启动 ComfyUI、帮我关掉 ComfyUI、ComfyUI 工作区打不开、中继未就绪/启动失败、ComfyUI 后端不可达（8188）、自定义 ComfyUI 目录/ComfyUI 装在别处、自定义节点不显示/扩展脚本 403、帮我安装 ComfyUI、未检测到 ComfyUI 环境、画布执行、在画布上跑工作流、复制画布、副驾驶、共编画布、小花副驾驶、校验工作流、找官方模板、缺节点包。
 ---
 
 # Hana-ComfyUI（v0.12）
@@ -68,6 +68,9 @@ submit 走画布执行时**先看当前画布副驾驶开关**，二选一，不
 | 副驾驶（共编）与行为准则：大动作/小动作尺度、锁/高亮、开关细则 | `references/copilot.md` |
 | 排障：中继/桥/页面状态/常见坑/路由与日志位置 | `references/troubleshooting.md` |
 | 未安装 ComfyUI：完整安装流程（Windows 主线） | `INSTALL.md` |
+| 提交前校验工作流：8 类错误码、suggestions 怎么读、不通过时怎么办 | `references/validate.md` |
+| 官方模板库：检索参数、hui-templates 落盘与上画布、缺模型处理、mediaType 数据现状 | `references/templates.md` |
+| 缺节点包诊断：三态的下一步动作、多候选与纯前端扩展为什么查不到 | `references/deps.md` |
 
 ## 工具面速览
 
@@ -80,3 +83,6 @@ submit 走画布执行时**先看当前画布副驾驶开关**，二选一，不
 | `workflows` / `upload` | 列/读已保存工作流；上传参考图（图生图） | `references/submit.md` |
 | `service` / `update` | 8188 服务进程起停与环境检查；本体更新（仅源码安装） | `references/service.md` |
 | `canvas` | 读/改人正在看的同一张画布（写入需授权） | `references/canvas.md` |
+| `validate` | 提交前校验工作流（不拦 submit，报错/警告 + 可选值建议） | `references/validate.md` |
+| `templates` | 官方模板库检索（list）与拉取落盘（fetch） | `references/templates.md` |
+| `deps` | 缺节点包诊断（没装 / 装了没加载 / 查不到来源） | `references/deps.md` |

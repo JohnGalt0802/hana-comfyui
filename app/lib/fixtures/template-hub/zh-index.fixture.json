@@ -1,0 +1,734 @@
+[
+ {
+  "moduleName": "default",
+  "type": "image",
+  "category": "基础",
+  "icon": "icon-[lucide--image]",
+  "title": "图像",
+  "templates": [
+   {
+    "name": "api_nano_banana_2_1_t2i",
+    "title": "Nano Banana 2.1：文生图",
+    "description": "使用 Nano Banana 2.1（Google 基于 Gemini 的快速图像模型）从文本提示生成图像，输出一张已完成图像，无需任何输入文件。非常适合品牌营销海报、电商产品视觉图和 IP 角色系列。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "tags": [
+     "文生图",
+     "API",
+     "图像"
+    ],
+    "models": [
+     "Nano Banana"
+    ],
+    "logos": [
+     {
+      "provider": "Google"
+     }
+    ],
+    "minComfyUIVersion": "0.39.1",
+    "date": "2026-10-06",
+    "openSource": false,
+    "size": 0,
+    "usage": 4836,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "outputs": [
+      {
+       "nodeId": 3,
+       "nodeType": "SaveImageAdvanced",
+       "file": "api_nano_banana_2_1_t2i.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "output/api_nano_banana_2_1_t2i.png"
+    ]
+   },
+   {
+    "name": "image_qwen_image_2_1_image_edit",
+    "title": "Qwen Image 2.1：图像编辑",
+    "description": "使用 Qwen Image 2.1 编辑图像：向同一个同时负责生成和编辑的模型输入两张参考图，再将结果与原图对比。适合角色一致性编辑、带真实透明通道的产品抠图合成，以及原生 2K 风格迁移。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "compareSlider",
+    "tags": [
+     "图片编辑",
+     "Int8"
+    ],
+    "models": [
+     "Qwen Image 2.1"
+    ],
+    "minComfyUIVersion": "0.37.0",
+    "date": "2026-09-20",
+    "openSource": true,
+    "size": 26736171418,
+    "usage": 15978,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 470,
+       "nodeType": "LoadImage",
+       "file": "portrait_model_denim.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      },
+      {
+       "nodeId": 475,
+       "nodeType": "LoadImage",
+       "file": "clothing_light_blue_denim_shirt.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ]
+    },
+    "thumbnail": [
+     "input/portrait_model_denim.png",
+     "output/image_qwen_image_2_1_image_edit.png"
+    ]
+   },
+   {
+    "name": "image_qwen_image_2_1_t2i",
+    "title": "Qwen Image 2.1：文生图",
+    "description": "使用 Qwen Image 2.1（最新的开放权重 Qwen-Image 模型）从文本提示生成图像，经过 25 个采样步骤生成单张 1024×1024 图像。生成和基于指令的编辑共享同一模型，原生支持 2K 输出、专业排版和透明通道。非常适合海报和布局设计、透明素材创建以及快速概念可视化。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "tags": [
+     "文生图",
+     "Int8"
+    ],
+    "models": [
+     "Qwen Image 2.1"
+    ],
+    "minComfyUIVersion": "0.37.2",
+    "date": "2026-09-20",
+    "openSource": true,
+    "size": 26736171418,
+    "usage": 3935,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "outputs": [
+      {
+       "nodeId": 461,
+       "nodeType": "SaveImageAdvanced",
+       "file": "image_qwen_image_2_1_t2i.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "output/image_qwen_image_2_1_t2i.png"
+    ]
+   },
+   {
+    "name": "flux_kontext_dev_basic",
+    "title": "Flux Kontext Dev 图像编辑",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "hoverDissolve",
+    "description": "使用Flux Kontext全节点可见性编辑图像，非常适合学习工作流程。",
+    "tutorialUrl": "https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev",
+    "tags": [
+     "图片编辑"
+    ],
+    "models": [
+     "FLUX.1 Kontext",
+     "FLUX"
+    ],
+    "date": "2025-06-26",
+    "size": 17609365914,
+    "usage": 239,
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 190,
+       "nodeType": "LoadImage",
+       "file": "flux_kontext_dev_basic_input_image.jpg",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 136,
+       "nodeType": "SaveImage",
+       "file": "flux_kontext_dev_basic.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "username": "ComfyUI",
+    "openSource": true,
+    "searchRank": 0,
+    "minComfyUIVersion": "0.3.42"
+   },
+   {
+    "name": "image_flux2_klein_image_edit_9b_distilled",
+    "tutorialUrl": "https://docs.comfy.org/tutorials/flux/flux-2-klein",
+    "title": "FLUX.2 [Klein] 9B 蒸馏：图像编辑",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "compareSlider",
+    "description": "BFL 蒸馏模型。亚秒级速度下仍具出色画质。适合实时生成并保留质量。营销发布将重点聚焦该模型。",
+    "tags": [
+     "图像",
+     "文生图"
+    ],
+    "models": [
+     "FLUX",
+     "FLUX.2 Klein"
+    ],
+    "date": "2026-01-16",
+    "size": 19112604467,
+    "usage": 50,
+    "searchRank": 0,
+    "openSource": true,
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 76,
+       "nodeType": "LoadImage",
+       "file": "bold_outfit_woman.jpeg",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      },
+      {
+       "nodeId": 121,
+       "nodeType": "LoadImage",
+       "file": "handbag_white.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 9,
+       "nodeType": "SaveImage",
+       "file": "image_flux2_klein_image_edit_9b_distilled.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "username": "ComfyUI",
+    "includeOnDistributions": [
+     "local"
+    ],
+    "thumbnail": [
+     "output/image_flux2_klein_image_edit_9b_distilled.png",
+     "output/image_flux2_klein_image_edit_9b_distilled.png"
+    ],
+    "minComfyUIVersion": "0.3.72"
+   },
+   {
+    "name": "image_fibo2_edit_turbo_pe",
+    "title": "Fibo 2.0 Turbo: Image Edit",
+    "description": "Edit an image with local open-weights Fibo 2.0 Edit Turbo (int8) and an optional prompt enhancer: a local vision LLM reads the reference image and rewrites your instruction into the structured caption Fibo 2.0 was trained on before TextEncodeFibo2 samples 4 steps at CFG 1. Switch the enhancer off to feed your raw prompt, and compare the result against the source in the built-in image compare node. Ideal for fast instruction-based retouches that keep identity and composition.",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "compareSlider",
+    "tags": [
+     "图片编辑",
+     "Int8"
+    ],
+    "models": [
+     "Fibo 2.0"
+    ],
+    "minComfyUIVersion": "0.43.0",
+    "date": "2026-10-26",
+    "openSource": true,
+    "size": 26950919782,
+    "usage": 0,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 10,
+       "nodeType": "LoadImage",
+       "file": "auburn_afro_payphone_portrait.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 7,
+       "nodeType": "SaveImage",
+       "file": "image_fibo2_edit_turbo_pe.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "input/auburn_afro_payphone_portrait.png",
+     "output/image_fibo2_edit_turbo_pe.png"
+    ],
+    "includeOnDistributions": [
+     "local"
+    ]
+   },
+   {
+    "name": "image_fibo2_edit_dev_pe",
+    "title": "Fibo 2.0 Dev: Image Edit",
+    "description": "Same graph as the Turbo template loaded with the full non-distilled Fibo 2.0 Dev weights: 50 steps at CFG 5 with Bria's structured negative, for the cleanest edits when sampling time is not the constraint. The optional prompt enhancer rewrites the instruction into a structured caption; switch it off to sample the raw prompt.",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "compareSlider",
+    "tags": [
+     "图片编辑",
+     "Int8"
+    ],
+    "models": [
+     "Fibo 2.0"
+    ],
+    "minComfyUIVersion": "0.43.0",
+    "date": "2026-10-26",
+    "openSource": true,
+    "size": 26971291510,
+    "usage": 0,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 10,
+       "nodeType": "LoadImage",
+       "file": "red_bowler_hat_portrait.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 7,
+       "nodeType": "SaveImage",
+       "file": "image_fibo2_edit_dev_pe.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "input/red_bowler_hat_portrait.png",
+     "output/image_fibo2_edit_dev_pe.png"
+    ],
+    "includeOnDistributions": [
+     "local"
+    ]
+   },
+   {
+    "name": "image_lens_t2i",
+    "tutorialUrl": "https://docs.comfy.org/tutorials/image/lens/lens",
+    "title": "镜头：文生图",
+    "description": "输入文本提示词并选择分辨率和宽高比。使用高效的Lens文生图模型生成高质量图像。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "tags": [
+     "文生图"
+    ],
+    "models": [
+     "Lens"
+    ],
+    "date": "2026-05-26",
+    "openSource": true,
+    "size": 21796959027,
+    "usage": 37,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "outputs": [
+      {
+       "nodeId": 43,
+       "nodeType": "SaveImage",
+       "file": "image_lens_t2i.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "output/image_lens_t2i.png"
+    ],
+    "includeOnDistributions": [
+     "local"
+    ],
+    "minComfyUIVersion": "0.16.4"
+   },
+   {
+    "name": "image_lens_turbo_t2i",
+    "tutorialUrl": "https://docs.comfy.org/tutorials/image/lens/lens",
+    "title": "Lens Turbo: 文生图",
+    "description": "输入文本提示词并选择分辨率、宽高比和推理步数。使用Lens文生图模型生成高质量图像。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "tags": [
+     "文生图"
+    ],
+    "models": [
+     "Lens"
+    ],
+    "date": "2026-05-26",
+    "openSource": true,
+    "size": 21796959027,
+    "usage": 27,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "outputs": [
+      {
+       "nodeId": 43,
+       "nodeType": "SaveImage",
+       "file": "image_lens_turbo_t2i.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "output/image_lens_turbo_t2i.png"
+    ],
+    "includeOnDistributions": [
+     "local"
+    ],
+    "minComfyUIVersion": "0.16.4"
+   },
+   {
+    "name": "image_longcat_image_edit",
+    "title": "长猫图片编辑",
+    "description": "使用LongCat-Image-Edit模型编辑图像。支持双语指令，用于全局、局部、文本和参考引导编辑，同时保持视觉一致性。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "compareSlider",
+    "tags": [
+     "图像",
+     "图片编辑"
+    ],
+    "models": [
+     "LongCat Image Edit"
+    ],
+    "date": "2026-03-23",
+    "openSource": true,
+    "size": 22226455757,
+    "usage": 36,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 13,
+       "nodeType": "LoadImage",
+       "file": "steel_in_the_mist.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 9,
+       "nodeType": "SaveImage",
+       "file": "image_longcat_image_edit.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "input/steel_in_the_mist.png",
+     "output/image_longcat_image_edit.png"
+    ],
+    "includeOnDistributions": [
+     "local"
+    ],
+    "minComfyUIVersion": "0.9.0"
+   },
+   {
+    "name": "image_flux2_klein_9b_kv_image_edit",
+    "title": "FLUX.2 Klein KV：图像编辑",
+    "description": "上传参考图像和文本提示词。利用缓存的图像数据生成多个编辑后的图像，以加快处理速度。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "compareSlider",
+    "tags": [
+     "图像",
+     "图片编辑"
+    ],
+    "models": [
+     "FLUX.2 Klein"
+    ],
+    "date": "2026-03-12",
+    "openSource": true,
+    "size": 18790481920,
+    "usage": 16,
+    "searchRank": 0,
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 76,
+       "nodeType": "LoadImage",
+       "file": "man_in_street.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      },
+      {
+       "nodeId": 81,
+       "nodeType": "LoadImage",
+       "file": "safari_outfit.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 94,
+       "nodeType": "SaveImage",
+       "file": "image_flux2_klein_9b_kv_image_edit.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "username": "ComfyUI",
+    "includeOnDistributions": [
+     "local"
+    ],
+    "thumbnail": [
+     "input/man_in_street.png",
+     "output/image_flux2_klein_9b_kv_image_edit.png"
+    ],
+    "minComfyUIVersion": "0.17.0"
+   },
+   {
+    "name": "template_qwen_image_edit_2511_systms_action",
+    "title": "Qwen Image Edit 2511: SYSTMS ACTION LoRA",
+    "description": "Upload your target image and use the trigger phrase \"action the [thing]\" (e.g., \"action the scene\"). Generate a toy or action figure version of your subject with articulated joints, plastic materials, and painted details.",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "compareSlider",
+    "tags": [
+     "图片编辑",
+     "LoRA"
+    ],
+    "models": [
+     "Qwen Image Edit 2511"
+    ],
+    "date": "2026-05-10",
+    "openSource": true,
+    "size": 51646981734,
+    "usage": 0,
+    "searchRank": 0,
+    "username": "ingi",
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 223,
+       "nodeType": "LoadImage",
+       "file": "western_rider.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 9,
+       "nodeType": "SaveImage",
+       "file": "template_qwen_image_edit_2511_systms_action.png",
+       "mediaType": "image"
+      }
+     ]
+    },
+    "thumbnail": [
+     "input/western_rider.png",
+     "output/template_qwen_image_edit_2511_systms_action.png"
+    ],
+    "includeOnDistributions": [
+     "local"
+    ],
+    "minComfyUIVersion": "0.4.0"
+   }
+  ]
+ },
+ {
+  "moduleName": "default",
+  "type": "video",
+  "category": "基础",
+  "icon": "icon-[lucide--film]",
+  "title": "视频",
+  "templates": [
+   {
+    "name": "video_wan2_2_14B_i2v",
+    "title": "Wan万相 2.2 14B 图生视频",
+    "description": "使用 Wan 2.2 将静态图像转为动态视频，运动控制精准，风格保持稳定。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "thumbnailVariant": "hoverDissolve",
+    "tutorialUrl": "https://docs.comfy.org/tutorials/video/wan/wan2_2",
+    "tags": [
+     "图生视频",
+     "视频"
+    ],
+    "models": [
+     "Wan",
+     "Wan2.2"
+    ],
+    "date": "2025-07-29",
+    "size": 38010460570,
+    "usage": 10608,
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 97,
+       "nodeType": "LoadImage",
+       "file": "video_wan2_2_14B_i2v_input_image.jpg",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 108,
+       "nodeType": "SaveVideo",
+       "file": "video_wan2_2_14B_i2v.mp4",
+       "mediaType": "video"
+      }
+     ]
+    },
+    "openSource": true,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "thumbnail": [
+     "output/video_wan2_2_14B_i2v.mp4"
+    ],
+    "minComfyUIVersion": "0.16.4"
+   },
+   {
+    "name": "video_wan2_1_infinitetalk",
+    "title": "InfiniteTalk：音频驱动的全身视频配音",
+    "description": "上传源图像和目标音频。生成全身配音视频，同步动作，同时保留原始身份、背景和摄像机运动。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "tags": [
+     "音频转视频",
+     "口型同步",
+     "视频"
+    ],
+    "models": [
+     "Wan2.1 InfiniteTalk"
+    ],
+    "date": "2026-01-26",
+    "openSource": true,
+    "size": 29635274342,
+    "usage": 59,
+    "searchRank": 0,
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 24,
+       "nodeType": "LoadAudio",
+       "file": "audio_speaker1_woman.mp3",
+       "mediaType": "audio",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      },
+      {
+       "nodeId": 32,
+       "nodeType": "LoadImage",
+       "file": "two_character_talking.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      },
+      {
+       "nodeId": 90,
+       "nodeType": "LoadAudio",
+       "file": "audio_speaker2_man.mp3",
+       "mediaType": "audio",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ],
+     "outputs": [
+      {
+       "nodeId": 141,
+       "nodeType": "SaveVideo",
+       "file": "video_wan2_1_infinitetalk.mp4",
+       "mediaType": "video"
+      }
+     ]
+    },
+    "username": "ComfyUI",
+    "thumbnail": [
+     "output/video_wan2_1_infinitetalk.mp4"
+    ],
+    "minComfyUIVersion": "0.17.0"
+   }
+  ]
+ },
+ {
+  "moduleName": "default",
+  "type": "audio",
+  "category": "基础",
+  "icon": "icon-[lucide--volume-2]",
+  "title": "音频",
+  "templates": [
+   {
+    "name": "audio_stable_audio_3_medium",
+    "title": "Stable Audio 3.0 Medium",
+    "description": "输入一个简短的文本创意、可选的持续时间、种子和类别。使用Stable Audio 3生成立体声音频（音乐、音效或乐器），并带有可选的AI驱动文本扩展。",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "tags": [
+     "文本转音频"
+    ],
+    "models": [
+     "Stable Audio"
+    ],
+    "date": "2026-05-20",
+    "openSource": true,
+    "size": 15676630630,
+    "usage": 390,
+    "searchRank": 0,
+    "username": "ComfyUI",
+    "minComfyUIVersion": "0.19.2"
+   }
+  ]
+ },
+ {
+  "moduleName": "default",
+  "type": "3d",
+  "category": "基础",
+  "icon": "icon-[lucide--box]",
+  "title": "3D模型",
+  "templates": [
+   {
+    "name": "3d_hunyuan3d_image_to_model",
+    "title": "混元3D 2.0",
+    "mediaType": "image",
+    "mediaSubtype": "webp",
+    "description": "使用Hunyuan3D 2.0从单张图像生成3D模型。",
+    "tags": [
+     "图生3D模型",
+     "3D"
+    ],
+    "models": [
+     "Hunyuan3D",
+     "Tencent"
+    ],
+    "date": "2025-03-01",
+    "tutorialUrl": "",
+    "size": 4939212390,
+    "usage": 31,
+    "io": {
+     "inputs": [
+      {
+       "nodeId": 56,
+       "nodeType": "LoadImage",
+       "file": "3d_hunyuan3d_image_to_model_input_image.png",
+       "mediaType": "image",
+       "sourceRevision": "abb9cf6477b59c52dbe234c67f82318dadd872b2"
+      }
+     ]
+    },
+    "username": "ComfyUI",
+    "minComfyUIVersion": "0.3.28",
+    "openSource": true,
+    "searchRank": 0
+   }
+  ]
+ }
+]

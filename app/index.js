@@ -32,6 +32,8 @@ import { isPlainObject, convertUiToApi, applyInputs, summarizeWorkflow } from ".
 import { loadNodeAdapters } from "./lib/node-adapter-store.mjs";
 // T3-1 / T3-3（2026-10-10）：openWorkflow 链路的落定判定与路由失败文案（纯函数，见其 test.mjs）。
 import { nameMatchesTarget, openWorkflowLoadVerdict, openWorkflowRouteError, toIntOrNull } from "./lib/canvas-open-workflow.mjs";
+// T7（2026-11-02）：templates action 的版本标记用（lib 纯函数，只 import 不改动）。
+import { compareVersion } from "./lib/template-hub.mjs";
 
 const APP_ID = "comfyui-hana";
 // v0.6.0（M9）：ComfyUI 服务进程起停（中继 /_relay/backend/{start,stop,proc} + App 路由 + 工具 action=service
@@ -3102,6 +3104,298 @@ export default defineApp(async (sdk) => {
       }],
       details: { comfyui: { action: "upload", path, name, subfolder: sub, type: r.type || "input" } },
     };
+  }
+
+  // ── 提交前校验（T4 2026-11-02）─────────────────────────────────────────
+  // 实际校验在中继 /_relay/validate（T3 接线、T2 内核），本侧只组请求体 + 渲染中文摘要 + 原样回结构化结果。
+  // 立场（John 2026-11-02 拍板）：只警告不硬拦——独立 action，不拦 submit、不自动修图、不重试、不建宿主任务。
+  // 中继口径：URL 层面成功一律 200（校验不通过也 200，靠 valid 区分）；文件读不到/后端不可达等才 4xx/5xx。
+  async function actionValidate(args) {
+    const wfArg = args.workflow;
+    const wfPath = typeof wfArg === "string" && wfArg.trim() ? wfArg.trim() : "";
+    const wfObj = isPlainObject(wfArg) ? wfArg : null;
+    const tplObj = wfObj && typeof wfObj.template === "string" && Object.keys(wfObj).length === 1 ? wfObj.template.trim() : "";
+    const tplArg = typeof args.template === "string" && args.template.trim() ? args.template.trim() : "";
+    const forms = [wfPath, wfObj && !tplObj, tplObj || tplArg].filter(Boolean).length;
+    if (!forms) throw new Error("validate 需要 workflow（文件路径或 JSON 对象）/ template（userdata 工作流名）三选一，至少给一个");
+    if (forms > 1) throw new Error("workflow / template 三选一，互斥，不能同时给");
+    const reqBody = wfPath ? { path: wfPath } : tplObj || tplArg ? { template: tplObj || tplArg } : { workflow: wfObj };
+    if (isPlainObject(args.options)) reqBody.options = args.options;
+    const { ok, status, data } = await relayJson("/_relay/validate", { method: "POST", body: JSON.stringify(reqBody), timeoutMs: 30_000 });
+    if (!ok || !data || !Array.isArray(data.errors) || !isPlainObject(data.stats)) {
+      const detail = data && data.error ? String(data.error) : `HTTP ${status}`;
+      throw new Error(`校验请求失败：${detail}`);
+    }
+    const valid = data.valid === true;
+    const errors = data.errors;
+    const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    const stats = data.stats;
+    const renderV = (v) => {
+      const who = v.node === null || v.node === undefined ? "整图" : `节点 ${v.node}`;
+      const field = v.field ? ` · ${v.field}` : "";
+      const sug = Array.isArray(v.suggestions) && v.suggestions.length ? `；可用：${v.suggestions.slice(0, 8).join(" / ")}` : "";
+      return `[${who}${field}] ${String(v.message || "")}${sug}`;
+    };
+    let text;
+    if (valid) {
+      const lines = [`校验通过：${stats.nodeCount ?? 0} 个节点，${stats.linkCount ?? 0} 条连线，${stats.checkedEnums ?? 0} 个枚举值全在范围内。`];
+      if (warnings.length) {
+        lines.push(`${warnings.length} 条警告：`);
+        for (const w of warnings.slice(0, 10)) lines.push(renderV(w));
+        if (warnings.length > 10) lines.push(`…另有 ${warnings.length - 10} 条警告省略。`);
+      }
+      text = lines.join("\n");
+    } else {
+      const total = errors.length + warnings.length;
+      const lines = [`校验未通过（${errors.length} 个错误，${warnings.length} 条警告）：`];
+      for (const v of [...errors, ...warnings].slice(0, 10)) lines.push(renderV(v));
+      if (total > 10) lines.push(`…另有 ${total - 10} 条省略（完整清单见 details.comfyui）。`);
+      text = lines.join("\n");
+    }
+    return {
+      content: [{ type: "text", text }],
+      details: { comfyui: { action: "validate", ...data } },
+    };
+  }
+
+  // ── 缺包检查（T10 2026-11-02）────────────────────────────────────
+  // 实查在中继 POST /_relay/node-deps（relayJson 自带 key）：入参二选一 {classes:[...]}
+  // 或 {workflow:{path|template|object}}（中继自动递归 subgraph）。本侧只组请求 + 渲染三段式
+  // 中文摘要；中继完整结构化结果放 details.comfyui（正文不倒 JSON）。立场同 validate/templates：
+  // 查询不建宿主任务，不自动安装、不重启。多候选（一个类名命中多个包）不在本侧替调用方挑：
+  // 标注「这类名对应多个包」，未装/未加载的候选本就按仓库逐行列出。
+  // workflow 与 classes 都不给时默认取当前画布（canvas.get 读类免授权；子图实例 type 形如
+  // UUID，过滤掉，子图内部类名收不进来——要全量请显式传 workflow）。
+  const UUID_TYPE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  function depsBlock(title, entries, renderOne, cap = 5) {
+    if (!entries.length) return [];
+    const lines = [`【${title}】`];
+    for (const e of entries.slice(0, cap)) lines.push(renderOne(e));
+    if (entries.length > cap) lines.push(`  …另有 ${entries.length - cap} 条省略（完整清单见 details.comfyui）`);
+    return lines;
+  }
+
+  // 类名清单 + 多候选标注：multiSet 来自中继 resolutions（candidates.length>1 的类名）。
+  function depsClassList(classes, multiSet) {
+    const base = `缺 ${classes.length} 个类：${classes.join(", ")}`;
+    const multi = classes.filter((c) => multiSet.has(c));
+    return multi.length ? `${base}（这类名对应多个包）` : base;
+  }
+
+  async function actionDeps(args) {
+    const wfArg = args.workflow;
+    const hasClasses = Array.isArray(args.classes);
+    const wfPath = typeof wfArg === "string" && wfArg.trim() ? wfArg.trim() : "";
+    const wfObj = isPlainObject(wfArg) ? wfArg : null;
+    const tplObj = wfObj && typeof wfObj.template === "string" && Object.keys(wfObj).length === 1 ? wfObj.template.trim() : "";
+    const forms = [wfPath, wfObj && !tplObj, tplObj].filter(Boolean).length;
+    if (forms && hasClasses) throw new Error("workflow 与 classes 二选一，不能同时给");
+    if (forms > 1) throw new Error("workflow 路径 / 对象 / {template} 三选一，不能同时给");
+    let body = null;
+    let via = null; // classes | workflow | canvas
+    let classCount = null;
+    if (hasClasses) {
+      const names = [...new Set(args.classes.map((c) => String(c ?? "").trim()).filter(Boolean))];
+      if (!names.length) throw new Error("classes 是空的：需要至少一个节点类名（如 KSampler）");
+      body = { classes: names };
+      via = "classes";
+      classCount = names.length;
+    } else if (forms) {
+      // 中继 /_relay/node-deps 只认 workflow 为字符串（先试本机路径、再退 userdata 模板名）或内联对象，
+      // 不认 {path}/{template} 包装形态，故 template 单键对象在此拍平成纯字符串。
+      body = wfPath ? { workflow: wfPath } : tplObj ? { workflow: tplObj } : { workflow: wfObj };
+      via = "workflow";
+    } else {
+      // 默认当前画布：读类 op 免授权；桥不可达时明说，让调用方显式传 workflow / classes。
+      const got = await canvasBridgeInvoke("canvas.get", {}, 15_000);
+      if (!got.ok) {
+        throw new Error(`取当前画布失败（${got.error || "画布桥不可达"}）：请显式传 workflow（文件路径 / 对象 / {"template":"名称"}）或 classes（类名数组）`);
+      }
+      const graph = got.payload;
+      const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+      const names = [...new Set(
+        nodes.map((n) => (n && typeof n.type === "string" ? n.type.trim() : "")).filter((t) => t && !UUID_TYPE_RE.test(t))
+      )];
+      if (!names.length) throw new Error("当前画布上没有可识别的节点：请显式传 workflow 或 classes");
+      body = { classes: names };
+      via = "canvas";
+      classCount = names.length;
+    }
+    const { ok, status, data } = await relayJson("/_relay/node-deps", {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeoutMs: 30_000,
+    });
+    if (!ok || !data || !isPlainObject(data.summary)) {
+      throw new Error(`缺包检查失败（HTTP ${status}）：${(data && data.error) || JSON.stringify(data).slice(0, 200)}`);
+    }
+    const summary = data.summary;
+    const ni = Array.isArray(summary.notInstalled) ? summary.notInstalled : [];
+    const inl = Array.isArray(summary.installedNotLoaded) ? summary.installedNotLoaded : [];
+    const unres = Array.isArray(summary.unresolved) ? summary.unresolved : [];
+    const resolutions = Array.isArray(data.resolutions) ? data.resolutions : [];
+    const multiSet = new Set(
+      resolutions.filter((r) => r && Array.isArray(r.candidates) && r.candidates.length > 1).map((r) => r.className)
+    );
+    const uniq = (entries) => new Set(entries.flatMap((e) => (Array.isArray(e.classes) ? e.classes : []))).size;
+    const niCount = uniq(ni);
+    const inlCount = uniq(inl);
+    const unCount = unres.length;
+    const unknownTotal = niCount + inlCount + unCount;
+    const headParts = [];
+    if (niCount) headParts.push(`${niCount} 个属于没装的包`);
+    if (inlCount) headParts.push(`${inlCount} 个装了但没加载`);
+    if (unCount) headParts.push(`${unCount} 个查不到来源`);
+    const viaNote = via === "canvas" ? `（来源：当前画布，${classCount} 个类；子图内部未展开）` : via === "workflow" ? "（来源：指定工作流）" : `（来源：直接给类名，${classCount} 个）`;
+    const head = unknownTotal
+      ? `缺包检查${viaNote}：${unknownTotal} 个类不认识——${headParts.join("，")}。`
+      : `缺包检查${viaNote}：检查的 ${data.checked ?? classCount ?? "?"} 个类都能对上已加载节点，没发现缺包。`;
+    const lines = [
+      head,
+      ...depsBlock("没装", ni, (e) => `  ${e.title ? `${e.title}（${e.repo}）` : e.repo}  ${depsClassList(Array.isArray(e.classes) ? e.classes : [], multiSet)}`),
+      ...depsBlock("装了但没加载", inl, (e) => `  ${e.dir || e.repo}  ${depsClassList(Array.isArray(e.classes) ? e.classes : [], multiSet)}  → 多半是依赖没装或启动失败，看启动日志`),
+      ...depsBlock("查不到来源", unres, (e) => `  ${e.className}  → 映射表里没有，可能手写节点或类名拼错`),
+    ].filter(Boolean);
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      details: { comfyui: { action: "deps", via, ...data } },
+    };
+  }
+
+  // ── 官方模板库（T7 2026-11-02）────────────────────────────────────
+  // 检索/拉取实际发生在中继 /_relay/templates（免 key）与 /_relay/template-fetch（需 key，relayJson 自带），
+  // 本侧只组请求 + 渲染中文摘要 + 原样回结构化结果。立场与 validate 一致：查询不建宿主任务；
+  // fetch 虽落盘但不出图，不走 next-step；不自动下载模型、不自动打开模板、不因缺模型拒绝落盘。
+  // 版本标记（○）在本侧重算：拉取回执里中继已给出 runnable，检索行则用本机版本与 minComfyUIVersion 对比。
+  // 行渲染：中文名优先（无中文回落英文加 *），● 推荐，○ 版本不满足附所需版本。
+  function renderTemplateRow(r, localVer) {
+    const title = typeof r.titleZh === "string" && r.titleZh.trim() ? r.titleZh.trim() : `${String(r.title || r.name || "?")}*`;
+    const segs = [String(r.name || "?"), title];
+    if (r.mediaType) segs.push(`[${r.mediaType}]`);
+    if (r.recommend === "highly_recommended") segs.push("●推荐");
+    const min = r.minComfyUIVersion;
+    if (min) {
+      let unsat = false;
+      try { unsat = Boolean(localVer) && compareVersion(localVer, min) < 0; } catch { unsat = false; }
+      segs.push(unsat ? `○需 ${min}` : `需 ${min}（本机满足）`);
+    }
+    return `- ${segs.join("  ")}`;
+  }
+
+  async function actionTemplates(args) {
+    const op = String(args.op || "list").trim();
+    if (op === "list") {
+      const params = new URLSearchParams();
+      for (const k of ["q", "task", "model", "mediaType", "tag", "recommend"]) {
+        const v = typeof args[k] === "string" ? args[k].trim() : "";
+        if (v) params.set(k, v);
+      }
+      if (Number.isFinite(Number(args.limit)) && Number(args.limit) > 0) params.set("limit", String(Math.floor(Number(args.limit))));
+      if (Number.isFinite(Number(args.offset)) && Number(args.offset) > 0) params.set("offset", String(Math.floor(Number(args.offset))));
+      const qs = params.toString();
+      const { ok, status, data } = await relayJson(`/_relay/templates${qs ? `?${qs}` : ""}`, { timeoutMs: 30_000 });
+      if (!ok || !data || !Array.isArray(data.rows)) {
+        throw new Error(`模板索引不可用（HTTP ${status}）：${(data && data.error) || JSON.stringify(data).slice(0, 200)}`);
+      }
+      const localVer =
+        state.snapshot?.relay?.backend?.system && typeof state.snapshot.relay.backend.system.comfyui_version === "string"
+          ? state.snapshot.relay.backend.system.comfyui_version
+          : null;
+      const rows = data.rows;
+      const lines = [
+        `官方模板库：命中 ${data.total} 条，本页 ${rows.length} 条（offset=${data.offset || 0}；索引 ${
+          typeof data.indexAge === "number" ? `${Math.round(data.indexAge / 60)} 分钟前` : "时间未知"
+        }，source=${data.source || "?"}${localVer ? `；本机 ComfyUI ${localVer}` : "；本机版本未知"}）。`,
+        ...rows.map((r) => renderTemplateRow(r, localVer)),
+      ];
+      if (!rows.length) lines.push("（本页无条目——换关键词或调大 offset）");
+      const nextOffset = (data.offset || 0) + rows.length;
+      if (data.total > nextOffset) lines.push(`下一页：comfyui(action="templates", op="list", offset=${nextOffset})`);
+      lines.push(`拉取模板：comfyui(action="templates", op="fetch", name="<name>")；target="tmp" 落到临时目录。`);
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: {
+          comfyui: {
+            action: "templates",
+            op: "list",
+            total: data.total,
+            shown: data.shown,
+            offset: data.offset || 0,
+            rows: rows.slice(0, 200),
+            source: data.source || null,
+            indexAge: typeof data.indexAge === "number" ? data.indexAge : null,
+            localComfyUIVersion: localVer,
+          },
+        },
+      };
+    }
+    if (op === "fetch") {
+      const name = typeof args.name === "string" ? args.name.trim() : "";
+      if (!name) throw new Error('fetch 需要 name（模板名，来自 op=list 的结果）');
+      const target = typeof args.target === "string" && args.target.trim() ? args.target.trim() : "hub";
+      if (target !== "hub" && target !== "tmp") throw new Error('target 只接受 "hub" 或 "tmp"（默认 hub）');
+      const { ok, status, data } = await relayJson("/_relay/template-fetch", {
+        method: "POST",
+        body: JSON.stringify({ name, target }),
+        timeoutMs: 30_000,
+      });
+      if (!ok || !data || data.ok !== true) {
+        throw new Error(`拉取失败（HTTP ${status}）：${(data && data.error) || JSON.stringify(data).slice(0, 300)}`);
+      }
+      const models = data.models && typeof data.models === "object" ? data.models : {};
+      const required = Array.isArray(models.required) ? models.required : [];
+      const missing = Array.isArray(models.missing) ? models.missing : [];
+      const present = Array.isArray(models.present) ? models.present : [];
+      const mark = (m, have) => `${m.directory || "?"}/${m.name || "?"} ${have ? "✓" : "✗"}`;
+      const lines = [
+        `已拉取 ${data.name || name} → ${data.path || "（未返回路径）"}（${data.bytes ? `${Math.max(1, Math.round(Number(data.bytes) / 1024))} KB` : "大小未知"}）`,
+      ];
+      if (required.length) {
+        lines.push(
+          `需要 ${required.length} 个模型：${required.map((m) => mark(m, present.some((p) => p && p.name === m.name))).join("、")}`
+        );
+      }
+      if (missing.length) {
+        lines.push(
+          `缺 ${missing.length} 个：${missing.map((m) => `${m.directory || "?"}/${m.name || "?"}`).join("、")}（不自动下载；需要时手动放到 models/ 对应子目录）`
+        );
+      } else if (required.length) {
+        lines.push("缺 0 个：所需模型本机都在。");
+      }
+      // 可跑性：三态——true 可跑 / false 版本不满足 / null 本机版本未知无法断言（缺模型不算，模型权重缺不缺另行回执）
+      if (data.runnable === false) {
+        lines.push(`可跑性：本机 ComfyUI 版本不满足${data.minComfyUIVersion ? `（需 ≥ ${data.minComfyUIVersion}${data.localComfyUIVersion ? `，本机 ${data.localComfyUIVersion}` : ""}）` : ""}。`);
+      } else if (data.runnable === null) {
+        lines.push("可跑性：本机版本未知，无法断言。");
+      } else {
+        lines.push(missing.length ? "可跑性：版本满足，但缺上述模型权重。" : "可跑性：可直接跑。");
+      }
+      lines.push(
+        target === "hub"
+          ? "下一步：确认无误后用 comfyui(action=\"canvas\", op=\"openWorkflow\", workflow=\"<路径>\") 打开（agent 不自动打开）。"
+          : "文件在临时目录，不在工作流列表里；要留用请自行挪到工作流目录或重新以 target=\"hub\" 拉取。"
+      );
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: {
+          comfyui: {
+            action: "templates",
+            op: "fetch",
+            name: data.name || name,
+            path: data.path || null,
+            target,
+            bytes: typeof data.bytes === "number" ? data.bytes : null,
+            models: { required, missing, present },
+            runnable: data.runnable === true ? true : data.runnable === false ? false : null,
+            minComfyUIVersion: data.minComfyUIVersion || null,
+            localComfyUIVersion: data.localComfyUIVersion || null,
+            source: data.source || null,
+          },
+        },
+      };
+    }
+    throw new Error('op 必须是 "list"（检索模板库）或 "fetch"（拉取落盘）（收到 "' + op + '"）');
   }
 
   // ── ComfyUI 本体更新（M11）───────────────────────────────────────────────
@@ -7097,6 +7391,54 @@ export default defineApp(async (sdk) => {
           op: { type: "string", enum: ["start", "stop", "status"], description: "llmGateway 用：start=启动长轮询 worker（App 进程不监听，作模型执行端：经 runtime 通道长轮询主中继 /_relay/llm/jobs 取 job，用宿主模型执行并回填增量；幂等）/ stop=停止 worker / status=查 worker 与中继健康状态（token 只报尾 4 位，不回显全文；默认）" },
         },
       },
+      {
+        command: "validate",
+        required: [],
+        fields: {
+          workflow: {
+            description: "工作流（与 template 三选一，至少给一个）：① 字符串=本机工作流文件路径；② 对象=工作流 JSON 本体（API 或 UI 格式；{\"template\":\"名称\"} 形态按 template 处理）",
+            anyOf: [
+              { type: "string" },
+              { type: "object", properties: { template: { type: "string", description: "userdata/workflows 里的相对路径或文件名" } }, required: ["template"] },
+              { type: "object" },
+            ],
+          },
+          template: { type: "string", description: "userdata/workflows 里的工作流名（与 workflow 互斥；三选一，至少给一个）" },
+          options: { type: "object", additionalProperties: true, description: "可选，原样透传给中继侧校验内核" },
+        },
+      },
+      {
+        command: "deps",
+        required: [],
+        fields: {
+          workflow: {
+            description: "工作流（与 classes 二选一，都不给则取当前画布）：① 字符串=本机工作流文件路径；② 对象=工作流 JSON 本体（API 或 UI 格式；{\"template\":\"名称\"} 形态按 template 处理）；③ {\"template\":\"名称\"} 取 userdata/workflows 里保存的工作流",
+            anyOf: [
+              { type: "string" },
+              { type: "object", properties: { template: { type: "string", description: "userdata/workflows 里的相对路径或文件名" } }, required: ["template"] },
+              { type: "object" },
+            ],
+          },
+          classes: { type: "array", items: { type: "string" }, description: "直接给节点类名数组（与 workflow 二选一，都不给则取当前画布的类名集合）" },
+        },
+      },
+      {
+        command: "templates",
+        required: [],
+        fields: {
+          op: { type: "string", enum: ["list", "fetch"], description: "list=检索官方模板库（默认）；fetch=拉取指定模板落盘（<ComfyUI>/user/default/hui-templates/<分类>/<name>.json；不自动下载模型、不自动打开、不因缺模型拒绝落盘）" },
+          q: { type: "string", description: "list 用：关键词（匹配 name/title/中文标题/描述/模型族，中英文都能搜）" },
+          task: { type: "string", description: "list 用：按任务类型精确过滤（如 Text to Image）" },
+          model: { type: "string", description: "list 用：按模型族精确过滤" },
+          mediaType: { type: "string", description: "list 用：按媒体类型精确过滤（如 image/video/audio/3d）" },
+          tag: { type: "string", description: "list 用：按标签精确过滤" },
+          recommend: { type: "string", description: "list 用：按推荐级精确过滤（如 highly_recommended）" },
+          limit: { type: "number", description: "list 用：每页条数（默认 20，上限 200）" },
+          offset: { type: "number", description: "list 用：分页偏移（默认 0）" },
+          name: { type: "string", description: "fetch 用（必填）：模板名（来自 op=list 的 name 列）" },
+          target: { type: "string", enum: ["hub", "tmp"], description: "fetch 用：hub=落到 user/default/hui-templates/<分类>/（默认）；tmp=落到系统临时目录不上列表" },
+        },
+      },
     ];
   }
 
@@ -7109,6 +7451,9 @@ export default defineApp(async (sdk) => {
         "status=服务/中继/队列/运行中任务聚合（含四态环境诊断）；submit=提交工作流（三形态：API 格式 JSON 对象 / 文件路径 / {template:\"名称\"}；inputs 注入 \"<node_id>.<input>\"; clientLabel 标签；front 插队；mode=auto|canvas|backend 选执行位置——默认 auto：画布在线且已授权时复制副本-装载-画布执行（canvas.queue）；环境缺（中继/服务/工作区）自动自举：快返「环境准备中」→ 后台准备（服务拉起/必要时自动拉起工作区窗口）→ 就绪自动继续；阻断/补不上/授权缺停下（blocked：原因+选项，不自动改走后台）；inline 对象/带 inputs 结构豁免直走后台并注明）→ 返回 prompt_id，后台自动跟踪并在完成时按 next-step 回执；" +
         "query=按 prompt_id/taskId 查任务或列最近；result=取产物（本地路径+预览 URL，可选入会话文件）；cancel=定向取消（all:true 才全清）；service=ComfyUI 服务进程起停与环境检查（op=status/start/stop/envcheck/clear/wait：start 自动先 envcheck，异常时返回阻断说明；envcheck=检查 GPU 占用/端口残留；clear=按快照清理进程（snapshotId+pids）；wait=轮询就绪，单次≤25s）——服务由计划任务拉起，独立于 Hana 存活；workflows=列出/读取已保存工作流的节点结构；upload=上传图片（图生图输入）；" +
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
+        "validate=提交前校验（不提交、不改图、不拦 submit：workflow 三形态同 submit 或 template=userdata 工作流名，options 透传；返回 errors/warnings/统计摘要，校验不通过也正常返回 valid:false，是否修复由 agent 决定）；" +
+        "deps=缺包检查（不安装、不重启：workflow 三形态（路径/对象/{template}）或 classes 类名数组，二选一，都不给则取当前画布；返回没装/装了但没加载/查不到来源三段式摘要与建议，一个类名命中多个包时全列候选不代挑，完整结构化结果在 details.comfyui）；" +
+        "templates=官方模板库（op=list 检索：q/task/model/mediaType/tag/recommend 过滤 + limit/offset 分页，中文标题优先、●推荐、○版本不满足；op=fetch 拉取落盘：name 必填、target=hub|tmp，返回落盘路径/大小/所需与缺失模型/可跑性；不自动下载模型、不自动打开模板）；" +
         "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）/ trace 追踪端口来源/去向（multi 多级链）/ outline 大纲（功能块+块间连线；detail 下钻）/ diff 两文件语义 diff（source=file；path 基准/pathB 目标）/ prompt 可提交形态 / running 当前执行节点 / progress 执行进度聚合（只读：执行中？/当前节点/画布节点数/队列剩余/promptId）/ probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / moveNode 移动节点（nodeId+pos 或批量 nodes:[[id,x,y],...]）/ connect 连线 / disconnect 断线 / setNodeMode mute或bypass / addGroup 新建分组（nodeIds 自动算框）/ setGroup 改组（改名/重算框）/ removeGroup 删组（不动节点）/ save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖）；source=file 对工作流 JSON 文件操作：读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak；path 相对工作流目录 user/default/workflows 或绝对路径〕）——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "window=工作区原生窗：op=open 打开宿主原生窗装载工作区（/workspace.html；需能力 app/windows.manage；窗口页自取 surface 凭据；壳页桥为单桶——同刻仅一壳页，开窗前建议先关掉其它工作区壳页）/ op=status 列出本 App 已开窗口（默认）/ op=close 关闭窗口（默认关最近一次打开的，可传 windowId）。提交环境缺时自举链也会自动拉起该窗（同刻仅一壳页；无需手动）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",
@@ -7178,8 +7523,11 @@ export default defineApp(async (sdk) => {
             case "window": return await actionWindow(args, context);
             case "llmGateway": return await actionLlmGateway(args);
             case "upload": return await actionUpload(args);
+            case "validate": return await actionValidate(args);
+            case "templates": return await actionTemplates(args);
+            case "deps": return await actionDeps(args);
             default:
-              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update / canvas / window / llmGateway（收到 "${action}"）`);
+              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update / canvas / window / llmGateway / validate / templates / deps（收到 "${action}"）`);
           }
         } catch (e) {
           const text = `comfyui(${action || "?"}) 失败：${msgOf(e)}`;
@@ -7188,7 +7536,7 @@ export default defineApp(async (sdk) => {
         }
       },
     });
-    log("工具注册：comfyui（v0.3：status/submit/query/result/cancel/workflows/upload/service/update/canvas/window/llmGateway）");
+    log("工具注册：comfyui（v0.3：status/submit/query/result/cancel/workflows/upload/service/update/canvas/window/llmGateway/validate/templates/deps）");
   } catch (e) {
     error(`工具注册失败：${msgOf(e)}`);
   }

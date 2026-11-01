@@ -1,0 +1,770 @@
+{
+ "ok": {
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+   {
+    "id": 1,
+    "type": "EmptyImage",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       1
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {
+     "width": 512,
+     "height": 512,
+     "batch_size": 1,
+     "color": 0
+    }
+   },
+   {
+    "id": 2,
+    "type": "SaveImage",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": 1
+     }
+    ],
+    "outputs": [],
+    "widgets_values": [
+     "ComfyUI"
+    ],
+    "widgets_values_named": {
+     "filename_prefix": "ComfyUI"
+    }
+   }
+  ],
+  "links": [
+   [
+    1,
+    1,
+    0,
+    2,
+    0,
+    "IMAGE"
+   ]
+  ],
+  "extra": {}
+ },
+ "unknown": {
+  "last_node_id": 3,
+  "last_link_id": 1,
+  "nodes": [
+   {
+    "id": 1,
+    "type": "EmptyImage",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       1
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {
+     "width": 64,
+     "height": 64,
+     "batch_size": 1,
+     "color": 0
+    }
+   },
+   {
+    "id": 2,
+    "type": "PreviewImage",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": 1
+     }
+    ],
+    "outputs": [],
+    "widgets_values": [],
+    "widgets_values_named": {}
+   },
+   {
+    "id": 3,
+    "type": "TotallyFakeNode",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [],
+    "widgets_values": [],
+    "widgets_values_named": {}
+   }
+  ],
+  "links": [
+   [
+    1,
+    1,
+    0,
+    2,
+    0,
+    "IMAGE"
+   ]
+  ],
+  "extra": {}
+ },
+ "missing_required": {
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+   {
+    "id": 1,
+    "type": "EmptyImage",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": []
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {
+     "width": 64,
+     "height": 64,
+     "batch_size": 1,
+     "color": 0
+    }
+   },
+   {
+    "id": 2,
+    "type": "SaveImage",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": null
+     }
+    ],
+    "outputs": [],
+    "widgets_values": [
+     "ComfyUI"
+    ],
+    "widgets_values_named": {
+     "filename_prefix": "ComfyUI"
+    }
+   }
+  ],
+  "links": [],
+  "extra": {}
+ },
+ "enum_mismatch": {
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+   {
+    "id": 1,
+    "type": "CheckpointLoaderSimple",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "MODEL",
+      "type": "MODEL",
+      "links": []
+     },
+     {
+      "name": "CLIP",
+      "type": "CLIP",
+      "links": []
+     },
+     {
+      "name": "VAE",
+      "type": "VAE",
+      "links": []
+     }
+    ],
+    "widgets_values": [
+     "nope.safetensors"
+    ],
+    "widgets_values_named": {
+     "ckpt_name": "nope.safetensors"
+    }
+   }
+  ],
+  "links": [],
+  "extra": {}
+ },
+ "subgraph": {
+  "id": "wf-subgraph",
+  "revision": 1,
+  "last_node_id": 8,
+  "last_link_id": 11,
+  "nodes": [
+   {
+    "id": 5,
+    "type": "3f2a9c4e-1b7d-4e5a-9c8f-2a1b3c4d5e6f",
+    "title": "采样组",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "LATENT",
+      "type": "LATENT",
+      "links": [
+       10
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {}
+   },
+   {
+    "id": 7,
+    "type": "VAEDecode",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "samples",
+      "type": "LATENT",
+      "link": 10
+     },
+     {
+      "name": "vae",
+      "type": "VAE",
+      "link": 12
+     }
+    ],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       11
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {}
+   },
+   {
+    "id": 9,
+    "type": "VAELoader",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "VAE",
+      "type": "VAE",
+      "links": [
+       12
+      ]
+     }
+    ],
+    "widgets_values": [
+     "ae.safetensors"
+    ],
+    "widgets_values_named": {
+     "vae_name": "ae.safetensors"
+    }
+   },
+   {
+    "id": 8,
+    "type": "SaveImage",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": 11
+     }
+    ],
+    "outputs": [],
+    "widgets_values": [
+     "ComfyUI"
+    ],
+    "widgets_values_named": {
+     "filename_prefix": "ComfyUI"
+    }
+   }
+  ],
+  "links": [
+   [
+    10,
+    5,
+    0,
+    7,
+    0,
+    "LATENT"
+   ],
+   [
+    11,
+    7,
+    0,
+    8,
+    0,
+    "IMAGE"
+   ],
+   [
+    12,
+    9,
+    0,
+    7,
+    1,
+    "VAE"
+   ]
+  ],
+  "definitions": {
+   "subgraphs": [
+    {
+     "id": "3f2a9c4e-1b7d-4e5a-9c8f-2a1b3c4d5e6f",
+     "name": "采样组",
+     "version": 1,
+     "state": {
+      "offsets": [
+       0,
+       0
+      ]
+     },
+     "inputs": [],
+     "outputs": [
+      {
+       "name": "LATENT",
+       "type": "LATENT",
+       "links": []
+      }
+     ],
+     "widgets": [],
+     "nodes": [
+      {
+       "id": 11,
+       "type": "CheckpointLoaderSimple",
+       "mode": 0,
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          1
+         ]
+        },
+        {
+         "name": "CLIP",
+         "type": "CLIP",
+         "links": [
+          2,
+          3
+         ]
+        },
+        {
+         "name": "VAE",
+         "type": "VAE",
+         "links": null
+        }
+       ],
+       "widgets_values": [],
+       "widgets_values_named": {
+        "ckpt_name": "sdpose_wholebody_fp16.safetensors"
+       }
+      },
+      {
+       "id": 12,
+       "type": "CLIPTextEncode",
+       "mode": 0,
+       "inputs": [
+        {
+         "name": "clip",
+         "type": "CLIP",
+         "link": 2
+        }
+       ],
+       "outputs": [
+        {
+         "name": "CONDITIONING",
+         "type": "CONDITIONING",
+         "links": [
+          4
+         ]
+        }
+       ],
+       "widgets_values_named": {
+        "text": "positive"
+       }
+      },
+      {
+       "id": 13,
+       "type": "CLIPTextEncode",
+       "mode": 0,
+       "inputs": [
+        {
+         "name": "clip",
+         "type": "CLIP",
+         "link": 3
+        }
+       ],
+       "outputs": [
+        {
+         "name": "CONDITIONING",
+         "type": "CONDITIONING",
+         "links": [
+          5
+         ]
+        }
+       ],
+       "widgets_values_named": {
+        "text": "negative"
+       }
+      },
+      {
+       "id": 14,
+       "type": "EmptyLatentImage",
+       "mode": 0,
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "LATENT",
+         "type": "LATENT",
+         "links": [
+          6
+         ]
+        }
+       ],
+       "widgets_values_named": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+       }
+      },
+      {
+       "id": 15,
+       "type": "KSampler",
+       "mode": 0,
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 1
+        },
+        {
+         "name": "positive",
+         "type": "CONDITIONING",
+         "link": 4
+        },
+        {
+         "name": "negative",
+         "type": "CONDITIONING",
+         "link": 5
+        },
+        {
+         "name": "latent_image",
+         "type": "LATENT",
+         "link": 6
+        }
+       ],
+       "outputs": [
+        {
+         "name": "LATENT",
+         "type": "LATENT",
+         "links": [
+          7
+         ]
+        }
+       ],
+       "widgets_values_named": {
+        "seed": 1,
+        "steps": 20,
+        "cfg": 8,
+        "sampler_name": "SAMPLER_PLACEHOLDER",
+        "scheduler": "normal",
+        "denoise": 1
+       }
+      }
+     ],
+     "links": [
+      {
+       "id": 1,
+       "origin_id": 11,
+       "origin_slot": 0,
+       "target_id": 15,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 2,
+       "origin_id": 11,
+       "origin_slot": 1,
+       "target_id": 12,
+       "target_slot": 0,
+       "type": "CLIP"
+      },
+      {
+       "id": 3,
+       "origin_id": 11,
+       "origin_slot": 1,
+       "target_id": 13,
+       "target_slot": 0,
+       "type": "CLIP"
+      },
+      {
+       "id": 4,
+       "origin_id": 12,
+       "origin_slot": 0,
+       "target_id": 15,
+       "target_slot": 1,
+       "type": "CONDITIONING"
+      },
+      {
+       "id": 5,
+       "origin_id": 13,
+       "origin_slot": 0,
+       "target_id": 15,
+       "target_slot": 2,
+       "type": "CONDITIONING"
+      },
+      {
+       "id": 6,
+       "origin_id": 14,
+       "origin_slot": 0,
+       "target_id": 15,
+       "target_slot": 3,
+       "type": "LATENT"
+      },
+      {
+       "id": 7,
+       "origin_id": 15,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "LATENT"
+      }
+     ]
+    }
+   ]
+  },
+  "extra": {}
+ },
+ "no_output": {
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+   {
+    "id": 1,
+    "type": "EmptyLatentImage",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "LATENT",
+      "type": "LATENT",
+      "links": []
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {
+     "width": 1024,
+     "height": 1024,
+     "batch_size": 1
+    }
+   }
+  ],
+  "links": [],
+  "extra": {}
+ },
+ "type_mismatch": {
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+   {
+    "id": 1,
+    "type": "EmptyLatentImage",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "LATENT",
+      "type": "LATENT",
+      "links": [
+       1
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {
+     "width": 512,
+     "height": 512,
+     "batch_size": 1
+    }
+   },
+   {
+    "id": 2,
+    "type": "SaveImage",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": 1
+     }
+    ],
+    "outputs": [],
+    "widgets_values": [
+     "ComfyUI"
+    ],
+    "widgets_values_named": {
+     "filename_prefix": "ComfyUI"
+    }
+   }
+  ],
+  "links": [
+   [
+    1,
+    1,
+    0,
+    2,
+    0,
+    "LATENT"
+   ]
+  ],
+  "extra": {}
+ },
+ "reroute": {
+  "last_node_id": 3,
+  "last_link_id": 2,
+  "nodes": [
+   {
+    "id": 1,
+    "type": "EmptyImage",
+    "mode": 0,
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       1
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {
+     "width": 64,
+     "height": 64,
+     "batch_size": 1,
+     "color": 0
+    }
+   },
+   {
+    "id": 2,
+    "type": "Reroute",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "",
+      "type": "IMAGE",
+      "link": 1
+     }
+    ],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       2
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {}
+   },
+   {
+    "id": 3,
+    "type": "SaveImage",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": 2
+     }
+    ],
+    "outputs": [],
+    "widgets_values": [
+     "ComfyUI"
+    ],
+    "widgets_values_named": {
+     "filename_prefix": "ComfyUI"
+    }
+   }
+  ],
+  "links": [
+   [
+    1,
+    1,
+    0,
+    2,
+    0,
+    "IMAGE"
+   ],
+   [
+    2,
+    2,
+    0,
+    3,
+    0,
+    "IMAGE"
+   ]
+  ],
+  "extra": {}
+ },
+ "api": {
+  "1": {
+   "class_type": "KSampler",
+   "inputs": {
+    "seed": 1,
+    "steps": 20,
+    "cfg": 8,
+    "sampler_name": "SAMPLER_PLACEHOLDER",
+    "scheduler": "normal",
+    "denoise": 1,
+    "model": [
+     "2",
+     0
+    ],
+    "positive": [
+     "3",
+     0
+    ],
+    "negative": [
+     "4",
+     0
+    ],
+    "latent_image": [
+     "5",
+     0
+    ]
+   }
+  },
+  "6": {
+   "class_type": "TotallyFakeNode",
+   "inputs": {}
+  },
+  "7": {
+   "class_type": "EmptyLatentImage",
+   "inputs": {
+    "width": 512,
+    "height": 512,
+    "batch_size": 1
+   }
+  }
+ }
+}

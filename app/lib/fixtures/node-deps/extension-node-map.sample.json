@@ -1,0 +1,223 @@
+{
+  "https://github.com/0nikod/ComfyUI-Metadata-Tools": [
+    [
+      "ImageGetMetadata",
+      "ImageSetMetadata",
+      "LoadImageWithMetadata",
+      "SaveImageWithMetadata"
+    ],
+    {
+      "title_aux": "ComfyUI-Metadata-Tools"
+    }
+  ],
+  "https://github.com/AIFSH/AniTalker-ComfyUI": [
+    [
+      "AniTalkerNode",
+      "PreViewVideo"
+    ],
+    {
+      "title_aux": "AniTalker-ComfyUI"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-3d-photo-inpainting": [
+    [
+      "LoadImagePath",
+      "PreViewVideo",
+      "TreeDNode"
+    ],
+    {
+      "title_aux": "ComfyUI-3d-photo-inpainting"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-DiffSynth-Studio": [
+    [
+      "ControlNetPathLoader",
+      "DiffTextNode",
+      "DiffutoonNode",
+      "ExVideoNode",
+      "LoadVideo",
+      "PreViewVideo",
+      "SDPathLoader"
+    ],
+    {
+      "title_aux": "ComfyUI-DiffSynth-Studio"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-Hallo": [
+    [
+      "HalloNode",
+      "LoadAudio",
+      "LoadAudioPath",
+      "LoadImagePath",
+      "PreViewVideo"
+    ],
+    {
+      "title_aux": "ComfyUI-Hallo"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-I2V-Adapter": [
+    [
+      "I2V_AdapterNode",
+      "LoraPathLoader",
+      "MotionLoraLoader",
+      "PreViewVideo",
+      "PromptNode"
+    ],
+    {
+      "title_aux": "ComfyUI-I2V-Adapter"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-IP_LAP": [
+    [
+      "CombineAudioVideo",
+      "IP_LAP",
+      "LoadVideo",
+      "PreViewVideo"
+    ],
+    {
+      "title_aux": "ComfyUI-IP_LAP"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-MimicMotion": [
+    [
+      "LoadVideo",
+      "MimicMotionNode",
+      "PreViewVideo"
+    ],
+    {
+      "title_aux": "ComfyUI-MimicMotion"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-MuseTalk_FSH": [
+    [
+      "CombineAudioVideo",
+      "LoadVideo",
+      "MuseTalk",
+      "MuseTalkRealTime",
+      "PreViewVideo"
+    ],
+    {
+      "title_aux": "ComfyUI-MuseTalk_FSH"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI-UniAnimate": [
+    [
+      "LoadImagePath",
+      "LoadVideo",
+      "PoseAlignNode",
+      "PreViewVideo",
+      "UniAnimateNode"
+    ],
+    {
+      "title_aux": "ComfyUI-UniAnimate"
+    }
+  ],
+  "https://github.com/AIFSH/ComfyUI_V-Express": [
+    [
+      "LoadAudioPath",
+      "LoadImagePath",
+      "LoadVideo",
+      "PreViewVideo",
+      "VExpress"
+    ],
+    {
+      "title_aux": "ComfyUI_V-Express"
+    }
+  ],
+  "https://github.com/AIFSH/DHLive-ComfyUI": [
+    [
+      "CombineVideo",
+      "DHLIVELoadVideo",
+      "DHLiveNode",
+      "PreViewVideo",
+      "StaticVideo"
+    ],
+    {
+      "title_aux": "DHLive-ComfyUI"
+    }
+  ],
+  "https://github.com/AIFSH/RealisDance-ComfyUI": [
+    [
+      "LoadFile",
+      "LoadVideo",
+      "PreViewVideo",
+      "RealisDanceNode"
+    ],
+    {
+      "title_aux": "RealisDance-ComfyUI"
+    }
+  ],
+  "https://github.com/AIFSH/VideoSys-ComfyUI": [
+    [
+      "PreViewVideo",
+      "TextNode",
+      "VideoSysNode"
+    ],
+    {
+      "title_aux": "VideoSys-ComfyUI"
+    }
+  ],
+  "https://github.com/AIFSH/ViewCrafter-ComfyUI": [
+    [
+      "LoadVideo",
+      "PreViewVideo",
+      "ViewCrafterTxTNode"
+    ],
+    {
+      "title_aux": "ViewCrafter-ComfyUI"
+    }
+  ],
+  "https://github.com/Arctenox/Arctenoxs-Essentials_ComfyUI": [
+    [
+      "ArctenoxBox",
+      "ArctenoxCheckpointPassthrough",
+      "ArctenoxLoadCheckpoint",
+      "ArtifactRiskPredictor",
+      "CLIPTextEncodeWithString",
+      "EfficientLatentImage",
+      "ExecutionCostEstimator",
+      "KSamplerWithLatent",
+      "LoadLoRAWithString",
+      "PromptPhaseSplitter",
+      "PromptStyler",
+      "PromptStylerAdvanced",
+      "SaveImageWithMetadata",
+      "SeedTopologyMapper"
+    ],
+    {
+      "title_aux": "Arctenoxs-Essentials_ComfyUI"
+    }
+  ],
+  "https://github.com/Braeden90000/comfyui-save-image-metadata": [
+    [
+      "SaveImageWithMetadata"
+    ],
+    {
+      "title_aux": "comfyui-save-image-metadata"
+    }
+  ],
+  "https://github.com/WaddingtonHoldings/ComfyUI-InstaSD": [
+    [
+      "GPTImage1Generate",
+      "InstaCBoolean",
+      "InstaCFloat",
+      "InstaCInteger",
+      "InstaCLoadImageFromS3",
+      "InstaCLoraLoader",
+      "InstaCSaveImageToS3",
+      "InstaCSeed",
+      "InstaCText",
+      "InstaCTextML",
+      "InstaFileExist",
+      "InstaLoadImageLocal",
+      "InstaLoadImageWithMask",
+      "InstaPromptMultipleStyleSelector",
+      "InstaPromptStyleSelector",
+      "LoadVideo",
+      "PreViewVideo"
+    ],
+    {
+      "title_aux": "InstaSD nodes for ComfyUI"
+    }
+  ]
+}

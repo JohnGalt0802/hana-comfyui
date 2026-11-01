@@ -1,0 +1,426 @@
+{
+ "schema": 1,
+ "builtAt": "2026-11-02T03:00:00.000Z",
+ "source": {
+  "host": "127.0.0.1",
+  "port": 8188,
+  "note": "trimmed sample for tests; real classes from live /object_info"
+ },
+ "classes": {
+  "CheckpointLoaderSimple": {
+   "required": {
+    "ckpt_name": "COMBO"
+   },
+   "optional": {},
+   "enums": {
+    "ckpt_name": [
+     "sdpose_wholebody_fp16.safetensors"
+    ]
+   },
+   "outputs": [
+    "MODEL",
+    "CLIP",
+    "VAE"
+   ],
+   "output_node": false
+  },
+  "CLIPTextEncode": {
+   "required": {
+    "text": "STRING",
+    "clip": "CLIP"
+   },
+   "optional": {},
+   "enums": {},
+   "outputs": [
+    "CONDITIONING"
+   ],
+   "output_node": false
+  },
+  "EmptyLatentImage": {
+   "required": {
+    "width": "INT",
+    "height": "INT",
+    "batch_size": "INT"
+   },
+   "optional": {},
+   "enums": {},
+   "outputs": [
+    "LATENT"
+   ],
+   "output_node": false
+  },
+  "KSampler": {
+   "required": {
+    "model": "MODEL",
+    "seed": "INT",
+    "steps": "INT",
+    "cfg": "FLOAT",
+    "sampler_name": "COMBO",
+    "scheduler": "COMBO",
+    "positive": "CONDITIONING",
+    "negative": "CONDITIONING",
+    "latent_image": "LATENT",
+    "denoise": "FLOAT"
+   },
+   "optional": {},
+   "enums": {
+    "sampler_name": [
+     "euler",
+     "euler_cfg_pp",
+     "euler_ancestral",
+     "euler_ancestral_cfg_pp",
+     "heun",
+     "heunpp2",
+     "exp_heun_2_x0",
+     "exp_heun_2_x0_sde",
+     "dpm_2",
+     "dpm_2_ancestral",
+     "lms",
+     "dpm_fast",
+     "dpm_adaptive",
+     "dpmpp_2s_ancestral",
+     "dpmpp_2s_ancestral_cfg_pp",
+     "dpmpp_sde",
+     "dpmpp_sde_gpu",
+     "dpmpp_2m",
+     "dpmpp_2m_cfg_pp",
+     "dpmpp_2m_sde",
+     "dpmpp_2m_sde_gpu",
+     "dpmpp_2m_sde_heun",
+     "dpmpp_2m_sde_heun_gpu",
+     "dpmpp_3m_sde",
+     "dpmpp_3m_sde_gpu",
+     "ddpm",
+     "lcm",
+     "ipndm",
+     "ipndm_v",
+     "deis",
+     "cfgpp_ud10_ab",
+     "res_multistep",
+     "res_multistep_cfg_pp",
+     "res_multistep_ancestral",
+     "res_multistep_ancestral_cfg_pp",
+     "gradient_estimation",
+     "gradient_estimation_cfg_pp",
+     "er_sde",
+     "seeds_2",
+     "seeds_3",
+     "sa_solver",
+     "sa_solver_pece",
+     "ddim",
+     "uni_pc",
+     "uni_pc_bh2"
+    ],
+    "scheduler": [
+     "simple",
+     "sgm_uniform",
+     "karras",
+     "exponential",
+     "ddim_uniform",
+     "beta",
+     "normal",
+     "linear_quadratic",
+     "kl_optimal"
+    ]
+   },
+   "outputs": [
+    "LATENT"
+   ],
+   "output_node": false
+  },
+  "VAEDecode": {
+   "required": {
+    "samples": "LATENT",
+    "vae": "VAE"
+   },
+   "optional": {},
+   "enums": {},
+   "outputs": [
+    "IMAGE"
+   ],
+   "output_node": false
+  },
+  "VAELoader": {
+   "required": {
+    "vae_name": "COMBO"
+   },
+   "optional": {},
+   "enums": {
+    "vae_name": [
+     "ae.safetensors",
+     "flux2-vae.safetensors",
+     "flux2-vae_small.safetensors",
+     "full_encoder_small_decoder.safetensors",
+     "minimax_h3_audio_vae_fp32.safetensors",
+     "minimax_h3_video_vae_fp16.safetensors",
+     "qwen_image_2.1_vae_bf16.safetensors",
+     "qwen_image_vae.safetensors",
+     "texture_fix_vae_for_qwen_image_2.1_bf16.safetensors",
+     "pixel_space"
+    ]
+   },
+   "outputs": [
+    "VAE"
+   ],
+   "output_node": false
+  },
+  "SaveImage": {
+   "required": {
+    "images": "IMAGE",
+    "filename_prefix": "STRING"
+   },
+   "optional": {},
+   "enums": {},
+   "outputs": [
+    "IMAGE"
+   ],
+   "output_node": true
+  },
+  "LoadImage": {
+   "required": {
+    "image": "COMBO"
+   },
+   "optional": {},
+   "enums": {
+    "image": [
+     "bn2_base.png",
+     "bn3_base.png",
+     "cat.webp",
+     "clipspace-mask-1792095301302.png",
+     "clipspace-mask-1792095779738.png",
+     "clipspace-mask-1792095837035.png",
+     "clipspace-mask-1792096037372.png",
+     "clipspace-mask-1792096191231.png",
+     "clipspace-mask-1792096790627.png",
+     "clipspace-mask-1792096800915.png",
+     "clipspace-mask-1792098448955.png",
+     "clipspace-mask-1792098462047.png",
+     "clipspace-mask-1792098891636.png",
+     "clipspace-mask-1792098900951.png",
+     "clipspace-paint-1792095301302.png",
+     "clipspace-paint-1792095779738.png",
+     "clipspace-paint-1792095837035.png",
+     "clipspace-paint-1792096037372.png",
+     "clipspace-paint-1792096191231.png",
+     "clipspace-paint-1792096790627.png",
+     "clipspace-paint-1792096800915.png",
+     "clipspace-paint-1792098448955.png",
+     "clipspace-paint-1792098462047.png",
+     "clipspace-paint-1792098891636.png",
+     "clipspace-paint-1792098900951.png",
+     "clipspace-painted-1792095301302.png",
+     "clipspace-painted-1792095779738.png",
+     "clipspace-painted-1792095837035.png",
+     "clipspace-painted-1792096037372.png",
+     "clipspace-painted-1792096191231.png",
+     "clipspace-painted-1792096790627.png",
+     "clipspace-painted-1792096800915.png",
+     "clipspace-painted-1792098448955.png",
+     "clipspace-painted-1792098462047.png",
+     "clipspace-painted-1792098891636.png",
+     "clipspace-painted-1792098900951.png",
+     "clipspace-painted-masked-1792095301302.png",
+     "clipspace-painted-masked-1792095779738.png",
+     "clipspace-painted-masked-1792095837035.png",
+     "clipspace-painted-masked-1792096037372.png",
+     "clipspace-painted-masked-1792096191231.png",
+     "clipspace-painted-masked-1792096790627.png",
+     "clipspace-painted-masked-1792096800915.png",
+     "clipspace-painted-masked-1792098448955.png",
+     "clipspace-painted-masked-1792098462047.png",
+     "clipspace-painted-masked-1792098891636.png",
+     "clipspace-painted-masked-1792098900951.png",
+     "cr1_paste2_mid.png",
+     "db2_base.png",
+     "dc1_base.png",
+     "de3_base.png",
+     "dg_paste.png",
+     "dh2_paste.png",
+     "dh3_paste.png",
+     "dh_paste.png",
+     "dj1_base.png",
+     "example.png",
+     "face_seed_v5.png",
+     "fd_full.png",
+     "fe1_full.png",
+     "girl_basis_fB.png",
+     "girl_v4.png",
+     "hmv-logo-20261010.png",
+     "hmv-logo-v2.png",
+     "hmv-logo-v3.png",
+     "hmv-logo-v4.png",
+     "idphoto_facmask.png",
+     "idphoto_ref.png",
+     "idphoto_ref_test.png",
+     "idphoto_synth.png",
+     "krea_00011.png",
+     "mask_bg_clean.png",
+     "mask_bn3_eyes.png",
+     "mask_bn3_face.png",
+     "mask_bn3_face2.png",
+     "mask_brow_eye.png",
+     "mask_dh3_seam.png",
+     "mask_dh3_seam2.png",
+     "mask_expr1.png",
+     "mask_eye_only.png",
+     "mask_eyes.png",
+     "mask_face_hand_fix.png",
+     "mask_fix.png",
+     "mask_fuse1.png",
+     "mask_lamp_fix.png",
+     "mask_part_1.png",
+     "mask_shoulder_fix.png",
+     "mask_step2g.png",
+     "mask_suit_fix.png",
+     "mask_suit_fix2.png",
+     "mask_suit_fix3.png",
+     "mask_watermark.png",
+     "moss-image_00024_.png",
+     "moss-image_00037_.png",
+     "moss-image_00038_.png",
+     "moss-image_00042_.png",
+     "moss-image_00046_.png",
+     "moss_49.png",
+     "pose_half_clean.png",
+     "pose_man_shush_00001_.png",
+     "pose_sq.png",
+     "pose_tight.png",
+     "prev_n2.png",
+     "prev_q1.png",
+     "prev_r1.png",
+     "prev_s5.png",
+     "ref17.png",
+     "refA.png",
+     "refA_face.png",
+     "refB.png",
+     "refB_face.png",
+     "refC.png",
+     "refC_face.png",
+     "ref_exp_r2.png",
+     "ref_face.png",
+     "ref_face_g1.png",
+     "ref_face_smile.png",
+     "ref_frame_01.jpg",
+     "ref_frame_05.jpg",
+     "ref_girl.jpg",
+     "ref_girl_face.png",
+     "ref_girl_face2.png",
+     "ref_man_crop.png",
+     "ref_man_face.jpg",
+     "ref_man_face.png",
+     "ref_man_face2.png",
+     "ref_man_half.jpg",
+     "ref_man_shush.jpg",
+     "ref_man_sq.png",
+     "ref_man_tight.png",
+     "ref_real2.jpg",
+     "ref_real3.jpg",
+     "s2_basis.png",
+     "s4_basis.png",
+     "sketch-01-flow.png",
+     "sketch-02-petal.png",
+     "sketch-03-emerge.png",
+     "sketch-04-mono.png",
+     "sketch-card-01-node-garden.png",
+     "sketch-card-02-data-stream.png",
+     "sketch-narrative-hana-comfy.png",
+     "sketch-narrative-v6.png",
+     "src_cert_900.png",
+     "src_front_1120.png",
+     "src_hd_white.png",
+     "src_id_1120.png",
+     "src_krea07.png",
+     "src_life.jpg",
+     "src_life_1120.png",
+     "src_openear.png",
+     "src_real_1120.png",
+     "src_real_id.png",
+     "src_real_openear.png",
+     "src_real_openear2.png",
+     "src_real_openear3.png",
+     "step1_e_00001_.png",
+     "step1_f1.png",
+     "step1_f2.png",
+     "step1_man.png",
+     "step2_a2_base.png",
+     "step2_base.png",
+     "step2_g_base.png",
+     "step2_shoulder_base.png",
+     "step2_t1_base.png",
+     "step3_scene.png",
+     "style_id.png",
+     "v5_base.png",
+     "v6_seed.png",
+     "woman2.webp"
+    ]
+   },
+   "outputs": [
+    "IMAGE",
+    "MASK"
+   ],
+   "output_node": false
+  },
+  "EmptyImage": {
+   "required": {
+    "width": "INT",
+    "height": "INT",
+    "batch_size": "INT",
+    "color": "INT"
+   },
+   "optional": {},
+   "enums": {},
+   "outputs": [
+    "IMAGE"
+   ],
+   "output_node": false
+  },
+  "PreviewImage": {
+   "required": {
+    "images": "IMAGE"
+   },
+   "optional": {},
+   "enums": {},
+   "outputs": [
+    "IMAGE"
+   ],
+   "output_node": true
+  },
+  "LatentConcat": {
+   "required": {
+    "samples1": "LATENT",
+    "samples2": "LATENT",
+    "dim": "COMBO"
+   },
+   "optional": {},
+   "enums": {
+    "dim": [
+     "x",
+     "-x",
+     "y",
+     "-y",
+     "t",
+     "-t"
+    ]
+   },
+   "outputs": [
+    "LATENT"
+   ],
+   "output_node": false
+  },
+  "HypernetworkLoader": {
+   "required": {
+    "model": "MODEL",
+    "hypernetwork_name": "COMBO",
+    "strength": "FLOAT"
+   },
+   "optional": {},
+   "enums": {
+    "hypernetwork_name": []
+   },
+   "outputs": [
+    "MODEL"
+   ],
+   "output_node": false
+  }
+ }
+}

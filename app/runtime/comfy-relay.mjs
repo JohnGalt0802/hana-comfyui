@@ -20,6 +20,10 @@
 //   POST /_relay/fs/write          写入文本（{path, text}，上限 16 MiB；原子写 .tmp→rename；app 沙箱外的落盘代做）
 //   POST /_relay/upload            读取本机图片并 multipart 上传到后端 /upload/image
 //                                  （{path, subfolder?, type?, overwrite?}）
+//   POST /_relay/validate         校验工作流（{path | template | workflow, options?}；三选一；需 controlKey）
+//                                 → T2 validateWorkflow 的结构化结果（ok/format/errors/warnings/stats/source）
+//   POST /_relay/node-deps        缺包诊断（{classes:[..]} 或 {workflow:{path|template|object}}；需 controlKey）
+//                                 → 未知类名（不在 object_info）反查映射表 → 三态摘要（未装/装了没加载/查不到）；不实现自动安装
 //   POST /_relay/submit-file      读本机工作流文件（或 userdata 模板）→ UI→API 转换 → 注入 inputs
 //                                  → 提交后端 /prompt，返回 {prompt_id, source, nodeCount, applied}
 //                                  （{path | template, inputs?, front?}；需 controlKey）
@@ -27,6 +31,8 @@
 //   GET  /_relay/update            ComfyUI 本体更新检查（git fetch + 比较，带 TTL 缓存）
 //   POST /_relay/update            执行更新（{op:"check"|"apply"}；apply 后台跑，需 controlKey）
 //   GET  /_relay/update/status     更新进度（阶段 / 步骤 / 日志尾）
+//   GET  /_relay/templates        官方模板库检索（?q=&task=&model=&mediaType=&tag=&recommend=&limit=&offset=&refresh=1；缓存 24h，带 If-None-Match）
+//   POST /_relay/template-fetch   拉取指定模板落盘（{name, target:"hub"|"tmp"}；需 controlKey；只报缺哪些模型，不下载权重）
   //   POST /_relay/bridge           画布桥（只读阶段）：{op,args} → ComfyUI 内 hana_bridge 扩展执行
   //                                 （需 controlKey；token 读 custom_nodes/hana_bridge/.token）
 //
@@ -62,10 +68,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import http from "node:http";
 import net from "node:net";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
+import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, tmpdir, totalmem } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { isPlainObject, convertUiToApi, applyInputs } from "../lib/workflow-tools.mjs";
 // 节点适配档案加载（2026-10-30）：内置 <app>/lib/node-adapters + <appDataDir>/node-adapters（用户覆盖内置）。
@@ -73,6 +79,9 @@ import { isPlainObject, convertUiToApi, applyInputs } from "../lib/workflow-tool
 import { loadNodeAdapters } from "../lib/node-adapter-store.mjs";
 import { writeFileAtomic } from "../workflow-file.mjs"; // 原子写共享实现（T-fs 修复：中继代 app 落盘）
 import { handleHistoryCommit } from "./history-commit.mjs"; // 画布提交快照落盘（P1-B1，纯逻辑模块；中继只做路由接线）
+import { validateWorkflow } from "../lib/validate-workflow.mjs"; // 提交前校验内核（T2，纯函数；/_relay/validate 用）
+import { buildCatalog, searchCatalog, compareVersion, collectRequiredModels, diffModels, runnableCheck } from "../lib/template-hub.mjs"; // 模板库内核（T5，纯函数；/_relay/templates 与 /_relay/template-fetch 用）
+import { buildReverseIndex, resolveMissing, summarize, normalizeRepo } from "../lib/node-deps.mjs"; // 缺包诊断内核（T8，纯函数；/_relay/node-deps 用）
 
 // ── 退出码 ──────────────────────────────────────────────────────────────────
 const EXIT = Object.freeze({ OK: 0, INTERNAL: 1, BACKEND: 2, USAGE: 3, PORT: 7 });
@@ -3830,6 +3839,621 @@ async function handleSubmitFile(req, res) {
   });
 }
 
+// ── validate：校验工作流（T3 2026-11-02）─────────────────────────────
+// 收 {path | template | workflow, options?}（三选一，互斥），调 T2 validateWorkflow 原样回结果。
+// 约定：URL 层面成功一律 200，校验不通过也 200（靠 ok/valid 区分，同官方 MCP 姿势）；
+//   只有读不到文件/后端不可达/JSON 坏/内部异常才 4xx/5xx。objectInfo 只走 T1 缓存（oiEnsure），
+//   不另拉后端；不落盘、不缓存校验结果（每次现算）；不触发 UI→API 转换副作用。
+async function handleValidate(req, res) {
+  let body;
+  try { body = await readBodyJson(req, 2 * 1024 * 1024); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+  const pathArg = typeof body.path === "string" ? body.path.trim() : "";
+  const tplArg = typeof body.template === "string" ? body.template.trim() : "";
+  const wfArg = body.workflow;
+  const given = [pathArg, tplArg, wfArg !== undefined].filter(Boolean).length;
+  if (given === 0) return jsonOut(res, 400, { ok: false, error: "需要 path（本机工作流文件）/ template（userdata 工作流名）/ workflow（直接给对象）三选一" });
+  if (given > 1) return jsonOut(res, 400, { ok: false, error: "path / template / workflow 三选一，互斥，不能同时给" });
+
+  // 1) 取工作流对象与来源标签
+  let wf = null;
+  let sourceLabel = "";
+  if (pathArg) {
+    const st = safeStat(pathArg);
+    if (!st.exists || !st.isFile) return jsonOut(res, 404, { ok: false, error: `文件不存在或不是普通文件：${pathArg}`, stat: st });
+    if (st.size > SUBMIT_FILE_MAX_BYTES) return jsonOut(res, 413, { ok: false, error: `文件超过 ${Math.round(SUBMIT_FILE_MAX_BYTES / 1024 / 1024)} MiB 上限`, size: st.size });
+    let raw = "";
+    try { raw = readFileSync(pathArg, "utf8"); } catch (e) { return jsonOut(res, 500, { ok: false, error: `读取文件失败：${String((e && e.message) || e)}` }); }
+    try { wf = JSON.parse(raw); } catch (e) { return jsonOut(res, 400, { ok: false, error: `工作流文件不是合法 JSON：${pathArg}（${String((e && e.message) || e)}）` }); }
+    sourceLabel = `file:${pathArg}`;
+  } else if (tplArg) {
+    let t;
+    try { t = await resolveTemplateContent(tplArg); } catch (e) { return jsonOut(res, 502, { ok: false, error: String((e && e.message) || e) }); }
+    try { wf = JSON.parse(t.content); } catch (e) { return jsonOut(res, 400, { ok: false, error: `工作流不是合法 JSON：${t.path}（${String((e && e.message) || e)}）` }); }
+    sourceLabel = `userdata:${t.path}`;
+  } else {
+    if (!isPlainObject(wfArg)) return jsonOut(res, 400, { ok: false, error: "workflow 需要对象（UI 或 API 格式）" });
+    wf = wfArg;
+    sourceLabel = "inline";
+  }
+
+  // 2) objectInfo 只走 T1 缓存；后端不可达在此暴露为 502
+  let oi;
+  try {
+    oi = await oiEnsure();
+  } catch (e) {
+    return jsonOut(res, 502, { ok: false, error: "backend_unreachable", detail: String((e && e.message) || e).slice(0, 300) });
+  }
+
+  // 3) 调 T2 内核，结果原样回（不加工不过滤）；ok 与 valid 同义并存
+  const result = validateWorkflow({ workflow: wf, objectInfo: oi, options: isPlainObject(body.options) ? body.options : undefined });
+  log(`validate ${key2(sourceLabel)} → ok=${result.ok}（errors=${result.errors.length}, warnings=${result.warnings.length}）`);
+  return jsonOut(res, 200, { ...result, ok: result.ok, valid: result.ok, source: sourceLabel });
+}
+
+
+// ── node-deps：缺包诊断（T9 2026-11-02）──────────────────────────────────
+// 收 {classes:[类名]} 或 {workflow:{path|template|object}}（二选一），回三态诊断：
+//   未装（notInstalled，建议安装清单）/ 装了没加载（installedNotLoaded，需重启或看日志）/ 表里查不到（unresolved）。
+// 只读：扫 custom_nodes 仅读 .git\config 的 remote url；映射表只读不写。**不实现自动安装**（John 硬禁区）。
+// 类名集合口径：调用方给的 classes（或从 workflow 递归提取，含 definitions.subgraphs）先与本机
+//   object_info（只走 T1 的 oiEnsure，不另拉后端）求差，只对差集反查映射表。
+// 映射表选取：user/__manager/cache 里 mtime 最新的 *_extension-node-map.json 优先；
+//   读不到回落 venv site-packages 的 comfyui_manager/extension-node-map.json（随 pip 包，manager 未启用也在）。
+//   两份都读不到 → ok:false error:"node_map_unavailable"，绝不静默返回空。
+// 缓存：只缓存映射表解析结果，按（路径, mtime）失效——manager 刷了缓存立即生效；诊断结果不缓存。
+// 返回给调用方的只有 resolutions/summary，绝不回传映射表本身（1.4~2.6 MB）。
+const ND_WF_MAX_BYTES = 16 * 1024 * 1024;
+const ND_MAP_MAX_BYTES = 32 * 1024 * 1024;
+let ndMapCache = { path: null, mtimeMs: null, data: null };
+
+function ndReadJsonFile(p, maxBytes) {
+  try {
+    const st = statSync(p);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    const obj = JSON.parse(readFileSync(p, "utf8"));
+    return obj && typeof obj === "object" && !Array.isArray(obj) && Object.keys(obj).length ? obj : null;
+  } catch { return null; }
+}
+
+// cache 目录里 mtime 最新的映射表文件；目录不存在/为空 → null
+function ndNewestCacheMap(cacheDir) {
+  let files;
+  try { files = readdirSync(cacheDir); } catch { return null; }
+  let best = null;
+  for (const f of files) {
+    if (!f.endsWith("extension-node-map.json")) continue;
+    const p = join(cacheDir, f);
+    try {
+      const st = statSync(p);
+      if (st.isFile() && (!best || st.mtimeMs > best.mtimeMs)) best = { path: p, mtimeMs: st.mtimeMs };
+    } catch { /* 单文件 stat 失败跳过 */ }
+  }
+  return best;
+}
+
+// 映射表加载（cache 优先，site-packages 兜底）。命中内存缓存的条件：同路径同 mtime。
+// 返回 { map, source: "cache"|"site-packages", mtimeMs, path }；全部候选都读不到 → null。
+function ndLoadNodeMap(comfyRoot, pyDir) {
+  const cands = [];
+  if (comfyRoot) {
+    const hit = ndNewestCacheMap(join(comfyRoot, "user", "__manager", "cache"));
+    if (hit) cands.push({ ...hit, source: "cache" });
+  }
+  // venv 兜底：python 在 <venv>/Scripts 下，site-packages 两种布局都试（与 useManager 探测同口径）
+  for (const sp of [join(pyDir, "..", "Lib", "site-packages"), join(pyDir, "Lib", "site-packages")]) {
+    const p = join(sp, "comfyui_manager", "extension-node-map.json");
+    try {
+      const st = statSync(p);
+      if (st.isFile()) { cands.push({ path: p, mtimeMs: st.mtimeMs, source: "site-packages" }); break; }
+    } catch { /* 下一个候选 */ }
+  }
+  for (const c of cands) {
+    if (ndMapCache.path === c.path && ndMapCache.mtimeMs === c.mtimeMs && ndMapCache.data) {
+      return { ...c, map: ndMapCache.data };
+    }
+    const map = ndReadJsonFile(c.path, ND_MAP_MAX_BYTES);
+    if (map) {
+      ndMapCache = { path: c.path, mtimeMs: c.mtimeMs, data: map };
+      return { ...c, map };
+    }
+  }
+  return null;
+}
+
+// 读 .git/config 的 remote url：优先 [remote "origin"] 段，缺 origin 时取全文第一个 url。
+// 只认 origin/首个 url 是有意的近似：不做模糊匹配（任务书「不要强行匹配到看起来像的仓库」）。
+function ndReadGitUrl(cfgPath) {
+  try {
+    const text = readFileSync(cfgPath, "utf8");
+    const sec = text.match(/\[remote "origin"\]([\s\S]*?)(?=\n\[|$)/);
+    const m = (sec ? sec[1] : text).match(/^\s*url\s*=\s*(.+)$/m);
+    return m ? m[1].trim() : null;
+  } catch { return null; }
+}
+
+// 扫 custom_nodes：逐目录读 .git\config（只读）。返回归一化前的原始 url 作键（normalizeInstalled 负责归一化）。
+function ndScanInstalled(comfyRoot) {
+  const dir = join(comfyRoot, "custom_nodes");
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return { installed: {}, count: 0, gitRepos: 0 }; }
+  const installed = {};
+  let count = 0;
+  let gitRepos = 0;
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name.startsWith(".")) continue;
+    count++;
+    const url = ndReadGitUrl(join(dir, e.name, ".git", "config"));
+    if (!url) continue;
+    gitRepos++;
+    installed[url] = { present: true, dir: `custom_nodes/${e.name}` };
+  }
+  return { installed, count, gitRepos };
+}
+
+// 从 UI/API 工作流对象递归收集节点类名（含 definitions.subgraphs 的嵌套节点）
+function ndCollectClasses(wf, out) {
+  if (!wf || typeof wf !== "object") return;
+  if (Array.isArray(wf.nodes)) {
+    for (const n of wf.nodes) {
+      if (n && typeof n === "object" && typeof n.type === "string" && n.type) out.add(n.type);
+    }
+  }
+  const defs = wf.definitions && typeof wf.definitions === "object" ? wf.definitions : null;
+  if (defs && Array.isArray(defs.subgraphs)) {
+    for (const sg of defs.subgraphs) ndCollectClasses(sg, out);
+  }
+}
+
+async function handleNodeDeps(req, res) {
+  let body;
+  try { body = await readBodyJson(req, 2 * 1024 * 1024); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+  const hasClasses = Array.isArray(body.classes);
+  const hasWf = body.workflow !== undefined;
+  if (hasClasses && hasWf) return jsonOut(res, 400, { ok: false, error: "classes 与 workflow 二选一，不能同时给" });
+  if (!hasClasses && !hasWf) return jsonOut(res, 400, { ok: false, error: "需要 classes（字符串数组）或 workflow（本机路径 / userdata 模板名 / 对象）" });
+
+  let classesArg = null;
+  let sourceLabel = "classes";
+  if (hasClasses) {
+    classesArg = body.classes.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim()).slice(0, 500);
+    if (!classesArg.length) return jsonOut(res, 400, { ok: false, error: "classes 为空（需要至少一个类名）" });
+  } else {
+    const wfArg = body.workflow;
+    let wf = null;
+    if (typeof wfArg === "string") {
+      const p = wfArg.trim();
+      if (existsSync(p)) {
+        const st = safeStat(p);
+        if (!st.isFile) return jsonOut(res, 400, { ok: false, error: `不是普通文件：${p}` });
+        if (st.size > ND_WF_MAX_BYTES) return jsonOut(res, 413, { ok: false, error: `文件超过 ${Math.round(ND_WF_MAX_BYTES / 1024 / 1024)} MiB 上限`, size: st.size });
+        try { wf = JSON.parse(readFileSync(p, "utf8")); } catch (e) { return jsonOut(res, 400, { ok: false, error: `工作流文件不是合法 JSON：${String((e && e.message) || e)}` }); }
+        sourceLabel = `file:${p}`;
+      } else {
+        // 不存在的本机路径 → 按 userdata 模板名处理（与 /_relay/validate 的 template 同一查找）
+        try {
+          const t = await resolveTemplateContent(p);
+          wf = JSON.parse(t.content);
+          sourceLabel = `userdata:${t.path}`;
+        } catch (e) {
+          return jsonOut(res, 404, { ok: false, error: String((e && e.message) || e) });
+        }
+      }
+    } else if (isPlainObject(wfArg)) {
+      wf = wfArg;
+      sourceLabel = "inline";
+    } else {
+      return jsonOut(res, 400, { ok: false, error: "workflow 需要本机路径字符串或对象" });
+    }
+    const set = new Set();
+    ndCollectClasses(wf, set);
+    classesArg = [...set];
+    if (!classesArg.length) return jsonOut(res, 400, { ok: false, error: "工作流里没有提取到任何节点类名" });
+  }
+
+  // 本机真实类集合：只走 T1 的 oiEnsure；后端不可达在此暴露为 502
+  let oi;
+  try { oi = await oiEnsure(); } catch (e) {
+    return jsonOut(res, 502, { ok: false, error: "backend_unreachable", detail: String((e && e.message) || e).slice(0, 300) });
+  }
+  const known = oi && oi.classes && typeof oi.classes === "object" ? oi.classes : {};
+  const unknown = classesArg.filter((c) => !Object.hasOwn(known, c));
+
+  const t = resolveLaunchTarget(null);
+  if (!t.ok || !t.mainPy) return jsonOut(res, 502, { ok: false, error: "install_not_found", detail: "本机 ComfyUI 安装探测失败，custom_nodes 与映射表无从读起" });
+  const comfyRoot = dirname(t.mainPy);
+  const pyDir = dirname(t.python);
+
+  const loaded = ndLoadNodeMap(comfyRoot, pyDir);
+  if (!loaded) return jsonOut(res, 503, { ok: false, error: "node_map_unavailable", detail: `cache 与 site-packages 的 extension-node-map.json 都读不到（探测根：${comfyRoot}）` });
+
+  const scan = ndScanInstalled(comfyRoot);
+  const reverseIndex = buildReverseIndex(loaded.map);
+  const resolutions = unknown.length ? resolveMissing(unknown, reverseIndex, scan.installed) : [];
+  const summary = summarize(resolutions);
+  // 归一化命中率：已扫到的 git 仓库里有多少个能在映射表中找到同 owner/repo（诊断报告用，不参与判定）
+  const repoSet = new Set();
+  for (const list of Object.values(reverseIndex)) for (const c of list) repoSet.add(c.repo);
+  let gitReposInMap = 0;
+  for (const url of Object.keys(scan.installed)) {
+    const repo = normalizeRepo(url);
+    if (repo && repoSet.has(repo)) gitReposInMap++;
+  }
+
+  log(`node-deps ${key2(sourceLabel)}：checked=${classesArg.length} unknown=${unknown.length} map=${loaded.source}(${Math.round(loaded.mtimeMs ? (Date.now() - loaded.mtimeMs) / 3600000 : 0)}h) git=${scan.gitRepos}/${scan.count} inMap=${gitReposInMap}`);
+  return jsonOut(res, 200, {
+    ok: true,
+    checked: classesArg.length,
+    unknownCount: unknown.length,
+    resolutions,
+    summary,
+    source: {
+      map: loaded.source,
+      mapAge: Math.max(0, Math.round((Date.now() - loaded.mtimeMs) / 1000)),
+      customNodes: scan.count,
+      gitRepos: scan.gitRepos,
+      gitReposInMap,
+      mapPath: loaded.path,
+    },
+  });
+}
+
+
+// ── object-info 裁剪与缓存（T1 2026-11-02）─────────────────────────────────
+// 存在理由：宿主给 App 的网络响应体上限默认 5 MiB，而 /object_info 已 4.13 MiB（实测 4331637 B），
+// 用户再装两个节点包 App 侧就拉不动了。中继走 node:http 不受限，在这里裁成「校验够用」的
+// 精简结构并缓存（内存 + 落盘），App 经 /_relay/object-info 随时取；?digest=1 只回摘要。
+// 裁剪口径：每个节点类只留 required/optional 的「输入名 → 类型」、COMBO 选项（enums）、outputs；
+// 丢 tooltip/default/min/max/control_after_generate 等校验用不上的字段。
+// COMBO 实测两种形态（2026-11-02 样本 2549 类普查）：
+//   ① [["opt", ...], {tooltip?...}] —— v[0] 是选项数组（1779 处）
+//   ② ["COMBO", {options:["opt",...], multiselect?...}] —— v1 前端 API（647 处带 options；1 处缺省只记类型）
+// 失效判据：custom_nodes 目录 mtime 变了就重建；否则 TTL 24 小时。
+// schema 2（2026-11-02，T3）：classes[类名] 增加 output_node:bool（取自 /object_info 同名字段，
+//   本机实测 2549 类里 206 个为 true）；T2 校验内核的 no_output 判定靠它升级成 error。升版本
+//   是为了让 TTL 内的 schema 1 落盘缓存立即作废重建，不是结构兼容性断裂。
+// 落盘位置：<config.appDataDir>/object-info-cache.json（App 数据目录，不进仓库；standalone 无
+// appDataDir 时退到 ~/.hanako/comfy-relay/，同样在仓库外）。
+const OI_SCHEMA_VERSION = 2;
+const OI_TTL_MS = 24 * 60 * 60 * 1000;
+let oiCache = { built: null, building: null };
+
+function oiCacheFilePath() {
+  return join((config && config.appDataDir) || join(homedir(), ".hanako", "comfy-relay"), "object-info-cache.json");
+}
+
+function oiCustomNodesMtime() {
+  try {
+    const t = resolveLaunchTarget(null);
+    if (t.ok && t.mainPy) return safeStat(join(dirname(t.mainPy), "custom_nodes")).mtimeMs;
+  } catch { /* 探测不到 → 返回 null，只按 TTL 失效 */ }
+  return null;
+}
+
+// 单输入提取：返回 {type, enums?}；两种 COMBO 形态之外的未知形态返回 null（该输入不进裁剪结果）
+function oiExtractInput(spec) {
+  if (typeof spec === "string") return { type: spec }; // 防御：极老版本可能直接给类型字符串
+  if (!Array.isArray(spec) || !spec.length) return null;
+  if (Array.isArray(spec[0])) return { type: "COMBO", enums: spec[0].filter((o) => typeof o === "string" || typeof o === "number") }; // 形态①
+  if (spec[0] === "COMBO") {
+    const opts = spec[1] && typeof spec[1] === "object" && Array.isArray(spec[1].options) ? spec[1].options : null;
+    return opts ? { type: "COMBO", enums: opts } : { type: "COMBO" }; // 形态②（options 缺省只记类型）
+  }
+  if (typeof spec[0] === "string") return { type: spec[0] }; // 常规：["INT"/"STRING"/"MODEL"..., {min,max,...}]
+  return null;
+}
+
+function oiBuildFromRaw(raw, comfyuiVersion, customNodesMtimeMs) {
+  const classes = {};
+  for (const [name, nodeRaw] of Object.entries(raw)) {
+    if (!nodeRaw || typeof nodeRaw !== "object") continue;
+    const entry = {};
+    const enums = {};
+    const inp = nodeRaw.input && typeof nodeRaw.input === "object" ? nodeRaw.input : null;
+    for (const sec of ["required", "optional"]) {
+      const src = inp && typeof inp[sec] === "object" ? inp[sec] : null;
+      if (!src) continue;
+      const types = {};
+      for (const [inputName, spec] of Object.entries(src)) {
+        const ex = oiExtractInput(spec);
+        if (!ex) continue;
+        types[inputName] = ex.type;
+        if (ex.enums) enums[inputName] = ex.enums;
+      }
+      if (Object.keys(types).length) entry[sec] = types;
+    }
+    if (Object.keys(enums).length) entry.enums = enums;
+    const outs = Array.isArray(nodeRaw.output) ? nodeRaw.output.filter((t) => typeof t === "string") : null;
+    if (outs && outs.length) entry.outputs = outs;
+    if (nodeRaw.output_node === true || nodeRaw.output_node === false) entry.output_node = nodeRaw.output_node; // schema 2（T2 no_output 判定）
+    classes[name] = entry;
+  }
+  return {
+    schema: OI_SCHEMA_VERSION,
+    builtAt: new Date().toISOString(),
+    source: { host: backend.host, port: backend.port, comfyuiVersion: comfyuiVersion || null, customNodesMtimeMs: customNodesMtimeMs ?? null },
+    nodeCount: Object.keys(classes).length,
+    digest: createHash("sha256").update(JSON.stringify(classes)).digest("hex").slice(0, 16),
+    classes,
+  };
+}
+
+function oiReadDiskCache() {
+  try {
+    const obj = JSON.parse(readFileSync(oiCacheFilePath(), "utf8"));
+    if (obj && obj.schema === OI_SCHEMA_VERSION && typeof obj.digest === "string" && obj.classes && typeof obj.classes === "object") return obj;
+  } catch { /* 无缓存或损坏 → 走重建 */ }
+  return null;
+}
+
+async function oiEnsure() {
+  const mtime = oiCustomNodesMtime();
+  const stillFresh = (built) => built
+    && Number.isFinite(Date.parse(built.builtAt))
+    && Date.now() - Date.parse(built.builtAt) < OI_TTL_MS
+    && (mtime === null || (built.source && built.source.customNodesMtimeMs === mtime));
+  if (stillFresh(oiCache.built)) return oiCache.built;
+  if (!oiCache.building) {
+    oiCache.building = (async () => {
+      const disk = oiReadDiskCache();
+      if (disk && stillFresh(disk)) {
+        oiCache.built = disk;
+        log(`object-info 用落盘缓存（${disk.nodeCount} 类，digest=${disk.digest}）`);
+        return disk;
+      }
+      const info = await fetchBackendJson("/object_info", 60_000);
+      if (!info.ok || !info.data || typeof info.data !== "object") {
+        throw new Error(`/object_info HTTP ${info.status}`);
+      }
+      let comfyuiVersion = null;
+      try {
+        const st = await fetchBackendJson("/system_stats", 5_000);
+        comfyuiVersion = st.ok && st.data && st.data.system && typeof st.data.system.comfyui_version === "string" ? st.data.system.comfyui_version : null;
+      } catch { /* 版本取不到不拦重建 */ }
+      const built = oiBuildFromRaw(info.data, comfyuiVersion, mtime);
+      oiCache.built = built;
+      try {
+        mkdirSync(dirname(oiCacheFilePath()), { recursive: true });
+        writeFileAtomic(oiCacheFilePath(), JSON.stringify(built));
+        log(`object-info 重建并落盘（${built.nodeCount} 类，digest=${built.digest}）`);
+      } catch (e) {
+        warn(`[object-info] 缓存落盘失败（不影响路由返回）：${String((e && e.message) || e)}`);
+      }
+      return built;
+    })().finally(() => { oiCache.building = null; });
+  }
+  return oiCache.building;
+}
+
+// ── 官方模板库路由（T6 2026-11-02）───────────────────────────────────────
+// 数据源：Comfy-Org/workflow_templates 的 index.mcp.json（英文/检索）与 index.zh.json（中文补充）。
+// 固定三个地址模板（索引 ×2 + 单模板 ×1），只换 <name>；不是通用 HTTP 代理。
+// raw 失败（超时/DNS/非 2xx）自动回落 jsDelivr 同路径镜像；两条都失败才报错。
+// 缓存：中继数据目录 <appDataDir|~/.hanako/comfy-relay>/template-index-cache.json，
+// 内存 + 落盘，If-None-Match 条件请求（304 用本地），24h 强刷，?refresh=1 手动强刷。
+// 落盘（拉取路由）：默认写到 <安装根>/user/default/hui-templates/<分类子目录>/<name>.json ——
+// 刻意避开 workflows/（John 拍板 2026-11-02：不污染 ComfyUI 工作流列表）；target:"tmp" 写系统临时目录。
+const TEMPLATE_HUB_OWNER = "Comfy-Org/workflow_templates";
+const TEMPLATE_HUB_BRANCH = "main";
+const TEMPLATE_HUB_TTL_MS = 24 * 60 * 60 * 1000;
+const TEMPLATE_FETCH_TIMEOUT_MS = 20_000;
+const TEMPLATE_INDEX_MAX_BYTES = 20 * 1024 * 1024;
+const TEMPLATE_JSON_MAX_BYTES = 20 * 1024 * 1024;
+
+function templateHubUrl(path) {
+  return `https://raw.githubusercontent.com/${TEMPLATE_HUB_OWNER}/${TEMPLATE_HUB_BRANCH}/templates/${path}`;
+}
+function templateHubMirrorUrl(path) {
+  return `https://cdn.jsdelivr.net/gh/${TEMPLATE_HUB_OWNER}@${TEMPLATE_HUB_BRANCH}/templates/${path}`;
+}
+function templateIndexCacheFilePath() {
+  return join((config && config.appDataDir) || join(homedir(), ".hanako", "comfy-relay"), "template-index-cache.json");
+}
+
+// 模板索引缓存（内存态；落盘在 templateIndexCacheFilePath()）。
+// building 必须独立于缓存对象：缓存命中路径会同步重assign缓存对象，building 挂在上面会丢失引用（等者拿到 null）。
+let tplIndexCache = null; // { data, etag, fetchedAt, source }
+let tplIndexBuilding = null;
+
+function tplNormalizeName(name) {
+  const s = String(name || "").trim();
+  // 白名单字符集 + 长度限制，拼 URL 与拼落盘路径都靠它兜底防目录穿越
+  return /^[A-Za-z0-9._-]{1,120}$/.test(s) && !s.startsWith(".") ? s : null;
+}
+
+async function tplFetchWithMirror(path, { etag = null, binary = false } = {}) {
+  const urls = [templateHubUrl(path), templateHubMirrorUrl(path)];
+  const tried = [];
+  for (const url of urls) {
+    const headers = { accept: binary ? "application/octet-stream" : "application/json" };
+    if (etag) headers["if-none-match"] = etag;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(TEMPLATE_FETCH_TIMEOUT_MS), headers });
+      if (res.status === 304) return { ok: true, notModified: true, source: new URL(url).host, tried };
+      if (res.ok) {
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > TEMPLATE_INDEX_MAX_BYTES) throw new Error(`响应超过 ${TEMPLATE_INDEX_MAX_BYTES} 字节上限`);
+        return {
+          ok: true,
+          notModified: false,
+          source: new URL(url).host,
+          etag: typeof res.headers.get("etag") === "string" ? res.headers.get("etag") : null,
+          buf,
+          tried,
+        };
+      }
+      tried.push(`${new URL(url).host} HTTP ${res.status}`);
+    } catch (e) {
+      tried.push(`${new URL(url).host} ${(e && e.cause && e.cause.code) || (e && e.message) || e}`);
+    }
+  }
+  return { ok: false, tried };
+}
+
+function tplIndexStale(info) {
+  return !info.data || !Number.isFinite(info.fetchedAt) || Date.now() - info.fetchedAt >= TEMPLATE_HUB_TTL_MS;
+}
+
+function tplReadDiskCache() {
+  try {
+    const obj = JSON.parse(readFileSync(templateIndexCacheFilePath(), "utf8"));
+    if (obj && obj.schema === 1 && obj.mcp && typeof obj.mcp === "object" && Array.isArray(obj.catalog)) return obj;
+  } catch { /* 无缓存或损坏 → 走重拉 */ }
+  return null;
+}
+
+// 索引就绪（缓存策略集中在这里；检索与拉取都走它）：
+//   内存/落盘缓存未过期直接用 → 过期或缺失才重拉（If-None-Match 304 则沿用本地）。
+async function tplEnsureIndex({ force = false } = {}) {
+  if (!force && tplIndexCache && !tplIndexStale(tplIndexCache)) return tplIndexCache;
+  if (!tplIndexBuilding) {
+    tplIndexBuilding = (async () => {
+      let disk = force ? null : tplReadDiskCache();
+      if (disk && Date.now() - Number(disk.fetchedAt) < TEMPLATE_HUB_TTL_MS) {
+        const wrapped = { data: disk, etag: disk.etag, fetchedAt: Number(disk.fetchedAt), source: disk.source || null };
+        tplIndexCache = wrapped;
+        log(`[templates] 用落盘索引缓存（${disk.catalog.length} 条，age ${Math.round((Date.now() - disk.fetchedAt) / 1000)}s，source=${disk.source || "?"}）`);
+        return wrapped;
+      }
+      // 304/旧索引回退基准：盘上缓存优先，其次内存缓存（都是 entry 形状，含 mcp/zh/zhEtag/etag）
+      const prevEntry = disk || (tplIndexCache ? tplIndexCache.data : null);
+      const etag = prevEntry && prevEntry.etag ? prevEntry.etag : null;
+      const r1 = await tplFetchWithMirror("index.mcp.json", { etag });
+      if (!r1.ok) throw new Error(`两路模板索引都不可达：raw.githubusercontent.com 与 cdn.jsdelivr.net（${r1.tried.join("；") || "无尝试记录"}）`);
+      let mcp = null;
+      if (r1.notModified) {
+        mcp = prevEntry && prevEntry.mcp ? prevEntry.mcp : null;
+        if (!mcp) throw new Error("远端 304 但本地无 mcp 索引可用");
+      } else {
+        try { mcp = JSON.parse(r1.buf.toString("utf8")); } catch (e) { throw new Error(`index.mcp.json 解析失败：${(e && e.message) || e}`); }
+      }
+      // zh 索引只为补中文，拿不到/解析不动都不拦主流程（hasZh=false 回落英文）；304 策略与 mcp 一致
+      let zh = prevEntry && prevEntry.zh ? prevEntry.zh : null;
+      let zhEtag = prevEntry && prevEntry.zhEtag ? prevEntry.zhEtag : null;
+      let source = r1.source;
+      try {
+        const r2 = await tplFetchWithMirror("index.zh.json", { etag: zhEtag });
+        if (r2.notModified) {
+          if (!zh) throw new Error("zh 304 但本地无 zh 索引");
+        } else if (r2.ok) {
+          try { zh = JSON.parse(r2.buf.toString("utf8")); } catch { zh = prevEntry && prevEntry.zh ? prevEntry.zh : null; }
+          source += "+" + r2.source;
+          zhEtag = r2.etag;
+        }
+      } catch { /* zh 拿不到不拦主流程：保留旧 zh 与旧 etag */ }
+      if (!Array.isArray(mcp)) throw new Error("index.mcp.json 不是预期的分类数组结构");
+      const catalog = buildCatalog({ mcpIndex: mcp, zhIndex: zh === undefined ? null : zh });
+      const entry = { schema: 1, fetchedAt: Date.now(), etag: r1.notModified ? etag : r1.etag, source, mcp, zhEtag, zh, catalog };
+      const wrapped = { data: entry, etag: entry.etag, fetchedAt: entry.fetchedAt, source };
+      tplIndexCache = wrapped;
+      try {
+        mkdirSync(dirname(templateIndexCacheFilePath()), { recursive: true });
+        writeFileAtomic(templateIndexCacheFilePath(), JSON.stringify(entry));
+        log(`[templates] 索引拉取并落盘（${catalog.length} 条，source=${source}）`);
+      } catch (e) {
+        warn(`[templates] 索引缓存落盘失败（不影响路由返回）：${String((e && e.message) || e)}`);
+      }
+      return tplIndexCache;
+    })().finally(() => { tplIndexBuilding = null; });
+  }
+  return tplIndexBuilding;
+}
+
+// 安装根（main.py 同级）与 hui-templates 落盘根；探测不到返回 null（路由会报 503）。
+function templateInstallRoot() {
+  try {
+    const t = resolveLaunchTarget(null);
+    if (t && t.ok && t.mainPy) return dirname(t.mainPy);
+  } catch { /* 探测失败 → null */ }
+  return null;
+}
+function templateHubDir(installRoot) {
+  return join(installRoot, "user", "default", "hui-templates");
+}
+function tplSafeDirPart(text) {
+  const s = String(text || "").trim();
+  if (!s || s.length > 80 || !/^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(s) || /[.]{2}/.test(s)) return null;
+  return s;
+}
+
+// 扫 models/ 子目录文件名 → { "<子目录>": ["<文件名>", ...] }；diffModels 的 installed 参数形状。
+function tplScanInstalledModels() {
+  const root = templateInstallRoot();
+  if (!root) return null;
+  const modelsDir = join(root, "models");
+  if (!existsSync(modelsDir)) return {};
+  const out = {};
+  let entries;
+  try { entries = readdirSync(modelsDir, { withFileTypes: true }); } catch { return out; }
+  for (const d of entries) {
+    if (!d.isDirectory()) continue;
+    let names;
+    try { names = readdirSync(join(modelsDir, d.name)); } catch { continue; }
+    out[d.name] = names.filter((f) => f !== ".DS_Store");
+  }
+  return out;
+}
+
+async function handleTemplateFetch(req, res) {
+  let body;
+  try { body = await readBodyJson(req); } catch (e) { return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }); }
+  const name = tplNormalizeName(body && body.name);
+  if (!name) return jsonOut(res, 400, { ok: false, error: '需要 name（限 [A-Za-z0-9._-]，不以 . 开头）' });
+  const target = body && body.target !== undefined ? String(body.target) : "hub";
+  if (target !== "hub" && target !== "tmp") return jsonOut(res, 400, { ok: false, error: 'target 只接受 "hub" 或 "tmp"' });
+  let entry;
+  try { entry = await tplEnsureIndex(); } catch (e) {
+    return jsonOut(res, 502, { ok: false, error: `模板索引不可用：${String((e && e.message) || e)}` });
+  }
+  const row = entry.data.catalog.find((r) => r.name === name);
+  if (!row) return jsonOut(res, 400, { ok: false, error: `name 不在模板索引中：${name}（拒绝拉取索引外的任意地址）` });
+  const r = await tplFetchWithMirror(`${name}.json`);
+  if (!r.ok || r.notModified) return jsonOut(res, 502, { ok: false, error: `模板下载失败（raw + jsDelivr 都试过）：${r.tried.join("；") || "无尝试记录"}` });
+  let templateJson;
+  try { templateJson = JSON.parse(r.buf.toString("utf8")); } catch (e) { return jsonOut(res, 502, { ok: false, error: `模板 JSON 解析失败：${String((e && e.message) || e)}` }); }
+  let destPath;
+  let bytes;
+  if (target === "tmp") {
+    destPath = join(tmpdir(), "hui-template-" + name + ".json");
+  } else {
+    const installRoot = templateInstallRoot();
+    if (!installRoot) return jsonOut(res, 503, { ok: false, error: "未探测到本机 ComfyUI 安装（main.py），无法确定落盘位置" });
+    const part = tplSafeDirPart(row.category) || "misc";
+    destPath = join(templateHubDir(installRoot), part, name + ".json");
+  }
+  try {
+    mkdirSync(dirname(destPath), { recursive: true });
+    if (target !== "tmp" && existsSync(destPath)) {
+      const bak = destPath + ".bak";
+      try { rmSync(bak, { force: true }); } catch { /* 忽略 */ }
+      renameSync(destPath, bak);
+      log(`[template-fetch] 旧文件备份：${key2(bak)}`);
+    }
+    writeFileAtomic(destPath, r.buf);
+    bytes = statSync(destPath).size;
+  } catch (e) {
+    return jsonOut(res, 500, { ok: false, error: `落盘失败：${String((e && e.message) || e)}`, path: destPath });
+  }
+  const required = collectRequiredModels(templateJson);
+  const installed = tplScanInstalledModels();
+  const diff = installed === null ? null : diffModels(required, installed);
+  let runnable;
+  const ver = backend.system && typeof backend.system.comfyui_version === "string" ? backend.system.comfyui_version : null;
+  if (!row.minComfyUIVersion) runnable = true;
+  else if (ver) runnable = runnableCheck(row, ver).runnable;
+  else runnable = null; // 本机版本拿不到，无法断言
+  log(`[template-fetch] ${name} → ${key2(destPath)}（${bytes} B，required ${required.length}，missing ${diff ? diff.missing.length : "?"}）`);
+  return jsonOut(res, 200, {
+    ok: true,
+    name,
+    path: destPath,
+    bytes,
+    models: { required, missing: diff ? diff.missing : null, present: diff ? diff.present : null },
+    runnable,
+    minComfyUIVersion: row.minComfyUIVersion || null,
+    localComfyUIVersion: ver,
+    source: r.source,
+  }, req.method);
+}
 
 // ── OpenAI 兼容网关（HTTP + 队列；模型调用由 App 进程长轮询接管）──────────────
 // 另起一只 http server（默认 127.0.0.1:8790，config.llmGatewayPort 可覆盖），与中继主服务并存。
@@ -4223,6 +4847,51 @@ const server = http.createServer((req, res) => {
     }, req.method);
     return;
   }
+  if (pathOnly === "/_relay/templates") {
+    // 官方模板库检索（只读路由，与 /_relay/status、/_relay/userdata 同口径不强制 controlOk）
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    const uq = new URL(String(req.url || "/"), "http://relay.invalid");
+    const q = Object.fromEntries(["q", "task", "model", "mediaType", "tag", "recommend"].map((k) => {
+      const v = (uq.searchParams.get(k) || "").trim();
+      return [k, v === "" ? null : v];
+    }));
+    const limit = Math.min(200, Math.max(1, Number(uq.searchParams.get("limit")) || 20));
+    const offset = Math.max(0, Number(uq.searchParams.get("offset")) || 0);
+    void (async () => {
+      try {
+        const entry = await tplEnsureIndex({ force: uq.searchParams.get("refresh") === "1" });
+        const found = searchCatalog(entry.data.catalog, { ...q, limit, offset });
+        jsonOut(res, 200, {
+          ok: true,
+          ...found,
+          indexAge: Math.round((Date.now() - entry.fetchedAt) / 1000),
+          source: entry.source,
+          cacheFile: templateIndexCacheFilePath(),
+        }, req.method);
+      } catch (e) {
+        jsonOut(res, 502, { ok: false, error: String((e && e.message) || e) }, req.method);
+      }
+    })();
+    return;
+  }
+  if (pathOnly === "/_relay/template-fetch") {
+    // 拉取指定模板落盘（管理端点，需 x-comfy-relay-key）：{name, target:"hub"|"tmp"}
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    if (!controlOk(req)) {
+      jsonOut(res, 403, { error: "comfy-relay: control key required" });
+      return;
+    }
+    void handleTemplateFetch(req, res).catch((e) => {
+      try { jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }); } catch { /* 忽略 */ }
+    });
+    return;
+  }
   if (pathOnly === "/_relay/userdata") {
     // 代读后端 userdata 文件。存在的理由：App 侧经宿主 ctx.runtime.fetch 发起请求，
     // 其校验禁止 pathname 含编码斜杠（/userdata/workflows%2Fxxx.json 会被拒），
@@ -4266,6 +4935,60 @@ const server = http.createServer((req, res) => {
         jsonOut(res, 502, { ok: false, error: String((e && e.message) || e) }, req.method);
       }
     })();
+    return;
+  }
+  if (pathOnly === "/_relay/object-info") {
+    // 只读路由：与 /_relay/status、/_relay/userdata、/_relay/drives 同口径，不强制 controlOk
+    //（现有只读路由均无鉴权，2026-11-02 对源码核实）。
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { ok: false, error: "method not allowed" }, req.method);
+      return;
+    }
+    const uq = new URL(String(req.url || "/"), "http://relay.invalid");
+    const digestOnly = uq.searchParams.get("digest") === "1" || uq.searchParams.get("digest") === "true";
+    void (async () => {
+      try {
+        const built = await oiEnsure();
+        if (digestOnly) {
+          jsonOut(res, 200, { ok: true, digest: built.digest, nodeCount: built.nodeCount, builtAt: built.builtAt }, req.method);
+          return;
+        }
+        log(`object-info 返回全量（${built.nodeCount} 类，digest=${built.digest}）`);
+        jsonOut(res, 200, { ok: true, ...built }, req.method);
+      } catch (e) {
+        // 新路由异常只经 jsonOut 返回，不外抛（不影响主服务）；后端不可达按现有约定 502 + backend_unreachable
+        jsonOut(res, 502, { ok: false, error: "backend_unreachable", detail: String((e && e.message) || e).slice(0, 300) }, req.method);
+      }
+    })();
+    return;
+  }
+  if (pathOnly === "/_relay/validate") {
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    if (!controlOk(req)) {
+      jsonOut(res, 403, { error: "comfy-relay: control key required" });
+      return;
+    }
+    void handleValidate(req, res).catch((e) => {
+      try { jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }); } catch { /* 忽略 */ }
+    });
+    return;
+  }
+  if (pathOnly === "/_relay/node-deps") {
+    // 缺包诊断（T9 2026-11-02）：只 POST；扫 custom_nodes + 读映射表，属管理面，需 controlKey
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { ok: false, error: "method not allowed" }, req.method);
+      return;
+    }
+    if (!controlOk(req)) {
+      jsonOut(res, 403, { error: "comfy-relay: control key required" });
+      return;
+    }
+    void handleNodeDeps(req, res).catch((e) => {
+      try { jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }); } catch { /* 忽略 */ }
+    });
     return;
   }
   if (pathOnly === "/_relay/drives") {

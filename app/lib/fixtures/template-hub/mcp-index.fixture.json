@@ -1,0 +1,231 @@
+[
+ {
+  "category": "Image",
+  "description": "General-purpose workflow templates for native image generation, including text-to-image, image editing, inpainting, and other core image workflows supported out of the box.",
+  "templates": [
+   {
+    "name": "api_nano_banana_2_1_t2i",
+    "title": "Nano Banana 2.1: Text to Image",
+    "task": "Text to Image",
+    "model": "Nano Banana",
+    "freshness": "new",
+    "usage": 4836,
+    "recommend": "highly_recommended",
+    "description": "Generate images from text prompts using Nano Banana 2.1, Google's fast Gemini-based image model, delivering one finished image with no input files required. Ideal for brand marketing posters, e-commerce product visuals, and IP character series.",
+    "io": {
+     "inputs": [
+      "text: Prompt"
+     ],
+     "outputs": [
+      "image: Generated image"
+     ]
+    },
+    "minComfyUIVersion": "0.39.1",
+    "capabilities": {
+     "workflow": [
+      "text-to-image",
+      "api"
+     ],
+     "model_options": {
+      "GeminiNanoBanana2V2": [
+       "Gemini Nano Banana 2.1",
+       "Nano Banana 2 (Gemini 3.1 Flash Image)",
+       "Nano Banana 2 Lite"
+      ]
+     }
+    }
+   },
+   {
+    "name": "image_qwen_image_2_1_image_edit",
+    "title": "Qwen Image 2.1: Image Edit",
+    "task": "Image Edit",
+    "model": "Qwen Image 2.1",
+    "freshness": "recent",
+    "usage": 15978,
+    "recommend": "highly_recommended",
+    "description": "Edit images with Qwen-Image-2.1 by feeding two reference images through a single checkpoint that handles both generation and editing, then comparing the result against the original. Ideal for character-consistent edits, product cutout compositing with real transparency, and style-transfer passes at native 2K.",
+    "io": {
+     "inputs": [
+      "image: Reference image",
+      "text: Edit prompt"
+     ],
+     "outputs": [
+      "image: Edited image"
+     ]
+    },
+    "minComfyUIVersion": "0.37.0",
+    "capabilities": {
+     "workflow": [
+      "image-edit",
+      "int8"
+     ]
+    }
+   },
+   {
+    "name": "image_qwen_image_2_1_t2i",
+    "title": "Qwen Image 2.1: Text to Image",
+    "task": "Text to Image",
+    "model": "Qwen Image 2.1",
+    "freshness": "recent",
+    "usage": 3935,
+    "recommend": "highly_recommended",
+    "description": "Generate images from text prompts with Qwen Image 2.1, the latest open-weight Qwen-Image model, producing a single 1024×1024 image over 25 sampling steps. Generation and instruction-based editing share one model with native 2K output, professional typography, and alpha-channel support. Ideal for poster and layout design, transparent asset creation, and rapid concept visualization.",
+    "io": {
+     "inputs": [
+      "text: Prompt"
+     ],
+     "outputs": [
+      "image: Generated image"
+     ]
+    },
+    "minComfyUIVersion": "0.37.2",
+    "capabilities": {
+     "workflow": [
+      "text-to-image",
+      "int8"
+     ]
+    }
+   },
+   {
+    "name": "flux_kontext_dev_basic",
+    "title": "Flux Kontext Dev Image Edit",
+    "task": "Image Edit",
+    "model": "FLUX.1 Kontext",
+    "freshness": "established",
+    "usage": 239,
+    "recommend": "medium",
+    "description": "Smart image editing that keeps characters consistent, edits specific parts without affecting others, and preserves original styles.",
+    "io": {
+     "inputs": [
+      "text: Prompt"
+     ],
+     "outputs": [
+      "image: Generated output"
+     ]
+    },
+    "minComfyUIVersion": "0.3.42",
+    "capabilities": {
+     "workflow": [
+      "image-edit"
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "category": "Video",
+  "description": "General-purpose workflow templates for native video generation, including text-to-video, image-to-video, and other core video workflows supported out of the box.",
+  "templates": [
+   {
+    "name": "video_wan2_2_14B_i2v",
+    "title": "Wan 2.2 14B Image to Video",
+    "task": "Image to Video",
+    "model": "Wan",
+    "freshness": "established",
+    "usage": 10608,
+    "recommend": "highly_recommended",
+    "description": "Transform static images into dynamic videos with precise motion control and style preservation using Wan 2.2.",
+    "io": {
+     "inputs": [
+      "image: Reference image",
+      "text: Motion or style prompt"
+     ],
+     "outputs": [
+      "video: Animated video"
+     ]
+    },
+    "minComfyUIVersion": "0.16.4",
+    "capabilities": {
+     "workflow": [
+      "image-to-video"
+     ]
+    }
+   },
+   {
+    "name": "video_wan2_1_infinitetalk",
+    "title": "InfiniteTalk: Audio-Driven Full-Body Video Dubbing",
+    "task": "Lip Sync",
+    "model": "Wan2.1 InfiniteTalk",
+    "freshness": "established",
+    "usage": 59,
+    "recommend": "low",
+    "description": "Upload a source Image and target audio. Generate a full-body dubbed video with synchronized motion while preserving the original identity, background, and camera movement.",
+    "io": {
+     "inputs": [
+      "text: Prompt"
+     ],
+     "outputs": [
+      "image: Generated output"
+     ]
+    },
+    "minComfyUIVersion": "0.17.0",
+    "capabilities": {
+     "workflow": [
+      "audio-to-video",
+      "lip-sync"
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "category": "Audio",
+  "description": "General-purpose workflow templates for native audio generation, including text-to-audio and other core audio workflows supported out of the box.",
+  "templates": [
+   {
+    "name": "audio_stable_audio_3_medium",
+    "title": "Stable Audio 3.0 Medium",
+    "task": "Audio Generation",
+    "model": "Stable Audio",
+    "freshness": "current",
+    "usage": 390,
+    "recommend": "medium",
+    "description": "Input a short text idea, optional duration, seed, and category. Generate stereo audio (music, SFX, or instruments) using Stable Audio 3 with optional AI-driven text expansion.",
+    "io": {
+     "inputs": [
+      "text: Prompt"
+     ],
+     "outputs": [
+      "image: Generated output"
+     ]
+    },
+    "minComfyUIVersion": "0.19.2",
+    "capabilities": {
+     "workflow": [
+      "text-to-audio"
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "category": "3D Model",
+  "description": "General-purpose workflow templates for native 3D model generation, including image-to-3D and other core 3D workflows supported out of the box.",
+  "templates": [
+   {
+    "name": "3d_hunyuan3d_image_to_model",
+    "title": "HY 3D 2.0",
+    "task": "Image to 3D",
+    "model": "Hunyuan3D",
+    "freshness": "established",
+    "usage": 31,
+    "recommend": "not_recommended",
+    "description": "Generate a textured-ready 3D mesh from a single image using Hunyuan3D 2.0's shape diffusion pipeline, which aligns geometry to the given image and outputs an untextured white mesh. Ideal for 3D asset prototyping, game and AR content prep, and as a base for later texture painting or handcrafted detailing.",
+    "io": {
+     "inputs": [
+      "text: Prompt"
+     ],
+     "outputs": [
+      "image: Generated output"
+     ]
+    },
+    "minComfyUIVersion": "0.3.28",
+    "capabilities": {
+     "workflow": [
+      "image-to-3d"
+     ]
+    }
+   }
+  ]
+ }
+]

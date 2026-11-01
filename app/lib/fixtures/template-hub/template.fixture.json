@@ -1,0 +1,195 @@
+{
+  "version": 0.4,
+  "nodes": [
+    {
+      "id": 459,
+      "type": "bc1c967a-7f6a-4be9-a372-dad16e4f28e3",
+      "properties": {
+        "previewExposures": []
+      }
+    },
+    {
+      "id": 461,
+      "type": "SaveImageAdvanced",
+      "properties": {}
+    },
+    {
+      "id": 463,
+      "type": "MarkdownNote",
+      "properties": {}
+    },
+    {
+      "id": 470,
+      "type": "LoadImage",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      }
+    },
+    {
+      "id": 472,
+      "type": "ImageCompare",
+      "properties": {
+        "Node name for S&R": "ImageCompare"
+      }
+    },
+    {
+      "id": 475,
+      "type": "LoadImage",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      }
+    },
+    {
+      "id": 476,
+      "type": "MarkdownNote",
+      "properties": {}
+    },
+    {
+      "id": 501,
+      "type": "MarkdownNote",
+      "properties": {}
+    }
+  ],
+  "definitions": {
+    "subgraphs": [
+      {
+        "id": "bc1c967a-7f6a-4be9-a372-dad16e4f28e3",
+        "nodes": [
+          {
+            "id": 451,
+            "type": "UNETLoader",
+            "properties": {
+              "Node name for S&R": "UNETLoader",
+              "models": [
+                {
+                  "name": "qwen_image_2.1_int8_convrot.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+                  "directory": "diffusion_models"
+                }
+              ]
+            }
+          },
+          {
+            "id": 453,
+            "type": "CLIPLoader",
+            "properties": {
+              "Node name for S&R": "CLIPLoader",
+              "models": [
+                {
+                  "name": "qwen3vl_8b_int8_convrot.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+                  "directory": "text_encoders"
+                }
+              ]
+            }
+          },
+          {
+            "id": 454,
+            "type": "VAELoader",
+            "properties": {
+              "Node name for S&R": "VAELoader",
+              "models": [
+                {
+                  "name": "qwen_image_2.1_vae_bf16.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors",
+                  "directory": "vae"
+                }
+              ]
+            }
+          },
+          {
+            "id": 456,
+            "type": "EmptyLatentImage",
+            "properties": {
+              "Node name for S&R": "EmptyLatentImage"
+            }
+          },
+          {
+            "id": 457,
+            "type": "VAEDecode",
+            "properties": {
+              "Node name for S&R": "VAEDecode"
+            }
+          },
+          {
+            "id": 458,
+            "type": "KSampler",
+            "properties": {
+              "Node name for S&R": "KSampler"
+            }
+          },
+          {
+            "id": 468,
+            "type": "ComfySwitchNode",
+            "properties": {
+              "Node name for S&R": "ComfySwitchNode"
+            }
+          },
+          {
+            "id": 469,
+            "type": "QwenImage21Cache",
+            "properties": {
+              "Node name for S&R": "QwenImage21Cache"
+            }
+          },
+          {
+            "id": 474,
+            "type": "TextEncodeQwenImage21",
+            "properties": {
+              "Node name for S&R": "TextEncodeQwenImage21"
+            }
+          },
+          {
+            "id": 477,
+            "type": "CLIPLoader",
+            "properties": {
+              "Node name for S&R": "CLIPLoader",
+              "models": [
+                {
+                  "name": "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+                  "directory": "text_encoders"
+                }
+              ]
+            }
+          },
+          {
+            "id": 479,
+            "type": "PrimitiveStringMultiline",
+            "properties": {
+              "Node name for S&R": "PrimitiveStringMultiline"
+            }
+          },
+          {
+            "id": 480,
+            "type": "PreviewAny",
+            "properties": {
+              "Node name for S&R": "PreviewAny"
+            }
+          },
+          {
+            "id": 484,
+            "type": "ComfySwitchNode",
+            "properties": {
+              "Node name for S&R": "ComfySwitchNode"
+            }
+          },
+          {
+            "id": 485,
+            "type": "BatchImagesNode",
+            "properties": {
+              "Node name for S&R": "BatchImagesNode"
+            }
+          },
+          {
+            "id": 500,
+            "type": "TextGenerate",
+            "properties": {
+              "Node name for S&R": "TextGenerate"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
