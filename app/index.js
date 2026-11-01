@@ -5717,11 +5717,13 @@ export default defineApp(async (sdk) => {
       const defaultModel = typeof src.defaultModel === "string" && src.defaultModel.trim() ? src.defaultModel.trim() : null;
       // 视觉模型：未设置/留空 → 跟 defaultModel 走（读取时归一为 null，用的时候回退）
       const visionModel = typeof src.visionModel === "string" && src.visionModel.trim() ? src.visionModel.trim() : null;
+      // 暴露给 ComfyUI 节点的模型清单（v0.23.0）：字符串数组，坏值归一为 []
+      const exposeModels = Array.isArray(src.exposeModels) ? src.exposeModels.filter((x) => typeof x === "string" && x.trim()) : [];
       const modelMap = src.modelMap && typeof src.modelMap === "object" && !Array.isArray(src.modelMap) ? src.modelMap : {};
       const relayPort = Number.isInteger(src.relayPort) && src.relayPort > 0 && src.relayPort < 65536 ? src.relayPort : GATEWAY_DEFAULT.relayPort;
-      return { enabled: src.enabled !== false, port, host, token, defaultModel, visionModel, modelMap, relayPort };
+      return { enabled: src.enabled !== false, port, host, token, defaultModel, visionModel, exposeModels, modelMap, relayPort };
     } catch {
-      return { ...GATEWAY_DEFAULT, enabled: GATEWAY_DEFAULT.enabled, visionModel: null, modelMap: {} };
+      return { ...GATEWAY_DEFAULT, enabled: GATEWAY_DEFAULT.enabled, visionModel: null, modelMap: {}, exposeModels: [] };
     }
   }
 
@@ -5745,6 +5747,74 @@ export default defineApp(async (sdk) => {
       gatewayWriteConfig(cfg);
     }
     return cfg;
+  }
+
+  // ── 同步模型清单到 ComfyUI-Prompt-Assistant 插件配置（v0.23.0）──────────
+  // 目标文件：<ComfyUI 主目录>/user/default/prompt-assistant/config/config.json
+  // （真实路径：config_manager.py 用 folder_paths.get_user_directory() 拼 default/prompt-assistant/config）。
+  // App 进程沙箱不碰 ComfyUI 目录：读/写/备份全部经中继 /_relay/fs/*（中继 fs 全通，write 自带 tmp→rename 原子写）。
+  // 只改 model_services 里已存在的 hana 服务（未被 hui 初始化过就不动），绝不创建文件/服务。
+  function paModelEntry(name, displayName, isDefault) {
+    return { name, display_name: displayName, is_default: isDefault, temperature: 0.7, max_tokens: 4096, top_p: 0.9 };
+  }
+
+  function paHanaModels(exposeModels, visionModel, isVlm) {
+    const alias = isVlm ? "hana/vision" : "hana/default";
+    const first = paModelEntry(alias, isVlm ? "视觉（跟随 hui 设置）" : "默认（跟随 hui 设置）", true);
+    return [first, ...(Array.isArray(exposeModels) ? exposeModels : []).map((id) => paModelEntry(id, "", false))];
+  }
+
+  async function syncPromptAssistantModels(exposeModels, visionModel) {
+    try {
+      const main = await resolveComfyMainDir();
+      if (!main || !main.dir) {
+        return { ok: false, reason: (main && main.error) || "未找到 ComfyUI 主目录，无法定位插件配置" };
+      }
+      const cfgPath = join(main.dir, "user", "default", "prompt-assistant", "config", "config.json");
+      const st = await relayStatItem(cfgPath);
+      if (!st.ok) {
+        return { ok: false, reason: "未找到 ComfyUI-Prompt-Assistant 配置（可能未安装）" };
+      }
+      let text;
+      try { text = await readLocalText(cfgPath); }
+      catch (e) { return { ok: false, reason: `读取插件配置失败：${msgOf(e)}` }; }
+      let cfg;
+      try { cfg = JSON.parse(text); }
+      catch { return { ok: false, reason: "插件配置不是合法 JSON，不改动（可手工检查后重试）" }; }
+      if (!cfg || typeof cfg !== "object" || !cfg.model_services || typeof cfg.model_services !== "object") {
+        return { ok: false, reason: "插件配置里没有 model_services，不改动" };
+      }
+      const hana = Array.isArray(cfg.model_services)
+        ? cfg.model_services.find((s) => s && s.id === "hana")
+        : cfg.model_services.hana || null;
+      if (!hana) {
+        return { ok: false, reason: "插件配置里没有 hana 服务（未被 hui 初始化过）" };
+      }
+      // 写前备份：同目录 config.json.bak-hui-<yyyyMMdd-HHmm>（本地时间），存在则覆盖（不做无限备份）
+      const d = new Date();
+      const pad2 = (n) => String(n).padStart(2, "0");
+      const bakName = `config.json.bak-hui-${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}`;
+      try { await writeWorkflowFileViaRelay(join(main.dir, "user", "default", "prompt-assistant", "config", bakName), text); }
+      catch (e) { return { ok: false, reason: `写备份失败：${msgOf(e)}` }; }
+      hana.llm_models = paHanaModels(exposeModels, visionModel, false);
+      hana.vlm_models = paHanaModels(exposeModels, visionModel, true);
+      const cs = cfg.current_services && typeof cfg.current_services === "object" ? cfg.current_services : null;
+      if (cs) {
+        const csHana = (key, alias) => {
+          const svc = cs[key];
+          if (typeof svc === "string" && svc === "hana") cs[key] = alias;
+          else if (svc && typeof svc === "object" && svc.service === "hana") svc.model = alias;
+        };
+        csHana("llm", "hana/default");
+        csHana("vlm", "hana/vision");
+      }
+      try { await writeWorkflowFileViaRelay(cfgPath, JSON.stringify(cfg, null, 2)); }
+      catch (e) { return { ok: false, reason: `写插件配置失败：${msgOf(e)}` }; }
+      log(`llm-gateway：已同步 ${exposeModels.length} 个模型到插件配置（${cfgPath}），重启 ComfyUI 后节点下拉更新`);
+      return { ok: true, path: cfgPath };
+    } catch (e) {
+      return { ok: false, reason: msgOf(e) };
+    }
   }
 
   // 宿主公开模型目录 → [{ id: "<provider>/<modelId>", provider, modelId, raw }]；失败由调用方 catch（这里只抛）
@@ -7411,6 +7481,7 @@ export default defineApp(async (sdk) => {
           enabled: cfg.enabled !== false,
           defaultModel: cfg.defaultModel,
           visionModel: cfg.visionModel,
+          exposeModels: Array.isArray(cfg.exposeModels) ? cfg.exposeModels : [],
           workerRunning: state.gateway.workerRunning,
         };
       }
@@ -7454,6 +7525,20 @@ export default defineApp(async (sdk) => {
               }, 400);
             }
           }
+          // 暴露给 ComfyUI 的模型清单（v0.23.0）：逐个校验，不合法就 400 列出
+          const nextExpose = body && body.exposeModels !== undefined
+            ? (Array.isArray(body.exposeModels) ? [...new Set(body.exposeModels.map((x) => String(x).trim()).filter(Boolean))] : null)
+            : undefined;
+          if (nextExpose === null) {
+            return c.json({ ok: false, error: "exposeModels 必须是字符串数组" }, 400);
+          }
+          const badExpose = (nextExpose || []).filter((id) => !ids.includes(id));
+          if (badExpose.length) {
+            return c.json({
+              ok: false,
+              error: `「暴露给 ComfyUI 的模型」里有不在目录中的：${badExpose.join(", ")}。可用模型：${ids.slice(0, 10).join(", ")}${ids.length > 10 ? ` …共 ${ids.length} 个` : ""}`,
+            }, 400);
+          }
           // 写盘：只动 enabled/defaultModel/visionModel，token/port/host/relayPort/modelMap 原样保留；
           // modelMap 补两个别名键，指向新值（中继侧 job.model 传别名时 App 侧按它解析）
           const merged = {
@@ -7461,6 +7546,7 @@ export default defineApp(async (sdk) => {
             enabled: next.enabled,
             defaultModel: next.defaultModel,
             visionModel: next.visionModel,
+            exposeModels: nextExpose !== undefined ? nextExpose : (Array.isArray(cur.exposeModels) ? cur.exposeModels : []),
             modelMap: {
               ...(cur.modelMap && typeof cur.modelMap === "object" ? cur.modelMap : {}),
               "hana/default": next.defaultModel,
@@ -7469,6 +7555,8 @@ export default defineApp(async (sdk) => {
           };
           if (!gatewayWriteConfig(merged)) return c.json({ ok: false, error: "配置写入失败" }, 500);
           state.gateway.config = merged;
+          // 同步模型清单到 ComfyUI-Prompt-Assistant 插件配置（失败不拦截保存，只带回原因；重启后节点下拉更新）
+          const pluginSync = await syncPromptAssistantModels(merged.exposeModels, merged.visionModel || merged.defaultModel);
           // 强制重推：不等 worker 的 5 分钟周期。中继未就绪不报错（跟 preview-settings 同口径：已存待生效）
           let pushed = false;
           let pushError = null;
@@ -7479,10 +7567,55 @@ export default defineApp(async (sdk) => {
           log(`llm-gateway 设置：default=${next.defaultModel || "-"} vision=${next.visionModel || "-（跟默认）"} pushed=${pushed}${pushError ? ` (${pushError})` : ""}`);
           const payload = gatewayStatePayload();
           payload.pushed = pushed;
+          payload.pluginSync = pluginSync;
+          payload.restartRequired = !!(pluginSync && pluginSync.ok);
           if (pushError) payload.note = `已保存，重推中继失败（${pushError}），待周期补推`;
           return c.json(payload);
         } catch (e) {
           return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      // 同步到 ComfyUI 并重启（v0.23.0）：插件在加载时读配置生成节点下拉，改配置必须重启才生效。
+      // 停止/启动复用 service 通道（/_relay/backend/stop|start）；ComfyUI 本来没在跑就只启动不停止。
+      // 防重入：内存哨兵 + 5 分钟超时自恢复，重入请求直接返回「正在重启中」。
+      let gwComfyRestarting = false;
+      let gwComfyRestartAt = 0;
+      const GW_RESTART_STALE_MS = 5 * 60_000;
+      app.post("/comfyui-hana/llm-gateway/restart-comfy", async (c) => {
+        const now = Date.now();
+        if (gwComfyRestarting && now - gwComfyRestartAt < GW_RESTART_STALE_MS) {
+          return c.json({ ok: false, error: "正在重启中，请稍候" }, 409);
+        }
+        gwComfyRestarting = true;
+        gwComfyRestartAt = now;
+        try {
+          const wasRunning = serviceSnapshot().reachable;
+          if (wasRunning) {
+            const stop = await relayJson("/_relay/backend/stop", {
+              method: "POST", headers: { "content-type": "application/json" }, body: "{}", timeoutMs: 25_000,
+            });
+            if (!stop.ok) throw new Error((stop.data && stop.data.error) || "停止请求未成功（中继未就绪或中继返回错误）");
+            void refreshSnapshot();
+          }
+          const start = await relayJson("/_relay/backend/start", {
+            method: "POST", headers: { "content-type": "application/json" }, body: "{}", timeoutMs: 25_000,
+          });
+          if (!start.ok || (start.data && start.data.ok === false)) {
+            throw new Error((start.data && start.data.error) || `启动请求未成功（HTTP ${start.status}）`);
+          }
+          void refreshSnapshot();
+          log(`llm-gateway：已发起 ComfyUI 重启（本来${wasRunning ? "在跑，先停后启" : "未跑，只启动"}）`);
+          return c.json({
+            ok: true,
+            note: wasRunning
+              ? "已停止并重新拉起 ComfyUI；启动约需 30～90 秒，就绪后节点下拉更新。"
+              : "ComfyUI 本来未运行，已直接拉起；就绪后节点下拉更新。",
+          });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        } finally {
+          gwComfyRestarting = false;
         }
       });
 
@@ -7717,6 +7850,27 @@ export default defineApp(async (sdk) => {
       });
 
   
+      // 转告 agent：设置页 iframe 无 emit/剪贴板授权，由后端建会话投递文本。
+      // 复用 install-launch 的 sdk.sessions.create + send 范式（app/session.start-turn）。
+      app.post("/comfyui-hana/ask-agent", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          let text = typeof body.text === "string" ? body.text : "";
+          if (!text.trim()) return c.json({ ok: false, error: "缺少 text" }, 400);
+          let truncated = false;
+          if (text.length > 8000) { text = text.slice(0, 8000); truncated = true; }
+          const created = await sdk.sessions.create({});
+          const sessionId = (created && (created.sessionId || (created.sessionRef && created.sessionRef.sessionId))) || null;
+          if (!sessionId) return c.json({ ok: false, error: "会话创建返回异常" }, 502);
+          await sdk.sessions.send({ sessionId, text });
+          log(`ask-agent 已投递 | sessionId=${sessionId} | text=${text.slice(0, 60).replace(/\s+/g, " ")}…`);
+          return c.json({ ok: true, sessionId, truncated });
+        } catch (e) {
+          error(`ask-agent 失败：${msgOf(e)}`);
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
     app.post("/comfyui-hana/shell/hello", async (c) => {
       try {
         const body = await c.req.json().catch(() => ({}));

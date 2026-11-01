@@ -29,6 +29,43 @@ async function apiJson(path, init) {
   return { status: r.status, ok: r.ok, data };
 }
 
+// ── 剪贴板三级回落 ───────────────────────────────────────────────────────────
+// 设置页 iframe 没有宿主剪贴板写授权（sdk 的 clipboard 能力必失败），
+// 也不在安全上下文时 navigator.clipboard 可能被拒，所以依次退到 execCommand，再退到页面展开。
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch { /* 权限拒绝或非安全上下文 → 下一级 */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0;";
+  document.body.appendChild(ta);
+  try {
+    ta.focus();
+    ta.select();
+    if (!(document.execCommand && document.execCommand("copy"))) throw new Error("execCommand 复制失败");
+  } finally {
+    ta.remove();
+  }
+}
+
+// 最后兜底：把要复制的文本展开成按钮下方的只读框并全选，让人手动 Ctrl+C。
+function revealForManualCopy(btn, text) {
+  document.querySelectorAll("textarea.s-copy-reveal").forEach((el) => el.remove());
+  const ta = document.createElement("textarea");
+  ta.readOnly = true;
+  ta.className = "s-copy-reveal";
+  ta.value = text;
+  ta.style.cssText = "width:min(720px,100%);min-height:6em;margin-top:6px;white-space:pre-wrap;font:12px/1.5 monospace;";
+  (btn && btn.parentNode ? btn : document.body).insertAdjacentElement("afterend", ta);
+  ta.focus();
+  ta.select();
+}
+
 // ── 连接状态 ──────────────────────────────────────────────────────────────
 async function poll() {
   try {
@@ -244,6 +281,42 @@ function gwFillSelect(sel, cur, disabled) {
   if (!cur && ids.length) sel.value = ids[0];
 }
 
+// ── 暴露给 ComfyUI 的模型（复选清单 + 搜索过滤 + 全选/清空）──────────────
+function gwExposeSelected() {
+  return [...document.querySelectorAll("#s-gw-expose-list input[type=checkbox]:checked")].map((c) => c.value);
+}
+
+function gwRenderExpose(checkedIds) {
+  const box = $("s-gw-expose-list");
+  if (!box) return;
+  const kw = (($("s-gw-expose-filter") || {}).value || "").trim().toLowerCase();
+  const checked = new Set(Array.isArray(checkedIds) ? checkedIds : gwExposeSelected());
+  box.innerHTML = "";
+  const ids = gwModels.map((m) => m.id);
+  if (!ids.length) {
+    box.textContent = "（模型目录不可用，无可勾选模型）";
+    return;
+  }
+  let shown = 0;
+  for (const id of ids) {
+    if (kw && !id.toLowerCase().includes(kw)) continue;
+    shown++;
+    const lab = document.createElement("label");
+    lab.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = id;
+    cb.checked = checked.has(id);
+    const span = document.createElement("span");
+    span.textContent = id;
+    span.title = id;
+    lab.appendChild(cb);
+    lab.appendChild(span);
+    box.appendChild(lab);
+  }
+  if (!shown) box.textContent = "（无匹配模型）";
+}
+
 async function loadGateway() {
   try {
     const { data } = await apiJson("/comfyui-hana/llm-gateway");
@@ -257,6 +330,7 @@ async function loadGateway() {
     const noCatalog = !gwModels.length;
     gwFillSelect($("s-gw-default"), data.defaultModel || null, noCatalog);
     gwFillSelect($("s-gw-vision"), data.visionModel || null, noCatalog);
+    gwRenderExpose(Array.isArray(data.exposeModels) ? data.exposeModels : []); // 空数组 → 全不勾
     if (noCatalog) {
       setMsg("s-gw-msg", data.catalogError
         ? `模型目录不可用：${data.catalogError}`
@@ -267,35 +341,49 @@ async function loadGateway() {
   }
 }
 
-$("s-gw-copy-url").addEventListener("click", async () => {
+$("s-gw-copy-url").addEventListener("click", async (ev) => {
+  const btn = ev.currentTarget;
   const t = $("s-gw-base").textContent || "";
   if (!t || t === "—") return;
-  try { await hana.clipboard.writeText(t); setMsg("s-gw-msg", "接入地址已复制。", "ok"); }
-  catch { setMsg("s-gw-msg", "复制失败。", "bad"); }
+  try { await copyText(t); setMsg("s-gw-msg", "接入地址已复制。", "ok"); }
+  catch { revealForManualCopy(btn, t); setMsg("s-gw-msg", "已展开文本，请手动复制。", ""); }
 });
 
-$("s-gw-copy-token").addEventListener("click", async () => {
+$("s-gw-copy-token").addEventListener("click", async (ev) => {
+  const btn = ev.currentTarget;
   // 页面上只展示截断形态，复制时用最近一次 GET 拿到的全文
+  let full = null;
   try {
     const { data } = await apiJson("/comfyui-hana/llm-gateway");
-    const full = data && data.token;
+    full = data && data.token;
     if (!full) { setMsg("s-gw-msg", "token 不可用。", "bad"); return; }
-    await hana.clipboard.writeText(full);
+    await copyText(full);
     setMsg("s-gw-msg", "token 已复制（全文）。", "ok");
   } catch (e) {
-    setMsg("s-gw-msg", `复制失败：${String((e && e.message) || e)}`, "bad");
+    if (full) { revealForManualCopy(btn, full); setMsg("s-gw-msg", "已展开文本，请手动复制。", ""); }
+    else setMsg("s-gw-msg", `复制失败：${String((e && e.message) || e)}`, "bad");
   }
+});
+
+// 搜索过滤 / 全选 / 清空（列表元素在每次渲染时重建，事件只在控件层绑一次）
+if ($("s-gw-expose-filter")) $("s-gw-expose-filter").addEventListener("input", () => gwRenderExpose());
+if ($("s-gw-expose-all")) $("s-gw-expose-all").addEventListener("click", () => {
+  document.querySelectorAll("#s-gw-expose-list input[type=checkbox]").forEach((c) => { c.checked = true; });
+});
+if ($("s-gw-expose-none")) $("s-gw-expose-none").addEventListener("click", () => {
+  document.querySelectorAll("#s-gw-expose-list input[type=checkbox]").forEach((c) => { c.checked = false; });
 });
 
 $("s-gw-save").addEventListener("click", async () => {
   setMsg("s-gw-msg", "保存中…", "");
   const def = $("s-gw-default").value || null;
   const vis = $("s-gw-vision").value || null;
+  const expose = gwExposeSelected();
   try {
     const { data } = await apiJson("/comfyui-hana/llm-gateway", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ defaultModel: def, visionModel: vis }),
+      body: JSON.stringify({ defaultModel: def, visionModel: vis, exposeModels: expose }),
     });
     if (!data || !data.ok) {
       setMsg("s-gw-msg", `保存失败：${(data && data.error) || "未知原因"}`, "bad");
@@ -304,9 +392,41 @@ $("s-gw-save").addEventListener("click", async () => {
     // 以服务端确认后的值为准回填（含别名映射后的归一）
     gwFillSelect($("s-gw-default"), data.defaultModel || null, !gwModels.length);
     gwFillSelect($("s-gw-vision"), data.visionModel || null, !gwModels.length);
-    setMsg("s-gw-msg", data.pushed ? "已保存，立即生效" : `已保存，待生效${data.note ? `：${data.note}` : ""}`, data.pushed ? "ok" : "");
+    const okLine = data.pushed ? "已保存，立即生效" : `已保存，待生效${data.note ? `：${data.note}` : ""}`;
+    const syncLine = data.pluginSync && data.pluginSync.ok === false && data.pluginSync.reason
+      ? `；插件同步失败：${data.pluginSync.reason}` : "";
+    setMsg("s-gw-msg", okLine + syncLine, data.pushed ? "ok" : "");
+    const btn = $("s-gw-restart");
+    if (btn) btn.style.display = data.restartRequired ? "" : "none";
   } catch (e) {
     setMsg("s-gw-msg", `保存失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
+$("s-gw-restart").addEventListener("click", async () => {
+  const btn = $("s-gw-restart");
+  if (!btn) return;
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "重启中…";
+  setMsg("s-gw-msg", "正在同步并重启 ComfyUI…", "");
+  try {
+    const { data } = await apiJson("/comfyui-hana/llm-gateway/restart-comfy", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    if (!data || !data.ok) {
+      setMsg("s-gw-msg", `重启失败：${(data && data.error) || "未知原因"}`, "bad");
+      return;
+    }
+    setMsg("s-gw-msg", `已重启，节点下拉更新。${data.note || ""}`, "ok");
+    btn.style.display = "none";
+  } catch (e) {
+    setMsg("s-gw-msg", `重启失败：${String((e && e.message) || e)}`, "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
   }
 });
 
@@ -413,36 +533,48 @@ document.querySelectorAll('input[name="s-preview-tier"]').forEach((r) => {
   });
 });
 
-// 「请 Agent 下载」：照 workspace.js 的通知机制——没有现成的 agent 通知能力，
-// 主路走 hana.emit 回传会话（仅 card slot 有效），失败/被拒时回落剪贴板复制指引。
+// 「请 Agent 下载」：设置页 iframe 既无宿主剪贴板授权，emit 也只在卡片槽位可达会话，
+// 两条原路都必败；主路改走后端 ask-agent（建新会话投递），失败再退前端复制 / 展开文本。
 $("s-preview-agent-get").addEventListener("click", async () => {
   if (!previewModelInfo) await loadPreviewModel();
   const text = previewGuideText();
-  const dir = previewModelInfo && previewModelInfo.targetDir;
+  const dir = (previewModelInfo && previewModelInfo.targetDir) || "<ComfyUI>/models/vae_approx";
+  const filename = (previewModelInfo && previewModelInfo.filename) || "（未知，请按指引刷新选定）";
+  const request = `（这条消息由用户在 hui 设置页点「请 Agent 下载」发起。）\n请用 hana-downloader 下载 ComfyUI 预览模型 ${filename} 到 ${dir}。\n下载指引与镜像源：\n${text}`;
   try {
-    const res = await hana.emit("preview-model-download-request", {
-      filename: (previewModelInfo && previewModelInfo.filename) || null,
-      targetDir: dir || null,
-      message: `请下载 ComfyUI 预览模型 ${(previewModelInfo && previewModelInfo.filename) || "（未知：请先刷新设置页或在 preview-decoders 选定）"} 到 ${dir || "<ComfyUI>/models/vae_approx"}`,
+    const { data } = await apiJson("/comfyui-hana/ask-agent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: request, title: "hui 预览模型下载请求" }),
     });
-    if (res && res.delivered) { setMsg("s-preview-model-msg", "已发回会话，agent 收到后会开始下载。", "ok"); return; }
-    throw new Error("emit 未送达");
-  } catch {
+    if (data && data.ok) {
+      setMsg("s-preview-model-msg", data.truncated ? "已发到新会话（指引超长被截断），agent 会开始下载。" : "已发到新会话，agent 会开始下载。", "ok");
+      return;
+    }
+    throw new Error((data && data.error) || "未知错误");
+  } catch (e) {
+    const reason = String((e && e.message) || e);
     try {
-      await hana.clipboard.writeText(text);
-      setMsg("s-preview-model-msg", "无法直接通知会话，下载指引已复制，粘给任意会话即可让 agent 代办。", "");
+      await copyText(text);
+      setMsg("s-preview-model-msg", `无法直接通知会话（${reason}），指引已复制，粘给任意会话即可让 agent 代办。`, "");
     } catch {
-      setMsg("s-preview-model-msg", "无法通知会话，也无法复制。请手动转告 agent 下载指引。", "bad");
+      revealForManualCopy($("s-preview-agent-get"), text);
+      setMsg("s-preview-model-msg", `无法直接通知会话（${reason}），已展开文本，请手动复制。`, "bad");
     }
   }
 });
 
-$("s-preview-copy").addEventListener("click", async () => {
+$("s-preview-copy").addEventListener("click", async (ev) => {
+  const btn = ev.currentTarget;
   if (!previewModelInfo) await loadPreviewModel();
+  const text = previewGuideText();
   try {
-    await hana.clipboard.writeText(previewGuideText());
+    await copyText(text);
     setMsg("s-preview-model-msg", "下载指引已复制。", "ok");
-  } catch { setMsg("s-preview-model-msg", "复制失败。", "bad"); }
+  } catch {
+    revealForManualCopy(btn, text);
+    setMsg("s-preview-model-msg", "已展开文本，请手动复制。", "");
+  }
 });
 
 // ── 启动参数（issue #2 P1，2026-10-21）─────────────────────────────────
