@@ -188,7 +188,7 @@ const GATEWAY_DEFAULT = Object.freeze({
   port: 8790,
   host: "127.0.0.1",
   token: "", // 空则启动时生成 32 字节 hex 并持久化
-  defaultModel: "deepseek/deepseek-flash",
+  defaultModel: null, // 不写死模型名：为空时按模型目录第一条走（publish/resolve 都有目录校验）
   modelMap: {},
   relayPort: 8790, // 中继网关（受管 runtime）监听端口
 });
@@ -5715,11 +5715,13 @@ export default defineApp(async (sdk) => {
       const host = typeof src.host === "string" && src.host.trim() ? src.host.trim() : GATEWAY_DEFAULT.host;
       const token = typeof src.token === "string" && src.token.trim() ? src.token.trim() : "";
       const defaultModel = typeof src.defaultModel === "string" && src.defaultModel.trim() ? src.defaultModel.trim() : null;
+      // 视觉模型：未设置/留空 → 跟 defaultModel 走（读取时归一为 null，用的时候回退）
+      const visionModel = typeof src.visionModel === "string" && src.visionModel.trim() ? src.visionModel.trim() : null;
       const modelMap = src.modelMap && typeof src.modelMap === "object" && !Array.isArray(src.modelMap) ? src.modelMap : {};
       const relayPort = Number.isInteger(src.relayPort) && src.relayPort > 0 && src.relayPort < 65536 ? src.relayPort : GATEWAY_DEFAULT.relayPort;
-      return { enabled: src.enabled !== false, port, host, token, defaultModel, modelMap, relayPort };
+      return { enabled: src.enabled !== false, port, host, token, defaultModel, visionModel, modelMap, relayPort };
     } catch {
-      return { ...GATEWAY_DEFAULT, enabled: GATEWAY_DEFAULT.enabled, modelMap: {} };
+      return { ...GATEWAY_DEFAULT, enabled: GATEWAY_DEFAULT.enabled, visionModel: null, modelMap: {} };
     }
   }
 
@@ -5882,11 +5884,21 @@ export default defineApp(async (sdk) => {
     return { systemPrompt: systemParts.join("\n") || null, messages };
   }
 
-  // job.model 解析成 catalog 条目：1) modelMap[model]（映射值也按 catalog id 再查）
-  // 2) 直接匹配 catalog id（形如 provider/modelId） 3) defaultModel 4) 第一条可用。
+  // job.model 解析成 catalog 条目：1) hana/default、hana/vision 别名（设置页存的映射）
+  // 2) modelMap[model]（映射值也按 catalog id 再查） 3) 直接匹配 catalog id（形如 provider/modelId）
+  // 4) defaultModel 5) 第一条可用。
+  // 别名解析规则：目标 id 必须在目录里，不在则报错——不静默取第一条（避免选错模型）。
   function gatewayResolveModel(modelName, catalog, cfg) {
     const name = typeof modelName === "string" ? modelName.trim() : "";
     const byId = (id) => catalog.find((m) => m.id === id) || null;
+    if (name === "hana/default" || name === "hana/vision") {
+      const target = name === "hana/vision"
+        ? (typeof cfg.visionModel === "string" && cfg.visionModel.trim() ? cfg.visionModel.trim() : cfg.defaultModel)
+        : cfg.defaultModel;
+      const hit = typeof target === "string" && target.trim() ? byId(target.trim()) : null;
+      if (!hit) throw new Error(`别名 ${name} 指向的模型（${target || "未设置"}）不在模型目录里，请在设置页重新选择`);
+      return hit;
+    }
     if (name) {
       const mapped = cfg.modelMap && typeof cfg.modelMap === "object" ? cfg.modelMap[name] : null;
       if (typeof mapped === "string" && mapped.trim()) {
@@ -7380,6 +7392,95 @@ export default defineApp(async (sdk) => {
           lastLaunchSig = JSON.stringify({ extraArgs, env });
           log(`启动参数设置：已保存并下发；重启服务生效（extraArgs=${extraArgs ? JSON.stringify(extraArgs) : "无"}，env ${env.length} 项）`);
           return c.json({ ok: true, pushed: true, extraArgs, env, note: "已保存，需重启服务生效" });
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      // ── LLM 网关设置（v0.22.0，2026-11-02）───────────────────────────────
+      // 设置页展示接入地址/token，并从宿主模型目录里选默认/视觉模型（别名 hana/default、
+      // hana/vision 由 gatewayResolveModel 解析）。校验 → 写盘 → 立即重推中继，不等 5 分钟周期。
+      function gatewayStatePayload() {
+        const cfg = gatewayEnsureConfig();
+        return {
+          ok: true,
+          port: cfg.port,
+          baseUrl: `http://${cfg.host || "127.0.0.1"}:${cfg.port}/v1`,
+          token: cfg.token || null,
+          tokenTail: cfg.token ? String(cfg.token).slice(-4) : null,
+          enabled: cfg.enabled !== false,
+          defaultModel: cfg.defaultModel,
+          visionModel: cfg.visionModel,
+          workerRunning: state.gateway.workerRunning,
+        };
+      }
+
+      app.get("/comfyui-hana/llm-gateway", async (c) => {
+        try {
+          let models = [];
+          let catalogError = null;
+          try { models = await gatewayListModels(); }
+          catch (e) { catalogError = msgOf(e); }
+          const payload = gatewayStatePayload();
+          payload.models = models.map((m) => ({ id: m.id, provider: m.provider, modelId: m.modelId }));
+          payload.catalogError = catalogError;
+          return c.json(payload);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 500);
+        }
+      });
+
+      app.post("/comfyui-hana/llm-gateway", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          const cur = gatewayEnsureConfig();
+          const next = {
+            enabled: body && typeof body.enabled === "boolean" ? body.enabled : cur.enabled !== false,
+            defaultModel: body && body.defaultModel !== undefined ? body.defaultModel : cur.defaultModel,
+            visionModel: body && body.visionModel !== undefined ? body.visionModel : cur.visionModel,
+          };
+          for (const k of ["defaultModel", "visionModel"]) {
+            if (typeof next[k] !== "string" || !next[k].trim()) next[k] = null;
+            else next[k] = next[k].trim();
+          }
+          // 目录校验：选中的模型必须在宿主模型目录里，不在就 400 并列出可用前 10 个
+          const catalog = await gatewayListModels();
+          const ids = catalog.map((m) => m.id);
+          for (const k of ["defaultModel", "visionModel"]) {
+            if (next[k] && !ids.includes(next[k])) {
+              return c.json({
+                ok: false,
+                error: `「${k === "defaultModel" ? "默认模型" : "视觉模型"}」选的 ${next[k]} 不在模型目录里。可用模型：${ids.slice(0, 10).join(", ")}${ids.length > 10 ? ` …共 ${ids.length} 个` : ""}`,
+              }, 400);
+            }
+          }
+          // 写盘：只动 enabled/defaultModel/visionModel，token/port/host/relayPort/modelMap 原样保留；
+          // modelMap 补两个别名键，指向新值（中继侧 job.model 传别名时 App 侧按它解析）
+          const merged = {
+            ...cur,
+            enabled: next.enabled,
+            defaultModel: next.defaultModel,
+            visionModel: next.visionModel,
+            modelMap: {
+              ...(cur.modelMap && typeof cur.modelMap === "object" ? cur.modelMap : {}),
+              "hana/default": next.defaultModel,
+              "hana/vision": next.visionModel || next.defaultModel,
+            },
+          };
+          if (!gatewayWriteConfig(merged)) return c.json({ ok: false, error: "配置写入失败" }, 500);
+          state.gateway.config = merged;
+          // 强制重推：不等 worker 的 5 分钟周期。中继未就绪不报错（跟 preview-settings 同口径：已存待生效）
+          let pushed = false;
+          let pushError = null;
+          if (relayReady()) {
+            try { await gatewayPublishConfig(); pushed = true; }
+            catch (e) { pushError = msgOf(e); warn(`llm-gateway 设置重推失败（待周期补推）：${msgOf(e)}`); }
+          }
+          log(`llm-gateway 设置：default=${next.defaultModel || "-"} vision=${next.visionModel || "-（跟默认）"} pushed=${pushed}${pushError ? ` (${pushError})` : ""}`);
+          const payload = gatewayStatePayload();
+          payload.pushed = pushed;
+          if (pushError) payload.note = `已保存，重推中继失败（${pushError}），待周期补推`;
+          return c.json(payload);
         } catch (e) {
           return c.json({ ok: false, error: msgOf(e) }, 500);
         }

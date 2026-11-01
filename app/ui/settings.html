@@ -103,6 +103,21 @@ label.chk input { accent-color: var(--accent); }
     <div class="msg" id="s-ac-msg"></div>
   </div>
 
+  <div class="sec" id="s-gateway-sec">
+    <h2>LLM 网关（供 ComfyUI 节点调用）</h2>
+    <div class="row"><span class="k">接入地址</span><span class="v"><code id="s-gw-base">—</code> <button id="s-gw-copy-url" style="font-size:11px;padding:2px 8px;border-radius:6px;cursor:pointer;border:0.5px solid var(--border);background:var(--bg-card);color:var(--accent)">复制</button></span></div>
+    <div class="row"><span class="k">Token</span><span class="v"><code id="s-gw-token">—</code> <button id="s-gw-copy-token" style="font-size:11px;padding:2px 8px;border-radius:6px;cursor:pointer;border:0.5px solid var(--border);background:var(--bg-card);color:var(--accent)">复制 token</button></span></div>
+    <div class="row top"><span class="k">默认模型</span><span class="v"><select id="s-gw-default" style="font-size:12px;padding:4px 8px;border-radius:8px;color:var(--text);border:0.5px solid var(--border);background:var(--bg-card);max-width:380px"></select></span></div>
+    <div class="row top"><span class="k">视觉（图片）模型</span><span class="v"><select id="s-gw-vision" style="font-size:12px;padding:4px 8px;border-radius:8px;color:var(--text);border:0.5px solid var(--border);background:var(--bg-card);max-width:380px"></select></span></div>
+    <div class="ed"><button class="primary" id="s-gw-save">保存</button></div>
+    <div class="msg" id="s-gw-msg"></div>
+    <p class="note">
+      ComfyUI 节点里 <code>base_url</code> 填上面的接入地址、key 填 token。
+      模型名填别名：<code>hana/default</code> 走「默认模型」、<code>hana/vision</code> 走「视觉（图片）模型」（视觉未选时跟默认）。
+      保存后立即生效，无需重启。
+    </p>
+  </div>
+
   <div class="sec">
     <h2>出图实时预览</h2>
     <label class="chk"><input type="checkbox" id="s-preview-enabled"> 开启出图实时预览</label>

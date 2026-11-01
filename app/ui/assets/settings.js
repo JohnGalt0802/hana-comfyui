@@ -210,6 +210,106 @@ $("s-allow-copilot").addEventListener("change", async () => {
   }
 });
 
+// ── LLM 网关设置（v0.22.0，2026-11-02）─────────────────────────────
+// 展示接入地址/token，选默认与视觉模型；保存即写盘+重推中继，立即生效。
+// 模型选项全部来自后端 GET 返回的 models[].id，不写死任何模型名。
+let gwModels = []; // [{id, provider, modelId}]
+
+function gwTokenShort(t) {
+  const s = String(t || "");
+  if (!s) return "—";
+  return s.length <= 14 ? s : `${s.slice(0, 8)}…${s.slice(-4)}`;
+}
+
+function gwFillSelect(sel, cur, disabled) {
+  if (!sel) return;
+  sel.innerHTML = "";
+  if (disabled) {
+    sel.disabled = true;
+    const o = document.createElement("option");
+    o.textContent = "（模型目录不可用）";
+    sel.appendChild(o);
+    return;
+  }
+  sel.disabled = false;
+  const ids = gwModels.map((m) => m.id);
+  const opts = ids.includes(cur) || !cur ? ids : [cur, ...ids]; // 当前值不在目录里也展示出来，让人看到再改
+  for (const id of opts) {
+    const o = document.createElement("option");
+    o.value = id;
+    o.textContent = id;
+    if (id === cur) o.selected = true;
+    sel.appendChild(o);
+  }
+  if (!cur && ids.length) sel.value = ids[0];
+}
+
+async function loadGateway() {
+  try {
+    const { data } = await apiJson("/comfyui-hana/llm-gateway");
+    if (!data || !data.ok) {
+      setMsg("s-gw-msg", `读取失败：${(data && data.error) || "未知原因"}`, "bad");
+      return;
+    }
+    gwModels = Array.isArray(data.models) ? data.models : [];
+    $("s-gw-base").textContent = data.baseUrl || "—";
+    $("s-gw-token").textContent = gwTokenShort(data.token);
+    const noCatalog = !gwModels.length;
+    gwFillSelect($("s-gw-default"), data.defaultModel || null, noCatalog);
+    gwFillSelect($("s-gw-vision"), data.visionModel || null, noCatalog);
+    if (noCatalog) {
+      setMsg("s-gw-msg", data.catalogError
+        ? `模型目录不可用：${data.catalogError}`
+        : "模型目录为空（宿主没有可用模型），无法选择。", "bad");
+    }
+  } catch (e) {
+    setMsg("s-gw-msg", `读取失败：${String((e && e.message) || e)}`, "bad");
+  }
+}
+
+$("s-gw-copy-url").addEventListener("click", async () => {
+  const t = $("s-gw-base").textContent || "";
+  if (!t || t === "—") return;
+  try { await hana.clipboard.writeText(t); setMsg("s-gw-msg", "接入地址已复制。", "ok"); }
+  catch { setMsg("s-gw-msg", "复制失败。", "bad"); }
+});
+
+$("s-gw-copy-token").addEventListener("click", async () => {
+  // 页面上只展示截断形态，复制时用最近一次 GET 拿到的全文
+  try {
+    const { data } = await apiJson("/comfyui-hana/llm-gateway");
+    const full = data && data.token;
+    if (!full) { setMsg("s-gw-msg", "token 不可用。", "bad"); return; }
+    await hana.clipboard.writeText(full);
+    setMsg("s-gw-msg", "token 已复制（全文）。", "ok");
+  } catch (e) {
+    setMsg("s-gw-msg", `复制失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
+$("s-gw-save").addEventListener("click", async () => {
+  setMsg("s-gw-msg", "保存中…", "");
+  const def = $("s-gw-default").value || null;
+  const vis = $("s-gw-vision").value || null;
+  try {
+    const { data } = await apiJson("/comfyui-hana/llm-gateway", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ defaultModel: def, visionModel: vis }),
+    });
+    if (!data || !data.ok) {
+      setMsg("s-gw-msg", `保存失败：${(data && data.error) || "未知原因"}`, "bad");
+      return;
+    }
+    // 以服务端确认后的值为准回填（含别名映射后的归一）
+    gwFillSelect($("s-gw-default"), data.defaultModel || null, !gwModels.length);
+    gwFillSelect($("s-gw-vision"), data.visionModel || null, !gwModels.length);
+    setMsg("s-gw-msg", data.pushed ? "已保存，立即生效" : `已保存，待生效${data.note ? `：${data.note}` : ""}`, data.pushed ? "ok" : "");
+  } catch (e) {
+    setMsg("s-gw-msg", `保存失败：${String((e && e.message) || e)}`, "bad");
+  }
+});
+
 // ── 出图实时预览（2026-10-13：默认关 / 两级档位）──────────────────────────
 // 真相源在后端（preview-settings.json），生效值经中继下发。
 // 下载入口不是「点了就下」：app 侧无外网白名单 + 无 ComfyUI 目录写权，/preview-model/download
@@ -475,6 +575,7 @@ async function main() {
   void loadAllowWrite();
   void loadAllowCopilot();
   void loadPreview();
+  void loadGateway();
   void loadLaunch();
   setInterval(() => { void poll(); }, 3000);
   setInterval(() => { void loadInstall(); }, 20000);
