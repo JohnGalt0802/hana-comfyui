@@ -17,7 +17,8 @@
 // 负责（停用/卸载时回收其受管进程组与服务连接）。
 // ─────────────────────────────────────────────────────────────────────────────
 import { defineApp } from "./sdk/app-contract/server-client.js";
-import { createHash, randomInt, randomBytes } from "node:crypto";
+import { createHash, randomInt, randomBytes, timingSafeEqual } from "node:crypto";
+import http from "node:http";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -174,6 +175,23 @@ export function planJobWriteBack(from, next) {
 const CAP_TASKS = "app/tasks.manage";
 const CAP_START_TURN = "app/session.start-turn";
 const CAP_STAGE_FILE = "app/session.stage-file";
+// ── LLM 网关（v0.21.1：长轮询 worker 模式）──────────────────────────────
+// 已真机测试的硬限制（2026-11-01）：AppHost 子进程不开 --allow-net，
+// 进程内 listen() 同步抛 ERR_ACCESS_DENIED（Net 权限），try/catch 拦不住。
+// 因此本进程不再监听任何端口，改为「模型执行端」：长轮询受管 runtime 中继网关
+// （runtime/comfy-relay.mjs 另单实现）派发的 job，用 sdk.models.stream() 执行并回填增量。
+const GATEWAY_CONFIG_FILE = "llm-gateway.json";
+// 真机实测：AppHost 子进程不开 --allow-net，进程内无法监听。保留开关，拿到权限前恒为 false。
+const APP_PROCESS_CAN_LISTEN = false;
+const GATEWAY_DEFAULT = Object.freeze({
+  enabled: true, // worker 模式：不监听端口，只出站长轮询（拿不到 Net 权限也只是每轮退避重试）
+  port: 8790,
+  host: "127.0.0.1",
+  token: "", // 空则启动时生成 32 字节 hex 并持久化
+  defaultModel: "deepseek/deepseek-flash",
+  modelMap: {},
+  relayPort: 8790, // 中继网关（受管 runtime）监听端口
+});
 const KEEPALIVE_PROBE = true; // TODO 踹探针实验（临时代码，验证完按结论处理）
 
 const USER_TEXT = Object.freeze({
@@ -332,6 +350,7 @@ export default defineApp(async (sdk) => {
     jobs: new Map(), // promptId → job
     jobTimer: null,
     caps: { at: 0, map: null },
+    gateway: { server: null, config: null, workerRunning: false, workerTimer: null, workerStop: false, workerSeq: 0, workerLastPublish: 0, workerTaskId: null }, // LLM 网关：旧 listen 路径（已停用）+ 长轮询 worker 状态
   };
 
   function withCode(message, code) {
@@ -5680,6 +5699,573 @@ export default defineApp(async (sdk) => {
     throw new Error(`window 的 op 必须是 open / close / status（收到 "${op}"）`);
   }
 
+  // ── 本地 OpenAI 兼容网关（v0.21.0 第一阶段骨架）────────────────────────────
+  // 只验证两件事：① App 进程能否自己监听回环端口；② 能否读到宿主公开模型目录。
+  // 不实现 chat/completions；起不来只记日志，绝不影响 App 启动。
+  function gatewayConfigFile() {
+    return join(dataDir, GATEWAY_CONFIG_FILE);
+  }
+
+  // 读配置（带默认值归一；盘上坏 → 默认值 + 原样保留文件内容不覆写，等下次写时再重建）
+  function gatewayReadConfig() {
+    try {
+      const raw = JSON.parse(readFileSync(gatewayConfigFile(), "utf8"));
+      const src = raw && typeof raw === "object" ? raw : {};
+      const port = Number.isInteger(src.port) && src.port > 0 && src.port < 65536 ? src.port : GATEWAY_DEFAULT.port;
+      const host = typeof src.host === "string" && src.host.trim() ? src.host.trim() : GATEWAY_DEFAULT.host;
+      const token = typeof src.token === "string" && src.token.trim() ? src.token.trim() : "";
+      const defaultModel = typeof src.defaultModel === "string" && src.defaultModel.trim() ? src.defaultModel.trim() : null;
+      const modelMap = src.modelMap && typeof src.modelMap === "object" && !Array.isArray(src.modelMap) ? src.modelMap : {};
+      const relayPort = Number.isInteger(src.relayPort) && src.relayPort > 0 && src.relayPort < 65536 ? src.relayPort : GATEWAY_DEFAULT.relayPort;
+      return { enabled: src.enabled !== false, port, host, token, defaultModel, modelMap, relayPort };
+    } catch {
+      return { ...GATEWAY_DEFAULT, enabled: GATEWAY_DEFAULT.enabled, modelMap: {} };
+    }
+  }
+
+  // 写配置（token 生成一次后持久化，重启不换）
+  function gatewayWriteConfig(cfg) {
+    try {
+      mkdirSync(dataDir, { recursive: true });
+      writeFileSync(gatewayConfigFile(), JSON.stringify({ ...cfg, at: new Date().toISOString() }, null, 2), { mode: 0o600 });
+      return true;
+    } catch (e) {
+      warn(`llm-gateway 配置写入失败：${msgOf(e)}`);
+      return false;
+    }
+  }
+
+  // 配置 + token 保证（无 token 则生成 32 字节 hex 并落盘；写盘失败时内存里仍可用本次生成的）
+  function gatewayEnsureConfig() {
+    const cfg = gatewayReadConfig();
+    if (!cfg.token) {
+      cfg.token = randomBytes(32).toString("hex");
+      gatewayWriteConfig(cfg);
+    }
+    return cfg;
+  }
+
+  // 宿主公开模型目录 → [{ id: "<provider>/<modelId>", provider, modelId, raw }]；失败由调用方 catch（这里只抛）
+  async function gatewayListModels() {
+    const res = await sdk.models.list(); // bus "model:list"（不另需授权）；返回 { models: AppModelInfoV2[] }
+    const models = res && Array.isArray(res.models) ? res.models : [];
+    const out = [];
+    for (const m of models) {
+      if (!m || typeof m !== "object") continue;
+      const provider = typeof m.provider === "string" && m.provider ? m.provider : (typeof m.providerId === "string" && m.providerId ? m.providerId : "unknown");
+      const modelId = typeof m.modelId === "string" && m.modelId ? m.modelId : (typeof m.id === "string" && m.id ? m.id : null);
+      if (!modelId) continue;
+      out.push({ id: `${provider}/${modelId}`, provider, modelId, raw: m });
+    }
+    return out;
+  }
+
+  // ── 长轮询 worker（v0.21.1）：App 进程作模型执行端 ───────────────
+  // 不监听端口：与中继的所有通信走 relayFetch/relayJson（内部 sdk.runtime.fetch，
+  // 带 x-comfy-relay-key，支持 POST；sdk.network.fetch 对回环 POST 会被 manifest
+  // network.methods=["GET"] 拒绝，不可用）。每轮：长轮询 /_relay/llm/jobs →
+  // 拿到 job → 解析模型 → sdk.models.stream() → 增量回填 event → 结束回填 done。
+  // 任何失败都只记日志并退避（1s 起指数到 30s），绝不抛出、绝不影响 ComfyUI 主功能。
+
+  // ── worker 持久 task（模型调用归属上下文）───────────────────────
+  // 真机实测（2026-11-02）：脱离调用上下文后 sdk.models.stream 报
+  // 「App invocation expired or belongs to another App」→ 需要活动 taskId 归属。
+  // 契约：task 一旦存在，归属由宿主生成的 taskId + 持久 appId 保证；
+  // create 后台可调（callToken 只在 session-scoped create/schedule 才需要）。
+  // 复用策略：create 记录不回显 externalId，用 metadata.purpose 标记找回（跨 reload）；
+  // stop 不销毁，仅失效时重建。
+  const GW_TASK_META_PURPOSE = "llm-gateway-worker";
+
+  function isTerminalTaskStatus(status) {
+    return status === "completed" || status === "failed" || status === "canceled" || status === "aborted";
+  }
+
+  async function gatewayEnsureWorkerTask() {
+    if (state.gateway.workerTaskId) {
+      try {
+        const rec = await sdk.tasks.get(state.gateway.workerTaskId);
+        if (rec && rec.taskId) return state.gateway.workerTaskId;
+      } catch { /* get 失败按不存在处理，走找回/重建 */ }
+      state.gateway.workerTaskId = null;
+    }
+    try {
+      const list = await sdk.tasks.list();
+      const hit = (Array.isArray(list) ? list : []).find(
+        (t) => t && !isTerminalTaskStatus(t.status) && t.metadata && t.metadata.purpose === GW_TASK_META_PURPOSE
+      );
+      if (hit && hit.taskId) {
+        state.gateway.workerTaskId = String(hit.taskId);
+        log(`llm-gateway worker task 复用：${state.gateway.workerTaskId}`);
+        return state.gateway.workerTaskId;
+      }
+      const created = await sdk.tasks.create({
+        label: "LLM 网关 worker（模型执行端）",
+        delivery: "none",
+        scope: "app",
+        metadata: { purpose: GW_TASK_META_PURPOSE, at: new Date().toISOString() },
+      });
+      if (!created || !created.taskId) throw new Error("tasks.create 未返回 taskId");
+      state.gateway.workerTaskId = String(created.taskId);
+      log(`llm-gateway worker task 已创建：${state.gateway.workerTaskId}`);
+      return state.gateway.workerTaskId;
+    } catch (e) {
+      state.gateway.workerTaskId = null;
+      throw new Error(`worker task 获取失败：${msgOf(e)}`);
+    }
+  }
+
+  // 「App invocation expired or belongs to another App」或 task 缺失 → 重建 task 再试一次
+  function isInvocationContextError(e) {
+    return /invocation expired|belongs to another app|task not found/i.test(msgOf(e));
+  }
+
+  async function gatewayJobEvent(jobId, body) {
+    const r = await relayJson(`/_relay/llm/jobs/${encodeURIComponent(jobId)}/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      timeoutMs: 10_000,
+    });
+    if (!r.ok) throw new Error(`event 回填 HTTP ${r.status}`);
+  }
+
+  async function gatewayJobDone(jobId, body) {
+    const r = await relayJson(`/_relay/llm/jobs/${encodeURIComponent(jobId)}/done`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      timeoutMs: 10_000,
+    });
+    if (!r.ok) throw new Error(`done 回填 HTTP ${r.status}`);
+  }
+
+  // OpenAI 角色（system/user/assistant）→ 宿主契约（user + systemPrompt）。
+  // 文本 content：字符串 → [{type:"text",text}]；数组 → type=text 项收 text、
+  // type=image_url 项拆 data URL（data:<mime>;base64,<data> → {type:"image",data,mimeType}）。
+  function gatewayConvertMessages(openaiMessages) {
+    const systemParts = [];
+    const messages = [];
+    const list = Array.isArray(openaiMessages) ? openaiMessages : [];
+    for (const m of list) {
+      if (!m || typeof m !== "object") continue;
+      const role = typeof m.role === "string" ? m.role.toLowerCase() : "";
+      const content = m.content;
+      const textParts = [];
+      const imageParts = [];
+      const pushText = (t) => { if (typeof t === "string" && t) textParts.push({ type: "text", text: t }); };
+      if (typeof content === "string") {
+        pushText(content);
+      } else if (Array.isArray(content)) {
+        for (const c of content) {
+          if (!c || typeof c !== "object") continue;
+          if (c.type === "text") pushText(typeof c.text === "string" ? c.text : "");
+          else if (c.type === "image_url") {
+            const url = c.image_url && typeof c.image_url === "object" ? c.image_url.url : null;
+            if (typeof url === "string") {
+              const dm = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+              if (dm) imageParts.push({ type: "image", data: dm[2], mimeType: dm[1] || "image/png" });
+              else warn(`llm-gateway worker：非 data URL 的 image_url 已忽略（宿主契约只收 base64）：${String(url).slice(0, 80)}`);
+            }
+          }
+        }
+      }
+      if (role === "system" || role === "developer") {
+        if (textParts.length) systemParts.push(textParts.map((p) => p.text).join("\n"));
+      } else if (role === "assistant") {
+        if (textParts.length) messages.push({ role: "user", content: [{ type: "text", text: `[assistant] ${textParts.map((p) => p.text).join("\n")}` }] });
+      } else {
+        // user 及未知角色都按 user 处理；text + image 合并为一条 user 消息
+        const parts = [...textParts, ...imageParts];
+        if (parts.length) messages.push({ role: "user", content: parts });
+      }
+    }
+    return { systemPrompt: systemParts.join("\n") || null, messages };
+  }
+
+  // job.model 解析成 catalog 条目：1) modelMap[model]（映射值也按 catalog id 再查）
+  // 2) 直接匹配 catalog id（形如 provider/modelId） 3) defaultModel 4) 第一条可用。
+  function gatewayResolveModel(modelName, catalog, cfg) {
+    const name = typeof modelName === "string" ? modelName.trim() : "";
+    const byId = (id) => catalog.find((m) => m.id === id) || null;
+    if (name) {
+      const mapped = cfg.modelMap && typeof cfg.modelMap === "object" ? cfg.modelMap[name] : null;
+      if (typeof mapped === "string" && mapped.trim()) {
+        const hit = byId(mapped.trim());
+        if (hit) return hit;
+      }
+      const direct = byId(name);
+      if (direct) return direct;
+    }
+    const dm = typeof cfg.defaultModel === "string" && cfg.defaultModel.trim() ? byId(cfg.defaultModel.trim()) : null;
+    if (dm) return dm;
+    return catalog.length ? catalog[0] : null;
+  }
+
+  // 读 NDJSON 事件流：text-delta/reasoning-delta 增量回填并累计全文；error 抛错。
+  async function gatewayRunJob(job, resolveModel, requestId, taskId) {
+    const { systemPrompt, messages } = gatewayConvertMessages(job.messages);
+    if (!messages.length) throw new Error("job.messages 转换后为空");
+    const res = await sdk.models.stream({
+      requestId,
+      provider: resolveModel.provider,
+      model: resolveModel.modelId,
+      messages,
+      ...(taskId ? { taskId } : {}),
+      ...(systemPrompt ? { systemPrompt } : {}),
+      ...(Number.isFinite(job.maxTokens) && job.maxTokens > 0 ? { maxTokens: Math.floor(job.maxTokens) } : {}),
+      ...(Number.isFinite(job.temperature) ? { temperature: job.temperature } : {}),
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let text = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          let ev;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (!ev || typeof ev !== "object") continue;
+          if (ev.type === "text-delta" && typeof ev.delta === "string" && ev.delta) {
+            text += ev.delta;
+            await gatewayJobEvent(job.id, { type: "text-delta", delta: ev.delta });
+          } else if (ev.type === "reasoning-delta" && typeof ev.delta === "string" && ev.delta) {
+            await gatewayJobEvent(job.id, { type: "reasoning-delta", delta: ev.delta });
+          } else if (ev.type === "error") {
+            throw new Error(`模型流 error：${ev.code || "unknown"} ${ev.message || ""}`.trim());
+          }
+          // start / tool-call / done：文本执行不消费，忽略
+        }
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* 已关闭 */ }
+    }
+    return text;
+  }
+
+  // token/relayPort 仍按配置保留：token 随 config 下发给中继（LLM 转发请求时用），
+  // relayPort 仅为信息字段（App→中继流量实际走 runtime 通道，不按端口直连）。
+
+  async function gatewayPublishConfig() {
+    const catalog = await gatewayListModels(); // 失败向上抛，由 worker 退避重试
+    const cfg = state.gateway.config || gatewayEnsureConfig();
+    const models = catalog.map((m) => ({ id: m.id, provider: m.provider, modelId: m.modelId }));
+    function byId(list, id) { return list.some((m) => m.id === id); }
+    const body = {
+      token: cfg.token,
+      models,
+      defaultModel: typeof cfg.defaultModel === "string" && cfg.defaultModel && byId(models, cfg.defaultModel) ? cfg.defaultModel : (models.length ? models[0].id : cfg.defaultModel || null),
+    };
+    const r = await relayJson("/_relay/llm/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      timeoutMs: 10_000,
+    });
+    if (!r.ok) throw new Error(`config 下发 HTTP ${r.status}：${r.data && r.data.error ? String(r.data.error).slice(0, 200) : ""}`.trim());
+    return models.length;
+  }
+
+  function gatewayStartWorker(reason = "manual") {
+    if (state.gateway.workerRunning) return false;
+    state.gateway.workerRunning = true;
+    state.gateway.workerStop = false;
+    state.gateway.workerSeq += 1;
+    const seq = state.gateway.workerSeq;
+    let backoffMs = 1_000;
+    log(`llm-gateway worker 启动（${reason}）：长轮询主中继 /_relay/llm/jobs`);
+    // 预热持久 task（模型调用归属上下文）：失败只记日志，job 处理时还会再确保/重建
+    gatewayEnsureWorkerTask()
+      .then((id) => log(`llm-gateway worker task 就绪：${id}`))
+      .catch((e) => warn(`llm-gateway worker task 预热失败（job 处理时重试）：${msgOf(e)}`));
+    const loop = async () => {
+      while (!state.gateway.workerStop && seq === state.gateway.workerSeq) {
+        try {
+          if (!state.gateway.config) state.gateway.config = gatewayEnsureConfig();
+          // 模型目录下发：首发一次 + 每 5 分钟刷新（失败抛错，走统一退避）
+          const now = Date.now();
+          if (now - state.gateway.workerLastPublish >= 5 * 60_000) {
+            await gatewayPublishConfig();
+            state.gateway.workerLastPublish = now;
+          }
+          // 长轮询取 job：wait=25000 配 timeoutMs 28000，都在 runtime.fetch 30s 上限内；
+          // 204 判空靠 status（relayJson 对 204 会解析出 data={raw:""}，不可靠）。
+          // 中继未就绪（runtime 未起/重启中）：退避等它，不发请求。
+          if (!relayReady()) throw new Error(`中继未就绪（phase=${state.phase}）`);
+          const res = await relayFetch("/_relay/llm/jobs?wait=25000", { method: "GET", timeoutMs: 28_000 });
+          if (res.status === 204) { backoffMs = 1_000; continue; }
+          if (!res.ok) throw new Error(`jobs 长轮询 HTTP ${res.status}`);
+          const text = await res.text();
+          let payload = null;
+          try { payload = JSON.parse(text); } catch { payload = null; }
+          const job = payload && payload.job && typeof payload.job === "object" ? payload.job : null;
+          if (!job || typeof job.id !== "string" || !job.id) { backoffMs = 1_000; continue; }
+          backoffMs = 1_000;
+          await gatewayHandleJob(job);
+        } catch (e) {
+          warn(`llm-gateway worker 轮次失败，${backoffMs}ms 后重试：${msgOf(e)}`);
+          await sleep(backoffMs);
+          backoffMs = Math.min(30_000, backoffMs * 2);
+        }
+      }
+      if (seq === state.gateway.workerSeq) {
+        state.gateway.workerRunning = false;
+        state.gateway.workerTimer = null;
+        log("llm-gateway worker 已停止");
+      }
+    };
+    state.gateway.workerTimer = loop(); // promise，仅作句柄；内部自捕获，不会抛出
+    return true;
+  }
+
+  async function gatewayHandleJob(job) {
+    let attemptNo = 0;
+    const attempt = async () => {
+      attemptNo += 1;
+      const cfg = state.gateway.config || gatewayEnsureConfig();
+      const catalog = await gatewayListModels().catch(() => []);
+      const resolveModel = gatewayResolveModel(job.model, catalog, cfg);
+      if (!resolveModel) {
+        await gatewayJobDone(job.id, { ok: false, error: "model not found" });
+        return;
+      }
+      const taskId = await gatewayEnsureWorkerTask();
+      const requestId = attemptNo > 1 ? `gw-${job.id}-r${attemptNo}` : `gw-${job.id}`;
+      try {
+        const text = await gatewayRunJob(job, resolveModel, requestId, taskId);
+        await gatewayJobDone(job.id, { ok: true, text });
+      } catch (e) {
+        try { await sdk.models.cancel(requestId); } catch { /* 流可能已自行结束 */ }
+        throw e;
+      }
+    };
+    try {
+      await attempt();
+    } catch (e) {
+      if (!isInvocationContextError(e)) {
+        await gatewayJobDone(job.id, { ok: false, error: msgOf(e).slice(0, 2000) }).catch((e2) => warn(`llm-gateway job ${job.id} done 回填也失败：${msgOf(e2)}`));
+        return;
+      }
+      // 归属上下文失效：重建 task 重试一次；仍败则如实结算失败
+      warn(`llm-gateway job ${job.id} 归属上下文失效，重建 task 重试：${msgOf(e)}`);
+      state.gateway.workerTaskId = null;
+      try {
+        await attempt();
+      } catch (e2) {
+        await gatewayJobDone(job.id, { ok: false, error: msgOf(e2).slice(0, 2000) }).catch((e3) => warn(`llm-gateway job ${job.id} done 回填也失败：${msgOf(e3)}`));
+      }
+    }
+  }
+
+  async function gatewayWorkerStatus() {
+    // 主 server 上没有 /healthz：健康检查用 /_relay/status（先例 index.js:1485），
+    // 走同一 relayJson 通道；未就绪/失败都如实报。
+    let relay = { reachable: false };
+    try {
+      const r = await relayJson("/_relay/status", { method: "GET", timeoutMs: 4_000 });
+      relay = { reachable: r.ok, status: r.status, body: r.data && typeof r.data === "object" ? r.data : null };
+    } catch (e) {
+      relay = { reachable: false, error: msgOf(e) };
+    }
+    return { workerRunning: state.gateway.workerRunning, relayHealth: relay };
+  }
+
+  function gatewayRunning() {
+    return !!(state.gateway.server && state.gateway.server.listening);
+  }
+
+  function gatewayTokenOk(req, cfg) {
+    const h = req.headers.authorization || "";
+    const m = /^Bearer\s+(.+)$/i.exec(h);
+    if (!m) return false;
+    const given = Buffer.from(m[1].trim(), "utf8");
+    const expect = Buffer.from(cfg.token, "utf8");
+    return given.length === expect.length && timingSafeEqual(given, expect);
+  }
+
+  function gatewayJson(res, status, body) {
+    const payload = JSON.stringify(body);
+    res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+    res.end(payload);
+  }
+
+  function gatewayStart(cfg) {
+    return new Promise((resolve) => {
+      const server = http.createServer((req, res) => {
+        try {
+          const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+          const path = url.pathname;
+          // /healthz 不校验 token
+          if (req.method === "GET" && path === "/healthz") {
+            gatewayJson(res, 200, { ok: true, app: APP_ID, version: APP_VERSION });
+            return;
+          }
+          if (!gatewayTokenOk(req, cfg)) {
+            gatewayJson(res, 401, { error: { message: "Invalid or missing bearer token", type: "authentication_error" } });
+            return;
+          }
+          if (req.method === "GET" && path === "/v1/models") {
+            gatewayListModels()
+              .then((list) => {
+                gatewayJson(res, 200, {
+                  object: "list",
+                  data: list.map((m) => ({ id: m.id, object: "model", owned_by: m.provider })),
+                });
+              })
+              .catch((e) => {
+                warn(`llm-gateway /v1/models 模型目录读取失败：${msgOf(e)}`);
+                gatewayJson(res, 502, { error: { message: `Host model catalog unavailable: ${msgOf(e)}`, type: "upstream_error" } });
+              });
+            return;
+          }
+          gatewayJson(res, 404, { error: { message: `Not found: ${req.method} ${path}`, type: "invalid_request_error" } });
+        } catch (e) {
+          try { gatewayJson(res, 500, { error: { message: msgOf(e), type: "internal_error" } }); } catch { /* 连接已坏 */ }
+        }
+      });
+      server.on("error", (e) => resolve({ ok: false, error: msgOf(e) }));
+      // AppHost 子进程默认不开 --allow-net：listen 会同步抛 ERR_ACCESS_DENIED。
+      // 必须在此捕获，否则异常会穿透到 apply 把整个 App 进程带崩（已踩过）。
+      try {
+        server.listen(cfg.port, cfg.host, () => resolve({ ok: true, server }));
+      } catch (e) {
+        try { server.close(); } catch { /* 未监听过，关不掉也无所谓 */ }
+        resolve({ ok: false, error: msgOf(e), netBlocked: true });
+      }
+    });
+  }
+
+  // 旧 listen 路径（v0.21.0 骨架）保留实现但不再被任何路径调用；
+  // APP_PROCESS_CAN_LISTEN 恒为 false，start 动作改走 worker（见 gatewayStartWorker）。
+  async function gatewayStartAction() {
+    if (gatewayRunning()) {
+      const cfg = state.gateway.config;
+      const models = await gatewayListModels().catch(() => []);
+      return { ok: true, port: cfg.port, host: cfg.host, models: models.map((m) => m.id), note: "已在运行（幂等）" };
+    }
+    // 硬限制（2026-11-01 真机实测）：AppHost 子进程不开 --allow-net，
+    // listen() 在内部 microtask 里抛 ERR_ACCESS_DENIED，try/catch 与 server.on("error")
+    // 都拦不住，会把整个 App 进程带崩（握手阶段 exit 1）。所以在未拿到网络权限前**不尝试监听**。
+    if (!APP_PROCESS_CAN_LISTEN) {
+      const cfg = gatewayEnsureConfig();
+      return {
+        ok: false,
+        port: cfg.port,
+        host: cfg.host,
+        models: [],
+        netBlocked: true,
+        note: "本进程无 Net 权限（ERR_ACCESS_DENIED）：AppHost 不开 --allow-net。已改 worker 模式：长轮询中继网关取 job 执行",
+      };
+    }
+    const cfg = gatewayEnsureConfig();
+    if (!cfg.enabled) return { ok: false, port: cfg.port, host: cfg.host, models: [], note: "配置 enabled=false，未启动" };
+    const r = await gatewayStart(cfg);
+    if (!r.ok) {
+      error(`llm-gateway 启动失败（${cfg.host}:${cfg.port}）：${r.error}`);
+      return { ok: false, port: cfg.port, host: cfg.host, models: [], note: `监听失败：${r.error}` };
+    }
+    state.gateway.server = r.server;
+    state.gateway.config = cfg;
+    log(`llm-gateway 已监听 http://${cfg.host}:${cfg.port}（/healthz 免鉴权；/v1/models 需 Bearer token）`);
+    const models = await gatewayListModels().catch((e) => {
+      warn(`llm-gateway 启动后拉取模型目录失败：${msgOf(e)}`);
+      return [];
+    });
+    return { ok: true, port: cfg.port, host: cfg.host, models: models.map((m) => m.id), note: `已启动；模型目录 ${models.length} 条` };
+  }
+
+  function gatewayStopAction() {
+    const server = state.gateway.server;
+    if (!server) return { ok: true, note: "未在运行" };
+    state.gateway.server = null;
+    state.gateway.config = null;
+    return new Promise((resolve) => {
+      server.close(() => resolve({ ok: true, note: "已关闭" }));
+    });
+  }
+
+  // 停 worker：置位后等当前轮次（长轮询最多 ~30s）自然退出；
+  // workerRunning/workerTimer 立即归零，避免停后 30s 内 op=start 被误判「已在运行」。
+  function gatewayStopWorker() {
+    if (!state.gateway.workerRunning && !state.gateway.workerTimer) return { stopping: false, note: "worker 未在运行" };
+    state.gateway.workerSeq += 1; // 使 loop 的 seq 检查失效，循环自然退出
+    state.gateway.workerStop = true;
+    state.gateway.workerRunning = false;
+    state.gateway.workerTimer = null;
+    return { stopping: true, note: "已请求停止，当前轮次结束后退出（长轮询最多 ~30s）" };
+  }
+
+  function gatewayWorkerTokenTail() {
+    const cfg = state.gateway.config || (() => { try { return gatewayReadConfig(); } catch { return GATEWAY_DEFAULT; } })();
+    return cfg.token ? String(cfg.token).slice(-4) : null;
+  }
+
+  async function gatewayStatusAction() {
+    const cfgFile = (() => { try { return gatewayReadConfig(); } catch { return GATEWAY_DEFAULT; } })();
+    let models = [];
+    let catalogError = null;
+    try {
+      models = await gatewayListModels();
+    } catch (e) {
+      catalogError = msgOf(e);
+      models = [];
+    }
+    const worker = await gatewayWorkerStatus();
+    return {
+      workerRunning: worker.workerRunning,
+      relayHealth: worker.relayHealth,
+      tokenSet: !!gatewayWorkerTokenTail(),
+      tokenTail: gatewayWorkerTokenTail(),
+      modelsCount: models.length,
+      models: models.map((m) => m.id),
+      catalogError,
+      defaultModel: cfgFile.defaultModel,
+    };
+  }
+
+  function gatewaySummaryLines(r) {
+    const health = r.relayHealth || {};
+    const healthText = health.reachable ? "可达" : `不可达${health.error ? `（${health.error}）` : `（HTTP ${health.status ?? "?"}）`}`;
+    return [
+      `worker：${r.workerRunning ? "运行中" : "未运行"}；中继（runtime 通道）${healthText}`,
+      `- token：${r.tokenSet ? `已设置（尾 4 位 ${r.tokenTail}）` : "未设置"}；defaultModel：${r.defaultModel || "（未设）"}`,
+      `- 模型目录：${r.modelsCount} 条${r.models.length ? `：${r.models.join(", ")}` : ""}`,
+      ...(r.catalogError ? [`- 目录读取失败：${r.catalogError}`] : []),
+    ];
+  }
+
+  async function actionLlmGateway(args) {
+    const op = String(args.op || "status").trim().toLowerCase();
+    if (op === "start") {
+      try {
+        state.gateway.config = gatewayEnsureConfig();
+        const started = gatewayStartWorker("tool:start");
+        const r = await gatewayStatusAction();
+        const text = [started ? "LLM 网关 worker 已启动（长轮询中继取 job）。" : "LLM 网关 worker 已在运行（幂等）。", ...gatewaySummaryLines(r)].join("\n");
+        return { content: [{ type: "text", text }], details: { comfyui: { action: "llmGateway", op, ok: true, started, ...r } } };
+      } catch (e) {
+        const text = `LLM 网关 worker 启动异常：${msgOf(e)}`;
+        return { content: [{ type: "text", text }], details: { comfyui: { action: "llmGateway", op, ok: false, error: msgOf(e) } } };
+      }
+    }
+    if (op === "stop") {
+      const r = gatewayStopWorker();
+      return { content: [{ type: "text", text: `LLM 网关：${r.note}` }], details: { comfyui: { action: "llmGateway", op, ...r } } };
+    }
+    if (op === "status") {
+      const r = await gatewayStatusAction();
+      const text = [`LLM 网关（worker 模式）：`, ...gatewaySummaryLines(r)].join("\n");
+      return { content: [{ type: "text", text }], details: { comfyui: { action: "llmGateway", op, ...r } } };
+    }
+    throw new Error(`llmGateway 的 op 必须是 start / stop / status（收到 "${op}"）`);
+  }
+
   // ── 画布移交（2026-10-09 首版；2026-10-09 晚修订 1：非破坏加入 + 任意次序接管）──────────
   // 方案：docs/画布移交-外开窗口到主工作区-20261009.md（含「⚠ 修订 1」节）。单桶壳页桥（shellBridge）
   // 下不做实时接力，本移交 = 一次性状态转移：
@@ -6422,6 +7008,13 @@ export default defineApp(async (sdk) => {
           windowId: { type: "string", description: "close 用：目标窗口 id（aw_*，来自 op=status / op=open 返回；省略则关最近一次打开的工作区窗）" },
         },
       },
+      {
+        command: "llmGateway",
+        required: [],
+        fields: {
+          op: { type: "string", enum: ["start", "stop", "status"], description: "llmGateway 用：start=启动长轮询 worker（App 进程不监听，作模型执行端：经 runtime 通道长轮询主中继 /_relay/llm/jobs 取 job，用宿主模型执行并回填增量；幂等）/ stop=停止 worker / status=查 worker 与中继健康状态（token 只报尾 4 位，不回显全文；默认）" },
+        },
+      },
     ];
   }
 
@@ -6501,9 +7094,10 @@ export default defineApp(async (sdk) => {
             case "update": return await actionUpdate(args, context);
             case "canvas": return await actionCanvas(args, context);
             case "window": return await actionWindow(args, context);
+            case "llmGateway": return await actionLlmGateway(args);
             case "upload": return await actionUpload(args);
             default:
-              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update / canvas / window（收到 "${action}"）`);
+              throw new Error(`action 必须是 status / submit / query / result / cancel / workflows / upload / service / update / canvas / window / llmGateway（收到 "${action}"）`);
           }
         } catch (e) {
           const text = `comfyui(${action || "?"}) 失败：${msgOf(e)}`;
@@ -6512,7 +7106,7 @@ export default defineApp(async (sdk) => {
         }
       },
     });
-    log("工具注册：comfyui（v0.3：status/submit/query/result/cancel/workflows/upload/service/update/canvas/window）");
+    log("工具注册：comfyui（v0.3：status/submit/query/result/cancel/workflows/upload/service/update/canvas/window/llmGateway）");
   } catch (e) {
     error(`工具注册失败：${msgOf(e)}`);
   }
@@ -7430,6 +8024,16 @@ export default defineApp(async (sdk) => {
   // ── 任务结算节拍（2s）────────────────────────────────────────────────────
   state.jobTimer = setInterval(() => { void jobTick(); }, JOB_TICK_MS);
   state.jobTimer.unref?.();
+
+  // ── LLM 网关 worker 自启（v0.21.1：enabled=true 时启动长轮询 worker；失败只记日志）────
+  // worker 模式不监听端口，只出站长轮询中继网关；中继未就绪时靠退避重试，不影响 App 其余功能。
+  Promise.resolve()
+    .then(async () => {
+      const cfg = gatewayEnsureConfig();
+      if (cfg.enabled !== true) return;
+      gatewayStartWorker("auto");
+    })
+    .catch((e) => warn(`llm-gateway worker 自启异常：${msgOf(e)}`));
 
   // ── 自动拉起（微任务，不占 apply 同步栈；单飞行）─────────────────────────
   Promise.resolve()

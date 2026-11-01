@@ -30,6 +30,18 @@
   //   POST /_relay/bridge           画布桥（只读阶段）：{op,args} → ComfyUI 内 hana_bridge 扩展执行
   //                                 （需 controlKey；token 读 custom_nodes/hana_bridge/.token）
 //
+// OpenAI 兼容网关（2026-11-02，另起一只 http server，默认 127.0.0.1:8790，config.llmGatewayPort 可覆盖）：
+//   GET  /healthz                  免鉴权探活（workerOnline / models 条数）
+//   GET  /v1/models                需 Bearer token；App 经 /_relay/llm/config 下发的目录缓存
+//   POST /v1/chat/completions      需 Bearer token；生成 job 入队，stream 走 SSE，非 stream 挂起等结果
+//   POST /_relay/llm/config        App 下发 {token, models, defaultModel}（loopback 信任）
+//   GET  /_relay/llm/jobs?wait=ms  App 长轮询取 job（同一 job 只取一次；无 job 超时 204）
+//   POST /_relay/llm/jobs/:id/event App 回填增量 {type:text-delta|reasoning-delta|error, ...}
+//   POST /_relay/llm/jobs/:id/done  App 收尾 {ok:true,text}|{ok:false,error}
+//   —— 以上 4 条 App 桥路由同时挂在主中继 server（App 经 ctx.runtime.fetch 只能到 service 端口，
+//   到不了 8790）与 8790 网关 server 上，共用同一 handler（scope="bridge"/"public"）与同一队列。
+//   job 30s 无任何回填超时：stream 发 error 事件后 [DONE]，非 stream 504。
+//
 // 启动方式：
 //   受管模式（生产）：node comfy-relay.mjs <runtime-config.json>
 //     —— 由 App 的 ctx.runtime.start({runtime:"node", service:{port,readyMarker}}) 拉起；
@@ -50,7 +62,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import http from "node:http";
 import net from "node:net";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { cpus as osCpus, freemem, homedir, platform as osPlatform, release as osRelease, totalmem } from "node:os";
@@ -230,6 +242,7 @@ function validateConfig(raw, sourceLabel) {
     comfyBase: null,
     clientId: "comfyui-relay-" + randomBytes(4).toString("hex"),
     appDataDir: null,
+    llmGatewayPort: 8790,
   };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`${sourceLabel}: 配置必须是 JSON 对象`);
@@ -263,6 +276,12 @@ function validateConfig(raw, sourceLabel) {
   if (typeof raw.clientId === "string" && raw.clientId.trim()) out.clientId = raw.clientId.trim();
   // app-data 根目录（2026-10-30）：仅用于定位节点适配档案目录 <appDataDir>/node-adapters
   if (typeof raw.appDataDir === "string" && raw.appDataDir.trim()) out.appDataDir = raw.appDataDir.trim();
+  // LLM 网关端口（2026-11-02）：默认 8790；App 经 /_relay/llm/config 下发 token 与模型目录
+  const gwPort = Number(raw.llmGatewayPort);
+  if (raw.llmGatewayPort !== undefined && (!Number.isInteger(gwPort) || gwPort < 1 || gwPort > 65535)) {
+    throw new Error(`${sourceLabel}: llmGatewayPort 必须是 1..65535 的整数`);
+  }
+  if (Number.isInteger(gwPort) && gwPort > 0) out.llmGatewayPort = gwPort;
   return out;
 }
 
@@ -3812,9 +3831,354 @@ async function handleSubmitFile(req, res) {
 }
 
 
+// ── OpenAI 兼容网关（HTTP + 队列；模型调用由 App 进程长轮询接管）──────────────
+// 另起一只 http server（默认 127.0.0.1:8790，config.llmGatewayPort 可覆盖），与中继主服务并存。
+// 事实约束：AppHost 子进程不开 --allow-net，App 内 listen 会带崩进程（ERR_ACCESS_DENIED 在内部
+// microtask 里抛，拦不住），且宿主总线没有 model:stream —— 所以监听与队列都由中继做，
+// App 经 /_relay/llm/* 桥取 job、回填增量。沿用 /_relay loopback 信任模型，不校验 App 侧调用者。
+const LLM_GATEWAY_VERSION = "0.1.0";
+const LLM_JOB_TIMEOUT_MS = 30_000; // job 超时：30s 无任何 event/done 即失败收尾
+const LLM_WAIT_DEFAULT_MS = 25_000; // /_relay/llm/jobs?wait= 缺省长轮询时长
+
+const llmGateway = {
+  server: null,
+  token: null,          // Bearer token（App 经 /_relay/llm/config 下发）
+  models: [],           // [{id, provider, modelId}]
+  defaultModel: null,
+  jobs: new Map(),      // id → job（入队到收尾全程保留，event/done 按 id 寻址）
+  pending: [],          // 待取队列（job id；同一 job 只会被 shift 一次）
+  waiters: [],          // 长轮询挂起的 { resolve, timer }
+  workerSeenAt: 0,      // 最近一次 App 来取 job 的时间（workerOnline 判定）
+};
+
+function llmJobView(job) {
+  return {
+    id: job.id,
+    model: job.model,
+    messages: job.messages,
+    stream: job.stream,
+    temperature: job.temperature,
+    maxTokens: job.maxTokens,
+  };
+}
+
+function llmWakeWaiters() {
+  while (llmGateway.waiters.length) {
+    const w = llmGateway.waiters.shift();
+    clearTimeout(w.timer);
+    w.resolve();
+  }
+}
+
+function llmSettleTimeout(job) {
+  if (job.settled) return;
+  job.settled = true;
+  clearTimeout(job.timeoutTimer);
+  llmGateway.jobs.delete(job.id);
+  const msg = `LLM job ${job.id} 超时：${LLM_JOB_TIMEOUT_MS / 1000}s 内未收到任何 App 回填`;
+  warn(`[llm-gateway] ${msg}`);
+  try {
+    if (job.stream) {
+      llmStreamWriteError(job.res, msg);
+      llmStreamFinish(job.res);
+    } else if (!job.res.writableEnded) {
+      jsonOut(job.res, 504, { error: { message: msg, type: "timeout" } }, "POST");
+    }
+  } catch (e) {
+    warn(`[llm-gateway] job 超时收尾异常：${(e && e.message) || e}`);
+  }
+}
+
+// 30s 无任何回填即超时；定时器从入队起贯穿全程（被取走也不取消），每次增量刷新
+function llmArmTimeout(job) {
+  clearTimeout(job.timeoutTimer);
+  job.timeoutTimer = setTimeout(() => llmSettleTimeout(job), LLM_JOB_TIMEOUT_MS);
+  job.timeoutTimer.unref?.();
+}
+
+function llmTakeJob() {
+  while (llmGateway.pending.length) {
+    const id = llmGateway.pending.shift();
+    const job = llmGateway.jobs.get(id);
+    if (job && !job.settled) return job;
+  }
+  return null;
+}
+
+function llmFindJob(id) {
+  const job = typeof id === "string" ? llmGateway.jobs.get(id) : null;
+  if (!job) warn(`[llm-gateway] 事件指向未知/已取走的 job：${String(id).slice(0, 64)}`);
+  return job;
+}
+
+function llmStreamWriteDelta(res, key, text) {
+  if (!res.writableEnded) {
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { [key]: text } }] })}\n\n`);
+  }
+}
+
+function llmStreamWriteError(res, message) {
+  if (!res.writableEnded) {
+    res.write(`data: ${JSON.stringify({ error: { message, type: "gateway_error" } })}\n\n`);
+  }
+}
+
+function llmStreamFinish(res) {
+  if (!res.writableEnded) {
+    res.write("data: [DONE]\n\n");
+    res.end();
+  }
+}
+
+function llmIsBridgeRoute(pathOnly) {
+  const p = String(pathOnly || "");
+  return p === "/_relay/llm/config" || p === "/_relay/llm/jobs" || /^\/_relay\/llm\/jobs\/[^/]+\/(event|done)$/.test(p);
+}
+
+// scope="public"：独立网关 server（对外 OpenAI 客户端）；scope="bridge"：主中继 server（App 经
+// ctx.runtime.fetch 代理，只到已注册 service 端口到不了 8790）。两处 server 共用本函数与同一队列。
+async function llmGatewayHandler(req, res, scope = "public") {
+  const pathOnly = String(req.url || "/").split("?", 1)[0];
+  const method = req.method || "GET";
+  // 路由守卫：bridge scope 只放行 /_relay/llm/*，public scope 只放行对外 OpenAI 面
+  const isPublicRoute = pathOnly === "/healthz" || pathOnly === "/v1/models" || pathOnly === "/v1/chat/completions";
+  if (scope === "bridge" ? !llmIsBridgeRoute(pathOnly) : !isPublicRoute) {
+    return jsonOut(res, 404, { error: { message: `No such gateway route: ${method} ${pathOnly}`, type: "not_found_error" } });
+  }
+  const bearerOk = () => {
+    if (!llmGateway.token) return false;
+    const h = req.headers.authorization;
+    if (typeof h !== "string") return false;
+    const m = /^Bearer\s+(.+)$/.exec(h.trim());
+    if (!m) return false;
+    const a = Buffer.from(m[1]);
+    const b = Buffer.from(llmGateway.token);
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
+
+  try {
+    // — 对外 OpenAI 兼容面 —
+    if (method === "GET" && pathOnly === "/healthz") {
+      return jsonOut(res, 200, {
+        ok: true,
+        app: "comfyui-hana",
+        role: "relay-gateway",
+        version: LLM_GATEWAY_VERSION,
+        workerOnline: llmGateway.waiters.length > 0 || Date.now() - llmGateway.workerSeenAt < 10_000,
+        models: llmGateway.models.length,
+      });
+    }
+
+    if (method === "GET" && pathOnly === "/v1/models") {
+      if (!bearerOk()) return jsonOut(res, 401, { error: { message: "Missing or invalid bearer token", type: "authentication_error" } });
+      return jsonOut(res, 200, {
+        object: "list",
+        data: llmGateway.models.map((m) => ({ id: m.id, object: "model", owned_by: "comfyui-hana" })),
+      });
+    }
+
+    if (method === "POST" && pathOnly === "/v1/chat/completions") {
+      if (!bearerOk()) return jsonOut(res, 401, { error: { message: "Missing or invalid bearer token", type: "authentication_error" } });
+      if (llmGateway.waiters.length === 0) {
+        return jsonOut(res, 503, { error: { message: "App worker not connected", type: "service_unavailable" } }, "POST");
+      }
+      let body;
+      try {
+        body = await readBodyJson(req, 4 * 1024 * 1024);
+      } catch (e) {
+        return jsonOut(res, 400, { error: { message: `Invalid JSON body: ${(e && e.message) || e}`, type: "invalid_request_error" } }, "POST");
+      }
+      const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : (llmGateway.defaultModel || (llmGateway.models[0] && llmGateway.models[0].id) || null);
+      const messages = Array.isArray(body.messages) ? body.messages : null;
+      if (!messages || messages.length === 0) {
+        return jsonOut(res, 400, { error: { message: "messages must be a non-empty array", type: "invalid_request_error" } }, "POST");
+      }
+      const stream = body.stream === true;
+      const temperature = typeof body.temperature === "number" && Number.isFinite(body.temperature) ? body.temperature : undefined;
+      const maxTokens = Number.isInteger(body.max_tokens) && body.max_tokens > 0 ? body.max_tokens : undefined;
+      const job = {
+        id: randomUUID(),
+        model,
+        messages,
+        stream,
+        temperature,
+        maxTokens,
+        createdAt: Date.now(),
+        res,
+        timeoutTimer: null,
+        parts: [], // 非 stream 模式的增量累积
+        settled: false, // 收尾只做一次（done / error / 超时三路互斥）
+      };
+      llmGateway.jobs.set(job.id, job);
+      llmGateway.pending.push(job.id);
+      llmArmTimeout(job);
+      llmWakeWaiters();
+      if (stream) {
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        res.write(": connected\n\n");
+        // 立刻返回；增量经 event / done 路由续写，job 超时兜底
+        return;
+      }
+      // 非 stream：挂起等 done；job 超时定时器兜底（504）
+      return;
+    }
+
+    // — App 侧桥（loopback 信任模型，沿用 /_relay 口径）—
+    if (method === "POST" && pathOnly === "/_relay/llm/config") {
+      let body;
+      try {
+        body = await readBodyJson(req);
+      } catch (e) {
+        return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }, "POST");
+      }
+      llmGateway.token = typeof body.token === "string" && body.token ? body.token : null;
+      llmGateway.models = Array.isArray(body.models)
+        ? body.models.filter((m) => m && typeof m.id === "string" && m.id).map((m) => ({ id: m.id, provider: m.provider ?? null, modelId: m.modelId ?? null }))
+        : [];
+      llmGateway.defaultModel = typeof body.defaultModel === "string" && body.defaultModel ? body.defaultModel : null;
+      log(`[llm-gateway] config 已下发：token=${llmGateway.token ? "已设置" : "未设置"}，models ${llmGateway.models.length} 个，default=${llmGateway.defaultModel || "-"}`);
+      return jsonOut(res, 200, { ok: true });
+    }
+
+    if (method === "GET" && pathOnly === "/_relay/llm/jobs") {
+      llmGateway.workerSeenAt = Date.now(); // 长轮询 worker 在线证据（healthz 用）
+      const uq = new URL(String(req.url || "/"), "http://relay.invalid");
+      const waitMs = Math.min(60_000, Math.max(0, Number(uq.searchParams.get("wait")) || 0)) || LLM_WAIT_DEFAULT_MS;
+      let job = llmTakeJob();
+      if (!job && waitMs > 0) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            const i = llmGateway.waiters.findIndex((w) => w.resolve === resolve);
+            if (i >= 0) llmGateway.waiters.splice(i, 1);
+            resolve();
+          }, waitMs);
+          timer.unref?.();
+          llmGateway.waiters.push({ resolve, timer });
+        });
+        job = llmTakeJob();
+      }
+      if (!job) return jsonOut(res, 204, {}, method);
+      // 定时器保留：取走后 30s 无回填仍要超时
+      return jsonOut(res, 200, { job: llmJobView(job) }, method);
+    }
+
+    const evMatch = /^\/_relay\/llm\/jobs\/([^/]+)\/(event|done)$/.exec(pathOnly);
+    if (evMatch) {
+      const job = llmFindJob(evMatch[1]);
+      if (!job) return jsonOut(res, 404, { ok: false, error: "unknown job" }, "POST");
+      let body;
+      try {
+        body = await readBodyJson(req);
+      } catch (e) {
+        return jsonOut(res, 400, { ok: false, error: String((e && e.message) || e) }, "POST");
+      }
+      // 收尾类请求（done / error 事件）先摘除 job，避免重复结算；settled 防超时双写
+      const isDone = evMatch[2] === "done" || body.type === "error";
+      if (isDone) {
+        llmGateway.jobs.delete(job.id);
+        if (job.settled) return jsonOut(res, 200, { ok: true, alreadySettled: true });
+        job.settled = true;
+        clearTimeout(job.timeoutTimer);
+      } else {
+        if (job.settled) return jsonOut(res, 200, { ok: true, alreadySettled: true });
+        llmArmTimeout(job); // 增量刷新 30s 窗口
+      }
+      try {
+        if (evMatch[2] === "event") {
+          if (body.type === "text-delta" || body.type === "reasoning-delta") {
+            const key = body.type === "text-delta" ? "content" : "reasoning_content";
+            const delta = typeof body.delta === "string" ? body.delta : String(body.delta ?? "");
+            if (job.stream) {
+              llmStreamWriteDelta(job.res, key, delta);
+            } else {
+              job.parts.push(delta);
+            }
+          } else if (body.type === "error") {
+            const msg = typeof body.message === "string" && body.message ? body.message : "App worker reported error";
+            warn(`[llm-gateway] job ${job.id} App 报错：${msg}`);
+            if (job.stream) {
+              llmStreamWriteError(job.res, msg);
+              llmStreamFinish(job.res);
+            } else if (!job.res.writableEnded) {
+              jsonOut(job.res, 502, { error: { message: msg, type: "upstream_error" } }, "POST");
+            }
+          } else {
+            return jsonOut(res, 400, { ok: false, error: `unknown event type: ${String(body.type)}` }, "POST");
+          }
+        } else { // done
+          if (body.ok === true) {
+            if (job.stream) {
+              llmStreamFinish(job.res);
+            } else {
+              const text = typeof body.text === "string" ? body.text : job.parts.join("");
+              jsonOut(job.res, 200, {
+                id: `chatcmpl-${job.id}`,
+                object: "chat.completion",
+                model: job.model,
+                choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+              }, "POST");
+            }
+          } else {
+            const msg = typeof body.error === "string" && body.error ? body.error : "App worker failed";
+            warn(`[llm-gateway] job ${job.id} done ok=false：${msg}`);
+            if (job.stream) {
+              llmStreamWriteError(job.res, msg);
+              llmStreamFinish(job.res);
+            } else if (!job.res.writableEnded) {
+              jsonOut(job.res, 502, { error: { message: msg, type: "upstream_error" } }, "POST");
+            }
+          }
+        }
+      } catch (e) {
+        warn(`[llm-gateway] job 结算异常：${(e && e.stack) || e}`);
+      }
+      return jsonOut(res, 200, { ok: true });
+    }
+
+    return jsonOut(res, 404, { error: { message: `No such gateway route: ${method} ${pathOnly}`, type: "not_found_error" } });
+  } catch (e) {
+    warn(`[llm-gateway] ${method} ${pathOnly} 处理异常：${(e && e.stack) || e}`);
+    try {
+      if (!res.writableEnded) jsonOut(res, 500, { error: { message: "internal gateway error", type: "internal_error" } }, method);
+    } catch { /* 已无法响应 */ }
+  }
+}
+
+function startLlmGateway() {
+  const gwPort = Number.isInteger(config?.llmGatewayPort) && config.llmGatewayPort > 0 && config.llmGatewayPort <= 65535
+    ? config.llmGatewayPort : 8790;
+  const gwServer = http.createServer((req, res) => {
+    void llmGatewayHandler(req, res, "public").catch((e) => {
+      warn(`[llm-gateway] handler 异常：${(e && e.stack) || e}`);
+      try { if (!res.writableEnded) jsonOut(res, 500, { error: { message: "internal gateway error", type: "internal_error" } }, req.method || "GET"); } catch { /* 已无法响应 */ }
+    });
+  });
+  gwServer.on("error", (e) => {
+    warn(`[llm-gateway] 监听 127.0.0.1:${gwPort} 失败（网关不可用，不影响中继主服务）：${(e && e.stack) || e}`);
+  });
+  gwServer.listen(gwPort, "127.0.0.1", () => {
+    llmGateway.server = gwServer;
+    log(`[llm-gateway] OpenAI 兼容网关监听 127.0.0.1:${gwPort}（/healthz 免鉴权；/v1/* 需 Bearer token；/_relay/llm/* 为 App 桥）`);
+  });
+}
+
 // ── 服务器 ─────────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   const pathOnly = String(req.url || "/").split("?", 1)[0];
+  // LLM 桥路由（App 经 ctx.runtime.fetch 代理到主 server；与 8790 网关共用同一 handler/队列）。
+  // 放在最前：llmIsBridgeRoute 只匹配 /_relay/llm/*，不与任何既有路由重叠，其余路由行为不变。
+  if (llmIsBridgeRoute(pathOnly)) {
+    void llmGatewayHandler(req, res, "bridge").catch((e) => {
+      warn(`[llm-gateway] bridge handler 异常：${(e && e.stack) || e}`);
+      try { if (!res.writableEnded) jsonOut(res, 500, { error: { message: "internal gateway error", type: "internal_error" } }, req.method || "GET"); } catch { /* 已无法响应 */ }
+    });
+    return;
+  }
   if (pathOnly === "/_relay/status") {
     if (req.method !== "GET" && req.method !== "HEAD") {
       jsonOut(res, 405, { error: "method not allowed" }, req.method);
@@ -4402,6 +4766,11 @@ async function main() {
   startProbeTimer();
   startMetricsSampler();
   startBackendEvents();
+  try {
+    startLlmGateway(); // 网关起不来只 warn（gwServer error 事件），绝不影响上面已就绪的中继主服务
+  } catch (e) {
+    warn(`[llm-gateway] 启动失败（忽略，不影响中继主服务）：${(e && e.stack) || e}`);
+  }
 }
 
 process.on("SIGINT", () => { log("收到 SIGINT，退出"); server.close(() => process.exit(EXIT.OK)); setTimeout(() => process.exit(EXIT.OK), 1000).unref?.(); });
