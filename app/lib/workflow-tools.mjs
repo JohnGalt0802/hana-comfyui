@@ -785,8 +785,9 @@ export function convertUiToApi(wf, objectInfo, options) {
   // mode 归因表（2026-10-31）：id → { id, type, reason }。仅登记因 mode 2/4 而退出 prompt 的节点，
   // 供下游「连线缺失」文案补上引擎真实知道的原因；virtual/档案 skip 不在此表，不参与归因。
   const modeDrop = new Map();
-  // 旁路死链精确归因（2026-10-31）："上游id:输出槽" → 原因。在连线重写块内按 pickEntry 逐输出槽
-  // 实算后填入（无任何输入 / 无同类型输入可穿透）；歧义映射由 pickEntry 自行推入 problems，不在此重复。
+  // 穿透死链精确归因（2026-10-31，2026-11-03 扩为三档）："上游id:输出槽" → 原因。在连线重写块内
+  // 按 pickEntry 逐输出槽实算后填入：mode 4 → 旁路（无输入/无同类型输入）；mode 0 转发节点 → 上游链路断裂
+  // 或入口类型不兼容（不把 mode 0 误归因为旁路）；歧义映射由 pickEntry 自行推入 problems，不在此重复。
   const bypassWhy = new Map();
   // pull 死链归因（2026-10-31）：GetNode id → 原因。GetNode 本身未被静音/旁路，
   // 但它按名字配到的 Set 被静音/旁路（P2 路径）时，连线同样因 mode 2/4 而作废，原因引擎真实知道。
@@ -890,6 +891,11 @@ export function convertUiToApi(wf, objectInfo, options) {
       }
       return hit;
     };
+    // 入口类型匹配（2026-11-03）：`*` 是通配类型，与任何输出类型都兼容。真实语料里 Reroute 的
+    // inputs[0].type 恒为 "*"（前端不往这个槽写具体类型），旧的严格比较（slot.type !== outType）会把
+    // 唯一入口过滤掉 → 穿透取不到源 → 下游误报「连线缺失」。这是 Reroute 大量失败的真因（档案本身已生效）。
+    // 分两层取候选，保证「不放宽到瞎猜」：精确同类型优先；只有精确层一个都没有时才放宽到 `*`。
+    // 于是原本能唯一定位的图行为完全不变，多入口在任何一层里都仍然按歧义拒绝。
     const pickEntry = (node, os) => {
       const ins = Array.isArray(node.inputs) ? node.inputs : [];
       const outs = Array.isArray(node.outputs) ? node.outputs : [];
@@ -897,14 +903,31 @@ export function convertUiToApi(wf, objectInfo, options) {
       const outType = out && typeof out.type === "string" ? out.type : "";
       const typed = Boolean(outType) && outType !== "*";
       const outName = out && typeof out.name === "string" ? out.name : "";
-      const cands = [];
-      for (let i = 0; i < ins.length; i += 1) {
-        const slot = ins[i];
-        if (!slot || typeof slot !== "object") continue;
-        if (typed && typeof slot.type === "string" && slot.type !== outType) continue;
-        const link = slotLinkOf(node, i);
-        if (!link) continue;
-        cands.push({ idx: i, name: typeof slot.name === "string" ? slot.name : "", link });
+      const linkedCands = (accept) => {
+        const list = [];
+        for (let i = 0; i < ins.length; i += 1) {
+          const slot = ins[i];
+          if (!slot || typeof slot !== "object") continue;
+          const slotType = typeof slot.type === "string" ? slot.type : "";
+          if (!accept(slotType)) continue;
+          const link = slotLinkOf(node, i);
+          if (!link) continue;
+          list.push({ idx: i, name: typeof slot.name === "string" ? slot.name : "", link });
+        }
+        return list;
+      };
+      let cands = [];
+      let wildcardTier = false; // 本轮候选来自 `*` 兜底层（仅用于歧义文案说明，不影响判定）
+      if (!typed) {
+        // 输出槽本身是 `*`（类型不可知）：任何入口都兼容，与改动前一致
+        cands = linkedCands(() => true);
+      } else {
+        // 精确层：同类型；槽类型缺失按改动前行为不参与过滤
+        cands = linkedCands((st) => !st || st === outType);
+        if (!cands.length) {
+          wildcardTier = true;
+          cands = linkedCands((st) => st === "*");
+        }
       }
       if (!cands.length) return { link: null, why: null }; // 没有可用入口 → 下游走「连线缺失」
       if (outName) {
@@ -914,20 +937,46 @@ export function convertUiToApi(wf, objectInfo, options) {
       if (cands.length === 1) return { link: cands[0].link, why: null };
       return {
         link: null,
-        why: `节点 #${node.id} ${node.type} 的旁路/穿透存在歧义映射：输出槽 ${os}${outName ? `「${outName}」` : ""}${typed ? `:${outType}` : ""} 对应多个同类型入口（${cands.map((c) => `「${c.name}」`).join("/")}），无法确定上游来源，已拒绝`,
+        why: `节点 #${node.id} ${node.type} 的旁路/穿透存在歧义映射：输出槽 ${os}${outName ? `「${outName}」` : ""}${typed ? `:${outType}` : ""} 对应多个${wildcardTier ? "通配（*）" : "同类型"}入口（${cands.map((c) => `「${c.name}」`).join("/")}），无法确定上游来源，已拒绝`,
       };
     };
-    // 旁路死链精确归因：对每个被旁路节点的每个输出槽实算一次入口选择，取不到源的原因引擎是知道的。
+    // 穿透死链精确归因（三档，2026-11-03）：对每个被穿透节点的每个输出槽实算一次入口选择，取不到源的原因引擎是知道的。
+    // 关键修正：mode 0 的 virtual 转发节点（Reroute）也在这条路径上，归因必须看节点自己的 mode，
+    // 不能一律写成「处于旁路（mode 4）」——假原因会把排查引到错误方向。
     // （有源与歧义两种结果不记：有源的连线会被重写、不会死；歧义由 resolveReal 路径推入 problems。）
     for (const pid of passthroughIds) {
       const pnode = nodeById.get(pid);
       if (!pnode) continue;
       const pouts = Array.isArray(pnode.outputs) ? pnode.outputs : [];
       const pins = Array.isArray(pnode.inputs) ? pnode.inputs.filter((s) => s && typeof s === "object") : [];
+      const pbypass = Number(pnode.mode) === 4; // 是否真的处于旁路：mode 0 的 virtual 转发节点（Reroute 等）同样会走到这里
+      // 入口是否有连线：区分「根本不接上游」与「接了但类型不兼容」，两种原因的下一步排查完全不同
+      const linkedInputs = pins.filter((s) => {
+        const idx = pnode.inputs.indexOf(s);
+        return idx >= 0 && Boolean(slotLinkOf(pnode, idx));
+      });
       for (let os = 0; os < pouts.length; os += 1) {
         const entry = pickEntry(pnode, os);
-        if (entry.why || entry.link) continue;
-        bypassWhy.set(`${pid}:${os}`, pins.length === 0 ? "处于旁路（mode 4）且没有任何输入" : "处于旁路（mode 4）且无同类型输入可穿透");
+        if (entry.why || entry.link) continue; // 歧义由 resolveReal 路径推入 problems，不在此重复
+        if (pbypass) {
+          // 旁路（mode 4）：保持原文案
+          bypassWhy.set(`${pid}:${os}`, pins.length === 0 ? "处于旁路（mode 4）且没有任何输入" : "处于旁路（mode 4）且无同类型输入可穿透");
+        } else if (linkedInputs.length === 0) {
+          // 三档之一：未旁路、入口根本没有连线 → 上游链路断裂
+          bypassWhy.set(
+            `${pid}:${os}`,
+            "未被旁路（mode 0）但入口没有接上游（输入槽为空或无对应连线），上游链路断裂：在画布上检查该转发节点的输入是否真的连到了上游",
+          );
+        } else {
+          // 三档之二：未旁路、接了上游但槽类型与输出槽不兼容（含 `*` 放宽后仍无一兼容）
+          const o = pouts[os] && typeof pouts[os] === "object" ? pouts[os] : null;
+          const oType = o && typeof o.type === "string" ? o.type : "";
+          const inTypes = [...new Set(linkedInputs.map((s) => (typeof s.type === "string" && s.type ? s.type : "(未声明)")))].join("/");
+          bypassWhy.set(
+            `${pid}:${os}`,
+            `未被旁路（mode 0）但入口类型与目标输出不兼容：入口 ${inTypes}，输出槽 ${os}${oType ? `:${oType}` : "(未声明)"}；检查该节点输入槽类型是否被改写（上游输出类型与下游期望不一致）`,
+          );
+        }
       }
     }
     // pull：按「名字」配对展开（独立于 passthrough 的解析路径；pull 节点只进 droppedIds，不进 passthroughIds）

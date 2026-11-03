@@ -756,3 +756,61 @@ test("autogrow 子槽跟随父项占位：未声明子控件只占位、不注�
   assert.equal(inputs.seed, 5, "子槽占一格时 seed 不能被挤到 1024");
   assert.equal("model.width" in inputs, false, "未声明子控件只占位不注入");
 });
+
+// ── 七、穿透入口的 `*` 通配类型（2026-11-03）────────────────────────────────
+// 真实语料里 Reroute 的 inputs[0].type 恒为 "*"（前端不往这个槽写具体类型）。旧严格比较把它
+// 与所有具体类型都判不相等 → 唯一入口被过滤掉 → 穿透取不到源 → 下游误报「连线缺失」。
+const REROUTE_ADAPTER = { Reroute: { virtual: true, passthrough: true } };
+const WILD_OBJ = {
+  SRCImg: { input: {} },
+  SinkImg: { input: { required: { image: ["IMAGE", {}] } } },
+};
+const imgOut = () => ({ name: "", type: "IMAGE", links: [] });
+
+test("Reroute 输入 `*` + 输出 IMAGE：穿透成功，下游直连真实上游（不吃通配就断）", () => {
+  const wf = {
+    nodes: [
+      { id: 1, type: "SRCImg", inputs: [], outputs: [imgOut()] },
+      // 关键：入口槽类型是 "*"，不是 "IMAGE"
+      { id: 2, type: "Reroute", inputs: [{ name: "", type: "*", link: 10 }], outputs: [imgOut()] },
+      { id: 3, type: "SinkImg", inputs: [{ name: "image", type: "IMAGE", link: 11 }] },
+    ],
+    links: [
+      [10, 1, 0, 2, 0, "IMAGE"],
+      [11, 2, 0, 3, 0, "IMAGE"],
+    ],
+  };
+  const o = convertUiToApi(wf, WILD_OBJ, { adapters: REROUTE_ADAPTER });
+  assert.equal("2" in o, false, "Reroute 不得出现在 prompt 里");
+  assert.deepEqual(Object.keys(o).sort(), ["1", "3"], "上游与下游都保留，Reroute 被摘除");
+  assert.deepEqual(o["3"].inputs.image, ["1", 0], "下游输入必须直连真实上游（不是把连接丢了）");
+  assert.equal(o["3"].class_type, "SinkImg");
+});
+
+test("Reroute 多个通配入口：`*` 放宽不得变成瞎猜，仍按歧义拒绝", () => {
+  const wf = {
+    nodes: [
+      { id: 1, type: "SRCImg", inputs: [], outputs: [imgOut()] },
+      { id: 4, type: "SRCImg", inputs: [], outputs: [imgOut()] },
+      {
+        id: 2,
+        type: "Reroute",
+        inputs: [
+          { name: "a", type: "*", link: 10 },
+          { name: "b", type: "*", link: 11 },
+        ],
+        outputs: [imgOut()],
+      },
+      { id: 3, type: "SinkImg", inputs: [{ name: "image", type: "IMAGE", link: 12 }] },
+    ],
+    links: [
+      [10, 1, 0, 2, 0, "IMAGE"],
+      [11, 4, 0, 2, 1, "IMAGE"],
+      [12, 2, 0, 3, 0, "IMAGE"],
+    ],
+  };
+  assert.throws(
+    () => convertUiToApi(wf, WILD_OBJ, { adapters: REROUTE_ADAPTER }),
+    (e) => /歧义映射/.test(e.message) && /多个通配（\*）入口/.test(e.message) && /「a」\/「b」/.test(e.message),
+  );
+});
