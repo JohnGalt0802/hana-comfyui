@@ -297,10 +297,16 @@ const subgraphUnwrap = (v) => (isPlainObject(v) && "value" in v ? v.value : v);
 
 // 按「声明顺序」枚举节点占据 widget 位（即 widgets_values 位置序）的输入，返回「输入名 → 位置」Map。
 // 与转换器主循环②段、子图展开 widget 值定位共用同一份实现（禁止两套口径漂移）：
-//   - 节点 inputs 里存在带 widget 标记的槽（实例槽证据）→ 按槽序枚举，剔除 socketless 展示件；
-//   - 无槽证据 → 按 object_info 声明序扫 required+optional，跳过非 widget 类型与 forceInput。
-// 两条路径都含 seed/noise_seed 的 control_after_generate 副值跳格（副值多占一格）。
-// info 为该节点的 /object_info 条目（可缺：无槽证据时拿不到任何位置 → 空 Map）。
+//   - 主口径：object_info 声明序（required 键序 → optional 键序），跳过非 widget 类型 / forceInput / socketless；
+//   - autogrow 子控件（声明项的子槽，如 `model.width`）紧跟其父项按槽序入列——它们不单独声明，
+//     但前端确实把它们排在父项之后占位（2026-11-03 核验：2264 个双写节点里该口径与 named 值一致 2152、槽序一致 0）；
+//   - 零散槽（如 `upload` / `audioUI`）排在末尾占位、不注入（全语料核验：34 个此类节点里它们恒在槽尾）；
+//   - 仅当对象完全没有 widget 声明（类型不在 object_info / 纯 socket 节点）或槽序与声明序**自相矛盾**时，
+//     才回落到旧的槽序口径（矛盾时不知哪边是真值，不猜）。
+// **不能按槽序取声明项**：只有部分 widget 带槽（稀疏槽，如 KSampler 只有 seed 带槽）时槽序 ≠ 声明序，
+// 值会整体错位（steps 被写成 scheduler 的 "simple" 这类，2026-11-03 修）。
+// 各路径都含 seed/noise_seed 的 control_after_generate 副值跳格（副值多占一格）。
+// info 为该节点的 /object_info 条目（可缺：既无声明也无槽 → 空 Map）。
 function declaredWidgetSlots(info, node) {
   const input = isPlainObject(info) && isPlainObject(info.input) ? info.input : {};
   const required = isPlainObject(input.required) ? input.required : {};
@@ -308,20 +314,49 @@ function declaredWidgetSlots(info, node) {
   const specOf = (name) => required[name] || optional[name];
   const nodeInputs = isPlainObject(node) && Array.isArray(node.inputs) ? node.inputs : [];
   const wvArr = isPlainObject(node) && Array.isArray(node.widgets_values) ? node.widgets_values : null;
-  const slotWidgets = nodeInputs.filter((s) => s && typeof s === "object" && isPlainObject(s.widget) && typeof s.name === "string");
-  const names = slotWidgets.length
-    ? slotWidgets
-        .filter((s) => {
-          const spec = specOf(s.name);
-          return !(spec && spec[1] && spec[1].socketless === true);
-        })
-        .map((s) => s.name)
-    : [...Object.keys(required), ...Object.keys(optional)].filter((name) => {
-        const spec = specOf(name);
-        if (!spec) return false;
-        const t = Array.isArray(spec[0]) ? "COMBO" : String(spec[0]);
-        return WIDGET_SPEC_TYPES.has(t) && !(spec[1] && spec[1].forceInput === true);
-      });
+  const socketlessOf = (name) => {
+    const spec = specOf(name);
+    return Boolean(spec && spec[1] && spec[1].socketless === true);
+  };
+  const declarable = [...Object.keys(required), ...Object.keys(optional)].filter((name) => {
+    const spec = specOf(name);
+    if (!spec) return false;
+    const t = Array.isArray(spec[0]) ? "COMBO" : String(spec[0]);
+    return WIDGET_SPEC_TYPES.has(t) && !(spec[1] && spec[1].forceInput === true) && !(spec[1] && spec[1].socketless === true);
+  });
+  const hasDeclaration = declarable.length > 0;
+  const slotOrderNames = nodeInputs
+    .filter((s) => s && typeof s === "object" && isPlainObject(s.widget) && typeof s.name === "string" && !socketlessOf(s.name))
+    .map((s) => s.name);
+  // 槽序 vs 声明序是否一致：只看「声明项的槽」（忽略 autogrow 子槽 / 未声明零散槽）的相对先后。
+  // 一致（含只有一个槽）→ 声明序可信；矛盾 → 该文件的槽布局与声明自相矛盾，不知道哪边是真值，
+  // 按「不猜」保留旧槽序口径（node-adapter.test.mjs 的 alias 撞键用例钉的就是这条边界）。
+  const declIndex = new Map(declarable.map((n, i) => [n, i]));
+  const slottedDeclared = slotOrderNames.filter((n) => declIndex.has(n));
+  const slotOrderConsistent = slottedDeclared.every((n, i) => i === 0 || declIndex.get(n) > declIndex.get(slottedDeclared[i - 1]));
+  let names;
+  if (hasDeclaration && slotOrderConsistent) {
+    // autogrow 子控件按「父项 + 子槽」入列；未声明零散槽排末尾（只占位，不注入）
+    const declaredSet = new Set(declarable);
+    const childOf = new Map();
+    const extra = [];
+    for (const s of nodeInputs) {
+      if (!s || typeof s !== "object" || !isPlainObject(s.widget) || typeof s.name !== "string") continue;
+      if (declaredSet.has(s.name) || socketlessOf(s.name)) continue;
+      const parent = declarable.find((d) => s.name.startsWith(`${d}.`));
+      if (!parent) { extra.push(s.name); continue; }
+      if (!childOf.has(parent)) childOf.set(parent, []);
+      childOf.get(parent).push(s.name);
+    }
+    names = [];
+    for (const d of declarable) {
+      names.push(d);
+      for (const c of childOf.get(d) || []) names.push(c);
+    }
+    for (const e of extra) names.push(e);
+  } else {
+    names = slotOrderNames; // 无声明可用（类型不在 object_info / 纯 socket 节点）/ 布局自相矛盾：旧槽序口径
+  }
   const slots = new Map();
   let pos = 0;
   for (const name of names) {
@@ -561,7 +596,7 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
   // 有 widgets_values_named：逐个键名 → 定义输入名 → 定义下标 j → -10 链接 → 内部消费端，
   //   写入该节点的 named（按内部 widget 名）并同步声明位序的位置值（与主循环共用 declaredWidgetSlots）；
   //   同名位置值存在且与 named 分歧 → 拒绝（R1 同精神，防过期 named 被静默采用）。
-  // 无 named：位置回退，序 = 定义「-10 链接指向的内部目标槽带 widget 标记」的输入按定义序；
+  //   无 named 时的位置回退，序 = 定义「-10 链接指向的内部目标槽带 widget 标记」的输入按定义序（定义本身就是声明序，不受稀疏槽影响）；
   //   实例 widgets_values 为空（字段缺失 / 0 项）→ 实例没覆盖任何参数，沿用子图内部默认值：不写值、只记 warning；
   //   其余项数与之不等 → 整份拒绝（不猜）。
   // 值与内部现值相同 → 放行不写入；定位不到现值 → 拒绝。外部连线已占用的输入不传递（连线值优先）。
@@ -1133,7 +1168,7 @@ export function convertUiToApi(wf, objectInfo, options) {
         if (val !== undefined) pushWidget(name, val);
       }
     } else {
-      // widget 位按实例槽的 widget 标记枚举（排除 socketless 展示件）；无槽证据时按声明顺序扫描
+      // widget 位按 /object_info 声明序（autogrow 子槽跟父项、未声明零散槽排末尾；仅无声明时回落槽序）
       // —— 与子图展开共用同一份实现（declaredWidgetSlots，含 seed control 副值跳格），防两套口径漂移。
       const positions = declaredWidgetSlots(info, n);
       for (const [name, pos] of positions) {

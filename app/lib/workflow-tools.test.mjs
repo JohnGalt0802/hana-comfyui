@@ -635,3 +635,124 @@ test("子图实例 widgets_values 非零但数量不一致：仍然拒绝，报�
     /子图实例 #5（「宽子图」）的 widgets_values 有 3 项，但定义按序可对位的 widget 输入有 8 个（t0、t1、t2、t3、t4、t5、t6、t7），数量不一致，无法按位置对位，已拒绝/,
   );
 });
+
+// ── 九、稀疏槽：widget 位序必须按声明序，不能按槽序（2026-11-03 修）──────
+// 背景：旧实现「有槽证据就按槽序取 widgets_values」，节点只有部分 widget 带输入槽时（KSampler 只带 seed/steps 槽）
+// 槽序 ≠ 声明序，值整体错位——实测把 steps 写成 43（真实 50）、BasicScheduler.steps 写成 "simple"。
+// 这里的 KSampler 声明序取自本机 /object_info 原样（键序 + 每条 spec），不手写臆造。
+const KSampler_OBJ = {
+  KSampler: {
+    input: {
+      required: {
+        model: ["MODEL", {}],
+        seed: ["INT", { default: 0, min: 0, max: 18446744073709551615, control_after_generate: true }],
+        steps: ["INT", { default: 20, min: 1, max: 10000 }],
+        cfg: ["FLOAT", { default: 8, min: 0, max: 100, step: 0.1 }],
+        sampler_name: [["euler", "uni_pc", "dpmpp_2m"], {}],
+        scheduler: [["simple", "karras", "beta"], {}],
+        positive: ["CONDITIONING", {}],
+        negative: ["CONDITIONING", {}],
+        latent_image: ["LATENT", {}],
+        denoise: ["FLOAT", { default: 1, min: 0, max: 1, step: 0.01 }],
+      },
+    },
+  },
+  SRC: { input: {} },
+};
+// 稀疏槽样本：节点 inputs 里只有 steps 一个 widget 槽（其余都是连线槽）——真实文件 image_longcat_image_edit.json #7 的形态
+const sparseKSamplerWf = () => ({
+  nodes: [
+    ...[1, 2, 3, 4].map((id) => ({ id, type: "SRC", inputs: [], outputs: [{ name: "X", type: "X", links: [id] }] })),
+    {
+      id: 7,
+      type: "KSampler",
+      inputs: [
+        { name: "model", type: "MODEL", link: 1 },
+        { name: "positive", type: "CONDITIONING", link: 2 },
+        { name: "negative", type: "CONDITIONING", link: 3 },
+        { name: "latent_image", type: "LATENT", link: 4 },
+        { name: "steps", type: "INT", link: null, widget: { name: "steps" } },
+      ],
+      outputs: [{ name: "LATENT", type: "LATENT", links: [] }],
+      widgets_values: [43, "fixed", 50, 4.5, "euler", "simple", 1],
+    },
+  ],
+  links: [
+    [1, 1, 0, 7, 0, "MODEL"],
+    [2, 2, 0, 7, 1, "CONDITIONING"],
+    [3, 3, 0, 7, 2, "CONDITIONING"],
+    [4, 4, 0, 7, 3, "LATENT"],
+  ],
+});
+
+test("稀疏槽（KSampler 只有 steps 带槽）：widget 值按声明序落位，不按槽序错位", () => {
+  const inputs = convertUiToApi(sparseKSamplerWf(), KSampler_OBJ)["7"].inputs;
+  assert.equal(inputs.seed, 43, "seed 必须落在 seed 名下");
+  assert.equal(inputs.steps, 50, "steps 必须是真实声明位的 50，不能吃到 seed 的 43");
+  assert.equal(inputs.cfg, 4.5);
+  assert.equal(inputs.sampler_name, "euler");
+  assert.equal(inputs.scheduler, "simple");
+  assert.equal(inputs.denoise, 1);
+  // seed 的 control_after_generate 副值（"fixed"）仍多占一格，并未被当成某个 widget 的值注入
+  assert.equal(Object.values(inputs).includes("fixed"), false, "control_after_generate 副值不得被当参数注入");
+  assert.deepEqual(Object.keys(inputs).sort(), ["cfg", "denoise", "latent_image", "model", "negative", "positive", "sampler_name", "scheduler", "seed", "steps"]);
+});
+
+// 对照：「全部 widget 都有槽」的常规路径必须一字不变（slot 与声明同位）
+const DENSE_OBJ = {
+  Dense: {
+    input: {
+      required: { a: ["STRING", {}], socketIn: ["IMAGE", {}], b: ["INT", {}], c: [["p", "q"], {}] },
+    },
+  },
+};
+const denseWf = () => ({
+  nodes: [
+    {
+      id: 3,
+      type: "Dense",
+      inputs: [
+        { name: "a", type: "STRING", link: null, widget: { name: "a" } },
+        { name: "socketIn", type: "IMAGE", link: null },
+        { name: "b", type: "INT", link: null, widget: { name: "b" } },
+        { name: "c", type: "COMBO", link: null, widget: { name: "c" } },
+      ],
+      outputs: [],
+      widgets_values: ["hello", 7, "q"],
+    },
+  ],
+  links: [],
+});
+
+test("对照：全部 widget 都带槽（稠密槽）时行为不变，socket 槽不占位", () => {
+  const inputs = convertUiToApi(denseWf(), DENSE_OBJ)["3"].inputs;
+  assert.deepEqual(inputs, { a: "hello", b: 7, c: "q" });
+});
+
+// autogrow 子槽（model.width 这类未声明子控件）必须紧跟父项占位，否则其后的 seed 会错位
+const AUTOGROW_OBJ = {
+  Dyn: { input: { required: { model: [["m1", "m2"], {}], seed: ["INT", { control_after_generate: true }] } } },
+};
+
+test("autogrow 子槽跟随父项占位：未声明子控件只占位、不注入，seed 不错位", () => {
+  const wf = {
+    nodes: [
+      {
+        id: 4,
+        type: "Dyn",
+        inputs: [
+          { name: "model", type: "COMBO", link: null, widget: { name: "model" } },
+          { name: "model.width", type: "INT", link: null, widget: { name: "model.width" } },
+          { name: "seed", type: "INT", link: null, widget: { name: "seed" } },
+        ],
+        outputs: [],
+        widgets_values: ["m1", 1024, 5, "fixed"],
+      },
+    ],
+    links: [],
+  };
+  const inputs = convertUiToApi(wf, AUTOGROW_OBJ)["4"].inputs;
+  assert.equal(inputs.model, "m1");
+  assert.equal(inputs.seed, 5, "子槽占一格时 seed 不能被挤到 1024");
+  assert.equal("model.width" in inputs, false, "未声明子控件只占位不注入");
+});
