@@ -357,6 +357,154 @@ test("汇总⑥：只有静音/旁路 → 不出现插件建议，出现静音�
 
 // ⑦ 只有参数分歧 → 归 value_mismatch 计数，出重存工作流建议，不出插件建议。
 //    挂点：分类顺序里 value_mismatch 未先行（被子图/其他抢走）或建议句丢失 → 本用例挂。
+// ── 七、子图输入槽扇出（2026-11-03）─────────────────────────────────────
+// ComfyUI 前端合法写法：同一个子图输入槽（-10 同一 origin_slot）被多个内部节点消费。
+// 展开时必须把同一个实例输入（外部连线 / widget 值）复制给每个消费端，不得整份拒绝。
+
+const FANOUT_OBJ = {
+  SRC: { input: {} },
+  TwoIn: { input: { required: { image: ["IMAGE", {}] } } },
+  Merger: { input: { required: { a: ["IMAGE", {}], b: ["IMAGE", {}] } } },
+  SaveImg: { input: { required: { images: ["IMAGE", {}] } } },
+  PromptNode: { input: { required: { text: ["STRING", {}] } } },
+};
+
+// 定义：输入 image 同时喂给内部 #11 与 #12（两条 -10 链接，旧版判据直接拒绝），两者再汇到 #13 → 输出接口。
+const fanoutWf = () => ({
+  nodes: [
+    { id: 1, type: "SRC", mode: 0, inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: [10] }] },
+    {
+      id: 5,
+      type: "fanout-def",
+      mode: 0,
+      inputs: [{ name: "image", type: "IMAGE", link: 10 }],
+      outputs: [{ name: "IMAGE", type: "IMAGE", links: [20] }],
+      widgets_values: [],
+      widgets_values_named: {},
+    },
+    { id: 8, type: "SaveImg", mode: 0, inputs: [{ name: "images", type: "IMAGE", link: 20 }], outputs: [] },
+  ],
+  links: [
+    [10, 1, 0, 5, 0, "IMAGE"],
+    [20, 5, 0, 8, 0, "IMAGE"],
+  ],
+  definitions: {
+    subgraphs: [
+      {
+        id: "fanout-def",
+        name: "扇出",
+        inputs: [{ name: "image", type: "IMAGE", links: [1, 2] }],
+        outputs: [{ name: "IMAGE", type: "IMAGE", links: [3] }],
+        widgets: [],
+        nodes: [
+          {
+            id: 11,
+            type: "TwoIn",
+            mode: 0,
+            inputs: [{ name: "image", type: "IMAGE", link: 1 }],
+            outputs: [{ name: "IMAGE", type: "IMAGE", links: [4] }],
+          },
+          {
+            id: 12,
+            type: "TwoIn",
+            mode: 0,
+            inputs: [{ name: "image", type: "IMAGE", link: 2 }],
+            outputs: [{ name: "IMAGE", type: "IMAGE", links: [5] }],
+          },
+          {
+            id: 13,
+            type: "Merger",
+            mode: 0,
+            inputs: [
+              { name: "a", type: "IMAGE", link: 4 },
+              { name: "b", type: "IMAGE", link: 5 },
+            ],
+            outputs: [{ name: "IMAGE", type: "IMAGE", links: [3] }],
+          },
+        ],
+        links: [
+          { id: 1, origin_id: -10, origin_slot: 0, target_id: 11, target_slot: 0, type: "IMAGE" },
+          { id: 2, origin_id: -10, origin_slot: 0, target_id: 12, target_slot: 0, type: "IMAGE" },
+          { id: 3, origin_id: 13, origin_slot: 0, target_id: -20, target_slot: 0, type: "IMAGE" },
+          { id: 4, origin_id: 11, origin_slot: 0, target_id: 13, target_slot: 0, type: "IMAGE" },
+          { id: 5, origin_id: 12, origin_slot: 0, target_id: 13, target_slot: 1, type: "IMAGE" },
+        ],
+      },
+    ],
+  },
+});
+
+test("子图输入槽扇出：外部连线同时接到全部内部消费端，产物链接数正确", () => {
+  const warnings = [];
+  const out = convertUiToApi(fanoutWf(), FANOUT_OBJ, { onWarning: (w) => warnings.push(w) });
+  // 实例 #5 消失，内部节点按 s5: 前缀进 prompt
+  assert.equal("5" in out, false);
+  assert.deepEqual(Object.keys(out).sort(), ["1", "8", "s5:11", "s5:12", "s5:13"]);
+  // 两个内部消费槽指向同一条外部连线（同一上游 #1 的输出槽 0）
+  assert.deepEqual(out["s5:11"].inputs.image, ["1", 0]);
+  assert.deepEqual(out["s5:12"].inputs.image, ["1", 0]);
+  // 内部连线与输出连线照旧
+  assert.deepEqual(out["s5:13"].inputs, { a: ["s5:11", 0], b: ["s5:12", 0] });
+  assert.deepEqual(out["8"].inputs.images, ["s5:13", 0]);
+  // 产物连线总数：两条扇出 + 两条内部 + 一条输出 = 5
+  const edges = Object.values(out).reduce((n, node) => n + Object.values(node.inputs || {}).length, 0);
+  assert.equal(edges, 5);
+  assert.equal(warnings.length, 0);
+});
+
+test("子图输入槽扇出：widget 值复制给每个内部消费端", () => {
+  const wf = {
+    nodes: [
+      {
+        id: 5,
+        type: "widget-fanout",
+        mode: 0,
+        inputs: [{ name: "text", type: "STRING", link: null }],
+        outputs: [],
+        widgets_values: ["hello"],
+      },
+    ],
+    links: [],
+    definitions: {
+      subgraphs: [
+        {
+          id: "widget-fanout",
+          name: "扇出写入",
+          inputs: [{ name: "text", type: "STRING", links: [1, 2] }],
+          outputs: [],
+          widgets: [],
+          nodes: [
+            {
+              id: 11,
+              type: "PromptNode",
+              mode: 0,
+              inputs: [{ name: "text", type: "STRING", link: 1, widget: { name: "text" } }],
+              outputs: [],
+              widgets_values: ["old"],
+            },
+            {
+              id: 12,
+              type: "PromptNode",
+              mode: 0,
+              inputs: [{ name: "text", type: "STRING", link: 2, widget: { name: "text" } }],
+              outputs: [],
+              widgets_values: ["old"],
+            },
+          ],
+          links: [
+            { id: 1, origin_id: -10, origin_slot: 0, target_id: 11, target_slot: 0, type: "STRING" },
+            { id: 2, origin_id: -10, origin_slot: 0, target_id: 12, target_slot: 0, type: "STRING" },
+          ],
+        },
+      ],
+    },
+  };
+  const out = convertUiToApi(wf, FANOUT_OBJ);
+  // 同一个实例值写给两个内部消费节点（位置回退对位表按「任一消费端带 widget 标记」入选）
+  assert.equal(out["s5:11"].inputs.text, "hello");
+  assert.equal(out["s5:12"].inputs.text, "hello");
+});
+
 test("汇总⑦：只有参数分歧 → value_mismatch 计数 + 重存建议，无插件建议", () => {
   assert.throws(
     () =>

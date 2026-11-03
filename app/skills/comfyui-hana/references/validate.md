@@ -34,6 +34,7 @@
 - 首行按 code 分组给条数：`校验未通过（3 个错误：subgraph_unexpanded ×1、enum_mismatch ×1、virtual_node ×1）：`；只有一种 code 时保持「3 个错误」原样。
 - 完整结构化结果在 `details.comfyui`（`valid` / `errors` / `warnings` / `stats`，每条含 `code` / `node` / `field` / `message`），要逐条处理时读它，不要让正文倒 JSON。
 - `suggestions` 是该字段当前的可选项（如 object_info 里真实存在的 checkpoint 名，最多展示 8 个）——enum_mismatch 时优先从这里挑，别自己编名字。
+- 子图展开失败（`subgraph_unexpanded`）时，它引发的连带问题会挂在根因的 `derived` 里（每条同样是 `code` / `node` / `message`），不再重复计数：顶层 `errors` 只留根因一条，别把 `derived` 里的 `virtual_node` 当成另一个独立故障去修。
 - 警告（warnings）不算失败，但常是"动态类型输入当前为空"这类需要人工确认的点，别默默略过。
 
 ## 官方模板拉下来的预告

@@ -776,8 +776,9 @@ async function startBackend() {
 }
 
 // 停止 8188 上的 ComfyUI 本体（与「重启中继」是两件事；正在跑的任务会中断）
+// force=true：用户显式操作，必须能穿过中继的启动宽限闸；source 用于日志留痕
 async function postBackendStop() {
-  const r = await hana.api.fetch("/comfyui-hana/backend/stop", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  const r = await hana.api.fetch("/comfyui-hana/backend/stop", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ force: true, source: "workspace" }) });
   return r.json().catch(() => ({}));
 }
 async function stopBackend() {

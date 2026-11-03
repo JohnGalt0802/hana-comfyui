@@ -5731,15 +5731,16 @@ export default defineApp(async (sdk) => {
       return { content: [{ type: "text", text: [envNote, text].filter(Boolean).join("\n") }], details: { comfyui: { action: "service", op, ...d } } };
     }
     if (op === "stop") {
+      // 不带 force：agent 走工具停服务要过中继的「启动宽限」闸（John 定，2026-11-03）
       const { ok, data } = await relayJson("/_relay/backend/stop", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({ source: "tool-service" }),
         timeoutMs: 25_000,
       });
       void refreshSnapshot();
       const d = data && typeof data === "object" ? data : {};
-      if (!ok) throw new Error(d.error || "停止请求未成功（中继未就绪或中继返回错误）");
+      if (!ok) throw new Error(d.error || d.note || "停止请求未成功（中继未就绪或中继返回错误）");
       const text = d.already
         ? "ComfyUI 服务本来就没在运行。"
         : d.alive
@@ -7964,8 +7965,10 @@ export default defineApp(async (sdk) => {
         try {
           const wasRunning = serviceSnapshot().reachable;
           if (wasRunning) {
+            // force=true：这是本 App 自己的「先停后启」，不能停在启动宽限上（用户已显式触发重启）
             const stop = await relayJson("/_relay/backend/stop", {
-              method: "POST", headers: { "content-type": "application/json" }, body: "{}", timeoutMs: 25_000,
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify({ source: "gateway-restart", force: true }), timeoutMs: 25_000,
             });
             if (!stop.ok) throw new Error((stop.data && stop.data.error) || "停止请求未成功（中继未就绪或中继返回错误）");
             void refreshSnapshot();
@@ -8442,10 +8445,16 @@ export default defineApp(async (sdk) => {
       app.post("/comfyui-hana/backend/stop", async (c) => {
         if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
         try {
+          // force/source 由调用方（UI 显式点停止 / 其它）带上，原样转发给中继的两道闸与留痕；
+          // 只透传白名单字段，不把整个 body 丢给中继。
+          const body = await c.req.json().catch(() => ({}));
+          const fwd = {};
+          if (body && body.force === true) fwd.force = true;
+          if (body && typeof body.source === "string" && body.source.trim()) fwd.source = body.source.trim().slice(0, 64);
           const { ok, status, data } = await relayJson("/_relay/backend/stop", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: "{}",
+            body: JSON.stringify(fwd),
             timeoutMs: 25_000,
           });
           void refreshSnapshot();

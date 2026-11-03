@@ -120,11 +120,14 @@ function hasAdapterRule(adapters, type) {
 // ── 子图展开（借冻结文件 expandSubgraphs 拿展开产物与问题清单）───────────────────
 // 展开后内部节点 id 变成 `s<实例id>:<内部id>`；同一子图被多个实例引用时各得一份复合 id。
 // expandSubgraphs 的 problems 是纯中文句子，从「实例 #12」「「子图名」」里抠定位信息做 subgraph_unexpanded。
+// residual（2026-11-03）：展开失败的实例会被原样留在产物里（冻结文件 664-669），产物里 type 仍命中
+//   defById 的节点就是「没展开成功」的实例。语义＝展开后还在的实例即失败实例；供子图根因回填 node、
+//   供转换兜底把连带问题挂到根因上。stats.nodeCount 口径不变（残留实例照旧计入）。
 function expandForCheck(wf, fullShape) {
   const defs = isPlainObject(wf.definitions) ? wf.definitions.subgraphs : null;
   const hasDefs = Array.isArray(defs) && defs.length > 0;
   if (!hasDefs) {
-    return { nodes: Array.isArray(wf.nodes) ? wf.nodes : [], links: Array.isArray(wf.links) ? wf.links : [], expanded: false, subgraphProblems: [] };
+    return { nodes: Array.isArray(wf.nodes) ? wf.nodes : [], links: Array.isArray(wf.links) ? wf.links : [], expanded: false, subgraphProblems: [], residual: new Map() };
   }
   const defById = new Map();
   for (const d of defs) if (isPlainObject(d) && typeof d.id === "string" && d.id) defById.set(d.id, d);
@@ -132,7 +135,7 @@ function expandForCheck(wf, fullShape) {
   const isInst = (n) => isPlainObject(n) && defById.has(String(n.type));
   if (!nodes.some(isInst)) {
     // 顶层无实例：定义只是随行（模板常见形态），无运行语义，不展开也不校验定义内部节点
-    return { nodes, links: Array.isArray(wf.links) ? wf.links : [], expanded: false, subgraphProblems: [] };
+    return { nodes, links: Array.isArray(wf.links) ? wf.links : [], expanded: false, subgraphProblems: [], residual: new Map() };
   }
   // 有实例：交给冻结文件的展开逻辑（它对展开失败的场景推 problems 后继续，不抛）。
   // objectInfo 给展开逻辑的形状：类名 → { input: { required/optional 带包装的 spec } }
@@ -140,19 +143,38 @@ function expandForCheck(wf, fullShape) {
   const problems = [];
   const warnings = [];
   const expanded = expandSubgraphs(wf, problems, fullShape, warnings);
+  const outNodes = Array.isArray(expanded.nodes) ? expanded.nodes : nodes;
+  // 残留实例：产物里 type 仍是子图定义 id 的节点 → 该实例没展开成功
+  const residual = new Map();
+  for (const n of outNodes) {
+    if (!isPlainObject(n)) continue;
+    const def = defById.get(String(n.type));
+    if (!def) continue;
+    residual.set(String(n.id), { defId: String(n.type), defName: typeof def.name === "string" && def.name ? def.name : def.id });
+  }
   return {
-    nodes: Array.isArray(expanded.nodes) ? expanded.nodes : nodes,
+    nodes: outNodes,
     links: Array.isArray(expanded.links) ? expanded.links : (Array.isArray(wf.links) ? wf.links : []),
     expanded: true,
-    subgraphProblems: problems.map(subgraphViolation),
+    subgraphProblems: problems.map((p) => subgraphViolation(p, residual)),
+    residual,
   };
 }
 
-function subgraphViolation(msg) {
+// 子图问题 → violation：消息里的「实例 #N」优先；没有 id 时（如「输入接口槽 N 对应多条链接…」
+// 这类不含实例 id 的措辞）用 residual 按子图名回填，只有一个候选时才回填（多个实例共用同名
+// 子图时无法确定是谁，宁可留 null 也不猜）。
+function subgraphViolation(msg, residual) {
   const m = /实例\s*#(-?\d+)/.exec(msg);
   const nm = /「([^」]+)」/.exec(msg);
-  const v = { code: "subgraph_unexpanded", node: m ? m[1] : null, field: "definitions.subgraphs", message: msg };
-  if (nm) v.title = nm[1];
+  const defName = nm ? nm[1] : null;
+  let node = m ? m[1] : null;
+  if (node === null && defName !== null && residual instanceof Map) {
+    const hits = [...residual].filter(([, r]) => r && r.defName === defName);
+    if (hits.length === 1) node = hits[0][0];
+  }
+  const v = { code: "subgraph_unexpanded", node, field: "definitions.subgraphs", message: msg };
+  if (defName !== null) v.title = defName;
   return v;
 }
 
@@ -303,8 +325,15 @@ function validateUiWorkflow(wf, classes, fullShape, options, adapters, stats, er
     errors.push({ code: "internal", node: null, message: "workflow 不是 UI 格式（nodes 不是数组）" });
     return;
   }
-  const { nodes, links, expanded, subgraphProblems } = expandForCheck(wf, fullShape);
-  for (const v of subgraphProblems) errors.push(v);
+  const { nodes, links, expanded, subgraphProblems, residual } = expandForCheck(wf, fullShape);
+  // 同一子图被多个实例引用时会重复报同一句话（消息里不带实例 id）：按 code|node|field|message 去重
+  const seenSubgraph = new Set();
+  for (const v of subgraphProblems) {
+    const key = `${v.code}|${v.node}|${v.field}|${v.message}`;
+    if (seenSubgraph.has(key)) continue;
+    seenSubgraph.add(key);
+    errors.push(v);
+  }
 
   // 连线索引：连线 id → { origin, originSlot, target, targetSlot, type }；统计只数有效项（与展开产物同源）
   const linkById = new Map();
@@ -442,7 +471,7 @@ function validateUiWorkflow(wf, classes, fullShape, options, adapters, stats, er
   // ── 转换兜底（任务书：两边的结论合并，不要二选一）────────────────────────────
   // convertUiToApi 有一批本函数没有的硬判定（连线缺失、未知 mode、R1 named/位置分歧、动态槽收编失败、
   // pull/passthrough 歧义）。跑一遍只取 problemsOut，分类后并入；产物丢弃。
-  mergeConverterProblems(runConverter(wf, fullShape, adapters), classes, nodeById, errors, warnings);
+  mergeConverterProblems(runConverter(wf, fullShape, adapters), classes, nodeById, errors, warnings, residual);
 }
 
 function runConverter(wf, fullShape, adapters) {
@@ -455,7 +484,9 @@ function runConverter(wf, fullShape, adapters) {
 
 // 转换器问题 → 固定 code 词表的映射。分类不进的按 internal 落 errors（词表外判定也是「提交会被拒」
 // 的事实，降 warning 会让 agent 拿着 ok:true 去撞墙）。
-function mergeConverterProblems(problems, classes, nodeById, errors, warnings) {
+// residual：expandForCheck 算出的「未展开成功的实例」；转换器会拿原始工作流重跑一次展开、同样失败，
+//   把残留实例当未知/环绕件报出来（冻结文件 1017-1019）。这类连带问题不单列，挂到根因的 derived 上。
+function mergeConverterProblems(problems, classes, nodeById, errors, warnings, residual) {
   // 本函数自己产的问题不重复转手（两边同报一条事实只留一条）
   const seen = new Set([...errors, ...warnings].map((v) => `${v.code}|${v.node}|${v.field}|${v.message}`));
   const push = (code, node, field, message, extra) => {
@@ -467,17 +498,37 @@ function mergeConverterProblems(problems, classes, nodeById, errors, warnings) {
     if (extra) Object.assign(v, extra);
     errors.push(v);
   };
+  // 问题节点所属的展开失败根因：优先按实例 id 对应；根因 node 为 null（多实例共用同名子图、
+  // 无法定位到具体实例）时按子图名对应。找不到就返回 null（调用方退回普通 push）。
+  const rootFor = (nid) => {
+    if (nid === null || nid === undefined || !(residual instanceof Map)) return null;
+    const r = residual.get(String(nid));
+    if (!r) return null;
+    return [...errors, ...warnings].find((v) => v.code === "subgraph_unexpanded"
+      && (String(v.node) === String(nid) || (v.node === null && typeof v.title === "string" && v.title === r.defName))) || null;
+  };
+  // 派生挂载：命中根因就不单列；匹配不到根因退回原 push（不许静默丢）
+  const pushOrDerive = (code, node, field, message, extra) => {
+    const root = rootFor(node);
+    if (!root) { push(code, node, field, message, extra); return; }
+    const item = { code, node, message };
+    if (field !== null && field !== undefined) item.field = field;
+    if (extra) Object.assign(item, extra);
+    const list = Array.isArray(root.derived) ? root.derived : (root.derived = []);
+    if (list.some((d) => d.code === item.code && String(d.node) === String(item.node))) return;
+    list.push(item);
+  };
   for (const p of problems) {
     // 与自家结论同义的去重：同节点同类型（消息措辞不同也算同一条）
     const nm = /#(-?\d+)/.exec(p);
     const node = nm ? nm[1] : null;
     const sameFact = (code, nid) => [...errors, ...warnings].some((v) => v.code === code && String(v.node) === String(nid));
     if (/不在 \/object_info/.test(p)) {
-      if (!sameFact("unknown_type", node) && !sameFact("virtual_node", node)) push("unknown_type", node, null, p);
+      if (!sameFact("unknown_type", node) && !sameFact("virtual_node", node)) pushOrDerive("unknown_type", node, null, p);
     } else if (/（子图\/环绕节点）/.test(p)) {
-      if (!sameFact("virtual_node", node) && !sameFact("unknown_type", node)) push("virtual_node", node, null, p);
+      if (!sameFact("virtual_node", node) && !sameFact("unknown_type", node)) pushOrDerive("virtual_node", node, null, p);
     } else if (/子图实例/.test(p) || /子图「/.test(p)) {
-      const v = subgraphViolation(p);
+      const v = subgraphViolation(p, residual);
       push("subgraph_unexpanded", v.node, v.field, p, v.title ? { title: v.title } : null);
     } else {
       // 「节点 #N 输入 X 的连线缺失（link Y）」：required 输入 → missing_required（连线无效等同没接）

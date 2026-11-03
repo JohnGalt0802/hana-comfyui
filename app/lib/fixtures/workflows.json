@@ -766,5 +766,217 @@
     "batch_size": 1
    }
   }
+ },
+ "subgraph_unexpanded": {
+  "id": "wf-subgraph-broken",
+  "revision": 1,
+  "last_node_id": 8,
+  "last_link_id": 10,
+  "nodes": [
+   {
+    "id": 5,
+    "type": "7c1d5e2a-3b4f-4a6c-8d9e-0f1a2b3c4d5e",
+    "title": "提示词组",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "clip",
+      "type": "CLIP",
+      "link": null
+     }
+    ],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       10
+      ]
+     }
+    ],
+    "widgets_values": [],
+    "widgets_values_named": {}
+   },
+   {
+    "id": 8,
+    "type": "SaveImage",
+    "mode": 0,
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": 10
+     }
+    ],
+    "outputs": [],
+    "widgets_values": [
+     "ComfyUI"
+    ],
+    "widgets_values_named": {
+     "filename_prefix": "ComfyUI"
+    }
+   }
+  ],
+  "links": [
+   [
+    10,
+    5,
+    0,
+    8,
+    0,
+    "IMAGE"
+   ]
+  ],
+  "definitions": {
+   "subgraphs": [
+    {
+     "id": "7c1d5e2a-3b4f-4a6c-8d9e-0f1a2b3c4d5e",
+     "name": "提示词组",
+     "version": 1,
+     "state": {
+      "offsets": [
+       0,
+       0
+      ]
+     },
+     "inputs": [
+      {
+       "name": "clip",
+       "type": "CLIP",
+       "links": [
+        1
+       ]
+      }
+     ],
+     "outputs": [
+      {
+       "name": "IMAGE",
+       "type": "IMAGE",
+       "links": [
+        3,
+        4
+       ]
+      }
+     ],
+     "widgets": [],
+     "nodes": [
+      {
+       "id": 11,
+       "type": "CLIPTextEncode",
+       "mode": 0,
+       "inputs": [
+        {
+         "name": "text",
+         "type": "STRING",
+         "widget": {
+          "name": "text"
+         },
+         "link": null
+        },
+        {
+         "name": "clip",
+         "type": "CLIP",
+         "link": 1
+        }
+       ],
+       "outputs": [
+        {
+         "name": "CONDITIONING",
+         "type": "CONDITIONING",
+         "links": []
+        }
+       ],
+       "widgets_values": [
+        "cat"
+       ],
+       "widgets_values_named": {
+        "text": "cat"
+       }
+      },
+      {
+       "id": 16,
+       "type": "EmptyImage",
+       "mode": 0,
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "IMAGE",
+         "type": "IMAGE",
+         "links": [
+          4
+         ]
+        }
+       ],
+       "widgets_values": [
+        512,
+        512,
+        1,
+        0
+       ],
+       "widgets_values_named": {
+        "width": 512,
+        "height": 512,
+        "batch_size": 1,
+        "color": 0
+       }
+      },
+      {
+       "id": 14,
+       "type": "EmptyImage",
+       "mode": 0,
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "IMAGE",
+         "type": "IMAGE",
+         "links": [
+          3
+         ]
+        }
+       ],
+       "widgets_values": [
+        512,
+        512,
+        1,
+        0
+       ],
+       "widgets_values_named": {
+        "width": 512,
+        "height": 512,
+        "batch_size": 1,
+        "color": 0
+       }
+      }
+     ],
+     "links": [
+      {
+       "id": 1,
+       "origin_id": -10,
+       "origin_slot": 0,
+       "target_id": 11,
+       "target_slot": 1,
+       "type": "CLIP"
+      },
+      {
+       "id": 3,
+       "origin_id": 14,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "IMAGE"
+      },
+      {
+       "id": 4,
+       "origin_id": 16,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "IMAGE"
+      }
+     ]
+    }
+   ]
+  },
+  "extra": {}
  }
 }

@@ -1,6 +1,6 @@
 // lib/validate-workflow.test.mjs — 校验内核测试（node:test，cwd = 仓根）
 // fixture：app/lib/fixtures/object-info.sample.json（T1 裁剪形状，真实类样本）
-//          app/lib/fixtures/workflows.json（九个工作流：六个规定用例 + 类型不匹配/reroute/API）
+//          app/lib/fixtures/workflows.json（十个工作流：六个规定用例 + 类型不匹配/reroute/API + 子图展开失败）
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -79,6 +79,38 @@ test("⑤b 子图内部节点报错带复合 id（s<实例id>:<内部id>）", ()
   assert.equal(hits.length, 1, JSON.stringify(r.errors, null, 1));
   assert.equal(hits[0].node, "s5:15"); // 实例 id 5，内部节点 id 15
   assert.equal(hits[0].field, "sampler_name");
+});
+
+test("⑤c 子图展开失败：根因回填实例 id，连带问题挂 derived，不再重复计数", () => {
+  // 夹具：子图定义里两个 EmptyImage 抢同一个输出接口槽（两条 target_id=-20、target_slot=0 的链接），
+  // 生产者天然歧义，冻结文件判据「输出接口槽 N 对应多条链接」即失败（2026-11-03 起输入扇出已合法，
+  // 不能再拿 -10 一槽多链接当失败夹具）。失败实例原样留在展开产物里；
+  // 否则这批症状会拆成两条（根因 node=null + 派生 virtual_node）。
+  const r = validateWorkflow({ workflow: flows.subgraph_unexpanded, objectInfo });
+  assert.equal(r.ok, false);
+  const roots = r.errors.filter((v) => v.code === "subgraph_unexpanded");
+  assert.equal(roots.length, 1, JSON.stringify(r.errors, null, 1));
+  assert.equal(roots[0].node, "5"); // 消息不含实例 id：由 residual 按子图名回填，不再是 null（整图）
+  assert.equal(roots[0].title, "提示词组");
+  assert.equal(roots[0].derived.length, 1, JSON.stringify(roots[0], null, 1));
+  const d = roots[0].derived[0];
+  assert.equal(d.code, "virtual_node");
+  assert.equal(d.node, "5");
+  assert.match(d.message, /子图\/环绕节点/);
+  // 该实例不再单列 virtual_node；errors 总数：改动前 2 条（根因 + 派生），现在 1 条
+  assert.equal(r.errors.filter((v) => v.code === "virtual_node").length, 0);
+  assert.equal(r.errors.length, 1, JSON.stringify(r.errors, null, 1));
+  assert.equal(r.stats.nodeCount, 2); // 口径不变：残留实例照旧计入
+});
+
+test("⑤d 同一子图被多个实例引用：同一条根因只报一次，派生按实例逐条挂", () => {
+  const wf = structuredClone(flows.subgraph_unexpanded);
+  wf.nodes.push({ id: 6, type: wf.definitions.subgraphs[0].id, title: "第二个提示词组", mode: 0, inputs: [], outputs: [], widgets_values: [], widgets_values_named: {} });
+  const r = validateWorkflow({ workflow: wf, objectInfo });
+  const roots = r.errors.filter((v) => v.code === "subgraph_unexpanded");
+  assert.equal(roots.length, 1, JSON.stringify(r.errors, null, 1)); // 消息不带实例 id，同一条只留一份
+  assert.equal(roots[0].node, null); // 两个候选实例：不猜，保持整图
+  assert.deepEqual(roots[0].derived.map((x) => x.node).sort(), ["5", "6"]);
 });
 
 test("⑥ 空图（无输出节点）：no_output", () => {

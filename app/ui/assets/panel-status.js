@@ -639,7 +639,8 @@ async function stopService() {
   let msg = "";
   try {
     const r = await hana.api.fetch("/comfyui-hana/backend/stop", {
-      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      // force=true：用户显式点「停止」，必须能穿过中继的启动宽限闸；source 用于日志留痕
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ force: true, source: "ui-panel" }),
     });
     const j = await r.json().catch(() => null);
     if (!r.ok) msg = "停止失败：" + ((j && j.error) || `HTTP ${r.status}`);

@@ -1572,27 +1572,129 @@ function killPidTree(pid) {
   return { code, text: text || (r.error ? String(r.error.message) : "") };
 }
 
-async function stopBackendService() {
+// 归属校验（停止闸二）：listeningPids 只按端口取 pid，不回答「谁在监听」。
+// 三条件与命令行兜底同一口径：python*.exe + main.py + --port=<port>。
+// 降级策略（受限令牌下 CIM 可能被拒、命令行读不到）：
+//   verified    —— 命令行可读且三条件全中：可杀
+//   mismatched  —— 命令行可读但不含 ComfyUI 特征：**不杀**（拒绝并报出它的命令行摘要）
+//   unverifiable—— 命令行不可读（既知降级情形）：**放行但标注**，不把「读不到」当「不是」
+function verifyListenerOwnership(info, port) {
+  const name = info && info.name ? basename(String(info.name)) : "";
+  const cmdline = info && info.cmdline != null ? String(info.cmdline) : "";
+  if (!cmdline) {
+    return {
+      verdict: "unverifiable",
+      reason: info && info.name
+        ? `命令行不可读（映像名 ${name}，受限令牌或 Get-Process/tasklist 降级）`
+        : "进程信息与命令行均不可读（受限令牌，或进程已退出）",
+    };
+  }
+  const cl = cmdline.toLowerCase();
+  const firstToken = basename(cl.split(/\s+/)[0].replace(/"/g, ""));
+  const imageOk = PY_IMAGE_RE.test(name) || (!name && PY_IMAGE_RE.test(firstToken));
+  const mainOk = /(^|[\\/\s"'])main\.py([\s"']|$)/i.test(cl);
+  const pv = portArgValue(cl);
+  if (imageOk && mainOk && pv === Number(port)) return { verdict: "verified", reason: null };
+  const brief = cmdline.replace(/\s+/g, " ").trim().slice(0, 160);
+  const why = !imageOk
+    ? `映像名不是 python*.exe（${name || firstToken || "未知"}）`
+    : (!mainOk ? "命令行不含 main.py" : `--port=${pv === null ? "（无）" : pv} ≠ ${port}`);
+  return { verdict: "mismatched", reason: `${why}；cmdline=${brief}` };
+}
+
+// 静默探测：只回答「此刻后端可达吗」，作为停止回执的佐证字段。
+// 为什么不用 probeBackend（2026-11-03 实踩）：它会翻转全局 backend.reachable 并打「转为不可达」warn，
+//   而停止后不可达**本来就是停止的结果**，日志读起来像因果倒置（把停止的后果当成了杀进程的原因）。
+async function probeBackendSilent() {
+  try {
+    const res = await fetch(`http://${backend.host}:${backend.port}/system_stats`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      headers: { accept: "application/json" },
+    });
+    return { reachable: res.ok, detail: `/system_stats HTTP ${res.status}` };
+  } catch (e) {
+    return { reachable: false, detail: classifyProbeError(e) };
+  }
+}
+
+// 停止 8188 上的 ComfyUI 本体。opts：
+//   force  —— true 时穿过「启动宽限」闸（用户显式点停止、重启类流程）
+//   source —— 调用方标识，写进日志与回执，回答「这次是谁停的」
+// 两道闸（2026-11-03 John 定；agent 仍允许停服务，但必须过闸）：
+//   闸一·启动宽限：backendProc.starting 且在 START_GRACE_MS 内且未 force → 不杀（branch=starting-grace）
+//   闸二·归属校验：端口上的 pid 必须自证是 ComfyUI（python + main.py + --port），不匹配的跳过不杀
+async function stopBackendService(opts = {}) {
+  const force = opts.force === true;
+  const source = typeof opts.source === "string" && opts.source.trim() ? opts.source.trim().slice(0, 64) : "unknown";
+  const srcTag = `src=${source} force=${force}`;
+
+  // 闸一·启动宽限：宁可让调用方报错，也不杀一个正在起来的进程（更新流程正是靠这条兜住）。
+  // 锚点取 startedAt；缺 startedAt 时退到本进程内的 startInFlight（同 startWindowOpen 口径）；
+  // 两者都没有 = 没有任何「正在启动」的证据，不拦。
+  if (!force && backendProc.starting === true) {
+    const anchor = backendProc.startedAt ? Date.parse(backendProc.startedAt) : (startInFlight || 0);
+    if (anchor && Date.now() - anchor < START_GRACE_MS) {
+      const sec = Math.max(0, Math.round((Date.now() - anchor) / 1000));
+      const note = `服务正在启动（已 ${sec} 秒），如确需强制停止请带 force=true`;
+      backendProc.lastStop = {
+        at: new Date().toISOString(), pids: [], stopped: [], alive: true,
+        ok: false, branch: "starting-grace", source, force,
+      };
+      saveBackendState();
+      warn(`停止 ComfyUI 服务被拦（启动宽限）：${srcTag} 启动已 ${sec}s < ${Math.round(START_GRACE_MS / 1000)}s，未杀任何进程`);
+      return {
+        ok: false, branch: "starting-grace", note, error: note,
+        source, force, pids: [], stopped: [], failed: [], alive: true, already: false, survivors: [],
+      };
+    }
+  }
+
   pidCache = { at: 0, pids: [], diag: null }; // 强制重查：不强依赖「可达」判断（端口有监听但 HTTP 不响时也要能撤）
   const pids = listeningPids({ force: true }); // force：不吃 5s 缓存，停止必须拿最新结论
   const diag = pidCache.diag;
   const sources = pidSourcesText(diag);
+
+  // 闸二·归属校验：逐 pid 自证，不匹配的不进 kill 队列（不让「端口上有个 pid」直接等于「可以杀」）
+  const targets = [];
+  const skipped = [];
+  const unverified = [];
+  if (pids.length) {
+    const infos = queryProcessInfo(pids);
+    for (const pid of pids) {
+      const own = verifyListenerOwnership(infos.get(pid), backend.port);
+      if (own.verdict === "mismatched") {
+        skipped.push({ pid, reason: own.reason });
+        warn(`停止服务跳过 pid=${pid}：端口 ${backend.port} 的监听者不像 ComfyUI（${own.reason}） ${srcTag}`);
+        continue;
+      }
+      if (own.verdict === "unverifiable") {
+        unverified.push({ pid, reason: own.reason });
+        warn(`停止服务无法校验 pid=${pid} 归属（${own.reason}）→ 放行，branch 记 owner-unverified ${srcTag}`);
+      }
+      targets.push(pid);
+    }
+  }
+
   const stopped = [];
   const failed = [];
-  for (const pid of pids) {
+  for (const pid of targets) {
     const k = killPidTree(pid);
     if (k.code === 0) stopped.push(pid);
     else failed.push({ pid, error: k.text || `exit ${k.code}` });
   }
-  runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000); // 顺手清理启动器任务
-  backendProc.starting = false;
-  startInFlight = null;
+  // 一个 pid 都不可信（全被归属校验跳过）时不动计划任务：这不是一次成立的「停止」，别顺手改启动器状态
+  const foreignOnly = pids.length > 0 && targets.length === 0;
+  if (!foreignOnly) {
+    runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000); // 顺手清理启动器任务
+    backendProc.starting = false;
+    startInFlight = null;
+  }
 
   // 硬证据 1：等这些 pid **真正终结**（内核等待，不是轮询也不是固定 sleep）。
   // 原来的 `sleep 800ms 后查一次」会把「正在退出」误判成 survivors（2026-10-21 实踩）。
   // 返回 survivor 才算真没杀成；内核等待失败（受限令牌）时 ok=false，降级为快照，
   // 此时 survivors 的结论仍可用但要当「没等过」看。
-  const waited = pids.length ? waitPidsExit(pids, 8_000) : { ok: true, alive: [], waitedMs: 0 };
+  const waited = targets.length ? waitPidsExit(targets, 8_000) : { ok: true, alive: [], waitedMs: 0 };
   const survivors = waited.alive;
   if (survivors.length) {
     log(`停止后仍有进程未退出（等 ${waited.waitedMs}ms）：${survivors.join(",")}${waited.ok ? "" : "（内核等待不可用，仅为快照）"}`);
@@ -1604,37 +1706,58 @@ async function stopBackendService() {
     await new Promise((r) => setTimeout(r, 700));
     if ((await probePortListening(backend.port)) === false) portListening = false;
   }
-  await probeBackend(); // reachable 仅作佐证回传（probeBackend 有防重入，该值可能陈旧，不参与判定）
-  const reachable = backend.reachable;
+  const probe = await probeBackendSilent(); // 静默：只作佐证，不翻转全局状态、不打「转为不可达」
+  const reachable = probe.reachable;
   pidCache = { at: 0, pids: [], diag: null };
 
-  const verdict = decideStopOutcome({ pids, survivors, portListening, reachable, failed, port: backend.port });
+  const verdict = decideStopOutcome({ pids: targets, survivors, portListening, reachable, failed, port: backend.port });
+  let ok = verdict.ok;
+  let branch = verdict.branch;
+  let errorText = verdict.error;
+  // 全被归属校验拦下 → 明确 ok:false（不能让调用方以为停成功了）；部分被拦时按杀后证据判（通常会是 killed-but-listening）
+  if (!stopped.length && skipped.length) {
+    ok = false;
+    branch = "foreign-listener";
+    errorText = `端口 ${backend.port} 的监听进程不是 ComfyUI，未终止任何进程：${skipped.map((x) => `pid=${x.pid} ${x.reason}`).join("; ")}`;
+  } else if (ok && unverified.length) {
+    branch = "owner-unverified"; // 杀成功了，但归属只是读不到命令行而非证实：降级标注，不改结论
+  }
   const alive = survivors.length > 0 || portListening !== false; // 旧字段兼容：可能仍在跑（不用 reachable 代言）
-  backendProc.lastStop = { at: new Date().toISOString(), pids, stopped, alive, survivors, portListening, ok: verdict.ok, branch: verdict.branch };
-  backendProc.lastError = verdict.ok
+  backendProc.lastStop = {
+    at: new Date().toISOString(), pids, targets, stopped, alive, survivors, portListening,
+    ok, branch, source, force, skipped,
+  };
+  backendProc.lastError = ok
     ? null
     : (survivors.length || failed.length
         ? `部分进程未能终止：${JSON.stringify(failed)}${survivors.length ? `，存活：${survivors.join(",")}` : ""}`
-        : verdict.error);
+        : errorText);
   saveBackendState();
   const elimText = diag && diag.cmdline && (diag.cmdline.eliminated || []).length
     ? ` 淘汰: ${diag.cmdline.eliminated.map((e) => `pid=${e.pid} ${e.reason}`).join("; ")}`
     : "";
-  const line = `停止 ComfyUI 服务：pids=${JSON.stringify(pids)} stopped=${JSON.stringify(stopped)} 仍可达=${reachable} ok=${verdict.ok}[${verdict.branch}]（源: ${sources}${elimText}）${verdict.error ? ` error=${verdict.error}` : ""}`;
-  if (verdict.ok) log(line); else logErr(line);
+  const skipText = skipped.length ? ` 跳过: ${skipped.map((x) => `pid=${x.pid} ${x.reason}`).join("; ")}` : "";
+  const line = `停止 ComfyUI 服务：${srcTag} pids=${JSON.stringify(pids)} 采用=${JSON.stringify(targets)} stopped=${JSON.stringify(stopped)} 仍可达=${reachable}（${probe.detail}） ok=${ok}[${branch}]（源: ${sources}${elimText}${skipText}）${errorText ? ` error=${errorText}` : ""}`;
+  if (ok) log(line); else logErr(line);
   return {
-    ok: verdict.ok,
+    ok,
     pids,
+    targets,
     stopped,
     failed,
     alive,
     already: pids.length === 0,
     survivors,
     portListening,
-    branch: verdict.branch,
+    branch,
+    source,
+    force,
     sources,
     reachable,
-    ...(verdict.error ? { error: verdict.error } : {}),
+    probe,
+    skipped,
+    unverified,
+    ...(errorText ? { error: errorText } : {}),
   };
 }
 
@@ -2612,7 +2735,7 @@ function startUpdateJob() {
       // 1) 停服务：pip 覆盖文件时被占用会失败，务必先停
       if (backend.reachable) {
         pushUpdateLog("停 ComfyUI 服务（更新期间必须停止）…");
-        const s = await stopBackendService();
+        const s = await stopBackendService({ source: "update" }); // 不带 force：更新前若正在启动，宽限闸应该拦住它
         step("停止服务", s.ok, s.ok ? null : `仍有进程存活：${JSON.stringify(s.failed || [])}`);
         if (!s.ok) throw new Error("停止服务失败，已中止更新（避免文件占用导致半更新）");
       } else {
@@ -5192,7 +5315,10 @@ const server = http.createServer((req, res) => {
         const body = await readBodyJson(req).catch(() => ({}));
         const out = pathOnly.endsWith("/start")
           ? await startBackendService(typeof body.path === "string" ? body.path.trim() : null)
-          : await stopBackendService();
+          : await stopBackendService({
+              force: body && body.force === true,
+              source: body && typeof body.source === "string" ? body.source : undefined,
+            });
         jsonOut(res, out.ok ? 200 : 502, out);
       } catch (e) {
         jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });

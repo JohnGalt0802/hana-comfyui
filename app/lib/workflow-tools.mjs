@@ -465,7 +465,6 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
       if (tid === "-10") { fail(`子图「${defName}」链接 #${l.id} 指向输入接口（-10）：不符合子图链接结构`); broken = true; break; }
       if (oid === "-20") { fail(`子图「${defName}」链接 #${l.id} 从输出接口（-20）出发：不符合子图链接结构`); broken = true; break; }
       if (oid === "-10") {
-        if (ctx.inputBySlot.has(os)) { fail(`子图「${defName}」输入接口槽 ${os} 对应多条链接，无法确定实例输入 ${os} 的消费端`); broken = true; break; }
         if (!idMap.has(tid)) { fail(`子图「${defName}」输入链接 #${l.id} 的目标节点 #${tid} 不在子图 nodes 里`); broken = true; break; }
         const tn = cloned.get(tid);
         const slot = Array.isArray(tn.inputs) ? tn.inputs[ts] : null;
@@ -474,7 +473,10 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
         if (slot.link !== null && slot.link !== undefined && String(slot.link) !== String(l.id)) { fail(`子图「${defName}」节点 #${tid} 输入槽 ${ts} 的 link 字段（${slot.link}）与输入接口链接 #${l.id} 不一致`); broken = true; break; }
         ctx.fedInputs.add(fedKey);
         slot.link = null; // 先清空：接线阶段有外部连线则改写为外部连线 id，否则走 widget/named 值
-        ctx.inputBySlot.set(os, { targetId: tid, targetSlot: ts });
+        // 扇出（2026-11-03）：同一输入接口槽被多个内部节点消费是 ComfyUI 前端合法写法，收集全部消费者，
+        // 接线/写值阶段逐个处理（一个实例输入的值/连线复制给每个消费槽）。
+        if (!ctx.inputBySlot.has(os)) ctx.inputBySlot.set(os, []);
+        ctx.inputBySlot.get(os).push({ targetId: tid, targetSlot: ts });
         continue;
       }
       if (tid === "-20") {
@@ -530,12 +532,15 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
         if (tCtx.defDupNames.has(sname)) { problems.push(`子图实例 #${l[3]}（「${tCtx.defName}」）的定义存在多个同名输入「${sname}」，无法确定连线 [${l[0]}] 的对位目标，已拒绝`); continue; }
         const j = tCtx.defByName.get(sname);
         if (j === undefined) { problems.push(`连线 [${l[0]}] 指向子图实例 #${l[3]}（「${tCtx.defName}」）的输入槽 ${k}「${sname}」，但子图定义的 inputs 里没有这个名字，已拒绝`); continue; }
-        const hit = tCtx.inputBySlot.get(j);
-        if (!hit) { problems.push(`连线 [${l[0]}] 指向子图实例 #${l[3]}（「${tCtx.defName}」）的输入「${sname}」，但子图中找不到该输入的接口链接（-10，定义下标 ${j}）`); continue; }
+        const hits = tCtx.inputBySlot.get(j);
+        if (!hits || hits.length === 0) { problems.push(`连线 [${l[0]}] 指向子图实例 #${l[3]}（「${tCtx.defName}」）的输入「${sname}」，但子图中找不到该输入的接口链接（-10，定义下标 ${j}）`); continue; }
         if (tCtx.usedInputs.has(j)) { problems.push(`子图实例 #${l[3]} 的输入「${sname}」被多条外部连线指向（连线 [${tCtx.usedInputs.get(j)}] 与 [${l[0]}]），无法确定取值来源`); continue; }
         tCtx.usedInputs.set(j, l[0]);
-        tCtx.cloned.get(hit.targetId).inputs[hit.targetSlot].link = l[0];
-        outLinks.push([l[0], l[1], l[2], tCtx.idMap.get(hit.targetId), hit.targetSlot, l[5]]);
+        // 扇出：一条外部连线接进实例输入槽后，逐个接到该槽的全部内部消费端（同一 link id 对应多个目标槽）
+        for (const hit of hits) {
+          tCtx.cloned.get(hit.targetId).inputs[hit.targetSlot].link = l[0];
+          outLinks.push([l[0], l[1], l[2], tCtx.idMap.get(hit.targetId), hit.targetSlot, l[5]]);
+        }
         continue;
       }
       if (oCtx) {
@@ -569,11 +574,15 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
     for (let j = 0; j < defInputsArr.length; j += 1) {
       const d = defInputsArr[j];
       if (!d || typeof d !== "object" || typeof d.name !== "string") continue;
-      const hit0 = ctx.inputBySlot.get(j);
-      if (!hit0) continue;
-      const tn0 = ctx.cloned.get(hit0.targetId);
-      const ts0 = tn0 && Array.isArray(tn0.inputs) ? tn0.inputs[hit0.targetSlot] : null;
-      if (ts0 && typeof ts0 === "object" && isPlainObject(ts0.widget) && typeof ts0.widget.name === "string") widgetNames.push({ name: d.name, j });
+      const hits0 = ctx.inputBySlot.get(j);
+      if (!hits0 || hits0.length === 0) continue;
+      // 扇出：任一消费端带 widget 标记即算该定义输入是 widget 输入（位置回退对位表的口径不变）
+      const isWidgetInput = hits0.some((h) => {
+        const tn0 = ctx.cloned.get(h.targetId);
+        const ts0 = tn0 && Array.isArray(tn0.inputs) ? tn0.inputs[h.targetSlot] : null;
+        return Boolean(ts0 && typeof ts0 === "object" && isPlainObject(ts0.widget) && typeof ts0.widget.name === "string");
+      });
+      if (isWidgetInput) widgetNames.push({ name: d.name, j });
     }
     if (!namedVals && wvArr && wvArr.length !== widgetNames.length) {
       problems.push(`子图实例 #${ctx.sid}（「${ctx.defName}」）的 widgets_values 有 ${wvArr.length} 项，但定义按序可对位的 widget 输入有 ${widgetNames.length} 个（${widgetNames.map((w) => w.name).join("、") || "无"}），数量不一致，无法按位置对位，已拒绝`);
@@ -592,8 +601,8 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
     for (const item of items) {
       const sname = item.name;
       const j = ctx.defByName.get(sname);
-      const hit = j !== undefined ? ctx.inputBySlot.get(j) : null;
-      if (!hit) continue; // 定义输入没有 -10 链接（接口未接内部）：值无处可写，跳过
+      const hits = j !== undefined ? ctx.inputBySlot.get(j) : null;
+      if (!hits || hits.length === 0) continue; // 定义输入没有 -10 链接（接口未接内部）：值无处可写，跳过
       // 外部连线占用（连线值优先）：该输入的实例槽存在且有连线即占用
       const iSlotIdx = insArr.findIndex((s) => s && typeof s === "object" && s.name === sname);
       if (iSlotIdx >= 0 && insArr[iSlotIdx].link !== null && insArr[iSlotIdx].link !== undefined) continue;
@@ -617,42 +626,45 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
         problems.push(`子图实例 #${ctx.sid}（「${ctx.defName}」）输入「${sname}」需要传递实例值，但实例${wvArr ? ` widgets_values 缺第 ${item.pos} 项` : "没有 widgets_values"}`);
         continue;
       }
-      const tn = ctx.cloned.get(hit.targetId);
-      if (!tn) continue; // 定义输入有 -10 链接但目标节点不存在：阶段一已拒绝，这里不再重复报
-      const tslot = tn.inputs[hit.targetSlot];
-      const wn = isPlainObject(tslot.widget) && typeof tslot.widget.name === "string" ? tslot.widget.name : sname;
-      const named = isPlainObject(tn.widgets_values_named) ? tn.widgets_values_named : null;
-      const wv = Array.isArray(tn.widgets_values) ? tn.widgets_values : null;
-      // 位置值定位：与主循环同源的声明序（declaredWidgetSlots），不是槽序近似。
-      const posIdx = subgraphWidgetIndexOf(objectInfo, tn, hit.targetSlot);
-      let cur;
-      let located = false;
-      if (named && Object.prototype.hasOwnProperty.call(named, wn)) { cur = subgraphUnwrap(named[wn]); located = true; }
-      if (!located && posIdx !== null && wv && posIdx < wv.length) { cur = wv[posIdx]; located = true; }
-      if (!located) {
-        // 未知类型 / 声明里找不到该 widget：声明序拿不到现值，退用节点自带槽序做**只读**比对——
-        // 相同则放行（写入与否结果一致），不同则拒绝并点名键名与两边取值；连槽序都定位不到才报无法定位。
-        if (wv) {
-          const slotPos = slotOrderWidgetIndexOf(tn, hit.targetSlot, wv);
-          if (slotPos !== null && slotPos < wv.length) {
-            if (subgraphValueEq(wv[slotPos], val)) continue; // 相同：放行，不写入
-            problems.push(
-              `子图实例 #${ctx.sid}（「${ctx.defName}」）输入「${sname}」（widget「${wn}」）的实例值 ${cutValue(val)} ≠ 内部节点 #${hit.targetId}（${tn.type}）键「${wn}」的现值 ${cutValue(wv[slotPos])}，且目标类型不在 /object_info（或该输入名不在声明里），无法安全写入，已拒绝`,
-            );
-            continue;
+      // 扇出：同一个实例值复制给该输入槽的全部内部消费端（每个消费者各自做定位与一致性判定）
+      for (const hit of hits) {
+        const tn = ctx.cloned.get(hit.targetId);
+        if (!tn) continue; // 定义输入有 -10 链接但目标节点不存在：阶段一已拒绝，这里不再重复报
+        const tslot = tn.inputs[hit.targetSlot];
+        const wn = isPlainObject(tslot.widget) && typeof tslot.widget.name === "string" ? tslot.widget.name : sname;
+        const named = isPlainObject(tn.widgets_values_named) ? tn.widgets_values_named : null;
+        const wv = Array.isArray(tn.widgets_values) ? tn.widgets_values : null;
+        // 位置值定位：与主循环同源的声明序（declaredWidgetSlots），不是槽序近似。
+        const posIdx = subgraphWidgetIndexOf(objectInfo, tn, hit.targetSlot);
+        let cur;
+        let located = false;
+        if (named && Object.prototype.hasOwnProperty.call(named, wn)) { cur = subgraphUnwrap(named[wn]); located = true; }
+        if (!located && posIdx !== null && wv && posIdx < wv.length) { cur = wv[posIdx]; located = true; }
+        if (!located) {
+          // 未知类型 / 声明里找不到该 widget：声明序拿不到现值，退用节点自带槽序做**只读**比对——
+          // 相同则放行（写入与否结果一致），不同则拒绝并点名键名与两边取值；连槽序都定位不到才报无法定位。
+          if (wv) {
+            const slotPos = slotOrderWidgetIndexOf(tn, hit.targetSlot, wv);
+            if (slotPos !== null && slotPos < wv.length) {
+              if (subgraphValueEq(wv[slotPos], val)) continue; // 相同：放行，不写入
+              problems.push(
+                `子图实例 #${ctx.sid}（「${ctx.defName}」）输入「${sname}」（widget「${wn}」）的实例值 ${cutValue(val)} ≠ 内部节点 #${hit.targetId}（${tn.type}）键「${wn}」的现值 ${cutValue(wv[slotPos])}，且目标类型不在 /object_info（或该输入名不在声明里），无法安全写入，已拒绝`,
+              );
+              continue;
+            }
           }
+          const why = posIdx === null
+            ? `目标类型 ${String(tn.type)} 不在 /object_info（或该输入名不在声明里），无法按声明位序定位`
+            : `widget 位序越界：${posIdx} ≥ widgets_values 长度`;
+          problems.push(
+            `子图实例 #${ctx.sid}（「${ctx.defName}」）输入「${sname}」（widget「${wn}」）的值 ${cutValue(val)} 无法定位到内部节点 #${hit.targetId}（${tn.type}）的现值：named${named ? ` 无键「${wn}」` : " 缺失"}，${why}；无法确认实例值与现值是否一致，已拒绝`,
+          );
+          continue;
         }
-        const why = posIdx === null
-          ? `目标类型 ${String(tn.type)} 不在 /object_info（或该输入名不在声明里），无法按声明位序定位`
-          : `widget 位序越界：${posIdx} ≥ widgets_values 长度`;
-        problems.push(
-          `子图实例 #${ctx.sid}（「${ctx.defName}」）输入「${sname}」（widget「${wn}」）的值 ${cutValue(val)} 无法定位到内部节点 #${hit.targetId}（${tn.type}）的现值：named${named ? ` 无键「${wn}」` : " 缺失"}，${why}；无法确认实例值与现值是否一致，已拒绝`,
-        );
-        continue;
+        if (subgraphValueEq(cur, val)) continue; // 相同：放行，不写入
+        if (named) named[wn] = val;
+        if (posIdx !== null && wv && posIdx < wv.length) wv[posIdx] = val;
       }
-      if (subgraphValueEq(cur, val)) continue; // 相同：放行，不写入
-      if (named) named[wn] = val;
-      if (posIdx !== null && wv && posIdx < wv.length) wv[posIdx] = val;
     }
   }
 
