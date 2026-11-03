@@ -31,7 +31,8 @@
 //   GET  /_relay/update            ComfyUI 本体更新检查（git fetch + 比较，带 TTL 缓存）
 //   POST /_relay/update            执行更新（{op:"check"|"apply"}；apply 后台跑，需 controlKey）
 //   GET  /_relay/update/status     更新进度（阶段 / 步骤 / 日志尾）
-//   GET  /_relay/templates        官方模板库检索（?q=&task=&model=&mediaType=&tag=&recommend=&limit=&offset=&refresh=1；缓存 24h，带 If-None-Match）
+//   GET  /_relay/templates        官方模板库检索（?q=&task=&model=&mediaType=&tag=&recommend=&limit=&offset=&refresh=1；缓存 24h，带 If-None-Match；
+//                                 refresh=1 走 stale-while-revalidate：立刻回当前缓存 + 后台单飞强刷，响应带 refreshing）
 //   POST /_relay/template-fetch   拉取指定模板落盘（{name, target:"hub"|"tmp"}；需 controlKey；只报缺哪些模型，不下载权重）
   //   POST /_relay/bridge           画布桥（只读阶段）：{op,args} → ComfyUI 内 hana_bridge 扩展执行
   //                                 （需 controlKey；token 读 custom_nodes/hana_bridge/.token）
@@ -4230,6 +4231,7 @@ async function oiEnsure() {
 // raw 失败（超时/DNS/非 2xx）自动回落 jsDelivr 同路径镜像；两条都失败才报错。
 // 缓存：中继数据目录 <appDataDir|~/.hanako/comfy-relay>/template-index-cache.json，
 // 内存 + 落盘，If-None-Match 条件请求（304 用本地），24h 强刷，?refresh=1 手动强刷。
+// ?refresh=1 走 stale-while-revalidate：立刻回当前缓存 + 后台单飞强刷，绝不阻塞本次请求（冷启动首拉除外）。
 // 落盘（拉取路由）：默认写到 <安装根>/user/default/hui-templates/<分类子目录>/<name>.json ——
 // 刻意避开 workflows/（John 拍板 2026-11-02：不污染 ComfyUI 工作流列表）；target:"tmp" 写系统临时目录。
 const TEMPLATE_HUB_OWNER = "Comfy-Org/workflow_templates";
@@ -4356,6 +4358,27 @@ async function tplEnsureIndex({ force = false } = {}) {
     })().finally(() => { tplIndexBuilding = null; });
   }
   return tplIndexBuilding;
+}
+
+// 当前可用缓存（内存优先，其次落盘；不判过期）——refresh=1 的 stale-while-revalidate 用它立刻回，过期也照用。
+function tplCachedEntry() {
+  if (tplIndexCache) return tplIndexCache;
+  const disk = tplReadDiskCache();
+  if (!disk) return null;
+  const wrapped = { data: disk, etag: disk.etag || null, fetchedAt: Number(disk.fetchedAt) || 0, source: disk.source || "disk" };
+  tplIndexCache = wrapped; // 顺手暖内存，后续请求不必再读盘
+  return wrapped;
+}
+
+// stale-while-revalidate 的后台强刷（refresh=1 用）：不等待，立刻返回。
+// 单飞复用 tplEnsureIndex 的 tplIndexBuilding —— 已有在飞构建（含别人发起的首拉/强刷）就直接复用，不重复发请求；
+// 后台失败只记日志，保持现有缓存不变，本次响应不受影响。
+function tplKickRefresh() {
+  if (tplIndexBuilding) return true;
+  void tplEnsureIndex({ force: true }).catch((e) => {
+    warn(`[templates] 后台强刷索引失败（本次仍回缓存，未落盘）：${String((e && e.message) || e)}`);
+  });
+  return true;
 }
 
 // 安装根（main.py 同级）与 hui-templates 落盘根；探测不到返回 null（路由会报 503）。
@@ -4860,14 +4883,21 @@ const server = http.createServer((req, res) => {
     }));
     const limit = Math.min(200, Math.max(1, Number(uq.searchParams.get("limit")) || 20));
     const offset = Math.max(0, Number(uq.searchParams.get("offset")) || 0);
+    const wantRefresh = uq.searchParams.get("refresh") === "1";
     void (async () => {
       try {
-        const entry = await tplEnsureIndex({ force: uq.searchParams.get("refresh") === "1" });
+        // stale-while-revalidate：refresh=1 时只要有任何缓存就立刻返回（过期也照用），另起后台强刷；
+        // 真·冷启动（内存与落盘都没有）才等一次首拉，这是唯一例外。
+        const entry = (wantRefresh && tplCachedEntry()) || await tplEnsureIndex();
+        // 刚刷过（<5s：冷启动首拉、或并发请求刚完成的强刷）不再重复发——单飞之外的第二层去抖
+        const justRefreshed = Number.isFinite(entry.fetchedAt) && Date.now() - entry.fetchedAt < 5_000;
+        const refreshing = wantRefresh && !justRefreshed ? tplKickRefresh() : false;
         const found = searchCatalog(entry.data.catalog, { ...q, limit, offset });
         jsonOut(res, 200, {
           ok: true,
           ...found,
           indexAge: Math.round((Date.now() - entry.fetchedAt) / 1000),
+          refreshing,
           source: entry.source,
           cacheFile: templateIndexCacheFilePath(),
         }, req.method);

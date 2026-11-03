@@ -240,7 +240,7 @@ function impl(input) {
   const stats = { nodeCount: 0, linkCount: 0, unknownCount: 0, checkedEnums: 0 };
 
   if (isApi) {
-    validateApiPrompt(wf, classes, options, stats, errors);
+    validateApiPrompt(wf, classes, options, stats, errors, warnings);
   } else {
     // 转换兜底用完整形状：类名 → { input: { required/optional 带包装的 spec } }
     const fullShape = {};
@@ -252,8 +252,10 @@ function impl(input) {
 }
 
 // ── API 格式：逐节点查 classes 表 + 枚举值域 ────────────────────────────────
-// API 图的连线是 [originId, slot] 引用，类型可查；输出节点信息 classes 表带 output_node（裁剪结构未带则不判）。
-function validateApiPrompt(wf, classes, options, stats, errors) {
+// API 图的连线是 [originId, slot] 引用，类型可查；输出节点信息 classes 表带 output_node。
+// no_output 与 UI 路径同一口径：能判定（classes 里有 output_node 字段）→ error；
+// 拿不到该字段（T1 裁剪结构未带）→ warning 说明无法判定，不静默通过。
+function validateApiPrompt(wf, classes, options, stats, errors, warnings) {
   for (const [id, node] of Object.entries(wf)) {
     if (!isPlainObject(node) || typeof node.class_type !== "string") continue;
     stats.nodeCount += 1;
@@ -285,6 +287,8 @@ function validateApiPrompt(wf, classes, options, stats, errors) {
   } else if (hasOutputNodeInfo(classes)) {
     const hasOut = Object.values(wf).some((n) => isPlainObject(n) && classes[n.class_type] && classes[n.class_type].output_node === true);
     if (!hasOut) errors.push({ code: "no_output", node: null, message: "工作流没有任何输出节点（output_node），提交必被拒" });
+  } else {
+    warnings.push({ code: "no_output", node: null, message: `无法确认是否有输出节点（缺少 output_node 信息；${stats.nodeCount} 个节点）` });
   }
 }
 

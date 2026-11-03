@@ -122,6 +122,29 @@ test("summarize：present:false 的候选按未装处理", () => {
   assert.equal(s.notInstalled.length, 1);
 });
 
+// ── 用例 4c：同类多候选、一装一未装 → notInstalled 条目带 alsoInstalled，两桶不重叠 ──
+test("summarize：同类另有已装候选时，notInstalled 条目带 alsoInstalled", () => {
+  // 合成最小映射表：两个仓库都提供 SharedNode（标题不同），只装 plugin-a。
+  const map = {
+    "https://github.com/acme/plugin-a": [["SharedNode"], { title_aux: "Plugin A" }],
+    "https://github.com/acme/plugin-b": [["SharedNode"], { title_aux: "Plugin B" }],
+  };
+  const installed = { "https://github.com/acme/plugin-a": { present: true, dir: "custom_nodes/plugin-a" } };
+  const res = resolveMissing(["SharedNode"], map, installed);
+  const s = summarize(res);
+  // 未装那个进 notInstalled，并带上已装候选（repo + dir）
+  assert.equal(s.notInstalled.length, 1);
+  const entry = s.notInstalled[0];
+  assert.equal(entry.repo, "acme/plugin-b");
+  assert.deepEqual(entry.classes, ["SharedNode"]);
+  assert.deepEqual(entry.alsoInstalled, [{ repo: "acme/plugin-a", dir: "custom_nodes/plugin-a" }]);
+  // 两桶互斥：已装那个不得出现在 installedNotLoaded
+  assert.equal(s.installedNotLoaded.length, 0);
+  // 没有已装候选时不该出现该字段
+  const s2 = summarize(resolveMissing(["SharedNode"], map, {}));
+  assert.ok(s2.notInstalled.every((e) => e.alsoInstalled === undefined));
+});
+
 // ── 用例 5：仓库地址归一化（ssh / https / 带 .git / 大小写 / 尾斜杠）──
 test("normalizeRepo：ssh / https / .git / 大小写归一一致", () => {
   const a = normalizeRepo("https://github.com/AIFSH/AniTalker-ComfyUI.git");

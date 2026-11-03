@@ -146,6 +146,8 @@ export function resolveMissing(unknownClasses, reverseIndex, installed) {
 }
 
 // 三态摘要。notInstalled / installedNotLoaded 按 repo 去重并合并类名；
+// notInstalled 条目可带可选字段 alsoInstalled:[{repo, dir?}]——同一类名对应的其它候选里已装的那些
+// （不进 installedNotLoaded，两个桶仍互斥；无已装候选时该字段不出现）。
 // unresolved 逐类列出。输出确定性排序（notInstalled/installedNotLoaded 按 repo 字母序，
 // unresolved 按 className 字母序；类名列表按首次出现序去重）。
 export function summarize(resolutions) {
@@ -167,10 +169,22 @@ export function summarize(resolutions) {
     }
     const missing = candidates.filter((c) => !c.installed);
     if (missing.length) {
-      // 有未装候选 → 建议安装；同类的已装候选不进 installedNotLoaded（避免两态互相打架）。
+      // 有未装候选 → 建议安装；同类的已装候选不进 installedNotLoaded（避免两态互相打架），
+      // 但记到该条目的 alsoInstalled 上：同一类可能多个候选仓库都能提供，装了其中一个还可能缺类，
+      // 得让调用方知道「另有已装候选」可查（避开「去装 repoY」装完仍缺类的偏差）。
+      const alsoInstalled = candidates
+        .filter((c) => c.installed && !missing.some((m) => m.repo === c.repo))
+        .map((c) => (c.dir !== undefined ? { repo: c.repo, dir: c.dir } : { repo: c.repo }));
       for (const c of missing) {
         if (!notInstalled.has(c.repo)) notInstalled.set(c.repo, { repo: c.repo, title: c.title, classes: [] });
+        const entry = notInstalled.get(c.repo);
         pushClass(notInstalled, c.repo, className);
+        if (alsoInstalled.length) {
+          if (!entry.alsoInstalled) entry.alsoInstalled = [];
+          for (const alt of alsoInstalled) {
+            if (!entry.alsoInstalled.some((x) => x.repo === alt.repo)) entry.alsoInstalled.push(alt);
+          }
+        }
       }
     } else {
       // 所有候选都已装但类没加载出来。
@@ -188,8 +202,13 @@ export function summarize(resolutions) {
     }
   }
   const byRepo = (a, b) => (a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : 0);
+  // alsoInstalled 也按 repo 字母序（跨多个类名合并时不依赖遍历顺序），保持输出确定性。
+  const ni = [...notInstalled.values()].sort(byRepo).map((e) => {
+    if (Array.isArray(e.alsoInstalled) && e.alsoInstalled.length) e.alsoInstalled.sort(byRepo);
+    return e;
+  });
   return {
-    notInstalled: [...notInstalled.values()].sort(byRepo),
+    notInstalled: ni,
     installedNotLoaded: [...installedNotLoaded.values()].sort(byRepo),
     unresolved: [...unresolved].sort().map((className) => ({ className })),
   };

@@ -3130,12 +3130,22 @@ export default defineApp(async (sdk) => {
     const errors = data.errors;
     const warnings = Array.isArray(data.warnings) ? data.warnings : [];
     const stats = data.stats;
+    // 行内必带 code（对应 references/validate.md 的 8 个 code）：`[节点 459 · ckpt_name · enum_mismatch] 消息`。
+    // 整图级（node 空）没有节点 id：标签位补 field，仍缺就补 code——保证 code 一定出现在行里。
     const renderV = (v) => {
-      const who = v.node === null || v.node === undefined ? "整图" : `节点 ${v.node}`;
-      const field = v.field ? ` · ${v.field}` : "";
+      const code = typeof v.code === "string" && v.code ? v.code : "";
+      const field = typeof v.field === "string" && v.field ? v.field : "";
+      const isGraph = v.node === null || v.node === undefined;
+      const tag = (isGraph ? ["整图", field || code, code] : [`节点 ${v.node}`, field, code]).filter(Boolean).join(" · ");
       const sug = Array.isArray(v.suggestions) && v.suggestions.length ? `；可用：${v.suggestions.slice(0, 8).join(" / ")}` : "";
-      return `[${who}${field}] ${String(v.message || "")}${sug}`;
+      return `[${tag}] ${String(v.message || "")}${sug}`;
     };
+    // 首行按 code 分组（只列实际出现的 code 与条数）；只有一个 code 时保持「N 个错误」原样。
+    const codeCounts = new Map();
+    for (const v of errors) {
+      const c = typeof v.code === "string" && v.code ? v.code : "unknown";
+      codeCounts.set(c, (codeCounts.get(c) || 0) + 1);
+    }
     let text;
     if (valid) {
       const lines = [`校验通过：${stats.nodeCount ?? 0} 个节点，${stats.linkCount ?? 0} 条连线，${stats.checkedEnums ?? 0} 个枚举值全在范围内。`];
@@ -3147,7 +3157,10 @@ export default defineApp(async (sdk) => {
       text = lines.join("\n");
     } else {
       const total = errors.length + warnings.length;
-      const lines = [`校验未通过（${errors.length} 个错误，${warnings.length} 条警告）：`];
+      const errHead = codeCounts.size > 1
+        ? `${errors.length} 个错误：${[...codeCounts].map(([c, n]) => `${c} ×${n}`).join("、")}；${warnings.length} 条警告`
+        : `${errors.length} 个错误，${warnings.length} 条警告`;
+      const lines = [`校验未通过（${errHead}）：`];
       for (const v of [...errors, ...warnings].slice(0, 10)) lines.push(renderV(v));
       if (total > 10) lines.push(`…另有 ${total - 10} 条省略（完整清单见 details.comfyui）。`);
       text = lines.join("\n");
@@ -3253,7 +3266,11 @@ export default defineApp(async (sdk) => {
       : `缺包检查${viaNote}：检查的 ${data.checked ?? classCount ?? "?"} 个类都能对上已加载节点，没发现缺包。`;
     const lines = [
       head,
-      ...depsBlock("没装", ni, (e) => `  ${e.title ? `${e.title}（${e.repo}）` : e.repo}  ${depsClassList(Array.isArray(e.classes) ? e.classes : [], multiSet)}`),
+      ...depsBlock("没装", ni, (e) => {
+        const alt = Array.isArray(e.alsoInstalled) ? e.alsoInstalled.map((x) => (x && x.repo) || "").filter(Boolean) : [];
+        const altNote = alt.length ? `（另有已装候选：${alt.join("、")}，若装了仍缺类请查它是否加载失败）` : "";
+        return `  ${e.title ? `${e.title}（${e.repo}）` : e.repo}  ${depsClassList(Array.isArray(e.classes) ? e.classes : [], multiSet)}${altNote}`;
+      }),
       ...depsBlock("装了但没加载", inl, (e) => `  ${e.dir || e.repo}  ${depsClassList(Array.isArray(e.classes) ? e.classes : [], multiSet)}  → 多半是依赖没装或启动失败，看启动日志`),
       ...depsBlock("查不到来源", unres, (e) => `  ${e.className}  → 映射表里没有，可能手写节点或类名拼错`),
     ].filter(Boolean);
@@ -3293,6 +3310,10 @@ export default defineApp(async (sdk) => {
       }
       if (Number.isFinite(Number(args.limit)) && Number(args.limit) > 0) params.set("limit", String(Math.floor(Number(args.limit))));
       if (Number.isFinite(Number(args.offset)) && Number(args.offset) > 0) params.set("offset", String(Math.floor(Number(args.offset))));
+      // refresh：触发中继后台刷新模板索引缓存（中继侧 24h 缓存；?refresh=1 走 stale-while-revalidate）。
+      // 本次仍回当前缓存，不阻塞查询；想看到新数据要稍后再查一次。
+      const refreshArg = args.refresh === true || args.refresh === "1" || args.refresh === "true";
+      if (refreshArg) params.set("refresh", "1");
       const qs = params.toString();
       const { ok, status, data } = await relayJson(`/_relay/templates${qs ? `?${qs}` : ""}`, { timeoutMs: 30_000 });
       if (!ok || !data || !Array.isArray(data.rows)) {
@@ -3306,7 +3327,8 @@ export default defineApp(async (sdk) => {
       const lines = [
         `官方模板库：命中 ${data.total} 条，本页 ${rows.length} 条（offset=${data.offset || 0}；索引 ${
           typeof data.indexAge === "number" ? `${Math.round(data.indexAge / 60)} 分钟前` : "时间未知"
-        }，source=${data.source || "?"}${localVer ? `；本机 ComfyUI ${localVer}` : "；本机版本未知"}）。`,
+        }，source=${data.source || "?"}${localVer ? `；本机 ComfyUI ${localVer}` : "；本机版本未知"
+        }）${data.refreshing === true ? "（已在后台刷新索引，稍后再查可见新数据）" : ""}。`,
         ...rows.map((r) => renderTemplateRow(r, localVer)),
       ];
       if (!rows.length) lines.push("（本页无条目——换关键词或调大 offset）");
@@ -3325,6 +3347,7 @@ export default defineApp(async (sdk) => {
             rows: rows.slice(0, 200),
             source: data.source || null,
             indexAge: typeof data.indexAge === "number" ? data.indexAge : null,
+            refreshing: data.refreshing === true,
             localComfyUIVersion: localVer,
           },
         },
@@ -7435,6 +7458,7 @@ export default defineApp(async (sdk) => {
           recommend: { type: "string", description: "list 用：按推荐级精确过滤（如 highly_recommended）" },
           limit: { type: "number", description: "list 用：每页条数（默认 20，上限 200）" },
           offset: { type: "number", description: "list 用：分页偏移（默认 0）" },
+          refresh: { type: "boolean", description: "list 用：触发模板索引后台刷新（不阻塞本次查询，本次仍返回当前缓存，稍后再查才看到新数据；平时走 24 小时缓存，不用加）" },
           name: { type: "string", description: "fetch 用（必填）：模板名（来自 op=list 的 name 列）" },
           target: { type: "string", enum: ["hub", "tmp"], description: "fetch 用：hub=落到 user/default/hui-templates/<分类>/（默认）；tmp=落到系统临时目录不上列表" },
         },
@@ -7453,7 +7477,7 @@ export default defineApp(async (sdk) => {
         "update=ComfyUI 本体更新（op=check 检查 / apply 执行 / status 查进度；仅源码安装支持，走 git pull --ff-only + pip install -r requirements.txt，更新前自动停服务，完成后需重新启动服务）；" +
         "validate=提交前校验（不提交、不改图、不拦 submit：workflow 三形态同 submit 或 template=userdata 工作流名，options 透传；返回 errors/warnings/统计摘要，校验不通过也正常返回 valid:false，是否修复由 agent 决定）；" +
         "deps=缺包检查（不安装、不重启：workflow 三形态（路径/对象/{template}）或 classes 类名数组，二选一，都不给则取当前画布；返回没装/装了但没加载/查不到来源三段式摘要与建议，一个类名命中多个包时全列候选不代挑，完整结构化结果在 details.comfyui）；" +
-        "templates=官方模板库（op=list 检索：q/task/model/mediaType/tag/recommend 过滤 + limit/offset 分页，中文标题优先、●推荐、○版本不满足；op=fetch 拉取落盘：name 必填、target=hub|tmp，返回落盘路径/大小/所需与缺失模型/可跑性；不自动下载模型、不自动打开模板）；" +
+        "templates=官方模板库（op=list 检索：q/task/model/mediaType/tag/recommend 过滤 + limit/offset 分页，行给 name、中文标题、mediaType，仅 highly_recommended 打 ●推荐，版本以「需 X（本机满足）」或「○需 X」明示；op=fetch 拉取落盘：name 必填、target=hub|tmp，返回落盘路径/大小/所需与缺失模型/可跑性；不自动下载模型、不自动打开模板）；" +
         "canvas=读/改人正在看的同一张画布（读：pages 在线页面清单 / state 最近快照（默认，零往返）/ summary 现抓摘要 / get 全量 UI JSON（select/fields 投影裁剪）/ check 体检（悬空/未接/mute·bypass；rules 可裁剪/扩展）/ trace 追踪端口来源/去向（multi 多级链）/ outline 大纲（功能块+块间连线；detail 下钻）/ diff 两文件语义 diff（source=file；path 基准/pathB 目标）/ prompt 可提交形态 / running 当前执行节点 / progress 执行进度聚合（只读：执行中？/当前节点/画布节点数/队列剩余/promptId）/ probe 桥自检 / revision 变更序号 / events 变更记录；写：setWidget 改参数 / addNode 加节点 / removeNode 删节点 / moveNode 移动节点（nodeId+pos 或批量 nodes:[[id,x,y],...]）/ connect 连线 / disconnect 断线 / setNodeMode mute或bypass / addGroup 新建分组（nodeIds 自动算框）/ setGroup 改组（改名/重算框）/ removeGroup 删组（不动节点）/ save 落盘 / undo 撤销 agent 上一步 / patch 意图级写（多编辑一次提交：edits、$引用、原子回滚、verify/dryRun）/ loadWorkflowFile 按路径装载 / openWorkflow 打开并完整装载（切前台+重绘）/ organize 排布命令 / queue 画布执行（快返，接宿主任务卡）/ duplicate 复制画布为新页 / visual 锁与高亮（visualAction）/ copilot 开关画布副驾驶（受「允许 Agent 开启画布副驾驶」总闸管辖）；source=file 对工作流 JSON 文件操作：读类 op 免画布免授权、patch 为文件版事务〔写盘+自动 .bak；path 相对工作流目录 user/default/workflows 或绝对路径〕）——写入类 op 需用户在设置页开启「允许 agent 修改画布」且需 ComfyUI 页面在线（壳页或桥扩展腿任一可达即可）；v2 硬约束：未开副驾驶的画布上写类 op 被拒（仅可打开/复制/落盘），开副驾驶由用户在画布顶栏开启或授权后由 agent 用 op=copilot 开启；agent 的改动要用 op=undo 撤（新版前端的 Ctrl+Z 撤不掉外部改动）。快照由前端在画布变化后主动推、缓在 ComfyUI 侧，所以 ComfyUI 页面没开着也能拿到上次状态；页面从未打开过时用 op=summary 现抓（需先部署 custom_nodes/hana_bridge 并启动服务）。" +
         "window=工作区原生窗：op=open 打开宿主原生窗装载工作区（/workspace.html；需能力 app/windows.manage；窗口页自取 surface 凭据；壳页桥为单桶——同刻仅一壳页，开窗前建议先关掉其它工作区壳页）/ op=status 列出本 App 已开窗口（默认）/ op=close 关闭窗口（默认关最近一次打开的，可传 windowId）。提交环境缺时自举链也会自动拉起该窗（同刻仅一壳页；无需手动）。" +
         "提交即返回（回合纪律：不要在提交后原地等待；进度用 query 查看）。完整手册见 SKILL: skills/comfyui-hana/SKILL.md",

@@ -119,6 +119,29 @@ test("⑨ API 格式：未知类报 unknown_type；无输出节点报 no_output"
   assert.equal(r.stats.nodeCount, 3);
 });
 
+test("⑨b API 格式 + 缺 output_node 信息：no_output 降为 warning，不静默通过", () => {
+  // classes 表里没有任何 output_node 字段（T1 裁剪结构未带）→ 无法判定，只能 warning。
+  const apiWf = {
+    "1": { class_type: "KSampler", inputs: {} },
+    "2": { class_type: "SaveImage", inputs: { images: ["1", 0] } },
+  };
+  const noOutputInfo = {
+    classes: {
+      KSampler: { required: {}, optional: {}, outputs: [] },
+      SaveImage: { required: {}, optional: {}, outputs: [] },
+    },
+  };
+  const r = validateWorkflow({ workflow: apiWf, objectInfo: noOutputInfo });
+  assert.equal(r.format, "api");
+  assert.equal(r.ok, true, JSON.stringify(r.errors, null, 1));
+  assert.equal(r.errors.filter((v) => v.code === "no_output").length, 0, "拿不到信息时不应硬报错");
+  const hits = r.warnings.filter((v) => v.code === "no_output");
+  assert.equal(hits.length, 1, JSON.stringify(r.warnings, null, 1));
+  assert.equal(hits[0].node, null);
+  assert.match(hits[0].message, /output_node/);
+  assert.equal(r.stats.nodeCount, 2);
+});
+
 test("⑩ 纯健壮性：坏输入不抛异常，统一 internal 错误", () => {
   for (const bad of [null, {}, { workflow: null }, { workflow: { nodes: [] }, objectInfo: null }, { workflow: { nodes: [] }, objectInfo: { classes: {} } }]) {
     const r = validateWorkflow(bad);
