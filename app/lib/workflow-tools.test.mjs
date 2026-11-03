@@ -540,3 +540,98 @@ test("汇总⑧：未知类型+参数分歧 → 两类计数与两句建议，�
     `两类计数与建议顺序应为 未知类型 → 参数分歧：${""}`,
   );
 });
+
+// ── 八、子图实例 widgets_values 为空（2026-11-03）────────────────────────────
+// John 拍板：实例没覆盖任何参数（字段缺失 / 0 项）→ 沿用子图内部默认值，不写值、只记 warning；
+// 只有这一种放行，其余数量不一致照旧拒绝。
+
+// 定义：1 个 widget 输入 text → -10 → 内部 PromptNode 的 text 槽（带 widget 标记，内部默认 "default text"）
+const emptyWvWf = () => ({
+  nodes: [
+    {
+      id: 5,
+      type: "empty-wv-def",
+      mode: 0,
+      inputs: [{ name: "text", type: "STRING", link: null }],
+      outputs: [],
+      widgets_values: [],
+    },
+  ],
+  links: [],
+  definitions: {
+    subgraphs: [
+      {
+        id: "empty-wv-def",
+        name: "空值子图",
+        inputs: [{ name: "text", type: "STRING", links: [1] }],
+        outputs: [],
+        widgets: [],
+        nodes: [
+          {
+            id: 11,
+            type: "PromptNode",
+            mode: 0,
+            inputs: [{ name: "text", type: "STRING", link: 1, widget: { name: "text" } }],
+            outputs: [],
+            widgets_values: ["default text"],
+          },
+        ],
+        links: [{ id: 1, origin_id: -10, origin_slot: 0, target_id: 11, target_slot: 0, type: "STRING" }],
+      },
+    ],
+  },
+});
+
+test("子图实例 widgets_values 为空：展开成功，内部节点保留定义默认值，只记一条 warning", () => {
+  // 对位表有 1 个 widget 输入、实例 0 项——旧版在这里拒绝，现在按「全用内部默认值」放行
+  const warnings = [];
+  const out = convertUiToApi(emptyWvWf(), FANOUT_OBJ, { onWarning: (w) => warnings.push(w) });
+  assert.equal("5" in out, false, "实例节点不进 prompt");
+  // 内部节点保留自己的默认 widget 值（不写值：既不是空、也不是错位）
+  assert.deepEqual(out["s5:11"].inputs, { text: "default text" });
+  assert.equal(warnings.length, 1, `应恰好一条 warning：${warnings.join(" | ")}`);
+  assert.equal(warnings[0], "子图实例 #5（「空值子图」）未携带 widgets_values，已使用子图内部默认值");
+});
+
+// 非零但数量不一致（3 项 vs 8 个 widget 输入）→ 仍是真正的位置歧义，文案与拒绝行为都不动
+const wideWvObj = {
+  ...FANOUT_OBJ,
+  Wide: {
+    input: {
+      required: { t0: ["STRING", {}], t1: ["STRING", {}], t2: ["STRING", {}], t3: ["STRING", {}], t4: ["STRING", {}], t5: ["STRING", {}], t6: ["STRING", {}], t7: ["STRING", {}] },
+    },
+  },
+};
+const mismatchWvWf = () => ({
+  nodes: [{ id: 5, type: "wide-def", mode: 0, inputs: [], outputs: [], widgets_values: ["a", "b", "c"] }],
+  links: [],
+  definitions: {
+    subgraphs: [
+      {
+        id: "wide-def",
+        name: "宽子图",
+        inputs: Array.from({ length: 8 }, (_, i) => ({ name: `t${i}`, type: "STRING", links: [i + 1] })),
+        outputs: [],
+        widgets: [],
+        nodes: [
+          {
+            id: 11,
+            type: "Wide",
+            mode: 0,
+            inputs: Array.from({ length: 8 }, (_, i) => ({ name: `t${i}`, type: "STRING", link: i + 1, widget: { name: `t${i}` } })),
+            outputs: [],
+            widgets_values: ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"],
+          },
+        ],
+        links: Array.from({ length: 8 }, (_, i) => ({ id: i + 1, origin_id: -10, origin_slot: i, target_id: 11, target_slot: i, type: "STRING" })),
+      },
+    ],
+  },
+});
+
+test("子图实例 widgets_values 非零但数量不一致：仍然拒绝，报错文案不变", () => {
+  assert.throws(
+    () => convertUiToApi(mismatchWvWf(), wideWvObj),
+    /子图实例 #5（「宽子图」）的 widgets_values 有 3 项，但定义按序可对位的 widget 输入有 8 个（t0、t1、t2、t3、t4、t5、t6、t7），数量不一致，无法按位置对位，已拒绝/,
+  );
+});

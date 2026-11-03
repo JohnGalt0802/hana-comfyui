@@ -562,7 +562,8 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
   //   写入该节点的 named（按内部 widget 名）并同步声明位序的位置值（与主循环共用 declaredWidgetSlots）；
   //   同名位置值存在且与 named 分歧 → 拒绝（R1 同精神，防过期 named 被静默采用）。
   // 无 named：位置回退，序 = 定义「-10 链接指向的内部目标槽带 widget 标记」的输入按定义序；
-  //   实例 widgets_values 项数与之不等 → 整份拒绝（不猜）。
+  //   实例 widgets_values 为空（字段缺失 / 0 项）→ 实例没覆盖任何参数，沿用子图内部默认值：不写值、只记 warning；
+  //   其余项数与之不等 → 整份拒绝（不猜）。
   // 值与内部现值相同 → 放行不写入；定位不到现值 → 拒绝。外部连线已占用的输入不传递（连线值优先）。
   for (const ctx of ctxByInst.values()) {
     const insArr = Array.isArray(ctx.inst.inputs) ? ctx.inst.inputs : [];
@@ -583,6 +584,13 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
         return Boolean(ts0 && typeof ts0 === "object" && isPlainObject(ts0.widget) && typeof ts0.widget.name === "string");
       });
       if (isWidgetInput) widgetNames.push({ name: d.name, j });
+    }
+    // 2026-11-03：实例 widgets_values 为空（字段缺失或 0 项）且没有 named → 实例没覆盖任何参数，
+    // 语义是「全用子图内部默认值」：跳过整个写值阶段（内部节点 widget 值保持原样），只记 warning，不拒绝。
+    // 只放行这一种；其余数量不一致仍是位置歧义，照旧拒绝（下一分支）。
+    if (!namedVals && (!Array.isArray(wvArr) || wvArr.length === 0)) {
+      if (Array.isArray(warnings)) warnings.push(`子图实例 #${ctx.sid}（「${ctx.defName}」）未携带 widgets_values，已使用子图内部默认值`);
+      continue;
     }
     if (!namedVals && wvArr && wvArr.length !== widgetNames.length) {
       problems.push(`子图实例 #${ctx.sid}（「${ctx.defName}」）的 widgets_values 有 ${wvArr.length} 项，但定义按序可对位的 widget 输入有 ${widgetNames.length} 个（${widgetNames.map((w) => w.name).join("、") || "无"}），数量不一致，无法按位置对位，已拒绝`);
