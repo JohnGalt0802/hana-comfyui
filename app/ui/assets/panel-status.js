@@ -762,6 +762,19 @@ function startUpdPolling() {
   void updStatusTick();
 }
 
+// 更新检查提示的尾注：运行时目录变动（output/input/models…）与未跟踪文件不影响 pull，
+// 只作为附注提一句，不参与 dirty / 星标判定。总数优先用中继给的 *Count（数组只截 20 条）。
+function extraNoteSuffix(d) {
+  const loc = (d && d.local) || {};
+  const n = Number(loc.noiseCount ?? (loc.noise || []).length) || 0;
+  const u = Number(loc.untrackedCount ?? (loc.untracked || []).length) || 0;
+  if (!n && !u) return "";
+  const bits = [];
+  if (n) bits.push(`${n} 个运行时文件变动`);
+  if (u) bits.push(`${u} 个未跟踪文件`);
+  return `另有 ${bits.join("与")}，不影响更新。`;
+}
+
 async function checkUpdate() {
   const btn = $("u-check");
   btn.disabled = true; btn.textContent = "检查中…";
@@ -778,9 +791,9 @@ async function checkUpdate() {
     noteUpdInfo(d); // 手动检查结果同步给信号灯
     const remoteEl = $("u-remote");
     if (remoteEl) remoteEl.textContent = d.remote ? fmtVer(d.remote) : "—";
-    if (d.local && d.local.dirty) $("u-note").textContent = "本地有未提交改动，git 会拒绝拉取（不擅自 merge/reset）。";
-    else if (d.upToDate) $("u-note").textContent = `已是最新（${d.local?.describe || ""}）。`;
-    else $("u-note").textContent = `落后 ${d.behind} 个提交：${fmtVer(d.local)} → ${fmtVer(d.remote)}`;
+    if (d.local && d.local.dirty) $("u-note").textContent = `本地有未提交改动，更新可能失败；可先用 git 处理后再更新。${extraNoteSuffix(d)}`;
+    else if (d.upToDate) $("u-note").textContent = `已是最新（${d.local?.describe || ""}）。${extraNoteSuffix(d)}`;
+    else $("u-note").textContent = `落后 ${d.behind} 个提交：${fmtVer(d.local)} → ${fmtVer(d.remote)}${extraNoteSuffix(d)}`;
   } catch (e) {
     $("u-note").textContent = `检查失败：${String((e && e.message) || e)}`;
   } finally {
@@ -837,11 +850,11 @@ async function applyUpdate() {
 
 // ── 状态信号灯（标题行旁；互斥优先级：异常 > 有更新 > 正常）──────────────────
 // 异常（红点）：中继不可达（relayError）/ 后端不可达 / 中继非 ready（含 boot.phase=error）；有更新（金色 ✦）：
-// 更新检查得 behind>0 且非 dirty；正常（绿点）：其余。更新检查自动化：启动静默查
+// 更新检查得 behind>0（dirty 不压制星标，只在 title 里提醒可能失败）；正常（绿点）：其余。更新检查自动化：启动静默查
 // 一次 + 每 10 分钟一次 + 页面变可见时一次（GET /comfyui-hana/update，带 TTL 缓存——
 // 中继侧 UPDATE_CHECK_TTL_MS=60s，监听间隔远大于 TTL，每次静默检查都是真实比对；失败静默不打扰）。
 let lastStatus = null; // 最近一次 /comfyui-hana/status 结果（信号灯推导）
-let updInfo = null;    // 最近一次更新检查结论 { behind, dirty, upToDate, at }
+let updInfo = null;    // 最近一次更新检查结论 { behind, dirty, upToDate, at }（dirty = 真源码改动）
 let sigOpt = null;     // 「乐观覆盖」{ at, title }：停止确认后立即置红，待晚于 at 的真实快照校验替换
 
 function applySignal() {
@@ -861,9 +874,12 @@ function applySignal() {
     } else if (boot.phase !== "ready" || !reachable) {
       cls = "bad";
       title = boot.phase !== "ready" ? `中继${PHASE_LABEL[boot.phase] || String(boot.phase || "")}` : "服务未跑";
-    } else if (updInfo && updInfo.behind > 0 && !updInfo.dirty) {
+    } else if (updInfo && updInfo.behind > 0) {
       cls = "update";
-      title = `有更新：落后远端 ${updInfo.behind} 个提交`;
+      // dirty 只影响提醒文案，不再拦星标（dirty 已是「真会拦住 pull 的源码改动」，噪音不算）
+      title = updInfo.dirty
+        ? `有更新：落后远端 ${updInfo.behind} 个提交（本地有改动，更新可能失败）`
+        : `有更新：落后远端 ${updInfo.behind} 个提交`;
     } else {
       cls = "ok";
       title = "正常";

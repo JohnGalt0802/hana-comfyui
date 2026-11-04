@@ -2379,18 +2379,74 @@ async function runStreamNet(exe, args, opts = {}, tries = 3) {
   return last;
 }
 
-// 仓库信息（未跟踪文件不算 dirty，否则 requirements.core.txt 这类会一直报脏）
+// ── 工作区状态分类（2026-11-04）─────────────────────────────────────────
+// ComfyUI 运行时自己会删 / 建 output、input、models、custom_nodes 下的文件（典型：把占位文件
+// output/_output_images_will_be_put_here 删掉），用户也常往仓库根丢工作流 json。这些与源码无关，
+// 却让 `git status --porcelain` 永远非空：旧口径把它们一并算 dirty，于是 behind>0 也不亮「有更新」
+// 星标、点更新被「本地有未提交改动」拦住。现按路径分三类：
+//   noise      运行时目录 / 缓存 / 日志 —— 不算 dirty
+//   untracked  未跟踪文件 —— `git pull --ff-only` 不拦，不算 dirty
+//   dirty      其余已跟踪文件的 M/D/A/R/T —— 真正会让 pull 失败的改动
+const GIT_NOISE_DIRS = ["output/", "input/", "user/", "models/", "temp/", "custom_nodes/", ".venv/", "venv/"];
+const GIT_NOISE_BASENAME_RE = /^(?:\.DS_Store|.+\.pyc|.+\.log)$/i;
+
+function isGitNoisePath(p) {
+  const s = String(p || "").replace(/\\/g, "/").trim();
+  if (!s) return false;
+  const parts = s.split("/").filter(Boolean);
+  if (parts.includes("__pycache__")) return true; // 任意层级的 __pycache__/
+  if (GIT_NOISE_DIRS.some((d) => s === d.slice(0, -1) || s.startsWith(d))) return true;
+  return GIT_NOISE_BASENAME_RE.test(parts[parts.length - 1] || "");
+}
+
+// 逐行拆 `git status --porcelain`：dirty 保留可读行（dirtyDetail 口径不变），noise / untracked 只放路径。
+// 注意：runExe 对 stdout 做过整体 trim()，**首行前导空格会被吃掉**（" D output/x" → "D output/x"），
+// 所以不能用固定偏移切路径；用容忍 0~2 个前导空格的 regex 取「状态码 + 路径」。
+const PORCELAIN_RE = /^\s{0,2}([A-Z?!]{1,2})\s+(.*)$/;
+function classifyPorcelain(status) {
+  const dirty = [], noise = [], untracked = [];
+  for (const raw of String(status || "").split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, "");
+    if (!line) continue;
+    const m = line.match(PORCELAIN_RE);
+    if (!m) continue; // 解析不了就跳过，不误判为 dirty
+    const code = m[1];
+    if (code === "!!") continue; // ignored 条目（仅 --ignored 才出现）不参与判定
+    const rest = m[2];
+    const path = rest.includes(" -> ") ? rest.split(" -> ").pop() : rest; // 重命名取新路径
+    if (code === "??") { // 未跟踪：噪音路径仍归 noise，其余进 untracked
+      (isGitNoisePath(path) ? noise : untracked).push(path);
+      continue;
+    }
+    (isGitNoisePath(path) ? noise : dirty).push(`${code} ${path}`);
+  }
+  return { dirty, noise, untracked };
+}
+
+// 仓库信息：dirty 只含真会被 pull 拦住的改动（噪音路径与未跟踪文件分别进 noise / untracked）。
 function gitInfo(git, repoDir) {
   const g = (args) => runExe(git, ["-C", repoDir, ...args], 15_000);
   const status = String(g(["status", "--porcelain"]).stdout || "");
-  const dirtyLines = status.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith("?? "));
+  const { dirty, noise, untracked } = classifyPorcelain(status);
   return {
     commit: g(["rev-parse", "--short", "HEAD"]).stdout || null,
     describe: g(["describe", "--tags", "--always"]).stdout || null,
     branch: g(["rev-parse", "--abbrev-ref", "HEAD"]).stdout || null,
-    dirty: dirtyLines.length > 0,
-    dirtyDetail: dirtyLines.slice(0, 5),
+    dirty: dirty.length > 0,
+    dirtyDetail: dirty.slice(0, 5),
+    dirtyCount: dirty.length,
+    noise: noise.slice(0, 20),
+    noiseCount: noise.length,
+    untracked: untracked.slice(0, 20),
+    untrackedCount: untracked.length,
   };
+}
+
+// dirty 的人话提示（只在真有源码改动时给，别让噪音把更新劝退）
+function dirtyNoteOf(local) {
+  if (!local || !local.dirty) return null;
+  const n = Number(local.dirtyCount || (local.dirtyDetail || []).length) || 0;
+  return n ? `本地有 ${n} 处未提交的源码改动，更新可能失败（可先用 git 处理）` : "本地有未提交的源码改动，更新可能失败（可先用 git 处理）";
 }
 
 // 仓库状态：detached HEAD 判定 + 最新 v* 标签。
@@ -2423,16 +2479,16 @@ function updatePathNote(repoState, isRepo, extra = null) {
     return "无 .git（便携包 tar 解压 / 手工解压）：没有版本基准点，只能盲装依赖，" +
       "反而可能把依赖升到比代码新，因此拒绝代为更新。请用官方 update/update_comfyui_stable.bat 更新。";
   }
+  const tail = extra ? `；${extra}` : "";
   const tag = repoState && repoState.latestTag;
   if (repoState && repoState.detached) {
-    return tag
+    return (tag
       ? `当前不在任何分支（detached HEAD，便携版常态）：会 fetch 标签后切到最新 tag ${tag}（等同官方 update/update_comfyui_stable.bat），不执行 pull。`
-      : "当前不在任何分支（detached HEAD），但仓库里没找到 v* 标签，无法确定目标版本，更新会失败。";
+      : "当前不在任何分支（detached HEAD），但仓库里没找到 v* 标签，无法确定目标版本，更新会失败。") + tail;
   }
   const br = (repoState && repoState.branch) || "master";
   return `当前在分支 ${br}：会 git fetch 后 git pull --ff-only 快进到 origin/${br}` +
-    (tag ? `（远端最新 tag ${tag} 不会自动切到，便携版请用官方脚本）` : "") +
-    (extra ? `；${extra}` : "");
+    (tag ? `（远端最新 tag ${tag} 不会自动切到，便携版请用官方脚本）` : "") + tail;
 }
 
 // ── pip 镜像回退判定 ───────────────────────────────────────────────────
@@ -2638,7 +2694,7 @@ async function checkUpdate(force = false) {
   const rs = detectRepoState(ctx.git.path, ctx.repoDir);
   const repoState = { detached: rs.detached, branch: rs.branch, latestTag: rs.latestTag };
   const updatePath = updatePathOf(rs, true);
-  const pathNote = updatePathNote(rs, true);
+  const pathNote = updatePathNote(rs, true); // 干净时只说路径，不声称「本地有未提交改动」
   // detached 要拿标签，分支要 prunes 远端引用：都要 --tags（便携版靠 tag 定位版本）
   const f = await runStreamNet(ctx.git.path, ["-C", ctx.repoDir, "fetch", "--prune", "--tags", "origin"], { timeoutMs: GIT_TIMEOUT_MS }, 2);
   if (!f.ok) {
@@ -2680,7 +2736,7 @@ async function checkUpdate(force = false) {
     local,
     repoState: { ...repoState, latestTag },
     updatePath,
-    pathNote: updatePathNote({ ...repoState, latestTag }, true),
+    pathNote: updatePathNote({ ...repoState, latestTag }, true, dirtyNoteOf(local)), // dirty 为假时不给该提示
     remote: {
       ref: remoteRef,
       commit: remoteRef ? (g(["rev-parse", "--short", remoteRef]).stdout || null) : null,
@@ -2703,7 +2759,8 @@ function startUpdateJob() {
   const rs = ctx.isRepo ? detectRepoState(ctx.git.path, ctx.repoDir) : { detached: false, branch: null, latestTag: null };
   const repoState = { detached: rs.detached, branch: rs.branch, latestTag: rs.latestTag };
   const updatePath = updatePathOf(rs, ctx.isRepo);
-  const pathNote = updatePathNote(rs, ctx.isRepo);
+  const before = ctx.isRepo ? gitInfo(ctx.git.path, ctx.repoDir) : null; // 更新前快照（dirty 只含源码改动）
+  const pathNote = updatePathNote(rs, ctx.isRepo, dirtyNoteOf(before));
   if (!ctx.isRepo) {
     // 便携版 tar 包（无 .git）：拒绝。拿不到版本基准点，唯一能做的 pip install 反而可能把依赖升到比代码新。
     return { accepted: false, reason: "该安装不是 Git 仓库（便携包 tar），无法代为更新；请用官方 update/update_comfyui_stable.bat", repoState, updatePath, pathNote };
@@ -2717,7 +2774,7 @@ function startUpdateJob() {
   updateProc.logTail = [];
   updateProc.lastError = null;
   updateProc.after = null;
-  updateProc.before = gitInfo(ctx.git.path, ctx.repoDir);
+  updateProc.before = before;
   updateStateLoaded = true;
   saveUpdateState();
   log(`开始更新 ComfyUI：repo=${ctx.repoDir} 当前=${updateProc.before.describe || updateProc.before.commit} 路径=${updatePath}`);
