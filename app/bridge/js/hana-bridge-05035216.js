@@ -17,7 +17,155 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-10-27 hana-bridge-02010800";
+const BUILD_TAG = "2026-11-05 hana-bridge-05035216";
+
+// ── 明暗跟随（2026-11-05）──────────────────────────────────────────
+// 背景：桥注入界面的深色覆盖原先只挂 `:root.dark-theme`。前端 1.58.5 起整个包里 `dark-theme`
+// 已不存在（build-manifest commit f7bcaf00，1056 个 js/css 全扫 0 命中），深色开关换成
+// Tailwind/lightningcss 的 `.scheme-dark`（static/assets/main-BHksRiL4.css：
+// `.scheme-dark{--lightningcss-light: ;--lightningcss-dark:initial;color-scheme:dark}`），
+// 而主题真正的落点是 documentElement 的内联 style（colorPaletteTheme.applyPaletteTheme
+// 写 --* 变量并设 style.colorScheme）。只认类名，前端再改一次名又会全线失效，所以这里加
+// 一层运行时兜底：脚本把「当前是不是深色」算成 documentElement 上的 data-hana-dark="1"，
+// CSS 深色块统一认这一路——前端怎么改类名都无所谓，只要它还在设 color-scheme，桥就跟上。
+// 三处深色块（historyBarStyleEnsure / historyNodeStyleEnsure / historyTreeStyleEnsure）共用
+// 下面这一个选择器列表，口径改动只改这里；各深色块仍须排在自己的浅色默认块之后（同源同特异靠后者取胜）。
+const HANA_DARK_SEL =
+  ':root.dark-theme, :root.scheme-dark, html.scheme-dark, .scheme-dark, :root[data-hana-dark="1"], html[data-hana-dark="1"]';
+const HANA_DARK_ATTR = "data-hana-dark";
+const HANA_DARK_MARKERS = ["dark-theme", "scheme-dark"]; // 已知深色标记类（新旧都认，不依赖计算值）
+let hanaDarkObserver = null;
+let hanaDarkBodyWatched = false;
+let hanaDarkSettingsBound = false;
+
+function hanaHasDarkMarker(el) {
+  if (!el || !el.classList) return false;
+  try {
+    for (const m of HANA_DARK_MARKERS) {
+      if (el.classList.contains(m)) return true;
+    }
+  } catch {
+    /* 读不到当没标记 */
+  }
+  return false;
+}
+
+// 取一个元素计算后的 color-scheme：true=深色 / false=浅色 / null=判不出（不据此下结论）。
+function hanaColorSchemeDark(el) {
+  if (!el) return null;
+  try {
+    const v = String(getComputedStyle(el).colorScheme || "").toLowerCase();
+    if (!v || v === "normal") return null;
+    const dark = /\bdark\b/.test(v);
+    const light = /\blight\b/.test(v);
+    if (dark && !light) return true;
+    if (light && !dark) return false;
+    if (dark && light) return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches); // 两可 → 跟系统
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// 依据 color-scheme 与已知标记类，把深色态写成 documentElement 的 data-hana-dark="1"。
+// 判不出按浅色处理（属性本来就不该存在）：宁可不加深色，也不误加深色。全程不抛。
+function hanaSyncDarkFlag() {
+  try {
+    const root = document.documentElement;
+    if (!root) return;
+    // body 可能晚于本模块求值才出现，这里补挂监听（只一次）。
+    if (hanaDarkObserver && !hanaDarkBodyWatched && document.body) {
+      try {
+        hanaDarkObserver.observe(document.body, { attributes: true, attributeFilter: ["class", "style"] });
+        hanaDarkBodyWatched = true;
+      } catch {
+        /* 挂不上就算了 */
+      }
+    }
+    const dark =
+      hanaColorSchemeDark(root) === true ||
+      hanaColorSchemeDark(document.body) === true ||
+      hanaHasDarkMarker(root) ||
+      hanaHasDarkMarker(document.body);
+    const cur = root.getAttribute(HANA_DARK_ATTR);
+    if (dark && cur !== "1") root.setAttribute(HANA_DARK_ATTR, "1");
+    else if (!dark && cur !== null) root.removeAttribute(HANA_DARK_ATTR); // 值未变不写，避免自触发
+  } catch {
+    /* 兜底失败不影响桥本体 */
+  }
+}
+
+// app.ui.settings 的主题变更订阅：新版是 Pinia store（$subscribe），老版可能是 EventTarget。
+// 桥内原先没有这份订阅，这里只开一份（幂等）；两种 API 都探不到就静默跳过——
+// 换主题必然改 documentElement 的 class/style，MutationObserver 那层已经兜住。
+function hanaDarkBindSettings() {
+  if (hanaDarkSettingsBound) return;
+  try {
+    const s = app && app.ui && app.ui.settings;
+    if (!s) return;
+    let bound = false;
+    try {
+      if (typeof s.$subscribe === "function") {
+        s.$subscribe(() => {
+          hanaSyncDarkFlag();
+        }, {});
+        bound = true;
+      }
+    } catch {
+      /* 忽略 */
+    }
+    try {
+      if (typeof s.addEventListener === "function") {
+        for (const evt of ["change", "settingChanged", "themeChanged"]) {
+          try {
+            s.addEventListener(evt, () => {
+              hanaSyncDarkFlag();
+            });
+            bound = true;
+          } catch {
+            /* 事件名不存在也无害 */
+          }
+        }
+      }
+    } catch {
+      /* 忽略 */
+    }
+    if (bound) hanaDarkSettingsBound = true;
+  } catch {
+    /* 忽略 */
+  }
+}
+
+// 安装明暗跟随（幂等）：首算 + 监听 documentElement/body 的 class、style 变化 + 设置订阅。
+function hanaDarkWatchInstall() {
+  try {
+    if (!hanaDarkObserver && typeof MutationObserver === "function" && document.documentElement) {
+      hanaDarkObserver = new MutationObserver(() => {
+        hanaSyncDarkFlag();
+      });
+      hanaDarkObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
+    }
+  } catch {
+    /* Observer 起不来就只剩首算与订阅 */
+  }
+  try {
+    // 系统偏好变化只在前端设成 `light dark`（两可）时影响判定
+    if (window.matchMedia) {
+      const mq = window.matchMedia("(prefers-color-scheme: dark)");
+      if (mq && typeof mq.addEventListener === "function") {
+        mq.addEventListener("change", () => {
+          hanaSyncDarkFlag();
+        });
+      }
+    }
+  } catch {
+    /* 忽略 */
+  }
+  hanaSyncDarkFlag();
+  hanaDarkBindSettings();
+}
+
+hanaDarkWatchInstall(); // 模块求值即装一次（此刻通常还是浅色，主题落地由 Observer 触发重算）
 
 const WIDGET_VALUE_MAX = 160;
 
@@ -3509,7 +3657,9 @@ function historyBarStyleEnsure() {
   const style = document.createElement("style");
   style.id = HISTORY_BAR_STYLE_ID;
   style.textContent = `
-/* 2026-10-15：中性色全部走变量，跟随 ComfyUI 明暗（:root=浅色默认，:root.dark-theme=深色覆盖）。
+/* 2026-10-15：中性色全部走变量，跟随 ComfyUI 明暗（:root=浅色默认，深色覆盖走 HANA_DARK_SEL）。
+   2026-11-05：深色块选择器改双路 + 运行时兜底（老前端 dark-theme / 新前端 scheme-dark /
+   脚本算出的 data-hana-dark="1"），本块仍排在上面 :root 浅色默认之后。
    语义色（谁提交 --hhb-c/--htr-c、HEAD 橙点 #e8c268、旧数据标记点、框色 --hnode-bc）不在此列。 */
 :root {
   --hhb-panel1: rgba(252,250,246,.96);
@@ -3569,7 +3719,7 @@ function historyBarStyleEnsure() {
   --hhb-lb-nav-bg: rgba(238,235,229,.88);
   --hhb-lb-nav-bg-h: rgba(226,222,216,.96);
 }
-:root.dark-theme {
+${HANA_DARK_SEL} {
   --hhb-panel1: rgba(38,44,54,.94);
   --hhb-panel2: rgba(27,32,40,.95);
   --hhb-fg: #fff;
@@ -4601,9 +4751,10 @@ function historyNodeStyleEnsure() {
   const style = document.createElement("style");
   style.id = ID;
   style.textContent = `
-/* 2026-10-15：中性灰底跟随明暗（内条的语义色 --hnode-bc 不动）。 */
+/* 2026-10-15：中性灰底跟随明暗（内条的语义色 --hnode-bc 不动）。
+   2026-11-05：深色那一行改双路选择器列表（见 HANA_DARK_SEL），仍跟在上面浅色默认之后。 */
 :root { --hnode-dim: rgba(0,0,0,.22); }
-:root.dark-theme { --hnode-dim: rgba(255,255,255,.16); }
+${HANA_DARK_SEL} { --hnode-dim: rgba(255,255,255,.16); }
 /* 2026-10-23：gap / 条最小高随档位走变量；2026-10-26（方案变更）：条保持正常粗细，
    --hnode-gap / --hnode-barmin 继续用档位原值（由 historyTreeShellTier 给出）；
    塞不下改由「节点高按 maxBlocks 自适应长高」解决（historyTreeAdaptSize）。
@@ -6146,7 +6297,9 @@ function historyTreeStyleEnsure() {
   const style = document.createElement("style");
   style.id = HISTORY_TREE_STYLE_ID;
   style.textContent = `
-/* 2026-10-15：中性色全部走变量，跟随 ComfyUI 明暗（:root=浅色默认，:root.dark-theme=深色覆盖）。
+/* 2026-10-15：中性色全部走变量，跟随 ComfyUI 明暗（:root=浅色默认，深色覆盖走 HANA_DARK_SEL）。
+   2026-11-05：深色块选择器改双路 + 运行时兜底（dark-theme / scheme-dark / data-hana-dark），
+   本块仍排在上面 :root 浅色默认之后。
    语义色（谁提交 --htr-c、HEAD 橙点 #e8c268、旧数据标记、框色 --hnode-bc）不在此列。 */
 :root {
   --htr-fg: #2c302d;
@@ -6178,7 +6331,7 @@ function historyTreeStyleEnsure() {
   --htr-err: #b0332f;
   --htr-thumb-bg: #e7e4de;
 }
-:root.dark-theme {
+${HANA_DARK_SEL} {
   --htr-fg: #e6edf5;
   --htr-sub: #9fb3c8;
   --htr-btn-fg: #dfe7ef;
@@ -8728,6 +8881,9 @@ api.addEventListener(EVT_CALL, async (event) => {
 app.registerExtension({
   name: "hana.bridge",
   async setup() {
+    // 明暗跟随（2026-11-05）：模块求值时已装一次，这里再幂等重装 + 重算一次——
+    // setup 阶段 app.ui.settings 已就绪，且主题可能已在 documentElement 上落地（补上 data-hana-dark）。
+    hanaDarkWatchInstall();
     // 壳页协同（修订 1.2）：把本实例身份推给 parent 壳页（定向直发用；与后端无关，先行；
     // 后端未就绪/hello 失败也不影响宣告——见上方 announceToShell 注释块）。
     announceToShell();
