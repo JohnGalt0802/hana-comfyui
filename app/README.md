@@ -1,148 +1,126 @@
-# Hana-ComfyUI（v2 App，开发仓）· v0.13
+# Hana-ComfyUI（v2 App，开发仓）· v0.25.4
 
 把本机 ComfyUI（服务在 `127.0.0.1:8188`）接进 HanaAgent 的 v2 App。
 **开发仓**：本目录（`app/`）；**宿主副本**：`<HANA_HOME>/apps/comfyui-hana/`（由 `../tools/sync-to-host.ps1` 同步）。
 
-## 状态（M0–M2 完成，M2.5/M2.6 收尾）
+面向用户的说明见市场 readme 口径（`docs/market/`）；本文件是**开发者视角**：结构在哪、契约是什么、哪些边界不能碰。
 
-- 工具 `comfyui` 全动作（10）：status / submit / query / result / cancel / workflows / upload / service / update / canvas
-- 任务桥：submit → `ctx.tasks.create({callToken, delivery:"next-step"})` → 2s 轮询结算（complete/fail/cancel）
-  - 能力已扩容（2026-09-21 批准并生效）：`app/tasks.manage` + `app/session.start-turn`（ledger=always）
-  - **子代理会话边界**：宿主可靠投递只写桌面会话；从子代理会话发起的任务不会自动回执（工具文案会如实标注；`query` 的「投递」行可查 `published/delivered`）
-- 中继 v0.3：订阅 8188 `/ws` 进度事件缓存（`/_relay/prompts`）、历史摘要（`/_relay/history`）、
-  `/_relay/fs/{stat,read}` + `/_relay/upload`（controlKey 保护）、日志落盘（`app-data/comfyui-hana/logs/relay.log`，>5MiB 滚动 `.1`）
-- 环境自举（v0.3 新增）：后端不可达时中继附「本机安装探测」（`/_relay/status` 的 `env` 字段；或 `node runtime/comfy-relay.mjs --probe-env` 直看）；
-  壳页按「装了没跑 / 未检测到」分流引导（复制引导语→交给 Hana）；安装手册 `skills/comfyui-hana/INSTALL.md`
-- 状态面板（v0.4 新增）：整页工作区左侧栏（functionPanel）带 GPU/CPU/内存实时图表（任务管理器风格曲线）
-  与「释放显存」按钮（`POST /comfyui-hana/release` → 中继反代后端 `/free`）；指标经中继 `/_relay/metrics`
-  （nvidia-smi 4s 缓存 + os 模块 CPU/内存采样；零新增能力）
-- 安装引导（v0.5 新增）：检测到「未装 ComfyUI」时弹窗——选安装位置（中继盘位探测给候选 + 剩余空间 + 推荐）/ 自定义目录（宿主目录选择器，写回配置）；
-  两个动作：直接发起安装（`session:create` + `session:send` 在默认工作区建会话投递提示词）/ 复制安装指令；
-  路由 `install-targets|install-target|install-prompt|install-launch`；中继新增 `/_relay/drives`、`/_relay/custom-roots`；
-  能力新增 `app/resources.read`（目录选择器用）
-- 服务起停（v0.6 新增，M9）：左侧面板「启动服务 / 停止服务」+ 工具 `comfyui(action="service", op=status|start|stop)`；
-  启动经 Windows 计划任务（`HanaComfyUI-Backend`）以当前用户身份拉起——中继自身跑在宿主沙箱 job 里，直接 spawn 的子进程
-  会随中继退出被回收（detached 也逃不出），走计划任务才**独立于 Hana 存活**；撤下走 `taskkill /T /F`（受限令牌实测可终止）；
-  中继新增 `/_relay/backend/{start,stop,proc}`，App 新增路由 `backend/start|stop|backend`；服务日志 `app-data/comfyui-hana/logs/backend.log`；
-  同时把面板原「重试启动」正名为「重启中继」（它只重启受管 runtime，与 ComfyUI 服务本体是两件事）
-- 拉起服务（T2）：service 增 `envcheck` / `clear` / `wait` 三个 op——
-  环境检查（GPU 计算进程分类：自身/阻断/其他；8188 端口探测；nvidia-smi 不可用降级为警告；产出 180s 一次性快照）；
-  精准清理（只认快照，逐项复核 pid+启动时间+映像名，列表外全拒，清后 2–3s 复查不循环杀）；
-  等待就绪（单次 ≤25s 轮询，总时限 120–150s，超时只报不杀）。
-  `op=start` 前自动 envcheck：有阻断（如 llama-server 占 GPU）暂缓拉起并返回阻断说明（指引 `service clear` 后重试）；
-  启动去重（in-flight + state 文件 + 计划任务兜底）。中继新增 `/_relay/backend/{envcheck,clear,wait}`。
-- 工作区直连 + 服务控制 + 安装目录（v0.7 新增，M10）：
-  - **工作区 iframe 直连 `127.0.0.1:8188`**（auto/direct 默认；manifest 新增 `ui.csp.frameDomains` 放行）。
-    原因：自定义节点的扩展脚本习惯用**绝对路径**（`/extensions/<node>/*.js`、`/scripts/app.js`、`/scripts/ui.js`），
-    走宿主代理路径时这些请求会绕过 App 前缀、打到宿主根（不是本 App 路由）被 **403**；直连后 ComfyUI 站在自己的根上，
-    官方前端与自定义节点全部可用（后端实测：这些路径在 8188 上均 200，且无 `X-Frame-Options`，可被 iframe 嵌入）。
-    代价：iframe 跨源 → 壳页摸不到 `contentWindow`。主题改为**改道**：订阅宿主主题钩子
-    `hana.theme.subscribe`（回调直给快照）→ `POST /comfyui-hana/theme` → 中继把宿主主题写成
-    ComfyUI 的**自定义色板**（`Comfy.CustomColorPalettes.hana`，键名与 `HANA_CSS_MAP`/`HANA_JS_MAP` 同源）
-    并选中（`Comfy.ColorPalette = "hana"`）→ **自动重载 ComfyUI 那层 iframe**（加 `_hana_t` 时间戳强制；
-    同 src 浏览器不会重载），前端起来即带宿主配色（面板 + 画布/节点/连线），无需手动刷新。
-    另有两道兜底：轮询（每 2.5s 重拉宿主主题 CSS 比对色值签名）、iframe 首帧加载前预推送。
-    路由 `theme`（GET 查 / POST 写）→ 中继 `/_relay/theme`。
-    踩坑：① `POST /settings` 成功是 **200 空 body**，不能按 JSON 解析（`docs/踩坑记录.md` 第 4 条）；
-    ② 它是 `{**settings, **new_settings}` **合并写**，实测不动用户其他设置；
-    ③ 色板 schema 实测接受 `colors:{comfy_base,litegraph_base,node_slot}`，键名与内置色板一致。
-    「连接方式」下拉保留原 `hana.api.url` / 直接相对路径两种代理方式，可随时切回。
-  - **服务控制提到工作区顶栏**：服务运行中时顶栏常驻「停止服务 / 重启中继」，与左侧状态面板互为入口（此前工作区内只能启动、不能关闭）。
-  - **设置页可自定义 ComfyUI 安装目录**（`ui/settings.html`，v0 只读骨架重做）：复用原有 `install-targets|install-target` 路由，
-    支持探测/手填/清除；中继侧 `customRoots` 优先于常见路径检查，保存即生效。
-  - **服务自动拉起开关**（默认**关**）：持久化在 `app-data/comfyui-hana/auto-start.json`。Hana 启动且中继就绪后，
-    若本机已装 ComfyUI、8188 上没有服务，则自动拉起一次（中继 `startBackendService` 自身幂等，已运行返回 `already`）。
-    路由 `auto-start`（GET/POST）；服务由计划任务拉起，仍独立于 Hana 存活。
-- ComfyUI 本体更新（v0.8 新增，M11）：
-  - **检查**：`GET /comfyui-hana/update` → 中继 `GET /_relay/update`（`git fetch` + 跟 `origin/<branch>` 比 commit，
-    给出 `behind/ahead` 与本地/远端 tag 描述；结果 60s TTL 缓存，`?force=1` 绕过）。
-  - **执行**：`POST /comfyui-hana/update` `{op:"apply"}` → 中继**后台**跑：停服务 → `git fetch` → `git pull --ff-only`
-    → `pip install -r requirements.txt`。用异步 `spawn`（**绝不 spawnSync 卡事件循环**，pip 可数分钟）；
-    只用 `--ff-only`（不产生 merge commit；本地有未提交改动会明确失败，**不擅自 merge/reset**）；
-    更新前记录旧 commit（与更新后一并写入 `logs/update-state.json`）；更新后**不自动起服务**（交用户决定）。
-  - **进度**：`GET /comfyui-hana/update/status`（阶段 stopping/fetching/pulling/installing/done/failed + 步骤 + 日志尾），
-    设置页「ComfyUI 更新」区块轮询它；工具面 `comfyui(action="update", op="check"|"apply"|"status")`。
-- **画布共驾（v0.9 新增，M12）：只读桥 + 变更感知 + 写入**：让 agent 读/改**人正在看的同一张画布**。
-  - 链路：`comfyui(action="canvas", op=…)` → 路由 `canvas` → 中继 `/_relay/bridge` → ComfyUI
-    `POST /api/hana_bridge/call` → `send_sync` 经自带 `/ws` → 前端扩展读 `window.app.graph` → 同源回传。
-  - 多页面按工作流定向：op `pages` 列在线页面（各自开着哪个工作流）；各 op 带 `workflow` 参数 → 只发给正打开该工作流的页面（找不到明确报错，不误伤别页）。
-  - 默认 op `state`：读**服务端缓存**的最近一次画布快照（零往返，**ComfyUI 页面没开着也能拿到**）。
-    快照由前端在画布变化后主动推（debounce 1.5s）缓在 ComfyUI 侧，带 `ageSec` 时间戳；
-    无快照或过期时改用 `op=summary` 现抓（需页面在线）。
-  - 只读 op：`summary`（现抓结构摘要）/ `get`（全量 UI JSON）/ `prompt`（可提交形态）/ `running`（当前执行节点）/ `progress`（执行进度聚合，只读）/ `probe`（自检）/
-    `revision`（变更序号，只问变没变）/ `events`（变更记录，可按 `since` 增量查，含按节点的 added/removed/changed）。
-  - 变更感知为 1.5s 轮询签名比对（新版 LiteGraph 没有可用的变更事件），签名**不含节点位置**。
-  - 写入 op（均需授权）：`setWidget`（改参数）/ `addNode`（加节点）/ `removeNode`（删节点）/ `connect` / `disconnect`（连线、断线）/ `setNodeMode`（mute / bypass）/ `undo`（撤销 agent 上一步，最多 20 步）。
-    撤销是**逆操作栈**（不是整图快照）：只回退 agent 那一步，不会动人在此期间的改动。
-    **默认关闭**，需在设置页打开「允许 agent 修改画布」才可用；未授权时直接报错。
-    注意：新版前端的撤销栈**不记录**外部直接改图，所以人的 Ctrl+Z 撤不掉 agent 的改动，要用 `op=undo`。
-  - **前置**：`custom_nodes/hana_bridge/`，用 `tools/deploy-bridge.ps1` 装 / 卸 / 查；
-    改 `__init__.py` 需重启 ComfyUI，改 JS 只需刷新页面（静态服务带 `Cache-Control: no-store`）。
-  - 安全：`/call` 校验 `X-Hana-Token`（token 由 Python 侧首启生成、中继读同一文件），无 token → 403。
-  - **排布与命令（2026-09-27 新增）**：`canvas` 增 `organize`（把命令递给前端扩展执行，默认 `node-organizer.organize` 自动排布，`command` 参数可换）/ `commands`（列已注册命令 id）/ `commandShape`（探命令表形状）；
-    工作流“直接进画布”用 `loadWorkflowFile {file}`（读文件 + loadGraphData，自带未保存保护）；`openWorkflow` 管“打开/切换到已保存工作流”的服务层语义，两者别混（见踩坑 §18）。
-    **纪律：排画布走 node-organizer 插件（先 `commands` 摸一下），不手算坐标；不要主动重排（尊重手调布局）。**
-  - **语义层（P1–P4，2026-09-28 生效窗口验收通过）**：读向 `get` 投影（`select` / `fields`，只回命中节点与白名单字段）/ `check` 体检（悬空·输出未接·mute·bypass，互斥口径）/ `trace` 追踪（端口来源 / 去向）/ `outline` 大纲（功能块 + 块间连线）；写向 `patch` 意图级事务（edits + `$w` 引用 + verify + 原子回滚 + dryRun，一次 patch = 一步撤销）。
-  - **定向与健壮性（2026-09-28）**：多页面按工作流名定向（找不到明确报错、不误伤别页）；死条目 TTL 15min（过期条目不再截胡定向，全过期明确报 `no_live_page`；定向命中回包顺带刷新存活时间）。
-  - 记录 `docs/M12-画布共驾-P1记录.md`；方案 `docs/画布共驾方案-20260926.md`、`docs/画布语义层-20260927.md`；全链验收 `docs/验收记录-画布语义层-全链-20260928.md`。
-  - 边界：仅**源码安装**（Git 仓库）可代为更新；便携包/手工解压会明确回报“无法代为更新”。
-- **大工作流提交（M13 新增，2026-09-29）**：文件/template 形态的 submit 改走**中继侧直读直提**（`/_relay/submit-file`）——
-  读文件 → UI→API 转换 → inputs 注入 → `/prompt` 提交全在中继完成，绕开宿主 `sdk.runtime.fetch` 隧道的
-  请求 1 MiB / 响应 4 MiB 硬限；4MiB+ 工作流可直接提交（inline 对象形态走原链路）。共享逻辑 `lib/workflow-tools.mjs`（app/中继同源）；
-  方案 `docs/大工作流提交修复-20260929.md`；测试 `tools/m13-checks/test-submit-file.mjs`（中继级 13/13 + 宿主段 E2E 通过，2026-09-29）。
-- **提交历史系统（v0.13 新增，2026-10-13~14）**：
-  - **主键改画布身份 id**：历史目录键独立于显示名，改名/移动不丢（mint 判据锚定文件系统事实；`history-migrate` 端点 + 存量重排工具）；
-  - **提交历史框**（画布底部）：横轴刻度形态——外框色=谁提交（蓝 user / 紫 agent）、线型=操作（实线 run / 虚线存档）、内条堆=本次碰过的画布分区（各自框色）、宽块=合并提交、金点=HEAD；单击缩略图浮层 / 双击确认回跳 / 悬停气泡；
-  - **提交树**：横向泳道（X=时间、Y=分支）+ 拓扑连线；连线不交叉（泳道 G 算法）、跨泳道固定过渡段 + 直线（两端与直线相切）；紧凑 / 时序两视角切换；
-  - **agent 提交标紫框**：桥内 `historyCommitSource` 标志——Agent 经 `canvas.queue` 提交标 `source=agent`（紫），用户原生点运行仍为 user（蓝）；人机共驾的归属在历史里可辨；
-  - **预览图降分辨率 + 磁盘缓存**（`bridge/thumbs.py` + `/hana_bridge/thumb`）：2.7MB → 39KB、二次命中 5ms；
-  - **首次进入引导**：工作区就绪后自动弹「提交历史框 & 提交树」说明页一次（跟随工作区明暗、带「不再提示」），标记持久化在 app-data（`/comfyui-hana/intro`）；
-  - **启动等待页 UI 重做**：主标记呼吸环 + 计时主角 + 三步轨（中继→服务→前端），连接方式收进「高级」。
-- **提交历史 UI 跟随主题（v0.13.1 补，2026-10-15）**：提交历史框 / 提交树 / 节点内条的**中性色**改为跟随 ComfyUI 明暗（纯 CSS：`:root` = 浅色默认、`:root.dark-theme` = 深色覆盖；ComfyUI 把明暗类名挂在根元素，桥同源即得，无需 JS 判定）。**语义色不变**（谁提交=蓝/紫、HEAD 橙点、功能区框色——这些是事实，不随主题漂）。深色观感零回归（原硬编码值原样搬入深色档）。
-- **语义层完善批（v0.12 新增，2026-10-09）**：
-  - **source=file 文件源通道**：读（`get`/`check`/`outline`/`trace`/`summary`/`diff`）与写（`patch` 事务：全成/零写盘/自动 `.bak`/`dryRun`/`verify`；组操作 `addGroup`/`setGroup`/`removeGroup`；`cloneNodes` 克隆子图）均支持文件路径；
-  - **lib 补强**：`check` 扩容（`MISSING_REQUIRED` + `DOMAIN_DIV16`/`STEPS_RANGE`/`SAVE_NAME`/`DENOISE_RANGE`，rules 可裁剪）、`outline` `detail=nodes` 下钻、`trace` `multi` 多级链、邻接选择器（`#id/down`、`#id/up:N`）、符号行 + `semanticRev`、`diff` 两文件语义图 diff；
-  - **修复**：文件源读/写改走中继（`/_relay/fs/write` 原子写），解决宿主 fs 白名单限制；
-  - **UI**：工作区「重载工作区」按钮自顶栏移至右上角悬浮（ready 态常显横条取消）。
-- 已实测：中继端点 11/11；中继级 E2E（EmptyImage→SaveImage 纯 CPU）9/9 ×3；宿主段工具全动作 17/17；
-  cancel 定向中断 10/10（M3）；静态校验 ok；画布共驾 + 语义层生效窗口验收全过（2026-09-28）
+## 一、运行结构（三段，各有硬约束）
 
-## 开发流程（2026-09-26 起生效）
+| 段 | 是什么 | 不能做什么 |
+|---|---|---|
+| **App 进程**（`index.js`） | 工具面、路由、设置页后端、模型调用执行端 | 宿主 AppHost 子进程**不开 `--allow-net`**，不能监听端口；App 总线白名单只有 `model:list`，`model:stream` 出不去 |
+| **中继 runtime**（`runtime/comfy-relay.mjs`，受管 runtime） | 后端代理、文件与提交、画布桥转发、LLM 网关监听、模板索引 | 拿不到宿主模型凭据，不能直接调模型 |
+| **ComfyUI 桥**（`bridge/`，装到 `custom_nodes/hana_bridge`） | 画布读写、提交历史与提交树、界面注入 | 不能改 ComfyUI 源码与前端打包产物（零改动铁律） |
 
-1. **改 App 前先写方案**：落 `docs/<主题>-<YYYYMMDD>.md`，日期结尾，便于对账。
-2. 方案写清：动机 → 边界 → 架构依据（**实测与推断分开**）→ 分期 → 风险。
-3. 交付时区分「已生效（实测）」与「待重启」；需要重启先告知。
-4. 涉及用户环境（ComfyUI 安装、宿主补丁等）的改动，先取得同意再动，并登记侵入面。
+三段的边界不是偏好，是宿主契约：想监听端口的只能放中继，想调模型的只能放 App。LLM 网关就是这条约束的产物。
 
-## 关键口径
+## 二、工具面（`comfyui`，15 个 action）
 
-- **clientId 配对**：ComfyUI 只把执行事件发给提交方 `client_id` 的 WS 连接；中继订阅与提交共用
-  同一个「每次启动随机」的 clientId（`comfyui-hana-relay-<hex>`）——不要复用固定 id（旧连接关闭时 Host 侧按 sid 清理，会误删新连接）。
-- **产物定位**：ComfyUI 安装根的 `output/...`（安装根由中继环境探测自动识别，不硬编码；`/_relay/fs/stat` 校验存在）；预览 URL 走代理 `view?`。
-- submit 不支持「UI 格式 → API」的完整转换：子图/环绕/静音/旁路节点会明确报错，改用「导出（API 格式）」。
-- 投递诊断：`ctx.tasks.getDelivery`（`query` 已暴露）；宿主被卡记录在 `%HANA_HOME%\.ephemeral\deferred-tasks.json`。
+`status` · `submit` · `query` · `result` · `cancel` · `workflows` · `upload` · `service` · `update` · `canvas` · `window` · `llmGateway` · `validate` · `templates` · `deps`
 
-## 本地开发
+常用子操作：
+
+- `service` → `op=status|start|stop|envcheck|clear|wait`
+- `update` → `op=check|apply|status`
+- `window` → `op=open|close|status`（宿主原生窗装载工作区）
+- `llmGateway` → `op=start|stop|status`
+- `templates` → `op=list|fetch`
+- `canvas` → 读向 `state|summary|get|prompt|check|trace|outline|diff|running|progress|revision|events|pages|commands|commandShape`；写向 `patch|setWidget|addNode|removeNode|connect|disconnect|setNodeMode|undo`；执行与共驾 `queue|duplicate|visual|copilot|organize|loadWorkflowFile|openWorkflow|historyDiff`
+
+能力声明（manifest，9 项）：`app/runtime.execute`、`app/runtime.local-machine`、`app/runtime.network`、`app/resources.read`、`app/models.infer`、`app/tools.expose-to-model`、`app/tasks.manage`、`app/session.start-turn`、`app/windows.manage`。
+
+## 三、工作流转换（`lib/workflow-tools.mjs`，app 与中继同源）
+
+UI 工作流 → API 提交形态的转换器，是这套东西最容易"转换成功但产物错"的地方，因此**宁可拒绝也不猜**。
+
+- **子图展开**（`expandSubgraphs`）：实例 id `s<实例id>:<内部id>`，link `s<实例id>L<原id>`，接口槽走 `-10/-20` 直连。实例槽与定义输入的**按名字对位**（下标对位会在多形态样本上静默错参数，已废弃）。输入槽扇出（一个槽喂多个内部消费端）支持；**嵌套子图不支持**。
+- **静音 / 旁路按 ComfyUI 语义**：mute 断链、bypass 走「同名 → 唯一同类型 → 歧义拒绝」穿透。
+- **pull 规则引擎**：Set/Get 按名字配对成虚拟节点；配对 Set 静音/旁路视为无值；`keyPath` 支持数组回退；同名多候选整份拒绝。
+- **取值按声明序**（`declaredWidgetSlots`）：节点只有部分参数带输入槽时，按声明序而不是槽序取值——按槽序会把参数写进错误槽且不报错（历史 bug，错位 902 处已清零）。
+- **`widgets_values`**：数量与对位表相等时按位置对位；**0 项**时回退子图默认值并给 warning；数量不符仍拒绝。
+- **适配档案**（`lib/node-adapters/`，18 份）：rgthree 系 12 份纯前端 `virtual:true`，Reroute 走 passthrough（输入槽 `*` 通配穿透）。档案语言可表达 `virtual` / `passthrough` / `bypass` / `slots` / `pull`；`PrimitiveNode` 这类"把常量写进下游 widget"的语义**现有语言表达不了**，少数模板因此如实拒绝。
+- **拒绝归因**：按类别汇总并给建议（`value_mismatch` 单独成类），`tools/scan-reject-reasons.mjs` 可批量扫描；`opts.problemsOut` 取结构化结果。
+- **量化基线**：668 份官方模板，可转换 **568（85%）**；改前 460（69%）。全量回归要求「原本能成功的不得新增失败」。
+
+## 四、提交前校验 / 模板库 / 缺包诊断（v0.24 新增）
+
+- **`validate`**：中继 `/_relay/validate` → 裁剪后的 `/object_info`（原始 4.33 MB → 0.97 MB，schema v2 带 `output_node`；24h TTL，`custom_nodes` 目录 mtime 判失效）。返回结构化 issue，正文带**错误码**、节点 id、字段名与合法可选项，首行按 code 分组。只报警不阻提交；`no_output`（有节点无输出节点）判 error。
+- **`templates`**：索引来自上游 GitHub raw（24h 缓存，`refresh=true` 是**后台刷新不阻塞**，本次仍返回当前缓存）；`fetch` 落到 `<ComfyUI>/user/default/hui-templates/<分类>/`，**不在工作流目录内**，不替你下模型。上游索引把视频模板的 `mediaType` 标成 `image`，按视频过滤会得 0 条，用关键词搜。
+- **`deps`**：类名 → 候选插件包，三态（没装 / 装了没加载 / 查不到来源）；同名多候选会标「另有已装候选」。
+
+## 五、画布共驾与执行
+
+- 链路：`comfyui(action="canvas")` → 路由 `canvas` → 中继 `/_relay/bridge` → ComfyUI `POST /api/hana_bridge/call` → `send_sync` 经 `/ws` → 前端扩展 → 同源回传。`/call` 校验 `X-Hana-Token`，无 token 403。
+- 多页面按工作流名定向，死条目 TTL 15min，全过期明确报 `no_live_page`。
+- 写向默认关闭，需设置页打开「允许 agent 修改画布」；撤销是**逆操作栈**（只回退 agent 那一步，不动人的改动）。新版前端撤销栈不记录外部改图，人按 Ctrl+Z 撤不掉 agent 的改动。
+- **执行纪律（v0.20 定稿，两分支）**：
+  - 副驾驶**开** → 在当前画布就地执行；执行前把当前画布落盘（未保存的画布先另存 `(AgentSaved)`，再**在该文件上重开驾驶位**，否则桥报 `copilot_off`）。
+  - 副驾驶**关** → 复制副本执行（副本开副驾驶），原画布零改动。
+  - 判定读 `canvas.pages` 的活动页账本（`state` 缓存降级，桥 `copilot_off` 为最终权威）；总闸「允许 Agent 开启画布副驾驶」**只约束副本路径**。
+  - 落点断言按分支：副本比页名，同页比「页面身份未变 + 内容已装载」。回执带 `canvasPath` / `preSave` / `copilotSource` / `landingCheck` / `pageIdentityCheck`。
+
+## 六、服务、更新与 LLM 网关
+
+- **服务起停（双闸）**：启动窗口内（150s）停止请求返回 `starting-grace`（用户点按钮可强制穿过）；只终止**确认属于 ComfyUI** 的进程，否则 `foreign-listener` 拒绝；停止内部的探测**静默**，不翻转全局状态（旧行为曾让人误判"中继杀了后端"）；日志带 `src` 与 `force`。启动走计划任务 `HanaComfyUI-Backend`，独立于 Hana 存活。
+- **本体更新**：`git fetch` + `git pull --ff-only` + `pip install`，只用 ff-only，本地有改动明确失败，不擅自 merge/reset。
+- **更新检查的脏判定**：`git status` 分三类——运行时目录变动算 `noise`、未跟踪文件算 `untracked`（不阻塞 ff 拉取）、只有真改源码算 `dirty`。星标只看「落后远端」，dirty 只影响提示语。解析 `git status` 用正则容忍前导空格（`runExe` 会 trim 掉首行空格，固定偏移切路径会错位）。
+- **LLM 网关**：中继在 `127.0.0.1:8790` 开 OpenAI 兼容端点（`/v1/models`、`/v1/chat/completions`，支持流式），Bearer token 鉴权；App `llmGateway` worker 经 `sdk.runtime.fetch` 长轮询取 job，用 `ctx.models.stream` 执行并回填增量。模型调用必须挂**持久 task 身份**，否则 stop/start 后报 `App invocation expired`。`hana/default`、`hana/vision` 是别名，跟设置页选择走；设置页可多选模型并同步进 ComfyUI-Prompt-Assistant 的服务配置。
+
+## 七、桥与提交历史
+
+- **提交历史**：主键是画布身份 id（改名/移动不丢）；横轴刻度形态（外框色=谁提交、线型=操作、内条堆=碰过的分区、宽块=合并、金点=HEAD）；**提交树**为横向泳道 + 拓扑连线（不交叉、跨泳道固定过渡段）；预览图降分辨率 + 磁盘缓存（`bridge/thumbs.py`）。
+- **构建标识三处同源**：js 文件名（`ddHHmmss`）＝ js `BUILD_TAG` ＝ py `BRIDGE_BUILD_TAG`。改动桥 JS 必须换名（浏览器对同一 URL 顽固缓存），用 `tools/bridge-reload.ps1` 或手动改名 + `tools/deploy-bridge.ps1`。
+- **主题跟随（v0.25.4 修）**：ComfyUI 前端 1.58.5 起**不再给 `<html>` 加 `dark-theme` 类**，改为往 `documentElement.style` 写内联 `color-scheme`。桥的深色覆盖用共享选择器 `HANA_DARK_SEL`（`dark-theme` / `scheme-dark` / `data-hana-dark` 三路），并由 `hanaSyncDarkFlag()` 读计算出的 `color-scheme` 自行打标记，MutationObserver + matchMedia + 设置订阅驱动。**中性色跟主题，语义色不跟**（谁提交=蓝/紫、HEAD 金点、分区框色是事实）。
+- 部署：`tools/deploy-bridge.ps1`（清 js\ 重建、只放活动文件，防双载）；改 `__init__.py` 需重启 ComfyUI，改 JS 只需刷新页面。
+
+## 八、关键口径
+
+- **clientId 配对**：ComfyUI 只把执行事件发给提交方 `client_id` 的 WS 连接；中继订阅与提交共用「每次启动随机」的 clientId（`comfyui-hana-relay-<hex>`），不要复用固定 id。
+- **产物定位**：ComfyUI 安装根的 `output/...`（安装根由中继环境探测识别，不硬编码）；预览走代理 `view?`。
+- **转换边界**（替代旧版"子图/静音/旁路一律报错"的说法）：子图、扇出、静音、旁路、Reroute 已支持；**不支持**嵌套子图、子图内跨层 Set/Get、`PrimitiveNode` 少数形态、未安装插件的未知节点类型（后者给候选包）。
+- **投递诊断**：`ctx.tasks.getDelivery`（`query` 已暴露）；宿主被卡记录在 `%HANA_HOME%\.ephemeral\deferred-tasks.json`。
+- **零改动铁律**：不碰 ComfyUI 源码与前端打包产物；一切经 `custom_nodes` 桥与 App 机制。
+
+## 九、本地开发与验证
 
 ```powershell
-# 静态校验（先 staging 到目录名=id；脚本在项目根 tools/ 下）
+# 静态校验（先 staging 到目录名 = id；脚本在项目根 tools\ 下）
 pwsh -NoProfile -File ..\tools\validate-app.ps1
 
-# 测试（按需；脚本在项目根 tools/ 下）
-node .\runtime\comfy-relay.mjs --probe-env          # 安装探测（应输出本机 ComfyUI 安装 JSON）
-node ..\tools\m2-checks\test-relay-v02.mjs          # 中继新端点
-node ..\tools\m2-checks\test-e2e-relay.mjs          # 中继级 E2E（前置：8188 队列为空）
-node ..\tools\m2-checks\host-stage.mjs              # 宿主段工具全动作
-node ..\tools\m3-checks\test-cancel.mjs             # cancel 定向取消
+# 单测（app\lib 全部内核，当前 289 项）
+node --test lib/*.test.mjs
+
+# 转换器专项
+node ..\tools\scan-reject-reasons.mjs          # 批量拒绝归因
+node ..\tools\m13-checks\test-submit-file.mjs   # 大工作流中继级提交
+
+# 桥：语法（必须 .mjs 口径，它是 ESM）、部署、重载
+node ..\tools\check-bridge-syntax.mjs
+pwsh -NoProfile -File ..\tools\deploy-bridge.ps1
+pwsh -NoProfile -File ..\tools\bridge-reload.ps1 -NoRestart
 
 # 同步到宿主副本（-DryRun 预览）
 pwsh -NoProfile -File ..\tools\sync-to-host.ps1 -DryRun
 ```
 
-## 纪律
+**语法校验必须用 `.mjs` 口径**：桥 JS 由 `<script type="module">` 加载，`node --check xxx.js` 会按 CJS 解析，能过不代表浏览器能加载（历史上因此把整个扩展搞挂过一次）。
+
+## 十、纪律
 
 - 不在用户队列非空时提交测试任务；测试工作流一律极小（纯 CPU）。
-- 宿主安装/重启由主脑统一安排；App 级 reload 可自行执行（本仓流程）。
-- 改 `manifest.json` 后走 `reload` 即可让宿主认到新版本（实测：reload 响应 `record.version` 会更新）；**无需**重装。
-  但若 `apps/comfyui-hana` 目录被占用，`install+confirm` 重装会报 `EPERM`（详见 `docs/踩坑记录.md`）。
-- 项目全景与待办见 `..\README.md` 与 `..\docs\待办与验收清单.md`。
+- 宿主安装/重启由主脑统一安排；App 级 reload 可自行执行。改 `manifest.json` 后 reload 即可认到新版本，无需重装；`apps/comfyui-hana` 目录被占用时 `install+confirm` 会报 `EPERM`。
+- 改 App 前先写方案到 `docs/<主题>-<YYYYMMDD>.md`；交付区分「已生效（实测）」与「待重启」；涉及用户环境的改动先取得同意并登记侵入面。
+
+## 十一、版本线（摘要）
+
+| 版本 | 要点 |
+|---|---|
+| v0.9–v0.13 | 画布共驾与语义层、大工作流中继直提、提交历史与提交树 |
+| v0.18 | pull 规则引擎（Set/Get 配对）+ 适配档案 |
+| v0.19 | 子图展开、静音/旁路语义化、拒绝归因 |
+| v0.20 | 画布执行两分支（副驾驶同页 / 副本） |
+| v0.21–v0.23 | LLM 网关（节点 API 指向 Hana）+ 设置页模型多选 |
+| v0.24 | 提交前校验、官方模板库、缺包诊断 |
+| v0.25.0 | 子图扇出、`widgets_values` 零值、声明序取值、Reroute 通配、停服务双闸 |
+| v0.25.3–.4 | 更新检查脏判定、桥界面主题跟随 |
