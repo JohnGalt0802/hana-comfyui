@@ -6,6 +6,8 @@
 // 业务面（/_relay/*，只读为主；管理端点需 x-comfy-relay-key）：
 //   GET  /_relay/status            聚合状态（后端可达性、队列、请求计数、事件订阅、日志文件；
 //                                  后端不可达时附 env：本机 ComfyUI 安装探测）
+//   GET  /_relay/backend/stuck     8188 占用诊断（free / live / stuck / foreign + 建议动作；只读，不需 controlKey）
+//   POST /_relay/backend/kill-stuck 清理僵死进程（{port?, dryRun?, source?}；需 controlKey；非 ComfyUI 的监听者不杀）
 //   GET  /_relay/prompts           进度事件缓存（订阅后端 /ws 得来）：active + recent
 //   GET  /_relay/prompts/<id>      单个 prompt 的事件记录
 //   GET  /_relay/history?id=&max=  历史摘要（裁剪版：status/error/outputs，避免全量历史体积）
@@ -1425,6 +1427,35 @@ function resolveLaunchTarget(overridePath) {
 async function startBackendService(overridePath) {
   const baseUrl = `http://${backend.host}:${backend.port}`;
   if (backend.reachable) return { ok: true, already: true, reachable: true, state: "ready", url: baseUrl };
+  // 启动前自愈（2026-11-26）：端口被占但 /system_stats 不通 = 典型僵死进程（崩溃后不退出、仍 LISTENING）。
+  //   不清掉的话计划任务起来也绑不上端口，只会干等 90s。
+  //   ① 必须排在下面 dedup 之前：僵死进程往往让计划任务继续显示 Running，去重会把这次启动直接挡回去；
+  //   ② 启动窗口内（startWindowOpen）不动手：那可能是我们自己刚拉起、还没开始监听（或正在重启）的进程；
+  //   ③ 只清 verified / unverifiable 的监听者，foreign 一律拒绝启动并给出可操作错误。
+  if (!startWindowOpen()) {
+    const occupied = listeningPids({ force: true });
+    if (occupied.length) {
+      const preProbe = await probeBackendSilent();
+      if (!preProbe.reachable) {
+        const heal = await killStuckBackend({ source: "start-autoclean" });
+        if (heal.killed.length) {
+          log(`启动前清理僵死进程 pid=${heal.killed.map((k) => k.pid).join(",")}（端口 ${backend.port} 占用但不可达：${preProbe.detail}）`);
+        } else if (heal.verdict === "foreign-only" || !heal.ok) {
+          const detail = heal.skipped.length
+            ? heal.skipped.map((s) => `pid ${s.pid}${s.name ? ` ${s.name}` : ""}：${s.reason}`).join("；")
+            : heal.note;
+          backendProc.lastError = heal.verdict === "foreign-only"
+            ? `${backend.port} 被非 ComfyUI 进程占用（${detail}），请先处理该进程再启动`
+            : `启动前清理僵死进程失败：${heal.note}`;
+          backendProc.starting = false;
+          backendProc.lastStartResult = { at: new Date().toISOString(), ok: false, error: backendProc.lastError };
+          saveBackendState();
+          logErr(`启动 ComfyUI 服务被拒：${backendProc.lastError}`);
+          return { ok: false, verdict: heal.verdict, error: backendProc.lastError, note: heal.note, skipped: heal.skipped, url: baseUrl };
+        }
+      }
+    }
+  }
   // 去重（三路 start 都走本入口）：in-flight → state 文件标记 → 计划任务 Running 兜底
   const dedup = detectStarting();
   if (dedup.starting) {
@@ -1759,6 +1790,143 @@ async function stopBackendService(opts = {}) {
     unverified,
     ...(errorText ? { error: errorText } : {}),
   };
+}
+
+// ── 8188「僵死进程」诊断与清理（2026-11-26）────────────────────────────────
+// 真实故障：ComfyUI 崩在 access violation → 进程不退出、8188 仍 LISTENING，但 /system_stats
+//   直接 connect 失败；此时再点「启动服务」只会因端口绑不上而干等 90s（计划任务起了、python 报占用）。
+// 口径：这里只回答「谁在占端口、它是不是 ComfyUI、此刻 HTTP 通不通」；能不能杀由归属校验
+//   （verifyListenerOwnership，与停止闸二同一口径）决定，mismatched 一律不碰。
+const STUCK_CACHE_MS = 5_000;                       // 与 listeningPids 的 5s 同频：/status 轮询不额外多跑一套探测
+const stuckDiag = { at: 0, port: null, data: null }; // 最近一次诊断快照（/status 直接复用，force 时重算）
+
+// 端口占用诊断（响应契约见文件头 /_relay/backend/stuck）。opts：
+//   force    —— 不吃 5s 缓存（诊断端点与清理前都用 true：要的就是「此刻」）
+//   reachable—— 调用方已有的可达结论（/status 用：同一轮刚 probeBackend 过，别再打一次 /system_stats）
+async function diagnoseStuckPort(opts = {}) {
+  const port = backend.port;
+  const force = opts.force === true;
+  if (!force && stuckDiag.data && stuckDiag.port === port && Date.now() - stuckDiag.at < STUCK_CACHE_MS) {
+    return stuckDiag.data;
+  }
+  const pids = listeningPids({ force }); // 5s 缓存口径与停止服务一致；force 供清理后复查
+  const occupied = pids.length > 0;
+  const entries = [];
+  let responsive = false;
+  if (occupied) {
+    if (typeof opts.reachable === "boolean") {
+      responsive = opts.reachable;
+    } else {
+      const probe = await probeBackendSilent(); // 静默：不翻转全局 backend.reachable
+      responsive = probe.reachable;
+    }
+    const infos = queryProcessInfo(pids);
+    for (const pid of pids) {
+      const info = infos.get(pid);
+      const own = verifyListenerOwnership(info, port);
+      const raw = info && info.cmdline ? String(info.cmdline).replace(/\s+/g, " ").trim() : "";
+      entries.push({
+        pid,
+        name: (info && info.name) || null,
+        verdict: own.verdict,
+        reason: own.reason || null,
+        cmdlineBrief: raw ? (raw.length > 160 ? `${raw.slice(0, 160)}…` : raw) : "（命令行不可读）",
+      });
+    }
+  }
+  // 判定：无监听=free / 可达=live / 不可达且有自证或读不到命令行的 pid=stuck / 全 mismatched=foreign
+  const verdict = !occupied
+    ? "free"
+    : (responsive ? "live" : (entries.some((e) => e.verdict !== "mismatched") ? "stuck" : "foreign"));
+  const recommendation = verdict === "free" ? "start" : verdict === "live" ? "stop" : verdict === "stuck" ? "kill-stuck" : "none";
+  const data = { ok: true, port, occupied, responsive, verdict, pids: entries, recommendation, checkedAt: new Date().toISOString() };
+  stuckDiag.at = Date.now();
+  stuckDiag.port = port;
+  stuckDiag.data = data;
+  return data;
+}
+
+// 清理僵死进程（响应契约见文件头 /_relay/backend/kill-stuck）。opts：dryRun / source。
+// 顺序即判定优先级：live 拒杀 → free 不用杀 → 全 mismatched 是别人家的 → dryRun 只诊断 → 真杀 → 复查。
+async function killStuckBackend(opts = {}) {
+  const port = backend.port;
+  const dryRun = opts.dryRun === true;
+  const source = typeof opts.source === "string" && opts.source.trim() ? opts.source.trim().slice(0, 64) : "unknown";
+  const before = await diagnoseStuckPort({ force: true }); // 清理必须拿最新结论，不吃 5s 缓存
+  const pids = before.pids.map((p) => p.pid);
+  const killed = [];
+  const skipped = [];
+  const out = {
+    ok: false,
+    port,
+    dryRun,
+    source,
+    before: { occupied: before.occupied, responsive: before.responsive, verdict: before.verdict },
+    killed,
+    skipped,
+    after: { occupied: before.occupied, responsive: before.responsive },
+    verdict: "nothing-to-kill",
+    note: "",
+  };
+  const line = () => `僵死进程清理：src=${source} dryRun=${dryRun} pids=${JSON.stringify(pids)} killed=${JSON.stringify(killed.map((k) => k.pid))} skipped=${JSON.stringify(skipped.map((s) => s.pid))} 后：occupied=${out.after.occupied} responsive=${out.after.responsive}`;
+
+  // 1) 后端还活着 → 不是僵死，交给「停止服务」（它有两道闸：启动宽限 + 归属校验）
+  if (before.verdict === "live") {
+    out.verdict = "refused-live";
+    out.note = `后端在端口 ${port} 上仍可达，拒绝清理；如需停止请改用停止服务（POST /_relay/backend/stop）`;
+    log(line());
+    return out;
+  }
+  // 2) 没人监听 → 本来就没事
+  if (!before.occupied) {
+    out.ok = true;
+    out.verdict = "not-needed";
+    out.note = `端口 ${port} 上没有监听进程，无需清理`;
+    log(line());
+    return out;
+  }
+  // 3) 归属分拣：mismatched 是别人的进程，记进 skipped，不进 kill 队列
+  const targets = [];
+  for (const p of before.pids) {
+    if (p.verdict === "mismatched") skipped.push({ pid: p.pid, name: p.name, reason: p.reason || "端口监听者不像 ComfyUI" });
+    else targets.push(p);
+  }
+  if (!targets.length) {
+    out.verdict = "foreign-only";
+    out.note = `端口 ${port} 被非 ComfyUI 进程占用（${skipped.map((s) => `pid=${s.pid} ${s.name || "?"}：${s.reason}`).join("；")}），未终止任何进程`;
+    log(line());
+    return out;
+  }
+  // 4) dryRun：只诊断不杀
+  if (dryRun) {
+    out.ok = true;
+    out.note = `dryRun：未执行杀进程；将终止 ${targets.map((t) => `pid=${t.pid}(${t.verdict})`).join("、")}`;
+    log(line());
+    return out;
+  }
+  // 5) 真杀（taskkill /T /F，与停止服务同一手段）
+  for (const t of targets) {
+    const k = killPidTree(t.pid);
+    if (k.code === 0) killed.push({ pid: t.pid, name: t.name || null });
+    else skipped.push({ pid: t.pid, name: t.name || null, reason: `taskkill 失败：${k.text || `exit ${k.code}`}` });
+  }
+  // 复查：force 重查监听（缓存里是杀之前的结论，没意义）+ 静默探测
+  const remain = listeningPids({ force: true });
+  const probe = await probeBackendSilent();
+  out.after = { occupied: remain.length > 0, responsive: probe.reachable };
+  if (remain.length) {
+    out.verdict = killed.length ? "killed" : "nothing-to-kill";
+    out.note = `清理后端口 ${port} 仍有监听：剩余 pid=${remain.join(",")}（${probe.detail}）；已终止 ${killed.length ? killed.map((k) => `pid=${k.pid}`).join("、") : "无"}`;
+    logErr(line());
+    return out;
+  }
+  out.ok = killed.length > 0;
+  out.verdict = killed.length ? "killed" : "nothing-to-kill";
+  out.note = killed.length
+    ? `已终止僵死进程 ${killed.map((k) => `pid=${k.pid}`).join("、")}；端口 ${port} 已释放（探测：${probe.detail}）`
+    : `归属校验通过但未终止任何进程：${skipped.map((s) => `pid=${s.pid} ${s.reason}`).join("；")}`;
+  if (out.ok) log(line()); else logErr(line());
+  return out;
 }
 
 // ── 拉起服务·T1 中继层（环境检查 / 快照清理 / 去重 / 等待就绪）───────────────────
@@ -3436,7 +3604,7 @@ function promptsPayload() {
   };
 }
 
-function statusPayload() {
+function statusPayload(stuck = null) {
   return {
     ok: true,
     relay: {
@@ -3461,6 +3629,9 @@ function statusPayload() {
       probeTimeoutMs: PROBE_TIMEOUT_MS,
       probeSlowStreak: backend.probeSlowStreak,
       probeRecentMs: backend.probeRecentMs.slice(),
+      // 端口占用诊断（additive，2026-11-26）：与 GET /_relay/backend/stuck 同一份结构，
+      // 由状态组装处传入（5s 缓存、与 listeningPids 同频），这里不额外开探测。
+      stuck,
     },
     queue: queueInfo,
     events: {
@@ -5015,7 +5186,9 @@ const server = http.createServer((req, res) => {
       const force = /[?&]probe=1(&|$)/.test(String(req.url || ""));
       if (force || Date.now() - backend.checkedAt > PROBE_INTERVAL_MS) await probeBackend();
       if (backend.reachable) await probeQueue();
-      jsonOut(res, 200, statusPayload(), req.method);
+      // 僵死诊断复用同一轮的可达结论（reachable 传入 → 不重复打 /system_stats），5s 缓存与 listeningPids 同频
+      const stuck = await diagnoseStuckPort({ reachable: backend.reachable });
+      jsonOut(res, 200, statusPayload(stuck), req.method);
     })();
     return;
   }
@@ -5389,6 +5562,67 @@ const server = http.createServer((req, res) => {
       return;
     }
     jsonOut(res, 200, { ok: true, reachable: backend.reachable, proc: backendProcPayload() }, req.method);
+    return;
+  }
+  // 8188 僵死进程诊断（只读，与 /_relay/status 同口径，不需 controlKey）
+  // port 口径与 POST /_relay/backend/kill-stuck 对齐：诊断只对 backend.port 成立，
+  //   传别的端口不能静默当 8188 用（会让调用方误以为查的是 8198），直接 400 说明。
+  if (pathOnly === "/_relay/backend/stuck") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    const uqStuck = new URL(String(req.url || "/"), "http://relay.invalid");
+    const portQ = (uqStuck.searchParams.get("port") || "").trim();
+    if (portQ !== "" && Number(portQ) !== backend.port) {
+      jsonOut(res, 400, {
+        ok: false, port: backend.port,
+        error: `只支持中继当前后端端口 ${backend.port}（收到：${portQ}）`,
+      }, req.method);
+      return;
+    }
+    void (async () => {
+      try {
+        jsonOut(res, 200, await diagnoseStuckPort({ force: true }), req.method);
+      } catch (e) {
+        jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) }, req.method);
+      }
+    })();
+    return;
+  }
+  // 清理僵死进程（POST，需 controlKey）：业务结论一律 200，成败由 ok / verdict 表达
+  //   （refused-live、foreign-only、not-needed 都不是传输错误，调用方要读 note）
+  if (pathOnly === "/_relay/backend/kill-stuck") {
+    if (req.method !== "POST") {
+      jsonOut(res, 405, { error: "method not allowed" }, req.method);
+      return;
+    }
+    if (!controlOk(req)) {
+      jsonOut(res, 403, { error: "comfy-relay: control key required" });
+      return;
+    }
+    void (async () => {
+      try {
+        const body = await readBodyJson(req).catch(() => ({}));
+        const portRaw = body && body.port !== undefined && body.port !== null ? Number(body.port) : null;
+        if (portRaw !== null && portRaw !== backend.port) {
+          // listeningPids 只按 backend.port 枚举，别的端口给不了可信结论 —— 直说，不猜
+          jsonOut(res, 400, {
+            ok: false, port: backend.port, dryRun: body.dryRun === true,
+            source: typeof body.source === "string" ? body.source : "unknown",
+            error: `只支持中继当前后端端口 ${backend.port}（收到：${body.port}）`,
+          }, req.method);
+          return;
+        }
+        const out = await killStuckBackend({
+          dryRun: body && body.dryRun === true,
+          source: body && typeof body.source === "string" ? body.source : undefined,
+        });
+        jsonOut(res, 200, out, req.method);
+      } catch (e) {
+        jsonOut(res, 500, { ok: false, error: String((e && e.message) || e) });
+      }
+    })();
     return;
   }
   // 拉起服务·T1：环境检查 / 等待就绪 / 快照清理（均需 controlKey）

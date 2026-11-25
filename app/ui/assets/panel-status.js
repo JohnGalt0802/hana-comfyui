@@ -275,7 +275,10 @@ function render(st) {
       svcFail("启动失败：" + (lr.error || "服务端报告启动未成功"));
     }
   }
-  if (reachable) { svcNoteMsg = ""; svcNoteRelay = false; hideSvcRetry(); }
+  if (reachable) {
+    hideSvcRetry();
+    if (Date.now() > svcNoteHoldUntil) { svcNoteMsg = ""; svcNoteRelay = false; } // 保护期内保留 kill 回执
+  }
   else if (!relayDown && svcNoteRelay) { svcNoteMsg = ""; svcNoteRelay = false; hideSvcRetry(); } // 中继已恢复：撤下「待中继恢复确认」
   if (!svcBusy) {
     if (relayDown) {
@@ -335,7 +338,7 @@ function render(st) {
   } else if (waiting) {
     // 等待就绪中：秒表由 renderSvcWaitNote 维护（写 #p-wait），此处不覆盖
   } else if (svcNoteMsg) {
-    setNote(svcNoteMsg);
+    setNote(withStuckHint(svcNoteMsg));
   } else if (relayDown) {
     setNote("中继不可达，可点「重启中继」尝试恢复。"); // 三态① 的常驻提示（2026-10-08）
     showSvcRetry();
@@ -352,6 +355,7 @@ function render(st) {
   syncSvcWaitTimer(waitingNow);
   if (waitingNow) renderSvcWaitNote();
   else setWait("");
+  renderStuckBtn(); // 僵死进程按钮的显示条件（verdict===stuck 且中继在线）每帧按最新快照重算
   applySignal();
 }
 
@@ -367,7 +371,11 @@ async function poll() {
     }
     lastStatusOkAt = Date.now(); // 自愈判定用：最近一次成功取数时刻
     render(st);
+    void stuckTick(); // 僵死判定跟在既有 2s 轮询里（结果缓存 5s，不新开定时器）
   } catch (e) {
+    // 状态都读不到 = 中继多半也不可达：僵死判定作废、按钮不显示（请求送不到）
+    stuckInfo = null;
+    renderStuckBtn();
     if (!svcStarting) setNote("状态读取失败：" + String((e && e.message) || e)); // 等待态由秒表维护，不覆盖
   }
 }
@@ -505,6 +513,16 @@ let svcNoteRelay = false; // 该粘性提示是「中继不可达」收尾文案
 let svcWaitFailStart = 0; // 已对哪个起点报过超时/失败（防服务端仍在途时反复重报）
 const SVC_START_TIMEOUT_MS = 120_000;
 const SVC_START_NOTE = "已请求启动 ComfyUI 服务，等待就绪（首次约 30～90 秒）…";
+// 僵死进程（2026-11-26）的模块态：声明提前到此，与其它服务态同处——render/svcFail 要在
+// 执行到下面「僵死进程」函数区之前就能读它们（避免 TDZ）。细节说明见那一区。
+const STUCK_TTL_MS = 5000;
+const STUCK_HINT = "可点下方「终止僵死进程」强制清理后再启动。";
+let stuckInfo = null;   // 最近一次判定 {verdict,pids,recommendation,…}；null = 未知/中继不可达
+let stuckFetchedAt = 0; // 上次取数时刻（缓存 5s）
+let stuckBusy = false;  // 请求瞬态（防双击）
+let stuckArmed = false; // 二次确认由按钮自身承载（沙箱 iframe 下 window.confirm 会被静默拦掉）
+let stuckArmTimer = null;
+let svcNoteHoldUntil = 0; // 粘性提示保护期（kill 回执不被「reachable 清空」立刻冲掉）
 
 // 启动等待起点（两侧共享契约，与 workspace.js 逐字一致，2026-10-14）：
 // 服务端权威优先（proc.startedAt，跨页一致、中继重启可恢复），本地起点仅作「点击瞬间到快照刷新之间」的兜底。
@@ -562,13 +580,16 @@ function endSvcStart() {
 
 function svcFail(msg) {
   endSvcStart();
-  svcNoteMsg = msg;
-  setNote(msg);
+  svcNoteMsg = withStuckHint(msg);
+  setNote(svcNoteMsg);
   const btn = $("p-svc");
   btn.disabled = false;
   btn.className = "primary";
   btn.textContent = "启动服务";
   showSvcRetry();
+  // 启动失败常伴随「端口被占却连不上」：立刻补一次僵死判定，下一帧 note 就能指向按钮
+  stuckFetchedAt = 0;
+  void stuckTick();
 }
 
 function svcWaitTick() {
@@ -656,6 +677,138 @@ async function stopService() {
   } finally {
     setNote(msg);
     setSvcBusy(false, "停止服务");
+  }
+}
+
+// ── 僵死进程（2026-11-26）───────────────────────────────────────────────
+// 场景：ComfyUI 原生崩溃（access violation → Fatal Python error: Aborted）后进程不肯退出，
+// 8188 仍被占用但连不上——「启动服务」只能干等 120s 报错。这里给一个明确的出口。
+// 显示条件唯一：中继判定 verdict==="stuck"（占用且连不上）且中继在线（否则请求送不到）；
+// live / free / foreign 一律不显示。判据来自 GET /comfyui-hana/backend/stuck（转中继
+// /_relay/backend/stuck）；取数挂在既有 2s 轮询 poll 里、结果缓存 5s（不新开定时器）。
+// 模块态（STUCK_* / stuck* / svcNoteHoldUntil）声明在「服务起停」状态区。
+
+function stuckVerdict() {
+  return stuckInfo && typeof stuckInfo.verdict === "string" ? stuckInfo.verdict : "";
+}
+
+// 启动失败类文案的尾巴：只在 verdict=stuck 时才追加指路（其余态不吓人）
+function withStuckHint(msg) {
+  const m = msg ? String(msg) : "";
+  if (!m || stuckVerdict() !== "stuck") return m;
+  if (!/^启动(失败|超时)/.test(m)) return m;
+  if (m.indexOf("终止僵死进程") >= 0) return m;
+  return `${m}\n${STUCK_HINT}`;
+}
+
+// 按钮元素：panel.html 不在本单可改范围，故由脚本建元素、挂在 #p-svc 同一行（.btn-row）
+function killBtn() {
+  let el = $("p-kill-stuck");
+  if (el) return el;
+  el = document.createElement("button");
+  el.id = "p-kill-stuck";
+  el.type = "button";
+  el.className = "danger";
+  el.textContent = "终止僵死进程";
+  el.title = "8188 被占用但连不上（崩溃后僵死的 ComfyUI 进程）：强制结束它";
+  el.hidden = true;
+  el.addEventListener("click", () => { void killStuck(); });
+  const svcBtn = $("p-svc");
+  if (svcBtn && svcBtn.parentNode) svcBtn.parentNode.appendChild(el);
+  return el;
+}
+
+function renderStuckBtn() {
+  const btn = killBtn();
+  const st = lastStatus || {};
+  const relayDown = st.relayError != null;
+  // busy 期间强制保留（回执还在路上，别让按钮先消失）；其余只看 verdict
+  const show = stuckBusy || (!relayDown && stuckVerdict() === "stuck");
+  btn.hidden = !show;
+  if (!show) {
+    if (stuckArmed) {
+      stuckArmed = false;
+      if (stuckArmTimer) { clearTimeout(stuckArmTimer); stuckArmTimer = null; }
+    }
+    btn.disabled = false;
+    btn.textContent = "终止僵死进程";
+    return;
+  }
+  if (stuckBusy) { btn.disabled = true; btn.textContent = "终止中…"; return; }
+  btn.disabled = false;
+  btn.textContent = stuckArmed ? "再点一次确认终止" : "终止僵死进程";
+  const pids = (stuckInfo && Array.isArray(stuckInfo.pids) ? stuckInfo.pids : [])
+    .map((p) => (p && p.pid)).filter((n) => Number.isInteger(n));
+  btn.title = `8188 被占用但连不上（僵死进程${pids.length ? " pid " + pids.join(", ") : ""}）：强制结束它，未保存的画布内容会丢`;
+}
+
+async function stuckTick() {
+  if (Date.now() - stuckFetchedAt < STUCK_TTL_MS) return; // 缓存 5s
+  stuckFetchedAt = Date.now(); // 先占位：同一拍内并发调用只打一枪
+  const st = lastStatus || {};
+  if (st.relayError != null) { stuckInfo = null; renderStuckBtn(); return; } // 中继不可达 → 不显示
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/backend/stuck", { cache: "no-store" });
+    const d = await r.json().catch(() => null);
+    stuckInfo = r.ok && d && d.ok !== false && typeof d.verdict === "string" ? d : null;
+  } catch {
+    stuckInfo = null; // 请求送不到：宁可不出按钮，也不给一个点了必失败的按钮
+  }
+  renderStuckBtn();
+}
+
+async function killStuck() {
+  if (stuckBusy) return;
+  // 二次确认由按钮自身承载（两段式点按，同「更新」按钮口径）
+  if (!stuckArmed) {
+    stuckArmed = true;
+    renderStuckBtn();
+    setNote("会强制结束占用 8188 的 ComfyUI 进程（崩溃僵死的进程不会自行退出），未保存的画布内容会丢。确认请再点一次（5 秒内）。");
+    if (stuckArmTimer) clearTimeout(stuckArmTimer);
+    stuckArmTimer = setTimeout(() => { stuckArmed = false; stuckArmTimer = null; renderStuckBtn(); }, 5000);
+    return;
+  }
+  stuckArmed = false;
+  if (stuckArmTimer) { clearTimeout(stuckArmTimer); stuckArmTimer = null; }
+  stuckBusy = true;
+  renderStuckBtn();
+  let msg = "";
+  try {
+    const r = await hana.api.fetch("/comfyui-hana/backend/kill-stuck", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source: "ui-panel" }),
+    });
+    const j = await r.json().catch(() => null);
+    const killed = j && Array.isArray(j.killed) ? j.killed : [];
+    const skipped = j && Array.isArray(j.skipped) ? j.skipped : [];
+    const pidText = (arr) => arr.map((x) => (x && x.pid != null ? x.pid : "?")).join(", ");
+    const skipText = skipped.length
+      ? `跳过 ${skipped.length} 个（${skipped.map((s) => `pid ${s && s.pid != null ? s.pid : "?"}：${(s && s.reason) || "原因未给出"}`).join("；")}）`
+      : "";
+    if (killed.length) {
+      msg = `已清理 pid ${pidText(killed)}，可点「启动服务」重新拉起。`;
+      if (skipText) msg += `；${skipText}`;
+      if (j.after && j.after.occupied === false) msg += "；8188 已释放。";
+      else if (j.after && j.after.occupied) msg += "；8188 仍被占用（可能还有别的监听者）。";
+      if (j.ok === false && j.note) msg += `\n${j.note}`; // 部分成功：中继的保留意见照抄，不美化
+    } else if (!(r.ok && j && j.ok !== false)) {
+      // ok:false / HTTP 错且一个没杀：中继 note 原文照抄，不吞（否则用户只见「失败」不知为何）
+      msg = "终止失败：" + String((j && (j.note || j.error)) || `HTTP ${r.status}`);
+    } else {
+      msg = `未终止任何进程：${(j && j.note) || (j && j.verdict) || "无可清理项"}。`;
+      if (skipText) msg += `；${skipText}`;
+    }
+  } catch (e) {
+    msg = "终止失败：" + String((e && e.message) || e);
+  } finally {
+    stuckBusy = false;
+    stuckFetchedAt = 0; // 端口态已变：下一拍强制重取判定
+    svcNoteMsg = msg;   // 走粘性提示位：2s 轮询不会把它冲掉
+    svcNoteHoldUntil = Date.now() + 8000; // 8s 内不被「reachable 清空」冲掉（refused-live 等场景）
+    setNote(msg);
+    renderStuckBtn();
+    pollBurst(); // 复用既有快速轮询波刷新状态（含 stuck 判定）
   }
 }
 

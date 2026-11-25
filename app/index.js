@@ -9,7 +9,7 @@
 //   3. 任务桥：submit → ctx.tasks.create({callToken, delivery:"next-step"}) → 轮询结算
 //      （complete/fail/cancel）—— 需要能力词 app/tasks.manage + app/session.start-turn，
 //      未授权时自动降级为「仅内存跟踪」（工具返回值里说明原因）
-//   4. 路由：/comfyui-hana/boot-state | status | health | relay/start | backend/start | backend/stop | backend | backend/{envcheck,clear,wait} | task
+//   4. 路由：/comfyui-hana/boot-state | status | health | relay/start | backend/start | backend/stop | backend | backend/{envcheck,clear,wait,stuck} | backend/kill-stuck | task
 //      （relay/start 只重启「中继」；backend/* 管 8188 上的 ComfyUI 本体，由计划任务拉起，独立于 Hana 存活）
 //   5. 每 1.5s 轮询中继 /_relay/status（ctx.runtime.fetch 优先）；每 2s 结算任务
 //
@@ -5603,6 +5603,8 @@ export default defineApp(async (sdk) => {
         p && p.install ? `安装根：${p.install}` : "",
         p && p.logFile ? `服务日志：${p.logFile}` : "",
         p && p.lastError ? `上次错误：${p.lastError}` : "",
+        // 空参自解释（2026-11-26）：服务未跑时顺带把「僵死」的处置办法说清，先用 op=kill 清障再 start。
+        !cur.reachable ? "若 8188 仍被占用却连不上（崩溃后僵死的进程），用 service op=\"kill\" 强制清理后再 start。" : "",
       ].filter(Boolean);
       return { content: [{ type: "text", text: lines.join("\n") }], details: { comfyui: { action: "service", op, reachable: cur.reachable, proc: p } } };
     }
@@ -5748,7 +5750,62 @@ export default defineApp(async (sdk) => {
           : `已停止 ComfyUI 服务（终止进程 ${JSON.stringify(d.stopped || [])}）。`;
       return { content: [{ type: "text", text }], details: { comfyui: { action: "service", op, ...d } } };
     }
-    throw new Error(`op 必须是 status / start / stop / envcheck / clear / wait（收到 "${op}"）`);
+    // ── 僵死进程：终止 8188 上的僵死 ComfyUI 进程（2026-11-26）──────────────
+    // 场景：ComfyUI 原生崩溃（access violation → Fatal Python error: Aborted）后进程不肯退出，
+    //       8188 仍 LISTENING 但连不上，start 只能干等报错。
+    // 闸在中继：后端仍可达（verdict=live）时中继拒绝（refused-live），这里只如实转述并提示改用 op=stop。
+    if (op === "kill") {
+      const { ok, status, data } = await relayJson("/_relay/backend/kill-stuck", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ source: "tool" }),
+        timeoutMs: 25_000,
+      });
+      void refreshSnapshot();
+      const d = data && typeof data === "object" ? data : {};
+      const killed = Array.isArray(d.killed) ? d.killed : [];
+      const skipped = Array.isArray(d.skipped) ? d.skipped : [];
+      const fmtP = (x) => `${x && x.pid != null ? x.pid : "?"}${x && x.name ? `（${x.name}）` : ""}`;
+      const skipLine = skipped.length ? `跳过：${skipped.map((s) => `${fmtP(s)}：${(s && s.reason) || "原因未给出"}`).join("；")}` : "";
+      const afterLine = d.after && typeof d.after === "object"
+        ? `之后 8188：${d.after.occupied ? "仍被占用" : "已释放"}${d.after.responsive ? "（且后端可达）" : ""}`
+        : "";
+      const note = String(d.note || d.error || "");
+      // 先看「杀了什么」（中继在「杀了但端口还有监听」时也会 ok=false，不能当全失败）
+      if (killed.length) {
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `已终止僵死进程：${killed.map(fmtP).join("、")}。`,
+              skipLine,
+              afterLine,
+              d.ok === false && note ? note : "",
+              "下一步：service op=start 重新拉起 ComfyUI（首次约 30～90 秒，用 service wait 轮询就绪）。",
+            ].filter(Boolean).join("\n"),
+          }],
+          details: { comfyui: { action: "service", op, ok: d.ok === true, verdict: d.verdict || null, killed, skipped, after: d.after || null, note } },
+        };
+      }
+      // 一个没杀：中继拒绝（ok=false / refused-live）或接口报错：不吞 note，如实转述 + 指路
+      if (!ok || d.ok === false) {
+        const hint = d.verdict === "refused-live"
+          ? "服务仍可达（不是僵死），不该强杀：请改用 service op=stop 正常停止。"
+          : "（kill-stuck 未执行；若 8188 无人占用则无需处理，直接 service op=start。）";
+        return {
+          content: [{ type: "text", text: [`未终止进程：${note || `中继返回 HTTP ${status}`}`, hint].filter(Boolean).join("\n") }],
+          details: { comfyui: { action: "service", op, ok: false, verdict: d.verdict || null, note } },
+        };
+      }
+      const text = [
+        `未终止任何进程（verdict=${d.verdict || "?"}）：${note || "无可清理项"}。`,
+        skipLine,
+        afterLine,
+        d.verdict === "foreign-only" || d.verdict === "nothing-to-kill" ? "可直接 service op=start 拉起服务。" : "",
+      ].filter(Boolean).join("\n");
+      return { content: [{ type: "text", text }], details: { comfyui: { action: "service", op, ok: true, verdict: d.verdict || null, killed, skipped, after: d.after || null, note } } };
+    }
+    throw new Error(`op 必须是 status / start / stop / kill / envcheck / clear / wait（收到 "${op}"）`);
   }
 
   // ── 工作区自开（B 前置原型：宿主原生窗装工作区）──────────────────────────
@@ -7277,7 +7334,7 @@ export default defineApp(async (sdk) => {
         command: "service",
         required: [],
         fields: {
-          op: { type: "string", enum: ["status", "start", "stop", "envcheck", "clear", "wait"], description: "status=查服务进程状态（默认）；start=拉起本机 ComfyUI 服务（先自动环境检查，发现阻断项时暂缓拉起并返回阻断说明）；stop=撤下服务（终止 8188 上的进程）；envcheck=环境检查（GPU 计算进程/显存水位/8188 残留 → warnings/blockers/processes/gpu/snapshotId，异常时随结果附阻断说明）；clear=清理快照内进程（需 snapshotId+pids；逐项复核，列表外全拒）；wait=等就绪（单次≤25s，轮询至 ready/timeout，不杀进程）" },
+          op: { type: "string", enum: ["status", "start", "stop", "kill", "envcheck", "clear", "wait"], description: "空参默认 status。status=查服务进程状态；start=拉起本机 ComfyUI 服务（先自动环境检查，发现阻断项时暂缓拉起并返回阻断说明）；stop=正常撤下服务（终止 8188 上的进程）；kill=终止 8188 上的**僵死** ComfyUI 进程（崩溃后不退出、端口仍 LISTENING 但连不上时用；后端仍可达会拒绝并提示改用 stop；回执列明杀了哪些 pid / 跳过哪些及原因 / 端口是否释放）；envcheck=环境检查（GPU 计算进程/显存水位/8188 残留 → warnings/blockers/processes/gpu/snapshotId，异常时随结果附阻断说明）；clear=清理快照内进程（需 snapshotId+pids；逐项复核，列表外全拒）；wait=等就绪（单次≤25s，轮询至 ready/timeout，不杀进程）" },
           path: { type: "string", description: "start 可选：指定 ComfyUI 安装根（默认用本机安装探测结果）" },
           snapshotId: { type: "string", description: "clear 用：service envcheck 返回的一次性快照 id（约 180s 内有效；过期会全部拒绝）" },
           pids: { type: "array", items: { type: "number" }, description: "clear 用：要清理的进程 pid 数组（必须都在快照内；不在快照/不可清理项会被拒绝）" },
@@ -8465,6 +8522,47 @@ export default defineApp(async (sdk) => {
         }
       });
 
+      // ── 僵死进程（2026-11-26）────────────────────────────────────────────
+      // 语义：ComfyUI 原生崩溃（access violation → Fatal Python error: Aborted）后进程不肯退出，
+      // 8188 仍 LISTENING 但连不上 → 「启动服务」只能干等 90s 报错。这两个路由给面板按钮与工具
+      // op=kill 用：GET stuck 判端口态（free/live/stuck/foreign），POST kill-stuck 强制清理。
+      // 判定与杀进程都在中继 runtime/comfy-relay.mjs（本 App 只转发，不改中继）。
+      app.get("/comfyui-hana/backend/stuck", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          const { ok, status, data } = await relayJson("/_relay/backend/stuck", { method: "GET", timeoutMs: 10_000 });
+          const out = data && typeof data === "object" ? data : { ok, status };
+          return c.json(out, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
+      app.post("/comfyui-hana/backend/kill-stuck", async (c) => {
+        if (!relayReady()) return c.json({ ok: false, error: "relay-not-ready", phase: state.phase }, 503);
+        try {
+          // 只透传白名单字段（port/dryRun/source），不把整个 body 丢给中继；
+          // source 缺省 panel：面板按钮点下来的都算人工显式操作（工具侧固定 tool）。
+          const body = await c.req.json().catch(() => ({}));
+          const fwd = {};
+          const port = Number(body && body.port);
+          if (Number.isInteger(port) && port > 0) fwd.port = port;
+          if (body && body.dryRun === true) fwd.dryRun = true;
+          fwd.source = body && typeof body.source === "string" && body.source.trim() ? body.source.trim().slice(0, 64) : "panel";
+          const { ok, status, data } = await relayJson("/_relay/backend/kill-stuck", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(fwd),
+            timeoutMs: 25_000,
+          });
+          void refreshSnapshot();
+          const out = data && typeof data === "object" ? data : { ok, status };
+          return c.json(out, ok ? 200 : 502);
+        } catch (e) {
+          return c.json({ ok: false, error: msgOf(e) }, 502);
+        }
+      });
+
       // 环境检查 / 快照清理 / 等待就绪（卡片功能恢复，2026-10-09）：环境检查卡的按钮直接 POST 的入口。
       // 语义同工具 service 的 envcheck/clear/wait op；转发到中继 /_relay/backend/{envcheck,clear,wait}，
       // 经 relayJson → x-comfy-relay-key（controlKey）管理；宿主侧由 surface 凭据（app_route）保护。
@@ -8652,7 +8750,7 @@ export default defineApp(async (sdk) => {
         }
       });
     });
-    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|relay/start|backend/start|backend/stop|backend|theme|update*）");
+    log("路由注册：ctx.routes.register（/comfyui-hana/boot-state|status|health|metrics|release|install-*|relay/start|backend/start|backend/stop|backend/stuck|backend/kill-stuck|backend|theme|update*）");
   } catch (e) {
     error(`ctx.routes.register 失败（壳页诊断面不可用，工具面仍可用）：${msgOf(e)}`);
   }
