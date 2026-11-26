@@ -6,7 +6,8 @@
 // 业务面（/_relay/*，只读为主；管理端点需 x-comfy-relay-key）：
 //   GET  /_relay/status            聚合状态（后端可达性、队列、请求计数、事件订阅、日志文件；
 //                                  后端不可达时附 env：本机 ComfyUI 安装探测）
-//   GET  /_relay/backend/stuck     8188 占用诊断（free / live / stuck / foreign + 建议动作；只读，不需 controlKey）
+//   GET  /_relay/backend/stuck     8188 占用诊断（free / live / stuck / foreign / unknown-owner + 建议动作；只读，不需 controlKey）
+//                                  recommendation：start / stop / kill-stuck / manual / none；unknown-owner = 有监听但定位不到 pid（交人工）
 //   POST /_relay/backend/kill-stuck 清理僵死进程（{port?, dryRun?, source?}；需 controlKey；非 ComfyUI 的监听者不杀）
 //   GET  /_relay/prompts           进度事件缓存（订阅后端 /ws 得来）：active + recent
 //   GET  /_relay/prompts/<id>      单个 prompt 的事件记录
@@ -38,6 +39,9 @@
 //   POST /_relay/template-fetch   拉取指定模板落盘（{name, target:"hub"|"tmp"}；需 controlKey；只报缺哪些模型，不下载权重）
   //   POST /_relay/bridge           画布桥（只读阶段）：{op,args} → ComfyUI 内 hana_bridge 扩展执行
   //                                 （需 controlKey；token 读 custom_nodes/hana_bridge/.token）
+  //                                 op=canvas.queue 时中继额外注入 args.clientId（本中继的 config.clientId）
+  //                                 与 args.previewMethod（preview-config 开启时的档位）：前端自己发的 /prompt
+  //                                 才能用中继的 clientId，实时预览帧才会回到中继的 /ws（issue #1）
 //
 // OpenAI 兼容网关（2026-11-02，另起一只 http server，默认 127.0.0.1:8790，config.llmGatewayPort 可覆盖）：
 //   GET  /healthz                  免鉴权探活（workerOnline / models 条数）
@@ -1125,6 +1129,7 @@ function cmdlineComfyCandidates(port) {
   const rows = parseJsonRows(out.split("HANA_CIM_OK")[1] ? out.split("HANA_CIM_OK")[1].replace(/HANA_CIM_EMPTY/g, "").trim() : "");
   const cands = [];
   const eliminated = [];
+  const noPort = [];  // python*.exe + main.py 但命令行没写 --port（手启动走默认端口的常见形态）
   for (const row of rows) {
     const pid = Number(row && row.ProcessId);
     if (!Number.isInteger(pid) || pid <= 0) continue;
@@ -1133,11 +1138,26 @@ function cmdlineComfyCandidates(port) {
     if (!PY_IMAGE_RE.test(name)) continue;                                    // 只认 python*.exe
     if (!/(^|[\\/\s"'])main\.py([\s"']|$)/i.test(cmdline)) continue;         // 只认以 main.py 为入口的
     const pv = portArgValue(cmdline);
-    if (pv === null) { eliminated.push({ pid, reason: `含 main.py 但无 --port 参数（不判为 ${port} 的监听者）` }); continue; }
+    if (pv === null) { noPort.push({ pid, name, cmdline }); continue; }       // 待定：可能走「缺 --port」兜底
     if (pv !== Number(port)) { eliminated.push({ pid, reason: `--port=${pv} ≠ ${port}` }); continue; }
     cands.push({ pid, name, cmdline });
   }
-  return { ok: true, cands, eliminated, reason: null };
+  // 缺 --port 的唯一候选兜底（issue #3 第一形态）：手启动不给 --port（用默认 8188）或用包装器启动时，
+  //   严格口径（--port 精确等于目标端口）一个候选都找不到，于是「终止僵死进程」永远没有靶子。
+  // 放宽只有两条，必须同时成立，防误杀的红线不动：
+  //   ① 没有任何 --port 精确匹配的候选（有严格候选时绝不退而求其次）；
+  //   ② 全机只有一个缺 --port 的候选（≥2 一律放弃：谁在监听本端口无从判断）。
+  let noPortFallback = false;
+  if (!cands.length && noPort.length === 1) {
+    cands.push({ ...noPort[0], noPort: true });
+    noPortFallback = true;
+    warnOnce(`cmdline-noport:${noPort[0].pid}`, `监听进程兜底：pid=${noPort[0].pid} 命令行含 main.py 但未写 --port，且全机唯一候选 → 按端口 ${port} 的候选采用（缺 --port 的唯一候选兜底，未经 --port 交叉验证）`);
+  } else if (!cands.length && noPort.length > 1) {
+    for (const c of noPort) eliminated.push({ pid: c.pid, reason: `含 main.py 但无 --port，且缺 --port 的候选不唯一（${noPort.length} 个），无法确认谁在监听 ${port}` });
+  } else {
+    for (const c of noPort) eliminated.push({ pid: c.pid, reason: `含 main.py 但无 --port 参数（不判为 ${port} 的监听者）` });
+  }
+  return { ok: true, cands, eliminated, noPortFallback, reason: null };
 }
 
 // 逐源诊断 → 日志片段：`netstat=0 ps=0 cmdline=1 候选=2(淘汰1) 采用=cmdline`（`-` = 该路未尝试）
@@ -1258,6 +1278,7 @@ function listeningPids(opts = {}) {
         if (rec.keep.length) {
           pids = diag.cmdline.pids;
           diag.adopted = "cmdline";
+          if (c.noPortFallback) diag.cmdline.note = "缺 --port 的唯一候选兜底（全机仅 1 个候选，未经 --port 交叉验证）";
         } else if (rec.ambiguous) {
           // (b) 失明且多候选：无法交叉验证监听者，绝不批量 kill
           diag.cmdline.note = `${c.cands.length} 个候选且无监听交叉验证 → 放弃（不批量 kill）`;
@@ -1434,8 +1455,22 @@ async function startBackendService(overridePath) {
   //   ② 启动窗口内（startWindowOpen）不动手：那可能是我们自己刚拉起、还没开始监听（或正在重启）的进程；
   //   ③ 只清 verified / unverifiable 的监听者，foreign 一律拒绝启动并给出可操作错误。
   if (!startWindowOpen()) {
-    const occupied = listeningPids({ force: true });
-    if (occupied.length) {
+    const pids = listeningPids({ force: true });
+    // 占用判定与 diagnoseStuckPort 同一口径（issue #3 第二形态，2026-11-27）：
+    //   occupied = TCP 连得上 或 枚举到 pid。旧写法只看 pids.length，PID 不可见时直接跳过自愈，
+    //   接着按「空端口」去启动，结果只能干等 90s 后报端口占用。
+    const probeListening = await probePortListening(backend.port);
+    const occupied = probeListening === true || pids.length > 0;
+    // 占用但 pids 为空（unknown-owner）：没靶子可杀，也不该盲目继续启动去干等 —— 直接给可操作错误。
+    if (occupied && !pids.length) {
+      backendProc.lastError = `${backend.port} 有监听但定位不到监听进程（常见于提权或其他用户拉起），无法自动清理；请用管理员权限运行本 App 或用 netstat -ano 人工确认后结束该进程，再点启动`;
+      backendProc.starting = false;
+      backendProc.lastStartResult = { at: new Date().toISOString(), ok: false, error: backendProc.lastError };
+      saveBackendState();
+      logErr(`启动 ComfyUI 服务被拒：${backendProc.lastError}`);
+      return { ok: false, verdict: "unknown-owner", error: backendProc.lastError, note: backendProc.lastError, pids: [], url: baseUrl };
+    }
+    if (pids.length) {
       const preProbe = await probeBackendSilent();
       if (!preProbe.reachable) {
         const heal = await killStuckBackend({ source: "start-autoclean" });
@@ -1717,7 +1752,9 @@ async function stopBackendService(opts = {}) {
   // 一个 pid 都不可信（全被归属校验跳过）时不动计划任务：这不是一次成立的「停止」，别顺手改启动器状态
   const foreignOnly = pids.length > 0 && targets.length === 0;
   if (!foreignOnly) {
-    runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000); // 顺手清理启动器任务
+    // 只有真停掉了东西才删启动器任务（2026-11-27）：pids=[] / 全 taskkill 失败时
+    //   删任务属于「没停成还偷了人家的启动器」，下次启动直接找不到任务。
+    if (stopped.length > 0) runExe("schtasks.exe", ["/delete", "/tn", BACKEND_TASK_NAME, "/f"], 15_000);
     backendProc.starting = false;
     startInFlight = null;
   }
@@ -1769,6 +1806,8 @@ async function stopBackendService(opts = {}) {
     ? ` 淘汰: ${diag.cmdline.eliminated.map((e) => `pid=${e.pid} ${e.reason}`).join("; ")}`
     : "";
   const skipText = skipped.length ? ` 跳过: ${skipped.map((x) => `pid=${x.pid} ${x.reason}`).join("; ")}` : "";
+  // pids=[]（什么都没找到）时明确告诉调用方「本轮未做任何清理」，避免被当成「已停止且已清理」
+  const noPidNote = pids.length === 0 ? "未找到监听进程，未做任何清理（计划任务未删除）" : null;
   const line = `停止 ComfyUI 服务：${srcTag} pids=${JSON.stringify(pids)} 采用=${JSON.stringify(targets)} stopped=${JSON.stringify(stopped)} 仍可达=${reachable}（${probe.detail}） ok=${ok}[${branch}]（源: ${sources}${elimText}${skipText}）${errorText ? ` error=${errorText}` : ""}`;
   if (ok) log(line); else logErr(line);
   return {
@@ -1789,6 +1828,7 @@ async function stopBackendService(opts = {}) {
     probe,
     skipped,
     unverified,
+    ...(noPidNote ? { note: noPidNote } : {}),
     ...(errorText ? { error: errorText } : {}),
   };
 }
@@ -1811,7 +1851,12 @@ async function diagnoseStuckPort(opts = {}) {
     return stuckDiag.data;
   }
   const pids = listeningPids({ force }); // 5s 缓存口径与停止服务一致；force 供清理后复查
-  const occupied = pids.length > 0;
+  // 端口占用与 pid 枚举解耦（issue #3 第二形态）：PID 不可见（受限令牌 / 其他用户 / 提权拉起）时
+  //   枚举回来是空数组，旧口径 occupied=false → verdict="free" → 面板给「启动」不给「终止僵死进程」，
+  //   而启动又会因端口真被占而干等。现在 occupied = TCP 连得上 或 枚举到 pid（两者取或）。
+  //   probe=null（超时/其他错误）只表示没探出来，不能反向否掉枚举结果，所以不做反向压制。
+  const probeListening = await probePortListening(port);
+  const occupied = probeListening === true || pids.length > 0;
   const entries = [];
   let responsive = false;
   if (occupied) {
@@ -1835,12 +1880,27 @@ async function diagnoseStuckPort(opts = {}) {
       });
     }
   }
-  // 判定：无监听=free / 可达=live / 不可达且有自证或读不到命令行的 pid=stuck / 全 mismatched=foreign
+  // 判定：无监听=free / 可达=live / 有监听但定位不到 pid=unknown-owner /
+  //       不可达且有自证或读不到命令行的 pid=stuck / 全 mismatched=foreign
+  const unknownOwner = occupied && !responsive && pids.length === 0;
   const verdict = !occupied
     ? "free"
-    : (responsive ? "live" : (entries.some((e) => e.verdict !== "mismatched") ? "stuck" : "foreign"));
-  const recommendation = verdict === "free" ? "start" : verdict === "live" ? "stop" : verdict === "stuck" ? "kill-stuck" : "none";
-  const data = { ok: true, port, occupied, responsive, verdict, pids: entries, recommendation, checkedAt: new Date().toISOString() };
+    : (responsive
+        ? "live"
+        : (unknownOwner ? "unknown-owner" : (entries.some((e) => e.verdict !== "mismatched") ? "stuck" : "foreign")));
+  // recommendation 新增 manual：占用与 pid 枚举解耦后必然多出「有人占着但本机看不见是谁」这一态，
+  //   它不是 stuck（不能自动杀）也不是 free（不能直接启动），交人工确认。调用方按本字段分支。
+  const recommendation = verdict === "free"
+    ? "start"
+    : verdict === "live"
+      ? "stop"
+      : verdict === "stuck"
+        ? "kill-stuck"
+        : verdict === "unknown-owner" ? "manual" : "none";
+  const note = unknownOwner
+    ? `端口 ${port} 有监听但本机定位不到监听进程（常见于进程由其他用户/提权拉起，或系统枚举被限制），请用管理员权限运行或用 netstat -ano 人工确认后结束该进程`
+    : null;
+  const data = { ok: true, port, occupied, responsive, verdict, pids: entries, recommendation, note, portListening: probeListening, checkedAt: new Date().toISOString() };
   stuckDiag.at = Date.now();
   stuckDiag.port = port;
   stuckDiag.data = data;
@@ -1886,6 +1946,13 @@ async function killStuckBackend(opts = {}) {
     log(line());
     return out;
   }
+  // 2.5) 有监听但定位不到 pid（issue #3 第二形态）：绝不假装杀成功，也不猜 pid
+  if (!pids.length) {
+    out.verdict = "no-pid";
+    out.note = `端口 ${port} 有监听但本机定位不到监听进程（常见于进程由其他用户/提权拉起，或系统枚举被限制），请用管理员权限运行或用 netstat -ano 人工确认后结束该进程；未终止任何进程`;
+    logErr(line());
+    return out;
+  }
   // 3) 归属分拣：mismatched 是别人的进程，记进 skipped，不进 kill 队列
   const targets = [];
   for (const p of before.pids) {
@@ -1911,13 +1978,17 @@ async function killStuckBackend(opts = {}) {
     if (k.code === 0) killed.push({ pid: t.pid, name: t.name || null });
     else skipped.push({ pid: t.pid, name: t.name || null, reason: `taskkill 失败：${k.text || `exit ${k.code}`}` });
   }
-  // 复查：force 重查监听（缓存里是杀之前的结论，没意义）+ 静默探测
+  // 复查：force 重查监听（缓存里是杀之前的结论，没意义）+ 静默探测 + 独立 TCP 探测
+  //   （issue #3 第二形态：pid 枚举可能与真实占用脱钩，复查不能只看 remain 长度）
   const remain = listeningPids({ force: true });
   const probe = await probeBackendSilent();
-  out.after = { occupied: remain.length > 0, responsive: probe.reachable };
-  if (remain.length) {
+  const stillListening = (await probePortListening(port)) === true;
+  out.after = { occupied: remain.length > 0 || stillListening, responsive: probe.reachable };
+  if (out.after.occupied) {
     out.verdict = killed.length ? "killed" : "nothing-to-kill";
-    out.note = `清理后端口 ${port} 仍有监听：剩余 pid=${remain.join(",")}（${probe.detail}）；已终止 ${killed.length ? killed.map((k) => `pid=${k.pid}`).join("、") : "无"}`;
+    out.note = remain.length
+      ? `清理后端口 ${port} 仍有监听：剩余 pid=${remain.join(",")}（${probe.detail}）；已终止 ${killed.length ? killed.map((k) => `pid=${k.pid}`).join("、") : "无"}`
+      : `清理后端口 ${port} 仍连得上，但本机定位不到监听进程（可能被其他实例/其他用户接手，或系统枚举被限制）；已终止 ${killed.length ? killed.map((k) => `pid=${k.pid}`).join("、") : "无"}`;
     logErr(line());
     return out;
   }
@@ -5514,6 +5585,16 @@ const server = http.createServer((req, res) => {
         // Python 侧同样只读顶层 body.sid）。
         const fwdArgs = (body && body.args) || {};
         const fwd = { op, args: fwdArgs };
+        // issue #1（2026-11-27）：画布执行收不到实时预览帧。
+        //   根因：ComfyUI 只把预览帧 / execution 事件发给**发起该 prompt 的 client_id**；画布执行由页面前端
+        //   自己 POST /prompt（client_id = 页面 uuid），与中继 /ws 订阅用的 config.clientId 不同 → 中继一条也收不到。
+        //   修法：把中继自己的 clientId 与当前预览档位随这次 bridge 调用下发，由桥在**那一条** /prompt 体里写入
+        //   （不动前端全局 api.clientId）。只对 canvas.queue 注入：其它 op 不提交，也不该带这份载荷。
+        //   注入值全部取运行时配置：clientId = config.clientId，档位 = previewCfg（未开启不带）。
+        if (op === "canvas.queue" && fwdArgs && typeof fwdArgs === "object" && !Array.isArray(fwdArgs)) {
+          fwdArgs.clientId = (config && config.clientId) || "comfyui-relay";
+          if (previewCfg.enabled && previewCfg.method) fwdArgs.previewMethod = previewCfg.method;
+        }
         const fwdWf = fwdArgs && typeof fwdArgs === "object" ? String(fwdArgs.workflow == null ? "" : fwdArgs.workflow).trim() : "";
         if (fwdWf) fwd.workflow = fwdWf;
         const fwdSid = fwdArgs && typeof fwdArgs === "object" ? String(fwdArgs.sid == null ? "" : fwdArgs.sid).trim() : "";
@@ -5530,6 +5611,14 @@ const server = http.createServer((req, res) => {
           data = text ? JSON.parse(text) : {};
         } catch {
           data = { ok: false, error: `桥返回非 JSON（HTTP ${upstream.status}）` };
+        }
+        // 画布执行的预览回执（桥侧按次改写 + 解码器反查的结果）落一行日志：
+        //   「有没有帧 / 用的哪个解码器」事后能在 _relay-log 里对得上（回执本身也随 payload 原样返回）。
+        if (op === "canvas.queue" && data && typeof data === "object") {
+          const pv = data.preview || (data.data && typeof data.data === "object" ? data.data.preview : null);
+          if (pv && typeof pv === "object") {
+            log(`画布执行预览：提交体改写=${pv.applied === true ? "是" : "否"} client_id=${pv.clientId || "未下发"} method=${pv.method || "null"} 解码器=${pv.file || "未定"}（via=${pv.via || "?"}）${pv.reason ? ` ${pv.reason}` : ""}`);
+          }
         }
         jsonOut(res, upstream.ok ? 200 : 502, data, req.method);
       } catch (e) {

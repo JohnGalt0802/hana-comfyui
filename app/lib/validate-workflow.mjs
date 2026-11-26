@@ -10,21 +10,14 @@
 //   `s<实例id>:<内部id>` 复合 id（与冻结文件同口径），所有报错都带这个 id。
 // objectInfo 兼容两种入参：T1 裁剪结构（有 .classes）与 /object_info 原始形状（顶层即类名），
 //   统一归一化成内部 classes 表；给 expandSubgraphs 的形状带 input 包装（它的子图定位依赖）。
-import { convertUiToApi, expandSubgraphs, UNSUPPORTED_UI_TYPES } from "./workflow-tools.mjs";
+import { convertUiToApi, expandSubgraphs, UNSUPPORTED_UI_TYPES, NON_WIDGET_INPUT_TYPES } from "./workflow-tools.mjs";
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const NOTE_TYPES = new Set(["Note", "MarkdownNote"]);
-// 与 workflow-tools.mjs 私有 NON_WIDGET_INPUT_TYPES 同名单（冻结文件未导出，按其口径抄全）：
-// socket 类输入不是 widget，不占 widgets_values 位序。
-const NON_WIDGET_INPUT_TYPES = new Set([
-  "MODEL", "CLIP", "VAE", "CLIP_VISION", "CLIP_VISION_OUTPUT", "STYLE_MODEL", "UPSCALE_MODEL",
-  "IMAGE", "MASK", "LATENT", "CONDITIONING", "CONTROL_NET", "SIGMAS", "SAMPLER", "GUIDER", "NOISE",
-  "AUDIO", "VIDEO", "WEBCAM", "LATENT_UPSCALE", "GLIGEN", "TAESD",
-]);
+// socket 类输入不是 widget，不占 widgets_values 位序——名单单一来源在 workflow-tools.mjs（2026-11-27，issue #4），
+// 本文件不再自抄副本：两处各存一份会漂移，且旧副本让「白名单 / 黑名单」两套 widget 判定标准并存。
 const SEED_CONTROL_VALUES = new Set(["fixed", "increment", "decrement", "randomize"]);
 const COMBO_TYPE_NAMES = new Set(["COMBO", "COMFY_DYNAMICCOMBO_V3", "EASY_COMBO"]);
-// 与冻结文件私有 WIDGET_SPEC_TYPES 同名单（冻结文件未导出）：占 widgets_values 位的类型
-const WIDGET_SPEC_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3", "AUTOCOMPLETE_TEXT_LORAS"]);
 // COMFY_*_V3 动态构造（MATCHTYPE/AUTOGROW/DYNAMICCOMBO 等）：类型在运行时按接入物变化，静态检查不判
 const isDynamicType = (t) => typeof t === "string" && t.startsWith("COMFY_");
 const UUID_TYPE_RE = /^[0-9a-fA-F-]{20,}$/; // 子图实例的 type 是 UUID（与冻结文件同口径）
@@ -202,9 +195,17 @@ function widgetValues(n, cls) {
   if (slotWidgets.length > 0) {
     names = slotWidgets.map((s) => s.name);
   } else {
+    // 与 workflow-tools.declaredWidgetSlots 同口径（2026-11-27）：黑名单排除——除 socket 类型外都占位；
+    // 文件把它序列化成普通输入槽（无 widget 标记）的，按 socket 处理（本文件槽证据优先，与转换器一致）。
+    // 旧实现用 7 种内置类型的白名单，社区插件的自定义 widget 类型在老文件里会被当成 socket 漏掉，
+    // 使本函数的位序与转换器错开一格。
+    const plainSlots = new Set(
+      (Array.isArray(n.inputs) ? n.inputs : []).filter((s) => isPlainObject(s) && typeof s.name === "string" && !isPlainObject(s.widget)).map((s) => s.name),
+    );
     names = declared.filter((name) => {
+      if (plainSlots.has(name)) return false;
       const t = typeof cls.required[name] === "string" ? cls.required[name] : cls.optional[name];
-      return typeof t === "string" && WIDGET_SPEC_TYPES.has(t);
+      return typeof t === "string" && !NON_WIDGET_INPUT_TYPES.has(t);
     });
   }
   let pos = 0;

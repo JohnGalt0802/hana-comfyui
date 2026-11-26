@@ -68,8 +68,8 @@ nvidia-smi
 New-Item -ItemType Directory -Force D:\ComfyUI | Out-Null
 cd D:\ComfyUI
 git clone https://github.com/comfyanonymous/ComfyUI
-# 直连失败时用镜像（国内实测可用）：
-# git clone https://ghproxy.net/https://github.com/comfyanonymous/ComfyUI.git
+# 直连失败时，自行替换为任意可用的镜像/代理（下面是格式示例，不是默认地址）：
+# git clone https://<你的代理>/https://github.com/comfyanonymous/ComfyUI.git
 cd ComfyUI
 git log -1 --oneline
 ```
@@ -167,7 +167,7 @@ Write-Output "等待超时：请看 $root\comfyui.err.log"; exit 1
 
 | 症状 | 对策 |
 |---|---|
-| clone 失败/极慢 | 换 ghproxy.net 镜像；或换时段 |
+| clone 失败/极慢 | 换一个可用的 GitHub 镜像/代理（格式：`https://<你的代理>/https://github.com/...`）；或换时段 |
 | pip 安装失败/超时 | 换镜像源；大包失败重试；检查代理 |
 | `torch.cuda.is_available()` False | 卸载 torch 三件套，按 §4 选对 cu 版本重装 |
 | 启动报端口占用 | 已有实例在跑（`netstat -ano | findstr 8188`），先清理或换 `--port` |

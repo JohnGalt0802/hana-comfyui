@@ -727,15 +727,19 @@ async function guideCopyPrompt() {
   }
 }
 
+// 仓库地址：官方为准，不绑定任何单一第三方代理（代理是否可用取决于用户网络/地区，写死一个
+// 会让该代理失效的用户第一步就卡死）。镜像只给「可自行替换」的形态提示，不作默认值。
 async function guideSelfInstall() {
   const lines = [
-    "ComfyUI 官方仓库：https://github.com/comfyanonymous/ComfyUI",
-    "国内镜像：https://ghproxy.net/https://github.com/comfyanonymous/ComfyUI.git",
+    "ComfyUI 官方仓库（首选）：https://github.com/comfyanonymous/ComfyUI.git",
+    "若本机访问 GitHub 受限，可自行替换为任意可用的镜像/代理，形如：",
+    "  https://<你的代理>/https://github.com/comfyanonymous/ComfyUI.git",
+    "（上面只是格式示例，不是默认地址：用哪个代理由你的网络环境决定。）",
     "安装文档：Hana-ComfyUI 技能目录下的 INSTALL.md（Windows 主线）",
     "装好后以 127.0.0.1:8188 启动服务，本工作区会自动识别。",
   ];
   const ok = await copyText(lines.join("\n"));
-  if (ok) guideDone("仓库地址已复制", "包含官方地址、国内镜像与启动说明。装完回到本页点「检测安装情况」即可接入。");
+  if (ok) guideDone("仓库地址已复制", "含官方地址、镜像替换格式与启动说明。装完回到本页点「检测安装情况」即可接入。");
   else guideNote("复制失败，请手动获取地址。");
 }
 

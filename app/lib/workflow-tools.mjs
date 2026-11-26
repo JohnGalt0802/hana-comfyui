@@ -11,10 +11,18 @@ export const NOTE_TYPES = new Set(["Note", "MarkdownNote"]);
 export const UNSUPPORTED_UI_TYPES = new Set(["Reroute", "PrimitiveNode", "Subgraph", "GroupNode", "SubgraphInputNode", "SubgraphOutputNode"]);
 
 // UI 格式（nodes/links）→ API 格式：经典图子集（环绕节点明确报错；静音/旁路按 ComfyUI 语义处理——mute 断链不执行、bypass 按类型穿透，2026-10-31；带 definitions.subgraphs 的实例先展开为普通节点，见「子图展开 v1」）
-const WIDGET_SPEC_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3", "AUTOCOMPLETE_TEXT_LORAS"]);
+//
+// widget 判定单一来源（2026-11-27，issue #4）：一律「黑名单排除法」——除 socket 类型（NON_WIDGET_INPUT_TYPES）外，
+// 声明里出现的输入都视为占 widgets_values 位。历史白名单只认 7 种内置类型，社区插件的自定义 widget 类型
+// （LoraManager 的 AUTOCOMPLETE_TEXT_LORAS、若干 Impact 变体等）在**只有 widgets_values** 的老文件里不占位，
+// 其后的参数整体前移一格 → 参数错位 / required_input_missing。named 分支早已只看黑名单，两套口径必须统一。
+// 白名单语义不再用于拦截，WIDGET_SPEC_TYPES 降级为「已知类型」清单（诊断 + 向后兼容导出）。
+export const WIDGET_SPEC_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3", "AUTOCOMPLETE_TEXT_LORAS"]);
 // 常见 socket 类型的近似名单（实测未覆盖全部：本机 /object_info 有 220 个输入类型、这里有 20 个）；
-// 未列出的类型靠「widgets_values_named 本就没有该键」兜底，不会误注入；名单不完备可接受。
-const NON_WIDGET_INPUT_TYPES = new Set([
+// 名单不完备的代价现在反过来了：未列出的 socket 类型会被当成 widget 占位（可能多占一格）。
+// 因此「不在 WIDGET_SPEC_TYPES 也不在此名单」的类型占位时一律记 unknown_widget_type warning，
+// 让上层看得见「这里按 widget 处理了」，名单缺口能靠 warning 计数暴露，而不是静默错位。
+export const NON_WIDGET_INPUT_TYPES = new Set([
   "MODEL", "CLIP", "VAE", "CLIP_VISION", "CLIP_VISION_OUTPUT", "STYLE_MODEL", "UPSCALE_MODEL",
   "IMAGE", "MASK", "LATENT", "CONDITIONING", "CONTROL_NET", "SIGMAS", "SAMPLER", "GUIDER", "NOISE",
   "AUDIO", "VIDEO", "WEBCAM", "LATENT_UPSCALE", "GLIGEN", "TAESD",
@@ -297,7 +305,8 @@ const subgraphUnwrap = (v) => (isPlainObject(v) && "value" in v ? v.value : v);
 
 // 按「声明顺序」枚举节点占据 widget 位（即 widgets_values 位置序）的输入，返回「输入名 → 位置」Map。
 // 与转换器主循环②段、子图展开 widget 值定位共用同一份实现（禁止两套口径漂移）：
-//   - 主口径：object_info 声明序（required 键序 → optional 键序），跳过非 widget 类型 / forceInput / socketless；
+//   - 主口径：object_info 声明序（required 键序 → optional 键序），跳过 socket 类型（NON_WIDGET_INPUT_TYPES）/
+//     forceInput / socketless；其余一律算 widget（含未知类型——与 named 分支同口径，2026-11-27 修 issue #4）；
 //   - autogrow 子控件（声明项的子槽，如 `model.width`）紧跟其父项按槽序入列——它们不单独声明，
 //     但前端确实把它们排在父项之后占位（2026-11-03 核验：2264 个双写节点里该口径与 named 值一致 2152、槽序一致 0）；
 //   - 零散槽（如 `upload` / `audioUI`）排在末尾占位、不注入（全语料核验：34 个此类节点里它们恒在槽尾）；
@@ -307,7 +316,7 @@ const subgraphUnwrap = (v) => (isPlainObject(v) && "value" in v ? v.value : v);
 // 值会整体错位（steps 被写成 scheduler 的 "simple" 这类，2026-11-03 修）。
 // 各路径都含 seed/noise_seed 的 control_after_generate 副值跳格（副值多占一格）。
 // info 为该节点的 /object_info 条目（可缺：既无声明也无槽 → 空 Map）。
-function declaredWidgetSlots(info, node) {
+function declaredWidgetSlots(info, node, onUnknownType) {
   const input = isPlainObject(info) && isPlainObject(info.input) ? info.input : {};
   const required = isPlainObject(input.required) ? input.required : {};
   const optional = isPlainObject(input.optional) ? input.optional : {};
@@ -318,11 +327,28 @@ function declaredWidgetSlots(info, node) {
     const spec = specOf(name);
     return Boolean(spec && spec[1] && spec[1].socketless === true);
   };
+  // onUnknownType(name, type)：非空时对「既不在已知 widget 类型清单、也不在 socket 黑名单」的类型回调一次——
+  // 这类类型按 widget 占位（与 named 分支同口径），warning 由调用方负责记录，本函数保持纯函数。
+  // 未知类型的占位判定只靠**文件自带的槽证据 + 声明结构**，不加类型名单（那是 issue #4 的病根）：
+  //   · 同名槽存在且带 widget 标记 → 前端把它序列化成「已转输入的 widget」→ 占位；
+  //   · 同名槽存在但不带 widget 标记 → 前端把它序列化成 socket → 不占位（有证据，不是猜）；
+  //   · 无同名槽但 spec 带 `template` 声明（COMFY_AUTOGROW_V3 容器 / COMFY_MATCHTYPE_V3 这类动态件）：
+  //     前端不为它本身建 widget（子控件才占位）→ 不占位；
+  //   · 都没有 → 只能按 widget 占位，并记 unknown_widget_type（这就是 issue #4 要保住的那类自定义 widget）。
+  const slotOf = (name) => nodeInputs.find((s) => s && typeof s === "object" && s.name === name);
   const declarable = [...Object.keys(required), ...Object.keys(optional)].filter((name) => {
     const spec = specOf(name);
     if (!spec) return false;
     const t = Array.isArray(spec[0]) ? "COMBO" : String(spec[0]);
-    return WIDGET_SPEC_TYPES.has(t) && !(spec[1] && spec[1].forceInput === true) && !(spec[1] && spec[1].socketless === true);
+    const specOpts = isPlainObject(spec[1]) ? spec[1] : {};
+    if (specOpts.forceInput === true || specOpts.socketless === true) return false;
+    if (NON_WIDGET_INPUT_TYPES.has(t)) return false; // socket 类型不占位
+    if (WIDGET_SPEC_TYPES.has(t)) return true; // 已知 widget 类型
+    const slot = slotOf(name); // 未知类型：先看文件的槽证据
+    if (slot) return isPlainObject(slot.widget);
+    if (isPlainObject(specOpts.template)) return false; // 声明式动态件（子控件占位，自己不占）
+    if (typeof onUnknownType === "function") onUnknownType(name, t);
+    return true;
   });
   const hasDeclaration = declarable.length > 0;
   const slotOrderNames = nodeInputs
@@ -369,7 +395,7 @@ function declaredWidgetSlots(info, node) {
 
 // widget 位序定位：目标输入名在声明序 widget 位里的位置（declaredWidgetSlots 的共用口径）。
 // 未知类型（不在 objectInfo）/ 目标名不在声明里 → null（不猜，由调用方拒绝并点名）。
-function subgraphWidgetIndexOf(objectInfo, node, targetSlotIdx) {
+function subgraphWidgetIndexOf(objectInfo, node, targetSlotIdx, onUnknownType) {
   const info = objectInfo && isPlainObject(node) && typeof node.type === "string" ? objectInfo[node.type] : null;
   if (!isPlainObject(info)) return null;
   const input = isPlainObject(info.input) ? info.input : {};
@@ -377,7 +403,7 @@ function subgraphWidgetIndexOf(objectInfo, node, targetSlotIdx) {
   const name = slot && typeof slot.name === "string" ? slot.name : "";
   if (!name) return null;
   if (!Object.prototype.hasOwnProperty.call(input.required || {}, name) && !Object.prototype.hasOwnProperty.call(input.optional || {}, name)) return null;
-  const idx = declaredWidgetSlots(info, node).get(name);
+  const idx = declaredWidgetSlots(info, node, onUnknownType).get(name);
   return idx === undefined ? null : idx;
 }
 
@@ -678,7 +704,9 @@ export function expandSubgraphs(wf, problems, objectInfo, warnings) {
         const named = isPlainObject(tn.widgets_values_named) ? tn.widgets_values_named : null;
         const wv = Array.isArray(tn.widgets_values) ? tn.widgets_values : null;
         // 位置值定位：与主循环同源的声明序（declaredWidgetSlots），不是槽序近似。
-        const posIdx = subgraphWidgetIndexOf(objectInfo, tn, hit.targetSlot);
+        const posIdx = subgraphWidgetIndexOf(objectInfo, tn, hit.targetSlot, (nm, ty) => {
+          if (Array.isArray(warnings)) warnings.push(`unknown_widget_type：子图内部节点 #${tn.id} ${tn.type} 的输入「${nm}」类型 ${ty} 不在已知 widget 类型清单，已按 widget 占位`);
+        });
         let cur;
         let located = false;
         if (named && Object.prototype.hasOwnProperty.call(named, wn)) { cur = subgraphUnwrap(named[wn]); located = true; }
@@ -1219,7 +1247,10 @@ export function convertUiToApi(wf, objectInfo, options) {
     } else {
       // widget 位按 /object_info 声明序（autogrow 子槽跟父项、未声明零散槽排末尾；仅无声明时回落槽序）
       // —— 与子图展开共用同一份实现（declaredWidgetSlots，含 seed control 副值跳格），防两套口径漂移。
-      const positions = declaredWidgetSlots(info, n);
+      // 未知 widget 类型（社区插件自定义类型）也占位，与 named 分支同口径；占位时记 warning 交代口径。
+      const positions = declaredWidgetSlots(info, n, (nm, ty) => {
+        warnings.push(`unknown_widget_type：节点 #${n.id} ${type} 的输入「${nm}」类型 ${ty} 不在已知 widget 类型清单，已按 widget 占位`);
+      });
       for (const [name, pos] of positions) {
         let val;
         if (pos < wv.length) val = wv[pos];

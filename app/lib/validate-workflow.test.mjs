@@ -186,3 +186,48 @@ test("⑩ 纯健壮性：坏输入不抛异常，统一 internal 错误", () => 
   const r = validateWorkflow({ workflow: { nodes: "not-an-array" }, objectInfo });
   assert.equal(r.errors[0].code, "internal");
 });
+
+// ⑪ widget 位序口径（2026-11-27，issue #4）：与转换器同源——黑名单排除，不再用 7 种内置类型的白名单。
+// 旧口径下自定义 widget 类型（这里 LORA_STACK_CUSTOM）在只有 widgets_values 的老文件里被当成 socket 漏掉，
+// 校验器的位序与转换器错开一格：命中的是后面的 steps（枚举/缺值判定全跟错）。
+test("⑪ 无 named 的老文件里，未知 widget 类型占位（位序与转换器一致）", () => {
+  const info = {
+    classes: {
+      CustomLoraStack: { required: { stacks: "LORA_STACK_CUSTOM", steps: "INT" }, optional: {}, outputs: [] },
+      SaveImage: { required: { images: "IMAGE" }, optional: {}, outputs: [] },
+    },
+    outputNodeIds: ["SaveImage"],
+  };
+  const wf = {
+    nodes: [
+      { id: 1, type: "CustomLoraStack", inputs: [], widgets_values: ["stackA", 30] },
+      { id: 2, type: "SaveImage", inputs: [{ name: "images", type: "IMAGE", link: null }] },
+    ],
+    links: [],
+  };
+  const r = validateWorkflow({ workflow: wf, objectInfo: info });
+  const missing = r.errors.filter((v) => v.code === "missing_required" && v.node === "1");
+  assert.deepEqual(missing, [], "stacks 有值（位置回退第一位），不能报缺值");
+});
+
+test("⑪b 同名槽被序列化成普通 socket 时，未知类型仍按 socket 处理（不抢位）", () => {
+  const info = {
+    classes: {
+      Srv3DCamera: { required: { things: "WHATEVER_SOCKET", steps: "INT" }, optional: {}, outputs: [] },
+      SaveImage: { required: { images: "IMAGE" }, optional: {}, outputs: [] },
+    },
+    outputNodeIds: ["SaveImage"],
+  };
+  const wf = {
+    nodes: [
+      { id: 1, type: "Srv3DCamera", inputs: [{ name: "things", type: "WHATEVER_SOCKET", link: null }], widgets_values: [20] },
+      { id: 2, type: "SaveImage", inputs: [{ name: "images", type: "IMAGE", link: null }] },
+    ],
+    links: [],
+  };
+  const r = validateWorkflow({ workflow: wf, objectInfo: info });
+  // things 是 socket（required 但没连线）→ 应该报它的缺值；steps 拿到 widgets_values[0]=20
+  const missing = r.errors.filter((v) => v.code === "missing_required" && v.node === "1");
+  assert.equal(missing.length, 1, JSON.stringify(r.errors, null, 1));
+  assert.equal(missing[0].field, "things");
+});

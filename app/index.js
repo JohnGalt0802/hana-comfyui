@@ -892,6 +892,95 @@ export default defineApp(async (sdk) => {
     return (Array.isArray(files) ? files : []).find((f) => String(f).toLowerCase().startsWith(p)) || null;
   }
 
+  // 本地实存 → 表项反查（issue #2）：拿后端 /models/vae_approx 的**实存文件名**反查它归哪一族。
+  // 判定口径与 latent_preview.py 一致（文件名以该族前缀开头才算）；关键词只作提示（hint），不作判定。
+  function reverseLookupLocalDecoders(files) {
+    const out = [];
+    for (const f of Array.isArray(files) ? files : []) {
+      const name = String(f);
+      let entry = null;
+      for (const e of PREVIEW_DECODERS) {
+        const prefix = decoderPrefix(e);
+        if (prefix && name.toLowerCase().startsWith(prefix.toLowerCase())) { entry = e; break; }
+      }
+      out.push({ file: name, entry, hint: entry ? null : matchPreviewDecoder(name) });
+    }
+    return out;
+  }
+
+  // 表提示的紧凑版（从表生成，不另写死模型名）：给「定不了族」时的可操作建议用。
+  function decoderFamilyHints() {
+    return PREVIEW_DECODERS
+      .filter((e) => e.fileName)
+      .map((e) => `${decoderPrefix(e)} ← ${String(e.family).split("（")[0].split(" / ").slice(0, 4).join(" / ")}`);
+  }
+
+  // 表提示 + 本地实存 两路合并（issue #2）：**判定以本地实存为准，表只作提示**，不再静默降级。
+  // 返回 { basis, installedFile, message, advice }；basis 即回执里的「命中方式」：
+  //   local        本地实存命中（文件在 vae_approx 里，ComfyUI 认得到）
+  //   table        表/画布命中，但建议文件本地不存在 → 回退 latent2rgb 必须写明，不静默
+  //   none         定不了族 → 列本地已有 + 按当前模型的 latent format 该选哪类
+  //   unknown      本地清单读不到（中继/后端不可用）→ 不下结论
+  //   no-upstream  该族上游没有解码器（Mochi）→ latent2rgb 是唯一选项，不是回退
+  function mergeDecoderEvidence(det, list) {
+    const entry = (det && det.entry) || null;
+    const files = list && Array.isArray(list.files) ? list.files : [];
+    const listOk = !!(list && list.ok);
+    const listErr = (list && list.error) || "未知原因";
+    const have = listOk && files.length ? files.join(" / ") : "（空）";
+
+    if (entry && !entry.fileName) {
+      return {
+        basis: "no-upstream",
+        installedFile: null,
+        message: `当前模型属于 ${entry.family}：上游没有 taesd 解码器（latent_formats 里就是 None），预览只能用基础档 latent2rgb —— 这不是回退，是该族唯一可选。`,
+      };
+    }
+    if (!entry) {
+      if (!listOk) {
+        return {
+          basis: "unknown",
+          installedFile: null,
+          message: `判不出当前模型该用哪个解码器，且读不到后端 /models/vae_approx：${listErr}。无法核对本地实存，HD 档若已开可能静默回退到 latent2rgb。`,
+          advice: "中继/后端恢复后重试；也可先用 ?decoder=<key> 显式指定（GET /comfyui-hana/preview-decoders 有全表与每族的 latent format 说明）。",
+        };
+      }
+      const local = reverseLookupLocalDecoders(files);
+      const localDetail = local.length
+        ? local.map((x) => (x.entry
+            ? `${x.file}（${x.entry.key}，${String(x.entry.family).split("（")[0].split(" / ").slice(0, 2).join("/")}）`
+            : `${x.file}（表里没有，自定义）`)).join("；")
+        : "（空）";
+      return {
+        basis: "none",
+        installedFile: null,
+        message: `判不出当前模型该用哪个解码器，当前回退到 latent2rgb（可能不是最佳）。后端 vae_approx 实存反查：${localDetail}。`,
+        advice: `按当前模型的 latent format 选一类（表里 key ← 适用族）：${decoderFamilyHints().join("；")}。选定后用 ?decoder=<key> 显式指定；表里没有的自定义解码器需自行确认其 latent format。`,
+      };
+    }
+    const installed = listOk ? findInstalledDecoderFile(files, entry) : null;
+    if (installed) {
+      return {
+        basis: "local",
+        installedFile: installed,
+        message: `命中方式：本地实存（${installed}）—— 与表里 ${entry.key} 的前缀 ${decoderPrefix(entry)} 一致，ComfyUI 认得到。`,
+      };
+    }
+    if (!listOk) {
+      return {
+        basis: "unknown",
+        installedFile: null,
+        message: `表提示 ${entry.fileName}，但读不到后端 /models/vae_approx：${listErr}。无法核对是否已装；未装时 HD 档会静默回退到 latent2rgb。`,
+      };
+    }
+    return {
+      basis: "table",
+      installedFile: null,
+      message: `建议文件 ${entry.fileName} 不存在于后端 /models/vae_approx，当前回退到 latent2rgb（可能不是最佳）。本地实存：${have}。`,
+      advice: `把 ${entry.fileName}（前缀 ${decoderPrefix(entry)}）放进 vae_approx 后 HD 档才用得上；下完调 POST /comfyui-hana/preview-model/verify 复核落地。`,
+    };
+  }
+
   // 安装探测结果 → ComfyUI 主目录候选（便携版外层 / 源码安装都覆盖；顺序即优先）。
   // 为什么不能直接用 installs[0].path：便携版外层根（D:\\ComfyUI）的 models/ 并不在它下面，
   // 真正的模型目录在 <root>/ComfyUI/models（relay detectInstall 的 mainPy 才是权威）。
@@ -1045,12 +1134,13 @@ export default defineApp(async (sdk) => {
   }
 
   // ── 判族三条路：user（显式指定）→ canvas（画布快照，带缓存）→ fallback（null + 原因）──
+  // 本函数只出「候选」与依据（source），不碰本地文件列表；本地实存核对由 detectPreviewDecoder 合并。
   const PREVIEW_CANVAS_TTL_MS = 30_000;
   const PREVIEW_CANVAS_FALLBACK_TTL_MS = 5_000; // 没认出来时缓存短一点：画布刚打开能尽快被认到
   const PREVIEW_CANVAS_MAX_AGE_SEC = 900; // 快照超过 15 分钟视为过期（画布多半已关，不拿旧图当证据）
   let previewCanvasCache = { at: 0, result: null };
 
-  async function detectPreviewDecoder(opts = {}) {
+  async function resolveDecoderCandidate(opts = {}) {
     const force = opts.force === true;
     // ① user：请求参数显式指定（不认识就报错，不偷换）
     if (opts.user !== undefined && opts.user !== null && String(opts.user).trim() !== "") {
@@ -1094,6 +1184,16 @@ export default defineApp(async (sdk) => {
     }
     previewCanvasCache = { at: Date.now(), result: res };
     return res;
+  }
+
+  // 判族对外入口（issue #2）：候选（user → canvas）+ 本地实存两路合并，结果里带 source/basis 说明依据。
+  // ⚠ 候选带 TTL 缓存，**本地合并每次现算**（不缓存）：否则刚放进去的解码器会被缓存判成「不存在」。
+  // opts.list 可由调用方传入已取到的 fetchVaeApproxList 结果，避免同一请求重复打后端。
+  async function detectPreviewDecoder(opts = {}) {
+    const det = await resolveDecoderCandidate(opts);
+    const list = opts.list && typeof opts.list === "object" ? opts.list : await fetchVaeApproxList();
+    const ev = mergeDecoderEvidence(det, list);
+    return { ...det, ...ev, localListOk: !!(list && list.ok), localListError: (list && list.error) || null };
   }
 
   // 对外的表行（加 installed / prefix；不暴露内部 excludes 之类的实现细节）
@@ -3838,6 +3938,47 @@ export default defineApp(async (sdk) => {
   // 不再本地重复实现（旧实现与之同口径：全串或基名相等）。保留本名作内部调用别名。
   const canvasPageMatches = (active, candidates) => nameMatchesTarget(active, candidates);
 
+  // ── P3-b 收尾（issue #2，2026-11-27）：openWorkflow 的 not_target 收口取证（只读）────────
+  // 桥侧「本页不是目标页」时回 blocked:"not_target"（空转、不碰画布，见桥 js 的 dirtyGateDecision）。
+  // 它不是失败——真正的装载由目标页自己做；多页广播时这条回执可能先回来抢到落定权（py 侧 first-response
+  // 解 future），旧口径就把它当成一次失败抛出。这里只读服务端页面账本（canvas.pages），给三种结论：
+  //   · 目标页在线且该页未标记未保存改动 → 认定「已由目标页完成」（证据 = 该页前台/已打开列表命中目标）；
+  //   · 目标页在线但该页 dirty → 归到脏保护（目标页自己的桥拦下的），文案点名目标页；
+  //   · 账本里没有这样的页（只剩我们这种非目标页，或目标页已关闭/不在线）→ 报「目标页未响应装载」。
+  // 为何不能更硬：桥 js 看不到别的页的脏状态，reviver 也只能读到某一个页的 revision（广播时谁先答是谁），
+  // 跨页唯一可信的共享状态就是 py 这份逐页账本。取不到账本 → 按「无证据」处理，绝不猜成功。
+  async function openWorkflowNotTargetVerdict({ target, wantSid }) {
+    const cands = target ? [target] : [];
+    let pages = [];
+    try {
+      const pgs = await canvasBridgeInvoke("canvas.pages", {});
+      if (pgs.ok && pgs.payload && Array.isArray(pgs.payload.pages)) pages = pgs.payload.pages;
+    } catch { /* 账本取不到 → 无证据 */ }
+    const short = (p) => String((p && (p.sid || p.sidFull)) || "").slice(0, 8);
+    const want = String(wantSid || "").trim();
+    const live = pages.filter((p) => p && p.stale !== true);
+    // 排除回执里那个 sid 本身（那是调用方指定的目标页，不是「我们这种非目标页」）
+    const others = want
+      ? live.filter((p) => {
+          const s = String(p.sidFull || p.sid || "");
+          return !(s === want || s.startsWith(want) || want.startsWith(s));
+        })
+      : live;
+    const hit = cands.length
+      ? others.find((p) => {
+          if (canvasPageMatches(p.workflow, cands)) return true;
+          const ow = Array.isArray(p.openWorkflows) ? p.openWorkflows : [];
+          return ow.some((w) => w && canvasPageMatches(w.name || w.path || w.filename, cands));
+        })
+      : null;
+    return {
+      page: hit ? { sid: short(hit), workflow: hit.workflow || null, modified: hit.modified === true } : null,
+      livePages: live.map((p) => ({ sid: short(p), workflow: p.workflow || null, stale: false })),
+      pagesSeen: pages.length,
+      targetPresent: !!hit,
+    };
+  }
+
   // settle（修复 3）：装载后等画布安定，再放行 queue。
   // 依据（v1.53.6 实证）：loadGraphData 在 configure 前至少 3 处 await（扩展钩子 ×2、
   // nodeReplacementStore.load），且 clean() 先行清图——桥侧快返后画布可能仍处「空图/旧图」窗口。
@@ -4926,6 +5067,54 @@ export default defineApp(async (sdk) => {
               : "";
             throw new Error(`openWorkflow 被拒：没有找到「${target || "?"}」${cands}${pagesBrief ? `\n- 在线页面：${pagesBrief}` : ""}`);
           }
+        } else if (payload.blocked === "not_target") {
+          // P3-b 收尾（issue #2，2026-11-27）：本页不是目标页、空转未参与 —— 不是失败。
+          // 以真正参与的那一页（目标页，由服务端页面账本核对）为准；只有全部页面都只是
+          // 「非目标页」（或没有任何页面完成装载）时才算失败，并点名目标页。
+          const target = String((bridgeArgs && (bridgeArgs.path || bridgeArgs.name || bridgeArgs.workflow)) || "").trim();
+          const reqSid = String((payload && payload.sid) || (bridgeArgs && bridgeArgs.sid) || "").trim();
+          const skippedSid = reqSid ? `${reqSid.slice(0, 8)}…` : "(未指定)";
+          const nt = await openWorkflowNotTargetVerdict({ target, wantSid: reqSid });
+          if (nt.page && nt.page.modified) {
+            // 目标页在线、但被它自己的脏保护拦下（它的回执可能在竞速里被我们这条顶掉）
+            const e = new Error(
+              `openWorkflow 被拒：目标页 ${nt.page.sid}…（「${nt.page.workflow || target || "?"}」）有未保存改动，确认丢弃请传 force=true` +
+                `\n- 说明：本次有 1 页因不是目标页而空转未参与（不代表目标页成功）`,
+            );
+            e.code = "canvas-failed";
+            throw e;
+          }
+          if (nt.page) {
+            // 目标页在线且干净 → 认定由它完成装载（证据：页面账本前台/已打开列表命中目标）
+            payload = {
+              opened: true,
+              pending: false,
+              loaded: true,
+              settled: true,
+              settleReason: "other-page",
+              matched: nt.page.workflow || target || null,
+              activeAfter: nt.page.workflow || target || null,
+              nodeCount: null,
+              // 桥回执的脏判定字段原样保留（不破旧字段名）
+              gate: payload.gate || null,
+              targetDirty: payload.targetDirty === true,
+              sid: payload.sid || reqSid || null,
+              // 跳过页记账（本页回的是 not_target，至少 1 页）
+              notTargetSkipped: 1,
+              skippedSids: null, // 桥回执不带「应答页自己的 sid」，不编造
+              viaPage: nt.page,
+              note: `本页不是目标页、已空转未参与；装载由目标页 ${nt.page.sid}…（「${nt.page.workflow || target || "?"}」）完成（证据：页面账本）`,
+            };
+          } else {
+            const pagesBrief = onlinePagesBrief(nt.livePages);
+            const e = new Error(
+              `openWorkflow 被拒：目标页 ${skippedSid} 未响应装载（可能已关闭或不在线）；` +
+                `本次共跳过 1 页（该页不是目标页，空转未参与），没有任何页面完成装载` +
+                (pagesBrief ? `\n- 在线页面：${pagesBrief}` : ""),
+            );
+            e.code = "target-not-responded";
+            throw e;
+          }
         } else {
           const why =
             payload.blocked === "dirty"
@@ -5224,6 +5413,11 @@ export default defineApp(async (sdk) => {
         let line = `已打开并装载「${name}」${payload.nodeCount != null ? `（${payload.nodeCount} 节点）` : ""}`;
         if (payload.settled) line += "；落定校验通过";
         else if (payload.pending) line += "；装载已发起（异步）";
+        // P3-b 收尾（issue #2）：本页不是目标页时由目标页完成装载——如实注明跳过页数与目标页。
+        if (payload.notTargetSkipped) {
+          const vp = payload.viaPage || {};
+          line += `\n- 本页非目标页已跳过 ${payload.notTargetSkipped} 页；装载由目标页 ${vp.sid ? `${vp.sid}…（「${vp.workflow || "?"}」）` : "(账本已命中)"} 完成（证据：页面账本）`;
+        }
         if (inv && inv.via === "shell" && payload.pending !== true) {
           line += "\n- 注意：本次由壳页腿执行（壳页桥尚未升级为完整装载语义）；如画布未刷新，请重试或改用 loadWorkflowFile";
         }
@@ -5303,6 +5497,16 @@ export default defineApp(async (sdk) => {
           ? {
               opened: payload.opened === true,
               loaded: payload.loaded === true,
+              ...(payload.notTargetSkipped
+                ? {
+                    notTargetSkipped: payload.notTargetSkipped,
+                    skippedSids: payload.skippedSids || null,
+                    viaPage: payload.viaPage || null,
+                    gate: payload.gate || null,
+                    targetDirty: payload.targetDirty === true,
+                    sid: payload.sid || null,
+                  }
+                : {}),
               ...(payload.unsettled ? { blocked: "unsettled", settleReason: payload.settleReason || null, diagnostics: payload.diagnostics || null } : {}),
             }
           : {}),
@@ -7766,7 +7970,7 @@ export default defineApp(async (sdk) => {
           const body = await c.req.json().catch(() => ({}));
           const raw = typeof body.path === "string" ? body.path.trim() : "";
           if (raw && !/^[A-Za-z]:[\\/]/.test(raw) && !raw.startsWith("/")) {
-            return c.json({ ok: false, error: "需要绝对路径（如 D:\\ComfyUI）" }, 400);
+            return c.json({ ok: false, error: "需要绝对路径（如 <盘符>:\\ComfyUI，或 /home/you/ComfyUI）" }, 400);
           }
           if (!writeInstallTarget(raw || null)) return c.json({ ok: false, error: "写入失败" }, 500);
           await syncCustomRoots(true);
@@ -8051,17 +8255,18 @@ export default defineApp(async (sdk) => {
         }
       });
 
-      // ── 解码器清单 + 判族（issue #1 修复，2026-10-21）──────────────────────────
+      // ── 解码器清单 + 判族（issue #1 修复，2026-10-21；issue #2：本地实存优先）──────────
       // 设置页与 agent 共用：对照表全量 + 当前判族结果 + 哪些已装 + 真实 targetDir。
       // 判族三条路：user（?decoder= 或已存 preview-decoder.json）→ canvas（画布快照，带 30s 缓存）
       // → fallback（decoder=null + reason，让用户自己选）。user 给了不认识的值直接 400，不偷换。
+      // detection.basis = 命中方式：local（本地实存）/ table（表命中但文件不存在，已回退）/ none / unknown / no-upstream。
       app.get("/comfyui-hana/preview-decoders", async (c) => {
         try {
           const q = c.req.query("decoder");
           const force = String(c.req.query("refresh") || "") === "1";
           const list = await fetchVaeApproxList();
           const dir = await resolvePreviewVaeApproxDir(force);
-          const det = await detectPreviewDecoder({ user: q, force });
+          const det = await detectPreviewDecoder({ user: q, force, list });
           if (det.source === "user" && det.error) return c.json({ ok: false, error: det.error, decoders: PREVIEW_DECODERS.map((e) => previewDecoderRow(e, list.files)) }, 400);
           const entry = det.entry || null;
           return c.json({
@@ -8070,6 +8275,10 @@ export default defineApp(async (sdk) => {
             detection: {
               key: det.key === undefined ? null : det.key,
               source: det.source,
+              basis: det.basis,
+              message: det.message,
+              ...(det.installedFile ? { installedFile: det.installedFile } : {}),
+              ...(det.advice ? { advice: det.advice } : {}),
               ...(det.via ? { via: det.via } : {}),
               ...(det.entry ? { fileName: det.entry.fileName, family: det.entry.family } : {}),
               ...(det.entry && det.entry.key === null ? { downloadable: false } : {}),
@@ -8132,12 +8341,21 @@ export default defineApp(async (sdk) => {
           } else if (wantName) {
             entry = matchPreviewDecoder(wantName);
           }
-          if (!entry && !wantName) {
-            const det = await detectPreviewDecoder({});
-            entry = det.entry;
-            if (!entry) return c.json({ ok: false, error: `没有可校验的目标：${det.error || "判族失败"}（请给 decoder 或 filename）` }, 400);
-          }
           const list = await fetchVaeApproxList();
+          if (!entry && !wantName) {
+            const det = await detectPreviewDecoder({ list });
+            entry = det.entry;
+            if (!entry) {
+              return c.json({
+                ok: false,
+                verified: false,
+                basis: det.basis,
+                error: `没有可校验的目标：${det.message || det.error || "判族失败"}（请给 decoder 或 filename）`,
+                ...(det.advice ? { advice: det.advice } : {}),
+                files: list.files,
+              }, 400);
+            }
+          }
           if (!list.ok) return c.json({ ok: false, verified: false, error: `读不到后端 /models/vae_approx：${list.error}`, files: list.files }, 502);
           const prefix = entry ? decoderPrefix(entry) : null;
           const name = wantName || (entry ? entry.fileName : "");
@@ -8167,7 +8385,7 @@ export default defineApp(async (sdk) => {
             files: list.files,
             ...(verified
               ? { note: `已落地且 ComfyUI 认得到（${hitFile}）；HD 档预览下次提交即生效` }
-              : { error: `文件没有出现在后端 /models/vae_approx 列表里（期望前缀 ${prefix || name}）——HD 档仍会静默降级到 latent2rgb` }),
+              : { error: `文件没有出现在后端 /models/vae_approx 列表里（期望前缀 ${prefix || name}）——HD 档仍会回退到 latent2rgb（可能不是最佳）` }),
           }, verified ? 200 : 404);
         } catch (e) {
           return c.json({ ok: false, verified: false, error: msgOf(e) }, 500);
@@ -8182,10 +8400,10 @@ export default defineApp(async (sdk) => {
         try {
           const body = await c.req.json().catch(() => ({}));
           const q = c.req.query("decoder") || (body && body.decoder);
-          const det = await detectPreviewDecoder({ user: q, force: true });
+          const list = await fetchVaeApproxList();
+          const det = await detectPreviewDecoder({ user: q, force: true, list });
           if (det.source === "user" && det.error) return c.json({ ok: false, error: det.error, decoders: PREVIEW_DECODERS.map((e) => ({ key: e.key, fileName: e.fileName, family: e.family })) }, 400);
           const dir = await resolvePreviewVaeApproxDir(true);
-          const list = await fetchVaeApproxList();
           const base = {
             needAgent: true,
             // filename 是 setting 页（ui/assets/settings.js）在读的旧字段名；fileName 为本轮新口径。
@@ -8193,6 +8411,11 @@ export default defineApp(async (sdk) => {
             filename: det.entry ? det.entry.fileName : null,
             decoder: det.key === undefined ? null : det.key,
             decoderSource: det.source,
+            // 命中方式（issue #2）：local=本地实存 / table=表命中但文件不存在（已回退）/ none / unknown / no-upstream
+            decoderBasis: det.basis,
+            decoderMessage: det.message,
+            ...(det.installedFile ? { installedFile: det.installedFile } : {}),
+            ...(det.advice ? { advice: det.advice } : {}),
             ...(det.error ? { decoderReason: det.error } : {}),
             ...(det.evidence ? { evidence: det.evidence } : {}),
             targetDir: dir.targetDir,
@@ -8207,8 +8430,8 @@ export default defineApp(async (sdk) => {
             return c.json({
               ...base,
               ok: false,
-              error: `判不出当前模型属于哪个解码器族：${det.error || "无证据"}。请用 decoder 参数显式指定（GET /comfyui-hana/preview-decoders 可查可用值）。`,
-              note: "宁可不给，也不给一个可能错的解码器名",
+              error: `判不出当前模型属于哪个解码器族：${det.message || det.error || "无证据"}`,
+              note: "宁可不给，也不给一个可能错的解码器名；预览当前回退到 latent2rgb（可能不是最佳）",
             }, 409);
           }
           if (det.entry.key === null || det.entry.downloadable === false) {
@@ -8232,7 +8455,7 @@ export default defineApp(async (sdk) => {
               prefix: decoderPrefix(det.entry),
               sources: det.entry.sources,
               ...(det.entry.caution ? { caution: det.entry.caution } : {}),
-              note: `已装（${installedFile}），无需再下载`,
+              note: `已装（${installedFile}），无需再下载；命中方式：本地实存`,
             });
           }
           if (!dir.targetDir) {
@@ -8246,7 +8469,7 @@ export default defineApp(async (sdk) => {
             family: det.entry.family,
             sources: det.entry.sources,
             ...(det.entry.caution ? { caution: det.entry.caution } : {}),
-            note: `请由 agent 用 hana-downloader 下载 ${det.entry.fileName} 到 targetDir；下完调 ${base.verifyRoute} 复核落地`,
+            note: `请由 agent 用 hana-downloader 下载 ${det.entry.fileName} 到 targetDir；下完调 ${base.verifyRoute} 复核落地。在此之前预览回退到 latent2rgb（可能不是最佳）。`,
           });
         } catch (e) {
           return c.json({ ok: false, error: msgOf(e) }, 500);

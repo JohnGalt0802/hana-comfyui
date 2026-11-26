@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import test from "node:test";
 import assert from "node:assert/strict";
-import { convertUiToApi } from "./workflow-tools.mjs";
+import { convertUiToApi, WIDGET_SPEC_TYPES, NON_WIDGET_INPUT_TYPES } from "./workflow-tools.mjs";
 
 // 类型不在 /object_info 之外都能过的最小 object_info
 const OBJ = {
@@ -128,8 +128,8 @@ test("放行：AUTOCOMPLETE_TEXT_LORAS 在 named 里有值时被注入", () => {
   assert.equal(out["12"].inputs.strength, 0.8);
 });
 
-// 关键变异守卫（位置回退分支）：named 分支不看 WIDGET_SPEC_TYPES，白名单只活在位置回退这条路上；
-// 一旦有人把 "AUTOCOMPLETE_TEXT_LORAS" 从 WIDGET_SPEC_TYPES 摘掉，本用例必须变红。
+// 关键变异守卫（位置回退分支）：位置回退与 named 分支同口径——看黑名单（socket 类型），不看白名单。
+// 一旦有人把「未知类型不占位」的旧白名单判定装回去，本用例必须变红。
 // 后果不是「少一个字段」而是整体错位：loras 那格不占位，widgets_values[0] 的字符串会溢到 strength 上。
 test("放行：无 named 时位置回退仍能给 AUTOCOMPLETE_TEXT_LORAS 占位（不错位）", () => {
   const out = convertUiToApi(
@@ -813,4 +813,102 @@ test("Reroute 多个通配入口：`*` 放宽不得变成瞎猜，仍按歧义�
     () => convertUiToApi(wf, WILD_OBJ, { adapters: REROUTE_ADAPTER }),
     (e) => /歧义映射/.test(e.message) && /多个通配（\*）入口/.test(e.message) && /「a」\/「b」/.test(e.message),
   );
+});
+
+// ── 四、widget 占位口径（2026-11-27，issue #4）：黑名单排除法，白名单不再拦截 ───────────
+// 病根：旧白名单只认 7 种内置类型，社区插件的自定义 widget 类型在「只有 widgets_values」的老文件里
+// 不占位 → 后面的参数整体前移一格 → 参数错位 / 后端 required_input_missing。named 分支从来看黑名单，
+// 两套口径会漂移，所以位置回退改成同一口径：除 socket 类型（NON_WIDGET_INPUT_TYPES）外一律视为 widget。
+
+const CUSTOM_WIDGET_OBJ = {
+  // 自定义 widget 类型（不在历史白名单里）排在声明首位：旧口径下它不占位，strength/steps 全部错位
+  CustomLoraStack: { input: { required: { stacks: ["LORA_STACK_CUSTOM", {}], strength: ["FLOAT", {}], steps: ["INT", {}] } } },
+};
+
+test("放行：未知 widget 类型在无 named 的老文件里也占位（issue #4 主症状）", () => {
+  const warnings = [];
+  const out = convertUiToApi(
+    { nodes: [{ id: 21, type: "CustomLoraStack", inputs: [], widgets_values: ["stackA", 0.75, 30] }], links: [] },
+    CUSTOM_WIDGET_OBJ,
+    { onWarning: (w) => warnings.push(w) },
+  );
+  const inputs = out["21"].inputs;
+  assert.deepEqual(inputs, { stacks: "stackA", strength: 0.75, steps: 30 });
+  const hit = warnings.filter((w) => w.includes("unknown_widget_type"));
+  assert.equal(hit.length, 1, JSON.stringify(warnings));
+  assert.match(hit[0], /CustomLoraStack/, "warning 要点名节点类型");
+  assert.match(hit[0], /「stacks」/, "warning 要点名参数名");
+  assert.match(hit[0], /LORA_STACK_CUSTOM/, "warning 要带上被判定的类型");
+});
+
+test("保留：同名槽被序列化成普通 socket（无 widget 标记）时未知类型不占位", () => {
+  const obj = {
+    Srv3DCamera: { input: { required: { things: ["WHATEVER_SOCKET", {}], steps: ["INT", {}] } } },
+  };
+  const warnings = [];
+  const out = convertUiToApi(
+    { nodes: [{ id: 22, type: "Srv3DCamera", inputs: [{ name: "things", type: "WHATEVER_SOCKET", link: null }], widgets_values: [20] }], links: [] },
+    obj,
+    { onWarning: (w) => warnings.push(w) },
+  );
+  assert.deepEqual(out["22"].inputs, { steps: 20 }, "socket 不占位，steps 不能吃到下一格");
+  assert.equal(warnings.filter((w) => w.includes("unknown_widget_type")).length, 0, "有槽证据就不是猜，不该出 warning");
+});
+
+test("保留：未知类型带 template 声明（autogrow 容器）本身不占位，子控件才占位", () => {
+  const obj = {
+    AgContainer: {
+      input: {
+        required: {
+          values: ["COMFY_AUTOGROW_V3", { template: { input: { required: { value: ["*", {}] } }, names: ["a", "b"] } }],
+          expr: ["STRING", {}],
+        },
+      },
+    },
+  };
+  const out = convertUiToApi(
+    { nodes: [{ id: 23, type: "AgContainer", inputs: [{ name: "values.a", type: "*", widget: { name: "values.a" }, link: null }], widgets_values: ["a+b"] }], links: [] },
+    obj,
+  );
+  assert.deepEqual(out["23"].inputs, { expr: "a+b" }, "容器不占位：唯一一项值归 expr，不能反过来被容器吃掉");
+  assert.equal(out["23"].inputs.values, undefined);
+  assert.equal(out["23"].inputs["values.a"], undefined, "未声明子槽只占位、不注入（位置已溢出）");
+});
+
+test("真实形态：union 类型 COMBO（Preview3D 的 model_file）在无 named 时能注入", () => {
+  const obj = {
+    Preview3D: {
+      input: {
+        required: { model_file: ["STRING,FILE_3D_GLB,FILE_3D_STL", {}] },
+        optional: { camera_info: ["LOAD3D_CAMERA", {}], bg_image: ["IMAGE", {}] },
+      },
+    },
+  };
+  const out = convertUiToApi(
+    {
+      nodes: [
+        {
+          id: 41,
+          type: "Preview3D",
+          inputs: [
+            { name: "camera_info", type: "LOAD3D_CAMERA", link: null },
+            { name: "bg_image", type: "IMAGE", link: null },
+          ],
+          widgets_values: ["a.glb", ""],
+        },
+      ],
+      links: [],
+    },
+    obj,
+  );
+  assert.deepEqual(out["41"].inputs, { model_file: "a.glb" }, "第一个位置给 model_file；两个 socket 输入不抢位");
+});
+
+test("常量单一来源：非 socket 黑名单是唯一拦截口径，WIDGET_SPEC_TYPES 降级为已知清单", () => {
+  assert.ok(NON_WIDGET_INPUT_TYPES instanceof Set);
+  assert.ok(WIDGET_SPEC_TYPES instanceof Set, "旧名字必须保持导出（其他调用方可能 import）");
+  assert.ok(NON_WIDGET_INPUT_TYPES.has("IMAGE") && NON_WIDGET_INPUT_TYPES.has("LATENT"));
+  assert.ok(WIDGET_SPEC_TYPES.has("COMBO") && WIDGET_SPEC_TYPES.has("INT"));
+  // 白名单不再拦截：不在已知清单里的类型仍然占位（上面 LORA_STACK_CUSTOM 用例钉的就是这条）
+  assert.equal(WIDGET_SPEC_TYPES.has("LORA_STACK_CUSTOM"), false);
 });

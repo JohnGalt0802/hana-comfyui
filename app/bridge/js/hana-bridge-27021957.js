@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-11-05 hana-bridge-05035216";
+const BUILD_TAG = "2026-11-27 hana-bridge-27021957";
 
 // ── 明暗跟随（2026-11-05）──────────────────────────────────────────
 // 背景：桥注入界面的深色覆盖原先只挂 `:root.dark-theme`。前端 1.58.5 起整个包里 `dark-theme`
@@ -334,12 +334,21 @@ function workflowDirty(wf) {
   return false;
 }
 
-// ── P3-b（2026-10-21，issue #2）：多页面定向的「判定可见化」──────────────────────
+// ── P3-b（issue #2）：多页面定向的脏保护判定（2026-11-27 修口径）────────────────
 // 桥 js 侧看不到别的页面开着什么（没有 _frontends 表，aw 永远是本页的活动工作流），
-// 能做的唯一判断是「这条指令是不是发给本页的」——靠 api.clientId（= /ws 的 sid）自比。
-// 注意：这两个函数只产出「标注」，不改变脏保护的拦/放口径（口径仍是 dirty && force!==true）。
-// 理由：异页 sid 放行是错的——py 侧 sid 无命中/歧义时会退化为广播，此时本页才是执行目标，
-// 放行就等于丢掉用户未保存的编辑。
+// 能看见的只有三样：force、这条指令的 sid 是不是指本页（api.clientId = /ws 的 sid 自比）、
+// 本页自己的 dirty。
+// 旧口径「dirty && force!==true」看的是「谁在拦」，而不是「被改的那一页脏不脏」：
+// A 页有未保存改动、B 页干净，对 B 发 openWorkflow（显式 sid=B）时，指令一旦落到 A 上就被
+// 「当前图有未保存改动」挡掉（多页广播时脏页往往先回，抢到落定权）。
+// 新口径以「目标页的脏状态」为准：
+//   · sid 指本页（targetsSelf===true）/ 没给 sid（广播：本页可能就是执行目标）
+//     → 目标页即本页 → 本页 dirty 才拦。
+//   · sid 明确指别的页（===false）→ 本页不是目标 → 本页 dirty 不参与判定：
+//     既不拦（目标页自己的桥会用它的 dirty 拦），也不执行（执行＝把本页未保存的改动冲掉），
+//     回执 blocked:"not_target" 让上层知道「这条不是发给本页的」。
+//   · clientId 取不到（"unknown"）→ 判不出是不是本页 → 保守按本页拦（丢脏数据比误拦严重）。
+// force=true 仍强制穿透。
 
 // 判定这条指令是否发给本页。
 // 返回 true=是本页 / false=不是本页 / "unknown"=本页 clientId 取不到；无 sid → null。
@@ -357,13 +366,25 @@ function sidTargetsSelf(rawSid) {
   return false;
 }
 
-// 计算脏检查走哪个分支（仅用于标注/日志，不参与拦/放判断）。
-function dirtyGateBranch(force, hasSid, targetsSelf) {
-  if (force === true) return "skipped-force";
-  if (!hasSid) return "enforced-no-sid";
-  if (targetsSelf === true) return "enforced-active-page";
-  if (targetsSelf === "unknown") return "enforced-sid-unknown";
-  return "enforced-sid-not-self";
+// 脏保护判定（纯函数、无副作用，夹具可测）。
+// 入参：force=强制穿透 / hasSid=是否明确给了 sid / targetsSelf=sidTargetsSelf 结果 /
+//      selfDirty=本页活动工作流是否未保存。
+// 出参：block=拦不拦 / standdown=本页不是目标页（不执行、不碰画布）/ gate=回执字段 /
+//      targetDirty=目标页脏状态（true 脏 / false 干净 / null 本页判不出）/ branch=分支名（日志 + dirtyCheck）。
+function dirtyGateDecision(force, hasSid, targetsSelf, selfDirty) {
+  const dirty = selfDirty === true;
+  if (force === true) {
+    return { block: false, standdown: false, gate: "forced", targetDirty: dirty, branch: "skipped-force" };
+  }
+  // 明确发往别的页：本页既不是判定者也不是执行者（不拿本页的 dirty 挡别人）
+  if (hasSid === true && targetsSelf === false) {
+    return { block: false, standdown: true, gate: "not-target", targetDirty: null, branch: "standdown-sid-not-self" };
+  }
+  const branch = !hasSid
+    ? "enforced-no-sid"
+    : (targetsSelf === "unknown" ? "enforced-sid-unknown" : "enforced-active-page");
+  if (dirty) return { block: true, standdown: false, gate: "dirty", targetDirty: true, branch };
+  return { block: false, standdown: false, gate: "clean", targetDirty: false, branch };
 }
 
 // 工作流是否为「临时页」（从未落盘、无真实文件路径）：v1.55.14 源码核对为布尔 getter
@@ -1629,6 +1650,266 @@ function locateLiveGroup(a) {
   return hits[0];
 }
 
+// ── 画布提交的实时预览归属（2026-11-27，issue #1）────────────────────────────────
+// 现象：画布执行（canvas.queue）期间卡片收不到实时预览帧，后台直提（mode=backend）正常。
+// 根因：ComfyUI 只把 PREVIEW_IMAGE / execution 进度发给**发起该 prompt 的那个 client_id**
+//   （server.py 按 sid 定向 send_sync）。中继的 /ws 订阅用 config.clientId；画布执行由页面前端
+//   自己 POST /prompt，body.client_id 取 api.clientId（= 本页 uuid）→ 中继那条 WS 一条帧都收不到。
+// 修法（方案 a：只改写**这一次**的 /prompt 请求体，不动全局 api.clientId）：
+//   ① 前端 api.queuePrompt(number, {output, workflow}, options) 的 options 只认 partialExecutionTargets /
+//      previewMethod，没有 client_id 覆盖口（实读 comfyui_frontend_package static/assets/api-*.js）；
+//      但请求体是 JSON 字符串、经 api.fetchApi 发出 → 在传输层按次改写 client_id / extra_data.preview_method。
+//   ② 不选 b（临时换 api.clientId + finally 复位）的理由：api.clientId 会被 WS status 消息随时改回
+//      （api.js 收到 status 即 this.clientId = data.sid），全局换值可能中途失效；且同批提交的历史回执
+//      会读到它（reportHistoryCommit 上报 sid = api.clientId）→ 把本页 sid 写成中继 id，定向语义被污染。
+// 契约：clientId / previewMethod 都由中继 /_relay/bridge 在 op=canvas.queue 时注入（不写死字符串）。
+let canvasQueueInFlight = null; // 单次提交窗口的互斥标记（值 = 进入时刻 ISO 串；null = 空闲）
+
+const PROMPT_BODY_PATH_RE = /(^|\/)(?:api\/)?prompt\/?$/i;
+
+// 只认「这一次」的 /prompt 提交：路径以 prompt 结尾 + POST（query / hash 忽略）。
+function isPromptSubmit(url, init) {
+  const u = String(url == null ? "" : url).split("#")[0].split("?")[0];
+  if (!PROMPT_BODY_PATH_RE.test(u)) return false;
+  return String((init && init.method) || "GET").toUpperCase() === "POST";
+}
+
+// 改写 /prompt 请求体：client_id → 中继 id；extra_data.preview_method → 中继当前档位（给了才写）。
+// 只动这两个字段，其余原样往返（/prompt 体是纯 JSON：无 Date / 函数 / BigInt，parse→stringify 无损）。
+// 返回 null = 不该改（非字符串体 / 解析失败 / 不是提交流程）→ 调用方原样透传，绝不影响原生提交。
+function rewritePromptSubmitBody(body, patch) {
+  if (typeof body !== "string" || !body.trim()) return null;
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return null; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (!parsed.prompt) return null;
+  let changed = false;
+  if (patch && patch.clientId && parsed.client_id !== patch.clientId) {
+    parsed.client_id = patch.clientId;
+    changed = true;
+  }
+  if (patch && patch.previewMethod) {
+    const ed = parsed.extra_data && typeof parsed.extra_data === "object" && !Array.isArray(parsed.extra_data) ? parsed.extra_data : {};
+    if (ed.preview_method !== patch.previewMethod) {
+      ed.preview_method = patch.previewMethod;
+      changed = true;
+    }
+    parsed.extra_data = ed;
+  }
+  return changed ? JSON.stringify(parsed) : null;
+}
+
+// ── 预览解码器运行时反查（issue #1 第 3 条）─────────────────────────────────────
+// 解码器目录的权威只有后端自己认的那份清单：GET /models/vae_approx（= folder_paths.get_filename_list）。
+// App 侧那张静态表（app/index.js 的 PREVIEW_DECODERS）管「下载 / 安装引导」；这里管「这次提交到底会用到
+// 哪个文件」：表里没命中的族按目录里**实际存在**的文件回退，并在回执 preview.decoder 里写明用的是哪个 /
+// 为什么定不了。不写死任何模型名或 URL —— 候选文件名全部来自运行时列表，模型关键词全部来自当前画布。
+const VAE_APPROX_TTL_MS = 15_000;
+let vaeApproxCache = { at: 0, files: null, error: null };
+
+async function listVaeApproxFiles(force) {
+  const now = Date.now();
+  if (!force && vaeApproxCache.files && now - vaeApproxCache.at < VAE_APPROX_TTL_MS) return vaeApproxCache;
+  const out = { at: now, files: null, error: null };
+  try {
+    const res = await api.fetchApi("/models/vae_approx", { cache: "no-store" });
+    if (!res || res.ok === false) {
+      out.error = `后端 /models/vae_approx 不可用（HTTP ${res ? res.status : "无响应"}）`;
+    } else {
+      const data = await res.json();
+      if (Array.isArray(data)) out.files = data.map((x) => String(x));
+      else out.error = "后端 /models/vae_approx 返回非数组";
+    }
+  } catch (err) {
+    out.error = "读取 /models/vae_approx 失败：" + String((err && err.message) || err).slice(0, 160);
+  }
+  vaeApproxCache = out;
+  return out;
+}
+
+// 画布里「像模型」的通用线索：loader 节点类型名 + 各控件上的模型文件名（静音 / 旁路节点不算证据）。
+// 刻意不认具体模型名：只认「扩展名像模型文件」和「节点类型名」，判族仍靠文本匹配。
+const MODEL_FILE_EXT_RE = /\.(safetensors|ckpt|pt|pth|bin|gguf)$/i;
+function canvasModelHints() {
+  const out = [];
+  try {
+    for (const n of nodeList(app.graph)) {
+      if (!n || n.mode === 2 || n.mode === 4) continue;
+      if (n.type) out.push(String(n.type));
+      for (const w of n.widgets || []) {
+        const v = w && w.value;
+        if (typeof v === "string" && MODEL_FILE_EXT_RE.test(v.trim())) out.push(v.trim());
+      }
+    }
+  } catch { /* 画布读不到 → 只剩目录这一路 */ }
+  return Array.from(new Set(out)).slice(0, 60);
+}
+
+const DECODER_TOKEN_NOISE = new Set(["decoder", "models", "model", "safetensors", "ckpt", "pth", "pt", "bin", "gguf", "encoder"]);
+function decoderStem(file) { return String(file).replace(/\.(pth|pt|safetensors|bin|gguf)$/i, ""); }
+function decoderTokens(s) {
+  return String(s == null ? "" : s).toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !DECODER_TOKEN_NOISE.has(t));
+}
+
+// 打分：解码器文件名的确定性 token 是否出现在画布模型线索里（整名双向子串 > 单 token 命中）。
+// 只做「文本对上」这一种判断，对不上就不猜（与 index.js 判族同一口径：宁可 null 不错配）。
+function scoreDecoderFile(file, hints) {
+  let stem = "";
+  try { stem = decoderStem(file).toLowerCase(); } catch { return { file, score: 0, token: null }; }
+  const compactStem = stem.replace(/[^a-z0-9]+/g, "");
+  const out = { file, score: 0, token: null };
+  if (!compactStem) return out;
+  for (const h of hints) {
+    const compactHint = String(h).toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (!compactHint) continue;
+    if (compactStem.length >= 4 && (compactHint.includes(compactStem) || compactStem.includes(compactHint))) {
+      return { file, score: 100 + compactStem.length, token: compactStem };
+    }
+    for (const t of decoderTokens(stem)) {
+      if (compactHint.includes(t) && t.length > out.score) { out.score = t.length; out.token = t; }
+    }
+  }
+  return out;
+}
+
+// method=taesd 才需要解码器；其它档位（latent2rgb / auto / none）由后端自选预览实现，不碰 vae_approx。
+async function resolvePreviewDecoderReceipt(method) {
+  const m = method ? String(method).toLowerCase() : null;
+  const receipt = { method: m, clientId: null, file: null, via: "none", reason: null, installed: null, listError: null };
+  if (m !== "taesd") {
+    receipt.via = "method-no-decoder";
+    receipt.reason = m ? `档位 ${m} 由后端自选预览实现，不需要 vae_approx 解码器` : "本次提交未设置预览档位（沿用后端默认）";
+    return receipt;
+  }
+  const list = await listVaeApproxFiles();
+  receipt.listError = list.error || null;
+  const files = list.files || [];
+  receipt.installed = files;
+  if (!files.length) {
+    receipt.reason = list.error
+      ? `读不到 vae_approx 清单（${list.error}），无法确认解码器`
+      : "vae_approx 目录为空：后端 get_previewer 找不到解码器只打一条 warning 后静默降级（多为全程无帧）";
+    return receipt;
+  }
+  const hints = canvasModelHints();
+  const scored = files.map((f) => scoreDecoderFile(f, hints)).sort((x, y) => y.score - x.score);
+  const top = scored[0];
+  const tie = scored.length > 1 && scored[1].score === top.score;
+  if (top && top.score > 0 && !tie) {
+    receipt.file = top.file;
+    receipt.via = "vae_approx-list+canvas-hint";
+    receipt.matchedToken = top.token;
+  } else if (files.length === 1) {
+    receipt.file = files[0];
+    receipt.via = "vae_approx-list(only-file)";
+    receipt.reason = "画布线索没对上解码器名，但目录里只有这一个文件（按实存回退）";
+  } else {
+    receipt.via = "vae_approx-list(ambiguous)";
+    receipt.reason = `画布线索没对上目录里的 ${files.length} 个解码器，未猜：后端按模型族自己挑，实际用哪个由 ComfyUI 决定`;
+  }
+  return receipt;
+}
+
+// canvas.queue 的实现体（单次提交窗口的互斥由 OPS 里的薄包装负责，见 canvasQueueInFlight）。
+// 快返：只提交不等执行。prompt_id 优先靠猴补 api.queuePrompt 捕获（E1 §2-a），
+// 捕获不到再用 /queue 前后差集兜底（E1 §2-b，仅取唯一新增项、不猜）。
+async function canvasQueueImpl(args) {
+  const a = args || {};
+  const front = a.front === true;
+  if (typeof app.queuePrompt !== "function") {
+    throw new Error("前端没有 app.queuePrompt（版本不支持）");
+  }
+  // 中继下发的两件东西（见本节开头说明）。缺任一件都退回原行为（老中继 / 预览关着）。
+  const relayClientId = typeof a.clientId === "string" && a.clientId.trim() ? a.clientId.trim() : null;
+  const previewMethod = typeof a.previewMethod === "string" && a.previewMethod.trim()
+    ? a.previewMethod.trim().toLowerCase().slice(0, 32)
+    : null;
+
+  let beforeIds = null;
+  try {
+    beforeIds = await queuePromptIds();
+  } catch { beforeIds = null; }
+
+  // 回执用的解码器反查：失败只降级成 reason，绝不阻断提交。
+  let preview = null;
+  try {
+    preview = await resolvePreviewDecoderReceipt(previewMethod);
+    preview.clientId = relayClientId;
+  } catch (err) {
+    preview = {
+      method: previewMethod, clientId: relayClientId, file: null, via: "none",
+      reason: "解码器反查失败：" + String((err && err.message) || err).slice(0, 160),
+    };
+  }
+
+  const orig = api.queuePrompt;
+  const origFetchApi = typeof api.fetchApi === "function" ? api.fetchApi : null;
+  // 没有可下发的东西（老中继 / 预览关着 + 无 clientId）就不装补丁：零行为变化。
+  const patchBody = !!(relayClientId || previewMethod) && !!origFetchApi;
+  let cap = null;
+  let capErr = null;
+  let bodyPatched = false;
+  api.queuePrompt = async function (...callArgs) {
+    try {
+      const res = await orig.apply(this, callArgs);
+      cap = res || null;
+      return res;
+    } catch (err) {
+      capErr = err;
+      throw err;
+    }
+  };
+  if (patchBody) {
+    // 按次改写：只对命中「这一次」的 /prompt 生效（bodyPatched 一次性），其余请求原样透传。
+    api.fetchApi = async function (url, init) {
+      try {
+        if (!bodyPatched && isPromptSubmit(url, init)) {
+          const rewritten = rewritePromptSubmitBody(init && init.body, { clientId: relayClientId, previewMethod });
+          if (rewritten) {
+            bodyPatched = true;
+            return await origFetchApi.call(api, url, Object.assign({}, init, { body: rewritten }));
+          }
+        }
+      } catch (err) {
+        console.warn(LOG_TAG, "改写 /prompt 提交体失败（本条提交退回原生行为）", err);
+      }
+      return origFetchApi.apply(api, arguments);
+    };
+  }
+  // 提交来源（2026-10-14）：本次运行由 Agent 工具发起 → 置 "agent"，供常驻包装上报时读取。
+  // 时序自证：orig = api.queuePrompt（= setup 装的常驻包装）→ 临时替换为捕获包装 →
+  // app.queuePrompt → 捕获包装调 orig（常驻包装）→ 常驻包装读 historyCommitSource（此刻="agent"）
+  // 上报 → 才回到本 finally 复位。故上报发生在复位之前 ✅。
+  const prevCommitSource = historyCommitSource;   // 保存现场（防嵌套）
+  historyCommitSource = "agent";
+  try {
+    await app.queuePrompt(front ? -1 : 0, 1);
+  } finally {
+    api.queuePrompt = orig;
+    if (patchBody) api.fetchApi = origFetchApi;   // 必须复位：抛错 / 中断都不留全局补丁
+    historyCommitSource = prevCommitSource;       // 还原
+  }
+  preview.applied = bodyPatched;
+  if (capErr) {
+    throw new Error("提交被拒：" + String(capErr).slice(0, 400));
+  }
+  if (cap && cap.prompt_id) {
+    return { queued: true, promptId: cap.prompt_id, number: cap.number, via: "app.queuePrompt", preview };
+  }
+  // 未捕获（如 processingQueue 忙时立即返回）：/queue 差集定位
+  let fallbackId = null;
+  if (beforeIds) {
+    try {
+      const afterIds = await queuePromptIds();
+      const added = [...afterIds].filter((id) => !beforeIds.has(id));
+      if (added.length === 1) fallbackId = added[0];
+    } catch { /* 兜底失败不阻断 */ }
+  }
+  const out = { queued: true, via: "app.queuePrompt", preview };
+  if (fallbackId) out.promptId = fallbackId;
+  return out;
+}
+
 const OPS = {
   // 全量 UI 格式（等价 Ctrl+S 写出的结构）
   "canvas.get": () => app.graph.toJSON(),
@@ -1929,22 +2210,44 @@ const OPS = {
     // 质检①（2026-10-08）：原判定只认 function 形式；v1.55.14 的 isModified 为布尔 getter
     // （ComfyWorkflow._isModified）→ function 判定恒 false、保护实际失效。改用 workflowDirty()
     // （兼容 getter / 函数两种形态；loadWorkflowFile 侧同点已走 workflowDirty，不受影响）。
-    // P3-b（2026-10-21，issue #2）：先算 branch 用于「标注 + 日志」（这条指令到底是不是发给本页的）；
-    // 拦/放口径与原来严格等价：原来 ⟺ dirty && force!==true，现 ⟺ dirty && branch!=="skipped-force"
-    // （branch 只在 force===true 时取 skipped-force）。异页 sid 放行是错的：py 侧 sid 无命中/歧义时
-    // 退化为广播，此时本页就是执行目标，放行等于丢掉用户未保存的编辑。
+    // P3-b（issue #2，2026-11-27）：脏保护按「目标页的脏状态」判，而不是「谁在拦」——见 dirtyGateDecision 注释。
     const rawSid = a.sid;
     const hasSid = rawSid != null && String(rawSid).trim() !== "";
-    const gateBranch = dirtyGateBranch(a.force === true, hasSid, hasSid ? sidTargetsSelf(rawSid) : null);
+    const sidVal = hasSid ? String(rawSid).trim() : null;
     let dirty = false;
     try { dirty = workflowDirty(aw); } catch { dirty = false; }
-    const sidLog = hasSid ? String(rawSid).trim().slice(0, 8) : "(none)";
+    const gate = dirtyGateDecision(a.force === true, hasSid, hasSid ? sidTargetsSelf(rawSid) : null, dirty);
+    const sidLog = hasSid ? sidVal.slice(0, 8) : "(none)";
     const pageLog = before || "(未命名)";
-    if (dirty && gateBranch !== "skipped-force") {
-      console.info(LOG_TAG + " openWorkflow 脏保护拦截 sid=" + sidLog + " branch=" + gateBranch + " page=" + pageLog);
-      return { opened: false, blocked: "dirty", activeBefore: before, dirtyCheck: gateBranch };
+    if (gate.standdown) {
+      // 本页不是目标页：不拦（本页 dirty 不参与判定）、也不执行（执行＝把本页未保存的改动冲掉）。
+      // 真正的拦/放由目标页自己的桥按它自己的 dirty 决定。
+      console.info(LOG_TAG + " openWorkflow 非目标页不执行 sid=" + sidLog + " page=" + pageLog + " selfDirty=" + dirty);
+      return {
+        opened: false,
+        blocked: "not_target",
+        activeBefore: before,
+        dirtyCheck: gate.branch,
+        gate: gate.gate,
+        targetDirty: gate.targetDirty,
+        sid: sidVal,
+        reason: "目标页 " + sidLog + " 不是本页（本页打开的是「" + pageLog + "」）：本页未执行、未触碰画布，本页的未保存改动不参与拦截",
+      };
     }
-    console.info(LOG_TAG + " openWorkflow 脏保护放行 sid=" + sidLog + " branch=" + gateBranch + " page=" + pageLog);
+    if (gate.block) {
+      console.info(LOG_TAG + " openWorkflow 脏保护拦截 sid=" + sidLog + " branch=" + gate.branch + " page=" + pageLog);
+      return {
+        opened: false,
+        blocked: "dirty",
+        activeBefore: before,
+        dirtyCheck: gate.branch,
+        gate: gate.gate,
+        targetDirty: gate.targetDirty,
+        sid: sidVal,
+        message: "目标页 " + (hasSid ? sidLog : "(广播/未指定)") + "（「" + pageLog + "」）有未保存改动，确认丢弃请传 force=true",
+      };
+    }
+    console.info(LOG_TAG + " openWorkflow 脏保护放行 sid=" + sidLog + " branch=" + gate.branch + " page=" + pageLog);
 
     // 在已保存的工作流里找目标（按 path 精确、按文件名/去扩展名的名字宽松）
     const list = (() => {
@@ -2014,7 +2317,10 @@ const OPS = {
       activeBefore: before,
       activeAfter: expectAfter,
       nodeCount,
-      dirtyCheck: gateBranch,
+      dirtyCheck: gate.branch,
+      gate: gate.gate,
+      targetDirty: gate.targetDirty,
+      sid: sidVal,
       note: "已发起完整装载（异步）：装载完成后画布刷新并激活该工作流，调用方按 nodeCount / activeAfter 落定校验确认",
     };
   },
@@ -2093,62 +2399,20 @@ const OPS = {
   // ── D1：画布执行 + 可视化（需 App 侧授权开闸；契约字段冻结）──────────────
 
   // 执行当前画布（等效点 Queue；front=true 等效 QueuePromptFront——前端以 number=-1 走 body.front）。
-  // 快返：只提交不等执行。prompt_id 优先靠猴补 api.queuePrompt 捕获（E1 §2-a），
-  // 捕获不到再用 /queue 前后差集兜底（E1 §2-b，仅取唯一新增项、不猜）。
+  // 实现体在 canvasQueueImpl（含「/prompt 体按次改写 + 解码器反查」）；这里只管单次提交窗口的互斥。
   "canvas.queue": async (args) => {
-    const a = args || {};
-    const front = a.front === true;
-    if (typeof app.queuePrompt !== "function") {
-      throw new Error("前端没有 app.queuePrompt（版本不支持）");
+    // 并发守卫：这一次提交会临时替换 api.fetchApi（把 client_id / preview_method 写进那条 /prompt 体）。
+    // 第二个提交若在窗口内混进来，两笔都带中继 clientId → prompt_id 归属与帧归属都分不清；这里直接拒绝，
+    // 明确报错、不排队、不静默丢弃（调用方重试即可）。
+    if (canvasQueueInFlight) {
+      throw new Error(`画布提交进行中（开始于 ${canvasQueueInFlight}），本次提交被拒绝：请等上一笔返回后再提交`);
     }
-    let beforeIds = null;
+    canvasQueueInFlight = new Date().toISOString();
     try {
-      beforeIds = await queuePromptIds();
-    } catch { beforeIds = null; }
-
-    const orig = api.queuePrompt;
-    let cap = null;
-    let capErr = null;
-    api.queuePrompt = async function (...callArgs) {
-      try {
-        const res = await orig.apply(this, callArgs);
-        cap = res || null;
-        return res;
-      } catch (err) {
-        capErr = err;
-        throw err;
-      }
-    };
-    // 提交来源（2026-10-14）：本次运行由 Agent 工具发起 → 置 "agent"，供常驻包装上报时读取。
-    // 时序自证：orig = api.queuePrompt（= setup 装的常驻包装）→ 临时替换为捕获包装 →
-    // app.queuePrompt → 捕获包装调 orig（常驻包装）→ 常驻包装读 historyCommitSource（此刻="agent"）
-    // 上报 → 才回到本 finally 复位。故上报发生在复位之前 ✅。
-    const prevCommitSource = historyCommitSource;   // 保存现场（防嵌套）
-    historyCommitSource = "agent";
-    try {
-      await app.queuePrompt(front ? -1 : 0, 1);
+      return await canvasQueueImpl(args);
     } finally {
-      api.queuePrompt = orig;
-      historyCommitSource = prevCommitSource;       // 还原
+      canvasQueueInFlight = null;
     }
-    if (capErr) {
-      throw new Error("提交被拒：" + String(capErr).slice(0, 400));
-    }
-    if (cap && cap.prompt_id) {
-      return { queued: true, promptId: cap.prompt_id, number: cap.number, via: "app.queuePrompt" };
-    }
-    // 未捕获（如 processingQueue 忙时立即返回）：/queue 差集定位
-    let fallbackId = null;
-    if (beforeIds) {
-      try {
-        const afterIds = await queuePromptIds();
-        const added = [...afterIds].filter((id) => !beforeIds.has(id));
-        if (added.length === 1) fallbackId = added[0];
-      } catch { /* 兜底失败不阻断 */ }
-    }
-    const out = { queued: true, via: "app.queuePrompt" };
-    if (fallbackId) out.promptId = fallbackId;
-    return out;
   },
 
   // 以当前画布为基础复制为新页（E1 §1 最小等效序列；原生 duplicateWorkflow 的逐行等效）。
