@@ -17,7 +17,7 @@ const PATH_RESULT = "/hana_bridge/result";
 
 // 构建标识（诊断口径；2026-09-28 起取代此前的陈旧占位标签，与桥文件名/构建日期对齐——
 // api.probe.bridgeBuild / window.__hanaBridge.build 同源）。
-const BUILD_TAG = "2026-11-27 hana-bridge-27021957";
+const BUILD_TAG = "2026-11-27 hana-bridge-27032254";
 
 // ── 明暗跟随（2026-11-05）──────────────────────────────────────────
 // 背景：桥注入界面的深色覆盖原先只挂 `:root.dark-theme`。前端 1.58.5 起整个包里 `dark-theme`

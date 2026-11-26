@@ -132,7 +132,7 @@ except ValueError:
 # 2026-10-27（侧向接入阈值 8→2，消除缩小后的台阶）：对齐新活动桥 hana-bridge-02010800。
 # 2026-11-05（历史框/树深色选择器改双路 + 运行时 data-hana-dark 兜底）：对齐新活动桥 hana-bridge-05035216。
 # 2026-11-27（issue 修复批：画布执行收帧 clientId 按次改写、定向未保存闸按目标页判定）：对齐新活动桥 hana-bridge-27021957。
-BRIDGE_BUILD_TAG = "2026-11-27 hana-bridge-27021957"
+BRIDGE_BUILD_TAG = "2026-11-27 hana-bridge-27032254"
 
 # 前端扩展上报的 clientId（即 /ws 的 sid）。多标签时保留最近一个。
 _frontend = {"sid": None}
