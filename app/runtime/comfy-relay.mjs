@@ -43,12 +43,13 @@
 //   GET  /healthz                  免鉴权探活（workerOnline / models 条数）
 //   GET  /v1/models                需 Bearer token；App 经 /_relay/llm/config 下发的目录缓存
 //   POST /v1/chat/completions      需 Bearer token；生成 job 入队，stream 走 SSE，非 stream 挂起等结果
-//   POST /_relay/llm/config        App 下发 {token, models, defaultModel}（loopback 信任）
-//   GET  /_relay/llm/jobs?wait=ms  App 长轮询取 job（同一 job 只取一次；无 job 超时 204）
-//   POST /_relay/llm/jobs/:id/event App 回填增量 {type:text-delta|reasoning-delta|error, ...}
-//   POST /_relay/llm/jobs/:id/done  App 收尾 {ok:true,text}|{ok:false,error}
-//   —— 以上 4 条 App 桥路由同时挂在主中继 server（App 经 ctx.runtime.fetch 只能到 service 端口，
-//   到不了 8790）与 8790 网关 server 上，共用同一 handler（scope="bridge"/"public"）与同一队列。
+//   POST /_relay/llm/config        App 下发 {token, models, defaultModel}（需 controlKey）
+//   GET  /_relay/llm/jobs?wait=ms  App 长轮询取 job（同一 job 只取一次；无 job 超时 204；需 controlKey）
+//   POST /_relay/llm/jobs/:id/event App 回填增量 {type:text-delta|reasoning-delta|error, ...}（需 controlKey）
+//   POST /_relay/llm/jobs/:id/done  App 收尾 {ok:true,text}|{ok:false,error}（需 controlKey）
+//   —— 以上 4 条 App 桥路由与其它 /_relay 控制面同口径，均校验 controlKey（x-comfy-relay-key），
+//   失败 403；实际由主中继 server 承载（App 经 ctx.runtime.fetch 只能到 service 端口，到不了 8790），
+//   8790 网关的 route 守卫只放行对外 OpenAI 面，对桥路由回 404。共用同一 handler 与同一队列。
 //   job 30s 无任何回填超时：stream 发 error 事件后 [DONE]，非 stream 504。
 //
 // 启动方式：
@@ -4833,7 +4834,8 @@ async function handleTemplateFetch(req, res) {
 // 另起一只 http server（默认 127.0.0.1:8790，config.llmGatewayPort 可覆盖），与中继主服务并存。
 // 事实约束：AppHost 子进程不开 --allow-net，App 内 listen 会带崩进程（ERR_ACCESS_DENIED 在内部
 // microtask 里抛，拦不住），且宿主总线没有 model:stream —— 所以监听与队列都由中继做，
-// App 经 /_relay/llm/* 桥取 job、回填增量。沿用 /_relay loopback 信任模型，不校验 App 侧调用者。
+// App 经 /_relay/llm/* 桥取 job、回填增量。桥路由与其它 /_relay 控制面同口径，均校验 controlKey
+// （原「沿用 loopback 信任模型、不校验 App 侧调用者」的假设已被市场审核否掉，2026-11-27 补上鉴权）。
 const LLM_GATEWAY_VERSION = "0.1.0";
 const LLM_JOB_TIMEOUT_MS = 30_000; // job 超时：30s 无任何 event/done 即失败收尾
 const LLM_WAIT_DEFAULT_MS = 25_000; // /_relay/llm/jobs?wait= 缺省长轮询时长
@@ -5025,7 +5027,12 @@ async function llmGatewayHandler(req, res, scope = "public") {
       return;
     }
 
-    // — App 侧桥（loopback 信任模型，沿用 /_relay 口径）—
+    // — App 侧桥（与其它 /_relay 控制面同口径：四条路由一律先校验 controlKey）—
+    // 校验放在最前：必须在任何状态变更（改 token/models、取 job、写回填、结算）之前。
+    if (!controlOk(req)) {
+      return jsonOut(res, 403, { ok: false, error: "comfy-relay: control key required" });
+    }
+
     if (method === "POST" && pathOnly === "/_relay/llm/config") {
       let body;
       try {
