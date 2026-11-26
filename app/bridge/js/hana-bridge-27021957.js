@@ -2442,7 +2442,11 @@ const OPS = {
     const dupP = app.loadGraphData(state, true, true, wf);
     armSystemWindow(sysWin, dupP);
     await dupP;
-    return { ok: true, page: wf.path, key: wf.key };
+    // 2026-11-27（issue ②）：回执带上「执行本 op 的页」的全量 sid（＝ api.clientId，与 hello 上报同值）。
+    // 为何需要：app 侧「复制副本 → 落盘 → 装载 → 排队」链要把后续写类 op 全部定向到副本页；
+    // 多页在线时桥的定向闸拒掉无 sid 的写，而台账对「刚建的页」有新名字上报延迟——这条回执是
+    // 「副本到底落在那页」最硬的证据（执行页自报），让链不必靠台账推断。旧 app 读不懂该字段（忽略）。
+    return { ok: true, page: wf.path, key: wf.key, sid: api.clientId || null };
   },
 
   // 编辑可视化：lock / highlight / clear（契约 §3.2 三动作语义，防呆照做）。
@@ -9065,6 +9069,8 @@ const WRITE_OPS = new Set([
   "canvas.loadWorkflowFile", "canvas.openWorkflow", "canvas.activateWorkflow",
   "canvas.setWidget", "canvas.addNode", "canvas.removeNode",
   "canvas.connect", "canvas.disconnect", "canvas.setNodeMode", "canvas.moveNode",
+  // setNodeSize（2026-11-27）：改节点尺寸/折叠——同样是改图，原先漏登记（与 py 定向闸名单对齐后补上）。
+  "canvas.setNodeSize",
   "canvas.addGroup", "canvas.setGroup", "canvas.removeGroup",
   "canvas.save", "canvas.undo", "canvas.patch", "canvas.organize",
   "canvas.queue", "canvas.duplicate", "canvas.visual", "canvas.copilot",

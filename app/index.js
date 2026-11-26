@@ -32,6 +32,7 @@ import { isPlainObject, convertUiToApi, applyInputs, summarizeWorkflow } from ".
 import { loadNodeAdapters } from "./lib/node-adapter-store.mjs";
 // T3-1 / T3-3（2026-10-10）：openWorkflow 链路的落定判定与路由失败文案（纯函数，见其 test.mjs）。
 import { nameMatchesTarget, openWorkflowLoadVerdict, openWorkflowRouteError, toIntOrNull } from "./lib/canvas-open-workflow.mjs";
+import { pickActivePageSid, matchNewPageSid } from "./lib/canvas-target.mjs";
 // T7（2026-11-02）：templates action 的版本标记用（lib 纯函数，只 import 不改动）。
 import { compareVersion } from "./lib/template-hub.mjs";
 
@@ -2728,26 +2729,33 @@ export default defineApp(async (sdk) => {
         copilotNow = await fetchCanvasCopilot();
       }
     }
-    const sameCanvas = !!(copilotNow && copilotNow.enabled === true);
+    // 2026-11-27（相邻一行修正）：原为 const —— 同页预存失败降级副本路径时 `sameCanvas = false` 会在
+    //   赋值处抛 TypeError，整条链直接倒（真机未覆盖到该分支所以一直没暴露）。改 let。
+    let sameCanvas = !!(copilotNow && copilotNow.enabled === true);
     const pageKeyFromCopilot = copilotNow && copilotNow.pageKey ? String(copilotNow.pageKey) : null;
+    // ②' 目标页自证（2026-11-27 issue ②）：本链的写全部落在「一页」上，先取定它的全量 sid。
+    //     多页在线时桥侧硬闸要求写类 op 带 sid（无 sid 一律 409）——不再靠广播「谁先回谁算」。
+    const chainTarget = await resolveChainTargetSid("画布执行");
+    const chainSid = chainTarget.sid;
     // 同页路径（v3 新增）：预存当前画布（装载会覆盖当前图，覆盖前必须先落盘），再装载 + 执行。
     // 2026-11-01：预存若走了另存形态（页面原本无文件身份，画布切到新 AgentSaved 文件），
     // 页面身份已变，副驾驶需在预存内重开；重开失败（总闸关等）→ 降级副本路径（preSave.reopenCopilotFailed）。
     let preSave = null;
     if (sameCanvas) {
-      preSave = await preSaveActiveCanvas();
+      preSave = await preSaveActiveCanvas(chainSid);
       if (preSave.reopenCopilotFailed) {
         sameCanvas = false;
       }
     }
     // ③ 复制副本（v3：仅未开副驾驶时；总闸 readAllowCopilot 只在副本路径需要——副本要开副驾驶才用得着它）。
-    let dup = null, dupPage = null, dupKey = null, pageKey = pageKeyFromCopilot, copyName = null, copyFile = null;
+    let dup = null, dupPage = null, dupKey = null, pageKey = pageKeyFromCopilot, copyName = null, copyFile = null, dupSid = null;
     if (!sameCanvas) {
       if (!readAllowCopilot()) {
         const e = new Error("未开启「允许 Agent 开启画布副驾驶」授权——canvas 流程需在副本上开启副驾驶（请先在 Hana-ComfyUI 设置页打开「允许 Agent 开启画布副驾驶」；或显式 mode=backend）");
         e.code = "canvas-unauthorized"; e.gate = "copilot"; throw e;
       }
-      const d = await canvasBridgeInvoke("canvas.duplicate", {});
+      // duplicate 也定向单发（它同样是写类 op）：只会在 chainSid 那一页复制一份副本。
+      const d = await canvasBridgeInvoke("canvas.duplicate", { sid: chainSid });
       if (!d.ok) {
         if (d.error === "copilot_off") throw copilotOffError("duplicate", d); // 防御：duplicate 本在豁免名单
         const e = new Error(`复制画布失败：${d.error || "未知"}`); e.code = "canvas-failed"; throw e;
@@ -2756,11 +2764,13 @@ export default defineApp(async (sdk) => {
       dupPage = dup.payload && dup.payload.page ? String(dup.payload.page) : null;
       dupKey = dup.payload && dup.payload.key ? String(dup.payload.key) : null;
       pageKey = dupPage || dupKey || null;
+      // 副本页究竟在哪一页：回执 sid / 台账名匹配唯一命中 / 定向证明；三者都拿不到 → 中止（不退回无 sid）。
+      dupSid = await confirmCopiedPageSid(dup.payload, chainSid, "复制副本");
       // 副本落盘：命名 <原名去尾> (AgentCopy) YYYYMMDD-HHmm（重名递增；语义见 pickAgentCopyName）。
       // 落盘走桥的「另存并切换」链——先拿到有文件身份的副本，再开副驾驶（v2 第 2、3 步顺序固定）。
       copyName = await pickAgentCopyName(dupPage || dupKey);
       const saveRevBefore = await canvasRevisionRead();
-      const sv = await canvasBridgeInvoke("canvas.save", { name: copyName });
+      const sv = await canvasBridgeInvoke("canvas.save", { name: copyName, sid: dupSid });
       if (!sv.ok) {
         if (sv.error === "copilot_off") throw copilotOffError("save", sv); // 防御：save 本在豁免名单
         const e = new Error(`副本落盘失败：${sv.error || "未知"}`); e.code = "canvas-failed"; throw e;
@@ -2770,11 +2780,13 @@ export default defineApp(async (sdk) => {
       }
       copyFile = sv.payload && sv.payload.saved ? String(sv.payload.saved) : `workflows/${copyName}.json`;
       // 开副本副驾驶（v2 第 3 步；Agent 默认在副本上工作——不碰原布）
-      const cp = await openCopilotOnActivePage();
+      const cp = await openCopilotOnActivePage(dupSid);
       if (cp !== true) {
         const e = new Error(`开启副本副驾驶失败：${cp || "回执未确认开启"}`); e.code = "canvas-failed"; throw e;
       }
     }
+    // 本链后续写操作（装载 / 执行）的目标页：副本路径→副本页；同页路径→活动页。
+    const writeSid = dupSid || chainSid;
 
     // ⑤ 装载提交的工作流（同页路径装到当前页——由预存保底；副本路径装到副本——force 零风险）。
     //    ⚠ 时序（修复 3）：桥侧 loadWorkflowFile 是快返（fire-and-forget）；v1.53.6 的
@@ -2790,7 +2802,7 @@ export default defineApp(async (sdk) => {
     const revBefore = await canvasRevisionRead(); // 装载前序号（settle 参照；取不到退化为纯计数判定）
     let ld = null;
     if (!skipLoad) {
-      ld = await canvasBridgeInvoke("canvas.loadWorkflowFile", { file: ref.file, force: true });
+      ld = await canvasBridgeInvoke("canvas.loadWorkflowFile", { file: ref.file, force: true, sid: writeSid });
       if (!ld.ok) {
         // v3 回落：仅限同页路径（__agentCopyFallback 重入不再回落，防无限递归）。copilot_off 说明
         // 缓存状态过期——桥是权威，转入副本路径重走全链；本变量不再使用。
@@ -2833,7 +2845,7 @@ export default defineApp(async (sdk) => {
     const pageIdentityCheck = sameCanvas ? (activeBefore ? "strict" : "weak") : "strict";
     // ⑦ 画布发起执行（快返）；promptId 缺失时用 /queue 前后差集反查
     const before = await queuePromptIdsSnapshot();
-    const q = await canvasBridgeInvoke("canvas.queue", args.front === true ? { front: true } : {});
+    const q = await canvasBridgeInvoke("canvas.queue", args.front === true ? { front: true, sid: writeSid } : { sid: writeSid });
     if (!q.ok) {
       // v3 回落：同页路径 queue 被桥拒（copilot_off）→ 同上，转入副本路径（此后代码不再使用）。
       if (q.error === "copilot_off" && sameCanvas && !args.__agentCopyFallback) {
@@ -3784,6 +3796,9 @@ export default defineApp(async (sdk) => {
         // 缺口 4（2026-10-13）：target_not_foreground 回执自带候选页（sid / foreground / matches）——
         // 与 pages 同款保留透传（此前被丢弃），供报错文案附候选便于定位。未携带时为 null。
         candidates: Array.isArray(d.candidates) ? d.candidates : null,
+        // 2026-11-27：回执里的机器可读错误码（py 侧定向闸给 canvas-target-required / -invalid）——
+        // 单独留字段，供上游按码分支，不必拿 error 字符串做前缀匹配。未携带时为 null。
+        code: typeof d.code === "string" ? d.code : null,
       };
     }
     return { ok: true, status, via, payload: d.data === undefined ? null : d.data, error: null, detail: null };
@@ -4319,12 +4334,97 @@ export default defineApp(async (sdk) => {
   // 未开 → 复制副本、开副本副驾驶、在副本上执行（原布零改动，v2 五步不变）。
   // 判定只信桥：写操作被 copilot_off 拒绝时立即回落副本路径，不凭缓存硬顶。
 
+  // ── 链内目标页自证（2026-11-27 issue ②）──────────────────────────────────
+  // 背景：桥 py 侧加了硬闸（bridge/__init__.py 的 `_write_target_gate`）——多页在线时，写类 op
+  //   **不带显式 sid/workflow 一律 409**（事故：未定向的 loadWorkflowFile 把用户页的布换成了测试图）。
+  //   本链（同页/副本路径 + 回填）原先所有写都不带 sid，多页时整链被拒 = agent 画布执行不可用。
+  // 口径：本链的写本来就只对「一页」成立——同页路径＝活动页，副本路径＝活动页上的新副本页。
+  //   链首从台账取定该页全量 sid（pickActivePageSid，与 py 定向路由 / activePageCopilot 同判据）；
+  //   duplicate 之后再用回执/台账确认副本页 sid（confirmCopiedPageSid）；取不到就**中止**，
+  //   绝不退回无 sid 的写法（那是广播 = 落到别人画布，正是事故成因）。
+  const CANVAS_TARGET_UNRESOLVED_MSG =
+    "无法确定刚创建页面的 sid，为避免落到别人的画布已中止；请重试或手动在目标页执行";
+
+  /** 读页面台账（canvas.pages 由 py 直答，不经前端）；取不到回 []，由调用方判「无活页」。 */
+  async function readCanvasPagesLedger() {
+    try {
+      const pgs = await canvasBridgeInvoke("canvas.pages", {});
+      if (pgs.ok && pgs.payload && Array.isArray(pgs.payload.pages)) return pgs.payload.pages;
+    } catch { /* 台账取不到 → 无解，调用方中止 */ }
+    return [];
+  }
+
+  function canvasTargetUnresolved(scope, why, pages) {
+    const brief = onlinePagesBrief(pages);
+    const e = new Error(
+      `${scope}：${why}；共中止，未对任何页面发起写操作。` +
+        `\n- 说明：${CANVAS_TARGET_UNRESOLVED_MSG}` +
+        `${brief ? `\n- 在线页面：${brief}` : "\n- 在线页面：（台账不可用）"}`
+    );
+    e.code = "canvas-target-unresolved";
+    return e;
+  }
+
+  /** 链首：取「要操作的那一页」的全量 sid（同页路径＝活动页；副本路径＝将被复制的那一页）。 */
+  async function resolveChainTargetSid(scope) {
+    const pages = await readCanvasPagesLedger();
+    const pick = pickActivePageSid(pages);
+    if (pick.sid) {
+      log(`${scope}：目标页 ${pick.page.sid}…（「${pick.page.workflow || "未命名"}」，台账 ${pick.liveCount} 活页，via=${pick.via}）`);
+      return { sid: pick.sid, page: pick.page, pages };
+    }
+    throw canvasTargetUnresolved(
+      scope,
+      `无法确定要操作的画布页（台账活页 0，共 ${pick.seenCount || 0} 条登记）`,
+      pages
+    );
+  }
+
+  /** duplicate 之后：确认副本落在哪一页（回执 sid 优先 > 台账名匹配唯一命中 > 定向证明）。
+   *
+   * 为何顺序如此：duplicate 已**定向到 preferredSid 单发**（py 只推给那一页），回执只可能来自那页——
+   * 这是「定向证明」，不是广播猜中；回执带 sid（新桥）则是执行页自报的真凭，更硬；台账名匹配用来
+   * 在两者都缺时补证据（刚建的页名上报有 ~1-3s 延迟，故短等两轮）。
+   * 三者都拿不到（例如台账里副本名撞车两页）→ 抛错中止，不退回无 sid。
+   */
+  async function confirmCopiedPageSid(dupPayload, preferredSid, scope) {
+    const respSid = dupPayload && typeof dupPayload.sid === "string" ? dupPayload.sid.trim() : "";
+    if (respSid) {
+      log(`${scope}：副本页 sid 取自回执（${respSid.slice(0, 8)}…）`);
+      return respSid;
+    }
+    for (let i = 0; i < 2; i++) {
+      const pages = await readCanvasPagesLedger();
+      const hit = matchNewPageSid(pages, dupPayload || {});
+      if (hit.sid) {
+        log(`${scope}：副本页 sid 取自台账名匹配（${hit.page.sid}…「${hit.page.workflow || "未命名"}」）`);
+        return hit.sid;
+      }
+      if (hit.reason === "ambiguous") {
+        throw canvasTargetUnresolved(
+          scope,
+          `台账里副本名同时命中 ${hit.candidates.length} 页（${hit.candidates.map((c) => `${c.sid}…「${c.workflow || "未命名"}」`).join("、")}），不猜目标`,
+          pages
+        );
+      }
+      if (i === 0) await sleep(1500); // 刚建的页通常 1-3s 内上报；只等一轮，别把整链拖慢
+    }
+    if (preferredSid) {
+      // duplicate 是带 sid 单发的：回执能回来就证明确实是这页执行的（定向证明）。
+      log(`${scope}：副本页 sid 采用定向证明（${preferredSid.slice(0, 8)}…；回执无 sid、台账尚未反映新页名）`);
+      return preferredSid;
+    }
+    throw canvasTargetUnresolved(scope, "回执既无 sid，台账也没匹配到副本页", await readCanvasPagesLedger());
+  }
+
   // 同页路径第 1 步：预存当前画布（装载会覆盖当前图，覆盖前必须先落盘）。
   // 先试同名保存（保存到它自己的文件，画布不切页）；若页面无文件身份（桥报「临时工作流」），
   // 改走另存形态：派生名 `<原名去尾> (AgentSaved) YYYYMMDD-HHmm`（重名递增，复用 pickAgentCopyName），
   // 落盘走「另存并切换」链——画布会切到新文件，需 settle 落定。savedAs 信息回传给调用方标注。
-  async function preSaveActiveCanvas() {
-    const sv = await canvasBridgeInvoke("canvas.save", {});
+  async function preSaveActiveCanvas(sid) {
+    // 2026-11-27：写类 op 必须定向（多页在线时桥侧闸会拒无 sid 的写）——sid 由调用方自证后传入。
+    const withSid = (extra) => (sid ? { ...extra, sid } : { ...extra });
+    const sv = await canvasBridgeInvoke("canvas.save", withSid({}));
     if (!sv.ok) {
       const msg = String(sv.error || "");
       const noFile = msg.includes("临时工作流"); // 桥侧对无文件身份页面（Unsaved Workflow）的显式报错
@@ -4335,7 +4435,7 @@ export default defineApp(async (sdk) => {
       // 落盘并切换（savedAs，画布会切到新文件，settle 落定后把实际名字记进 preSave）。
       const asName = await pickAgentSavedName(msg);
       const saveRevBefore = await canvasRevisionRead();
-      const svAs = await canvasBridgeInvoke("canvas.save", { name: asName });
+      const svAs = await canvasBridgeInvoke("canvas.save", withSid({ name: asName }));
       if (!svAs.ok) {
         const e = new Error(`同页执行前预存当前画布失败（另存「${asName}」）：${svAs.error || "未知"}`); e.code = "canvas-failed"; throw e;
       }
@@ -4346,7 +4446,7 @@ export default defineApp(async (sdk) => {
       // 2026-11-01（真机复现必修）：另存换了页面文件身份，副驾驶按页/文件记——必须重新进入驾驶位，
       // 否则后续同页装载被桥以 copilot_off 拒绝，白白回落副本路径。开不起来（总闸关等）时
       // 带 reopenCopilotFailed 返回，调用方改走副本路径（内容已落盘，不丢）。
-      const reopen = await openCopilotOnActivePage();
+      const reopen = await openCopilotOnActivePage(sid);
       if (reopen !== true) {
         return { name, savedAs: true, reopenCopilotFailed: reopen || "回执未确认开启" };
       }
@@ -4358,8 +4458,8 @@ export default defineApp(async (sdk) => {
 
   // 开当前活动页副驾驶（副本路径第 3 步专用；copilot 在写拦截豁免名单，但受副驾驶总闸管辖——
   // 总闸检查在调用方 readAllowCopilot()）。返回 true，或失败原因字符串。
-  async function openCopilotOnActivePage() {
-    const cp = await canvasBridgeInvoke("canvas.copilot", { enabled: true });
+  async function openCopilotOnActivePage(sid) {
+    const cp = await canvasBridgeInvoke("canvas.copilot", sid ? { enabled: true, sid } : { enabled: true });
     if (!cp.ok || !(cp.payload && cp.payload.enabled === true)) {
       if (cp.error === "copilot_off") return `copilot_off（防御：copilot 本在豁免名单）`;
       return cp.error || "回执未确认开启";
@@ -4684,26 +4784,39 @@ export default defineApp(async (sdk) => {
       if (running.payload && running.payload.runningNodeId != null) return keep("画布有执行中任务，暂不回填");
       const loadRef = resolveBackfillRef(rec.workflowRef);
       if (!loadRef) return keep(`workflowRef 不是可装载的文件引用：${rec.workflowRef}`);
+      // ②' 目标页自证（2026-11-27 issue ②）：回填链与 canvas 执行链同构，写全部定向到链首取定的那页。
+      let chainSid = null;
+      try {
+        chainSid = (await resolveChainTargetSid("待同步回填")).sid;
+      } catch (e) {
+        return keep(msgOf(e));
+      }
       // ② 复制副本（恒复制；原布零改动）
-      const dup = await canvasBridgeInvoke("canvas.duplicate", {});
+      const dup = await canvasBridgeInvoke("canvas.duplicate", { sid: chainSid });
       if (!dup.ok) return keep(`复制画布失败：${dup.error || "未知"}`);
       const dupPage = dup.payload && dup.payload.page ? String(dup.payload.page) : null;
       const pageKey = dupPage || (dup.payload && dup.payload.key ? String(dup.payload.key) : null);
+      let dupSid = null;
+      try {
+        dupSid = await confirmCopiedPageSid(dup.payload, chainSid, "待同步回填·复制副本");
+      } catch (e) {
+        return keep(msgOf(e));
+      }
       // ③ 副本落盘（<原名去尾> (AgentCopy) …）——v2 顺序：先落盘、再开副驾驶（见 copilot.md v2）
       const copyName = await pickAgentCopyName(dupPage || pageKey);
       const saveRevBefore = await canvasRevisionRead();
-      const sv = await canvasBridgeInvoke("canvas.save", { name: copyName });
+      const sv = await canvasBridgeInvoke("canvas.save", { name: copyName, sid: dupSid });
       if (!sv.ok) return keep(`副本落盘失败：${sv.error || "未知"}`);
       if (sv.payload && sv.payload.savedAs === true && sv.payload.pending === true) {
         await settleSaveAsPending(sv.payload, saveRevBefore);
       }
       // ④ 开副本副驾驶
-      const cp = await canvasBridgeInvoke("canvas.copilot", { enabled: true });
+      const cp = await canvasBridgeInvoke("canvas.copilot", { enabled: true, sid: dupSid });
       if (!cp.ok || !(cp.payload && cp.payload.enabled === true)) {
         return keep(`开副本副驾驶失败：${cp.error || "回执未确认开启"}`);
       }
       // ⑤ 装载产物工作流
-      const ld = await canvasBridgeInvoke("canvas.loadWorkflowFile", { file: loadRef.file, force: true });
+      const ld = await canvasBridgeInvoke("canvas.loadWorkflowFile", { file: loadRef.file, force: true, sid: dupSid });
       if (!ld.ok || (ld.payload && ld.payload.loaded === false)) {
         return keep(`装载失败：${(ld.payload && ld.payload.blocked) || ld.error || "未知"}`);
       }
@@ -4975,6 +5088,18 @@ export default defineApp(async (sdk) => {
         const why = inv.error || `HTTP ${inv.status}`;
         // v2：写拦截（copilot_off）——转译为友好文案＋如何开启的指引（任务书口径：工具层友好面）。
         if (inv.error === "copilot_off") throw copilotOffError(op, inv);
+        // 2026-11-27：多页在线的写类定向闸（桥 py 侧 409）——文案已由桥写成「为什么不执行 + 在线页」，
+        // 这里只补一条「下一步怎么做」，不改写原因（不盖掉现场证据），并带机器码。
+        // 为何需要单独分支：下方兜底是「读画布失败（…）」——写类被拒时报「读失败」会误导排查方向。
+        if (inv.code === "canvas-target-required" || inv.code === "canvas-target-invalid") {
+          const e = new Error(
+            `${inv.detail || `${op} 未指定目标页，已拒绝`}` +
+              `\n- 可行动指引：先用 comfyui(action="canvas", op="pages") 取在线页 sid，再带 sid="<页 sid>"（或 workflow="<工作流名>"）重试「${op}」；` +
+              `多页同时在线时不提供「不指定目标」的写法。`
+          );
+          e.code = inv.code;
+          throw e;
+        }
         // 缺口 4/5（2026-10-13）：target_not_foreground——目标工作流在某页已打开但不在前台
         //（前台是别的标签）。不静默切视线，只给可行动指引＋在线页面/候选清单，切不切由 agent 自主。
         if (inv.error === "target_not_foreground") {

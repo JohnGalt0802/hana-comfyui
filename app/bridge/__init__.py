@@ -357,6 +357,148 @@ def _pages_payload():
     }
 
 
+# ── 写类 op 清单 + 「多页在线时的写类定向闸」（2026-11-27 issue 修复批）───────────
+# 事故（2026-11-27）：新开一个工作区窗口后调 canvas.loadWorkflowFile，**未带页面定向**；
+#   桥按旧语义「没给目标 → send_sync(sid=None) 广播」派发，落到用户正在用的那一页，把人家的
+#   内存画布换成了两节点的测试图。那页 dirty=false，「未保存保护」管不到 → 一路放行。
+# 口径（安全默认值：无开关、无旁路、无页面/工作流特例）：
+#   · 写类 op、既无 sid 也无 workflow、台账里不止一页 → 拒绝，回执列在线页；
+#   · 写类 op 给了 sid 却解析不到活页（不存在 / 前缀歧义 / 已失活）→ 拒绝并说清是哪一种，**不退化广播**；
+#   · 台账只有一页（或零页）→ 行为不变（保留单页便利）；读类 op 一律不过闸。
+# 写类名单的唯一权威源是桥前端的 WRITE_OPS（bridge/js/hana-bridge-<build>.js 的 `const WRITE_OPS`，
+#   同一份名单也供副驾驶写拦截用）；Python 侧读不到 JS 的运行时集合，故镜像一份，**增删同改**。
+# 与 JS 名单的差异（逐条）：
+#   · canvas.setNodeSize：JS 的 WRITE_OPS 原先漏登记（它确实改图：改节点尺寸 + 折叠）；
+#     2026-11-27 同批已补进 JS 名单（与本文档对齐，消除两份清单漂移）。
+#   · canvas.loadWorkflowNewPage：JS 两名单均不含（口径＝用户主动移交，新建自己的页装载，
+#     不覆盖他人画布），本闸同样不列——它天生带目标（新页），不存在误落他页的问题。
+_WRITE_OPS = frozenset(
+    {
+        "canvas.loadWorkflowFile",
+        "canvas.openWorkflow",
+        "canvas.activateWorkflow",
+        "canvas.setWidget",
+        "canvas.setNodeSize",
+        "canvas.addNode",
+        "canvas.removeNode",
+        "canvas.connect",
+        "canvas.disconnect",
+        "canvas.setNodeMode",
+        "canvas.moveNode",
+        "canvas.addGroup",
+        "canvas.setGroup",
+        "canvas.removeGroup",
+        "canvas.save",
+        "canvas.undo",
+        "canvas.patch",
+        "canvas.organize",
+        "canvas.queue",
+        "canvas.duplicate",
+        "canvas.visual",
+        "canvas.copilot",
+    }
+)
+# 拒绝回执里最多列几个在线页（任务口径：按最近活跃排序、最多 5 个）
+_WRITE_TARGET_LIST_MAX = 5
+
+
+def _pages_brief_of(ledger, now, ttl):
+    """`_pages_brief()` 的台账参数版（纯函数：供定向闸复用，不读全局 _frontends）。"""
+    return [
+        {"sid": (k or "")[:8], "workflow": v.get("workflow"), "stale": _age_sec(v, now) > ttl}
+        for k, v in ledger.items()
+    ]
+
+
+def _pages_online_line(ledger, now, ttl, limit=_WRITE_TARGET_LIST_MAX):
+    """在线页人读清单（报错文案用）：`a1b2c3d4「名字」、e5f6a7b8「名字」`，按最近活跃排序、最多 limit 个。
+
+    页面名一律实时取自台账，不写死任何名字。超 TTL 未上报的条目标「久未上报」但不剔除——广播会打到
+    所有连接，过期 ≠ 已关闭；宁可多报一条，也不让写操作落到没人盯的页上。
+    """
+    ordered = sorted(ledger.items(), key=lambda kv: (kv[1] or {}).get("seenAt") or 0, reverse=True)
+    rows = []
+    for k, v in ordered[:limit]:
+        name = (v or {}).get("workflow") or "(未命名)"
+        tail = "（久未上报）" if _age_sec(v or {}, now) > ttl else ""
+        rows.append("%s「%s」%s" % ((k or "")[:8], name, tail))
+    text = "、".join(rows) if rows else "(台账里没有页面)"
+    rest = len(ordered) - len(rows)
+    return text + ("…（另 %d 页未列）" % rest if rest > 0 else "")
+
+
+def _write_target_reject(error, detail, ledger, now, ttl):
+    """定向闸的拒绝回执（409）。error 同时以下划线→短横线形态给 code，供上层结构化识别。"""
+    return {
+        "ok": False,
+        "error": error,
+        "code": error.replace("_", "-"),
+        "detail": detail,
+        "pages": _pages_brief_of(ledger, now, ttl),
+    }
+
+
+def _write_target_gate(op, sid_in, sid_target, sid_ambiguous, want_wf, ledger, now, ttl):
+    """写类 op 的定向闸（纯函数：只吃传入事实，返回 None＝放行 / dict＝拒绝回执）。
+
+    调用点：`_hana_call` 在 sid 前缀解析之后、`send_sync` 之前——也就是「单发 or 广播」的唯一决策处。
+    `sid_target` / `sid_ambiguous` 由调用点既有的前缀解析给出（不在此重算，避免两份前缀语义漂移）。
+    """
+    if op not in _WRITE_OPS:
+        return None  # 读类 op 不受影响
+    if sid_in:
+        if not sid_target:
+            if sid_ambiguous:
+                return _write_target_reject(
+                    "canvas_target_invalid",
+                    "写操作的目标页不唯一：sid 前缀「%s」命中多个在线页，不猜目标；请给完整 sid 再重试"
+                    "（当前在线：%s）" % (sid_in, _pages_online_line(ledger, now, ttl)),
+                    ledger,
+                    now,
+                    ttl,
+                )
+            return _write_target_reject(
+                "canvas_target_invalid",
+                "写操作的目标页「%s」不在线（当前 %d 页在线：%s）——本次「%s」未执行，也不会改投别的页；"
+                "请用 canvas.pages 取在线 sid 后重试"
+                % (sid_in, len(ledger), _pages_online_line(ledger, now, ttl), op),
+                ledger,
+                now,
+                ttl,
+            )
+        entry = ledger.get(sid_target) or {}
+        if not _is_fresh(entry, now, ttl):
+            return _write_target_reject(
+                "canvas_target_invalid",
+                "写操作的目标页 %s「%s」已失活：最近上报 %d 秒前（TTL %d 秒），本次「%s」未执行。"
+                "可先用只读 op 定向探活（回传即刷新台账），或让用户切回该页后重试（当前在线：%s）"
+                % (
+                    (sid_target or "")[:8],
+                    entry.get("workflow") or "(未命名)",
+                    int(_age_sec(entry, now)),
+                    int(ttl),
+                    op,
+                    _pages_online_line(ledger, now, ttl),
+                ),
+                ledger,
+                now,
+                ttl,
+            )
+        return None
+    if want_wf:
+        return None  # 按 workflow 名定向：下方既有路由负责（找不到即 409，从不广播）
+    if len(ledger) > 1:
+        return _write_target_reject(
+            "canvas_target_required",
+            "画布写入未指定目标页：当前有 %d 个页面在线（%s）。写操作必须带 sid（或 workflow）定向，"
+            "避免落到别人的画布上。" % (len(ledger), _pages_online_line(ledger, now, ttl)),
+            ledger,
+            now,
+            ttl,
+        )
+    return None
+
+
 def _state_age_sec():
     """快照年龄（秒）；无快照返回 None。"""
     ts = _state.get("ts")
@@ -501,6 +643,11 @@ if _ROUTES is not None:
         ttl = _frontend_ttl_sec()
         want_wf = str(body.get("workflow") or "").strip()
         sid = str(body.get("sid") or "").strip() or None
+        # 2026-11-27（写类定向闸）：留一份调用方原始 sid 与「是否落地」事实——
+        # 闸要区分「压根没给目标」与「给了目标但没落到活页」（后者此前会被置 None → 退化成广播）。
+        sid_in = sid
+        sid_target = sid if (sid and sid in _frontends) else None
+        sid_ambiguous = False
         # 页面清单里给的是 8 位短 sid（便于人读），定向时允许前缀匹配；
         # 只有唯一命中才认，多个命中视为歧义、不猜。
         # 2026-09-28（TTL）：精确 sid 保持原语义（可直指任意条目，含探死条目做诊断）；
@@ -510,6 +657,7 @@ if _ROUTES is not None:
             pref_live = [k for k in pref if _is_fresh(_frontends.get(k) or {}, now, ttl)]
             if len(pref_live) == 1:
                 sid = pref_live[0]
+                sid_target = sid
             elif pref and not pref_live:
                 return web.json_response(
                     {
@@ -521,7 +669,10 @@ if _ROUTES is not None:
                     status=409,
                 )
             else:
-                sid = None  # 无命中/歧义（多个活命中）→ 维持「不猜」语义
+                # 无命中 / 歧义（多个活命中）→ 维持「不猜」语义；
+                # 写类 op 此时由下方定向闸拒绝（不再退化成广播），读类 op 沿用旧行为。
+                sid_ambiguous = len(pref_live) > 1
+                sid = None
         routed = None
         if want_wf:
             # 多标签寻址（缺口3，2026-10-13）：除前台标签名外，同时扫该页 openWorkflows；
@@ -604,6 +755,15 @@ if _ROUTES is not None:
                     len(hits_live),
                     len(hits_stale),
                 )
+
+        # ── 多页在线时的写类定向闸（2026-11-27）───────────────────────────
+        # 此处是「单发 or 广播」的唯一决策点：上面已把 sid 解析完（含前缀歧义）或按 workflow 定向完，
+        # 下面就要 send_sync(sid) —— sid 为 None 即广播。写类 op 在广播前必须过闸：
+        #   多页在线且没给目标 → 拒；给了目标但没落地（不存在/歧义/已失活）→ 拒，不退化广播。
+        gate = _write_target_gate(op, sid_in, sid_target, sid_ambiguous, want_wf, _frontends, now, ttl)
+        if gate is not None:
+            LOG.warning("hana_bridge: 写类 op「%s」被定向闸拒绝：%s", op, gate.get("detail"))
+            return web.json_response(gate, status=409)
 
         rid = secrets.token_hex(8)
         fut = asyncio.get_running_loop().create_future()
